@@ -20,6 +20,13 @@ use rand::rngs::SmallRng;
 use crate::fixture::{self, Fixture, RawAccount, RawAddress, RawEmail, RawFixture, RawMailbox};
 use crate::templates;
 
+/// Hard cap on `count` for the bulk builders. Above this we'd be
+/// allocating gigabytes of `RawEmail`s; failure mode is OOM. The cap
+/// is high enough to permit "test sync at scale" scenarios but low
+/// enough that a typo in the script (`count = 9_000_000_000`) gets a
+/// clean error instead of a process death.
+const MAX_BULK_COUNT: i64 = 10_000_000;
+
 /// Read a `.lua` scenario file and produce a fully validated `Fixture`.
 pub fn load(path: &Path) -> Result<Fixture, String> {
     let source = std::fs::read_to_string(path)
@@ -164,6 +171,12 @@ fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
     if count < 0 {
         return fail(state, "bulk_emails count must be non-negative");
     }
+    if count > MAX_BULK_COUNT {
+        return fail(
+            state,
+            format!("bulk_emails count {count} exceeds MAX_BULK_COUNT={MAX_BULK_COUNT}"),
+        );
+    }
     let mailbox = read_string(state, 1, "mailbox")?;
     let seed = read_int_opt(state, 1, "seed")?.unwrap_or(42) as u64;
     let start_at_raw = read_string_opt(state, 1, "start_at")?
@@ -176,6 +189,23 @@ fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
         Ok(dt) => dt.with_timezone(&Utc),
         Err(e) => return fail(state, format!("bulk_emails bad start_at: {e}")),
     };
+
+    // Validate the worst-case timestamp arithmetic upfront. With
+    // count capped at MAX_BULK_COUNT this can only blow up on
+    // pathologically large interval_seconds, but the borrow checker
+    // makes mid-loop `fail()` painful (state vs builder), so we do
+    // the check here while we still hold &State.
+    if count > 0 {
+        let last_offset = (count - 1)
+            .checked_mul(interval_seconds)
+            .and_then(|s| start.checked_add_signed(Duration::seconds(s)));
+        if last_offset.is_none() {
+            return fail(
+                state,
+                "bulk_emails extends past the chrono datetime range; reduce count or interval_seconds",
+            );
+        }
+    }
 
     let mut rng = SmallRng::seed_from_u64(seed);
     let builder = builder_mut(state)?;
@@ -249,6 +279,12 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
     if count < 0 {
         return fail(state, "bulk_threads count must be non-negative");
     }
+    if count > MAX_BULK_COUNT {
+        return fail(
+            state,
+            format!("bulk_threads count {count} exceeds MAX_BULK_COUNT={MAX_BULK_COUNT}"),
+        );
+    }
     let mailbox = read_string(state, 1, "mailbox")?;
     let messages_per_thread = read_int_opt(state, 1, "messages_per_thread")?.unwrap_or(3);
     if messages_per_thread < 1 {
@@ -266,6 +302,23 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
         Ok(dt) => dt.with_timezone(&Utc),
         Err(e) => return fail(state, format!("bulk_threads bad start_at: {e}")),
     };
+
+    // Worst-case timestamp: last thread's last message =
+    // start + (count-1)*thread_interval + (messages_per_thread-1)*reply_interval.
+    if count > 0 {
+        let thread_offset = (count - 1).checked_mul(thread_interval);
+        let reply_offset = (messages_per_thread - 1).checked_mul(reply_interval);
+        let last = thread_offset
+            .zip(reply_offset)
+            .and_then(|(t, r)| t.checked_add(r))
+            .and_then(|s| start.checked_add_signed(Duration::seconds(s)));
+        if last.is_none() {
+            return fail(
+                state,
+                "bulk_threads extends past the chrono datetime range; reduce count, messages_per_thread, or interval seconds",
+            );
+        }
+    }
 
     let mut rng = SmallRng::seed_from_u64(seed);
     let messages_per_thread = messages_per_thread as usize;

@@ -53,15 +53,18 @@ impl OdataQuery {
         out
     }
 
-    /// Effective offset for paged collections. Honors `$skiptoken`
-    /// (if it carries a cursor we issued) and falls back to `$skip`.
-    pub fn offset(&self) -> u32 {
-        if let Some(t) = self.skiptoken.as_deref()
-            && let Some(off) = decode_skiptoken(t)
-        {
-            return off;
+    /// Effective offset for paged collections. Returns `None` if the
+    /// client supplied a `$skiptoken` we can't decode - that's a
+    /// pagination contract violation that should surface as a
+    /// `400 InvalidQueryParameter`, not a silent restart from offset
+    /// 0 (which would loop ratatoskr forever on a stale token).
+    /// Falls back to `$skip` (default 0) when no `$skiptoken` is
+    /// present.
+    pub fn offset(&self) -> Option<u32> {
+        if let Some(t) = self.skiptoken.as_deref() {
+            return decode_skiptoken(t);
         }
-        self.skip.unwrap_or(0)
+        Some(self.skip.unwrap_or(0))
     }
 
     /// Resolve `$top` against a resource-specific default and a
@@ -240,14 +243,36 @@ mod tests {
     fn skiptoken_round_trips() {
         let token = encode_skiptoken(42);
         let q = OdataQuery::parse(Some(&format!("$skiptoken={token}")));
-        assert_eq!(q.offset(), 42);
+        assert_eq!(q.offset(), Some(42));
     }
 
     #[test]
     fn skiptoken_overrides_skip() {
         let token = encode_skiptoken(99);
         let q = OdataQuery::parse(Some(&format!("$skip=5&$skiptoken={token}")));
-        assert_eq!(q.offset(), 99);
+        assert_eq!(q.offset(), Some(99));
+    }
+
+    #[test]
+    fn malformed_skiptoken_returns_none() {
+        // Bug fix: previously a bad skiptoken silently fell back to
+        // offset 0 (or $skip), which would restart pagination from
+        // the beginning and loop the client forever.
+        let q = OdataQuery::parse(Some("$skiptoken=garbage"));
+        assert_eq!(q.offset(), None);
+        // Even when $skip is also present, an unparseable skiptoken
+        // still wins (the token is the contract; if we can't
+        // decode it, that's a hard error).
+        let q = OdataQuery::parse(Some("$skip=5&$skiptoken=garbage"));
+        assert_eq!(q.offset(), None);
+    }
+
+    #[test]
+    fn no_skiptoken_falls_back_to_skip() {
+        let q = OdataQuery::parse(Some("$skip=5"));
+        assert_eq!(q.offset(), Some(5));
+        let q = OdataQuery::parse(None);
+        assert_eq!(q.offset(), Some(0));
     }
 
     #[test]

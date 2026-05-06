@@ -63,7 +63,16 @@ async fn list_folders(
 
     let total = folders.len() as u64;
     let top = q.page_size(FOLDERS_DEFAULT_TOP, FOLDERS_MAX_TOP);
-    let offset = q.offset();
+    let offset = match q.offset() {
+        Some(o) => o,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidQueryParameter",
+                "$skiptoken did not decode - reset pagination by retrying without it",
+            );
+        }
+    };
     let page: Vec<Value> = folders
         .iter()
         .skip(offset as usize)
@@ -132,7 +141,16 @@ async fn list_child_folders(
         .collect();
     let total = children.len() as u64;
     let top = q.page_size(FOLDERS_DEFAULT_TOP, FOLDERS_MAX_TOP);
-    let offset = q.offset();
+    let offset = match q.offset() {
+        Some(o) => o,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidQueryParameter",
+                "$skiptoken did not decode - reset pagination by retrying without it",
+            );
+        }
+    };
     let page: Vec<Value> = children
         .iter()
         .skip(offset as usize)
@@ -177,7 +195,16 @@ async fn list_messages(
     }
     let total = messages.len() as u64;
     let top = q.page_size(MESSAGES_DEFAULT_TOP, MESSAGES_MAX_TOP);
-    let offset = q.offset();
+    let offset = match q.offset() {
+        Some(o) => o,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidQueryParameter",
+                "$skiptoken did not decode - reset pagination by retrying without it",
+            );
+        }
+    };
     let page: Vec<Value> = messages
         .iter()
         .skip(offset as usize)
@@ -246,7 +273,16 @@ async fn delta_messages(
     let messages = sorted_messages_in(&state.fixture, &m.id);
     let total = messages.len() as u64;
     let top = q.page_size(MESSAGES_DEFAULT_TOP, MESSAGES_MAX_TOP);
-    let offset = q.offset();
+    let offset = match q.offset() {
+        Some(o) => o,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidQueryParameter",
+                "$skiptoken did not decode - reset pagination by retrying without it",
+            );
+        }
+    };
     let page: Vec<Value> = messages
         .iter()
         .skip(offset as usize)

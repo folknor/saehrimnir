@@ -209,9 +209,19 @@ async fn list_threads(
     let offset = q.offset();
 
     let mut threads = thread_summaries(&state.fixture);
-    if let Some(after_q) = &q.q
-        && let Some(date) = parse_after_query(after_q)
-    {
+    if let Some(after_q) = &q.q {
+        // v0 only knows the `after:YYYY/M/D` shape ratatoskr's
+        // initial-sync code emits. Anything else - typo, drift, or
+        // a Gmail query operator like `is:unread` - returns BAD
+        // rather than silently dropping the filter and bleeding all
+        // threads through (which the buggy fall-through used to do).
+        let Some(date) = parse_after_query(after_q) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                &format!("v0 mock only supports q=after:YYYY/M/D (got {after_q:?})"),
+                "invalidQuery",
+            );
+        };
         let cutoff = chrono::Utc
             .from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default());
         threads.retain(|t| t.received_at >= cutoff);
@@ -265,11 +275,17 @@ fn thread_summaries(fixture: &Fixture) -> Vec<ThreadSummary> {
         .into_iter()
         .map(|(id, mut messages)| {
             messages.sort_by_key(|e| e.received_at);
+            // by_thread is keyed by thread_id values pulled from
+            // the email list itself, so messages is always non-empty
+            // here. The `expect` documents that invariant; using a
+            // wall-clock fallback would silently break the
+            // determinism contract if the surrounding code ever
+            // shifted.
             let received_at = messages
                 .iter()
                 .map(|m| m.received_at)
                 .max()
-                .unwrap_or_else(chrono::Utc::now);
+                .expect("thread group derived from emails is non-empty by construction");
             let snippet = messages
                 .last()
                 .map(|m| match &m.body {

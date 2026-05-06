@@ -219,6 +219,19 @@ async fn delta_paginates_when_top_smaller_than_total() {
 }
 
 #[tokio::test]
+async fn malformed_skiptoken_returns_400_not_silent_restart() {
+    // Regression: a $skiptoken we can't decode used to silently
+    // fall back to offset 0, which would loop a client forever on
+    // a stale or corrupted token. Now it surfaces as 400.
+    let (status, v) = get_json(
+        "/v1.0/me/mailFolders/inbox/messages?$skiptoken=garbage",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "InvalidQueryParameter");
+}
+
+#[tokio::test]
 async fn unimplemented_paths_return_graph_shaped_404() {
     let (status, v) = get_json("/v1.0/me/calendar/events").await;
     assert_eq!(status, StatusCode::NOT_FOUND);

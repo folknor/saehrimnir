@@ -338,29 +338,36 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     Ok(Value::Object(out))
 }
 
-/// v0 filter shape. Only one condition at a time; FilterOperator
-/// (AND/OR/NOT) is not implemented because ratatoskr never sends one
-/// during initial sync.
-enum Filter {
-    None,
-    After(i64),
-    InMailbox(String),
+/// v0 filter shape. FilterCondition keys are AND-ed together;
+/// FilterOperator (explicit `operator` + `conditions` arrays) is
+/// rejected because ratatoskr never sends one during initial sync.
+#[derive(Default)]
+struct Filter {
+    after: Option<i64>,
+    in_mailbox: Option<String>,
 }
 
 impl Filter {
     fn matches(&self, e: &crate::fixture::Email) -> bool {
-        match self {
-            Filter::None => true,
-            Filter::After(ts) => e.received_at.timestamp() >= *ts,
-            Filter::InMailbox(id) => e.mailbox_ids.iter().any(|m| m == id),
+        if let Some(ts) = self.after
+            && e.received_at.timestamp() < ts
+        {
+            return false;
         }
+        if let Some(mb) = &self.in_mailbox
+            && !e.mailbox_ids.iter().any(|m| m == mb)
+        {
+            return false;
+        }
+        true
     }
 }
 
 fn parse_filter(raw: Option<&Value>) -> Result<Filter, Value> {
-    let Some(v) = raw else { return Ok(Filter::None) };
+    let mut f = Filter::default();
+    let Some(v) = raw else { return Ok(f) };
     if v.is_null() {
-        return Ok(Filter::None);
+        return Ok(f);
     }
     let obj = v.as_object().ok_or_else(|| {
         json!({
@@ -368,31 +375,35 @@ fn parse_filter(raw: Option<&Value>) -> Result<Filter, Value> {
             "description": "filter must be an object",
         })
     })?;
-    if obj.is_empty() {
-        return Ok(Filter::None);
+    for (key, val) in obj {
+        match key.as_str() {
+            "after" => {
+                let ts = val.as_i64().ok_or_else(|| {
+                    json!({
+                        "type": "invalidArguments",
+                        "description": "filter.after must be a unix-seconds integer",
+                    })
+                })?;
+                f.after = Some(ts);
+            }
+            "inMailbox" => {
+                let s = val.as_str().ok_or_else(|| {
+                    json!({
+                        "type": "invalidArguments",
+                        "description": "filter.inMailbox must be a string",
+                    })
+                })?;
+                f.in_mailbox = Some(s.to_string());
+            }
+            other => {
+                return Err(json!({
+                    "type": "unsupportedFilter",
+                    "description": format!("v0 does not support filter.{other:?}"),
+                }));
+            }
+        }
     }
-    if let Some(after) = obj.get("after") {
-        let ts = after.as_i64().ok_or_else(|| {
-            json!({
-                "type": "invalidArguments",
-                "description": "filter.after must be a unix-seconds integer",
-            })
-        })?;
-        return Ok(Filter::After(ts));
-    }
-    if let Some(mid) = obj.get("inMailbox") {
-        let s = mid.as_str().ok_or_else(|| {
-            json!({
-                "type": "invalidArguments",
-                "description": "filter.inMailbox must be a string",
-            })
-        })?;
-        return Ok(Filter::InMailbox(s.to_string()));
-    }
-    Err(json!({
-        "type": "unsupportedFilter",
-        "description": "v0 supports only {after} or {inMailbox}",
-    }))
+    Ok(f)
 }
 
 // ── Email/get ───────────────────────────────────────────────────────
@@ -993,6 +1004,39 @@ mod tests {
         let f = fix_for_query();
         let err = email_query(&f, &json!({"accountId": "nope"})).unwrap_err();
         assert_eq!(err.get("type").unwrap(), "accountNotFound");
+    }
+
+    #[test]
+    fn email_query_after_and_inmailbox_combine_with_and() {
+        // Regression: parse_filter previously returned on the first
+        // matched key and ignored later keys, so a filter with both
+        // `after` and `inMailbox` would silently ignore inMailbox and
+        // bleed cross-mailbox results.
+        let f = fix_for_query();
+        let cutoff = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 15, 11, 0, 0)
+            .unwrap()
+            .timestamp();
+        let resp = email_query(
+            &f,
+            &json!({
+                "accountId": "acct",
+                "filter": {"after": cutoff, "inMailbox": "mb-archive"},
+            }),
+        )
+        .unwrap();
+        // mb-archive has only "d" at 09:00, which is BEFORE the
+        // cutoff; AND-ing means the result is empty, not the
+        // 11:00+ inbox emails the buggy code would have returned.
+        let ids: Vec<&str> = resp
+            .get("ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(ids.is_empty(), "got: {ids:?}");
     }
 
     #[test]

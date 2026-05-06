@@ -113,6 +113,18 @@ async fn list_threads_filter_after_drops_older() {
 }
 
 #[tokio::test]
+async fn list_threads_unparseable_q_returns_400_not_unfiltered_dump() {
+    // Regression: the buggy code silently ignored unparseable `q=`
+    // and returned the full thread list. Now it errors out so
+    // ratatoskr notices a typo or operator drift instead of
+    // re-ingesting old threads.
+    let (status, v) =
+        get_json("/gmail/v1/users/me/threads?q=is%3Aunread").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["errors"][0]["reason"], "invalidQuery");
+}
+
+#[tokio::test]
 async fn get_thread_full_format_returns_message_payload() {
     let (status, v) =
         get_json("/gmail/v1/users/me/threads/email-001?format=full").await;

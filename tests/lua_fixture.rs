@@ -294,6 +294,57 @@ fn bulk_threads_zero_messages_per_thread_errors() {
 }
 
 #[test]
+fn bulk_emails_count_above_max_errors() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "x" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        bulk_emails({ count = 9000000000, mailbox = "mb" })
+        "#,
+        "@bulk",
+    )
+    .unwrap_err();
+    assert!(err.contains("MAX_BULK_COUNT"), "got: {err}");
+}
+
+#[test]
+fn bulk_emails_negative_interval_overflow_caught_clean() {
+    // Combining a large count with an obscene interval exceeds
+    // chrono's range; should error cleanly, not panic.
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "x" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        bulk_emails({
+            count = 1000000,
+            mailbox = "mb",
+            interval_seconds = 9223372036854775000,
+        })
+        "#,
+        "@bulk",
+    )
+    .unwrap_err();
+    assert!(err.contains("range") || err.contains("chrono"), "got: {err}");
+}
+
+#[test]
+fn bulk_threads_count_above_max_errors() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "x" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        bulk_threads({ count = 9000000000, mailbox = "mb" })
+        "#,
+        "@thr",
+    )
+    .unwrap_err();
+    assert!(err.contains("MAX_BULK_COUNT"), "got: {err}");
+}
+
+#[test]
 fn bulk_emails_validates_mailbox_at_normalize_time() {
     // bulk_emails accepts the mailbox id without checking it exists -
     // but normalize() catches the bad reference at the end.
