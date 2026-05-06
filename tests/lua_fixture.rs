@@ -155,6 +155,145 @@ fn bulk_emails_pure_lua_loop_is_equivalent_for_explicit_emails() {
 }
 
 #[test]
+fn bulk_threads_default_three_messages_per_thread() {
+    let fix = lua::load_source(
+        r#"
+        fixture({ name = "thr" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        bulk_threads({ count = 5, mailbox = "mb", seed = 9 })
+        "#,
+        "@thr",
+    )
+    .unwrap();
+    assert_eq!(fix.emails.len(), 5 * 3);
+
+    // Every thread shares one thread_id.
+    let mut by_thread: std::collections::BTreeMap<String, Vec<&_>> = Default::default();
+    for em in &fix.emails {
+        by_thread.entry(em.thread_id.clone()).or_default().push(em);
+    }
+    assert_eq!(by_thread.len(), 5);
+    for (_, msgs) in by_thread {
+        assert_eq!(msgs.len(), 3);
+    }
+}
+
+#[test]
+fn bulk_threads_chains_in_reply_to_and_references() {
+    let fix = lua::load_source(
+        r#"
+        fixture({ name = "thr" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        bulk_threads({
+            count = 1,
+            mailbox = "mb",
+            messages_per_thread = 4,
+            seed = 1,
+        })
+        "#,
+        "@thr",
+    )
+    .unwrap();
+    let msgs = &fix.emails;
+    assert_eq!(msgs.len(), 4);
+    let m0_id = &msgs[0].message_id[0];
+    let m1_id = &msgs[1].message_id[0];
+    let m2_id = &msgs[2].message_id[0];
+
+    // First message: no in_reply_to / references.
+    assert!(msgs[0].in_reply_to.is_empty());
+    assert!(msgs[0].references.is_empty());
+    // Second: replies to first; references = [m0].
+    assert_eq!(msgs[1].in_reply_to, vec![m0_id.clone()]);
+    assert_eq!(msgs[1].references, vec![m0_id.clone()]);
+    // Third: replies to second; references = [m0, m1].
+    assert_eq!(msgs[2].in_reply_to, vec![m1_id.clone()]);
+    assert_eq!(msgs[2].references, vec![m0_id.clone(), m1_id.clone()]);
+    // Fourth: replies to third; references = [m0, m1, m2].
+    assert_eq!(msgs[3].in_reply_to, vec![m2_id.clone()]);
+    assert_eq!(
+        msgs[3].references,
+        vec![m0_id.clone(), m1_id.clone(), m2_id.clone()]
+    );
+}
+
+#[test]
+fn bulk_threads_subjects_use_re_prefix_on_replies() {
+    let fix = lua::load_source(
+        r#"
+        fixture({ name = "thr" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        bulk_threads({ count = 1, mailbox = "mb", messages_per_thread = 3 })
+        "#,
+        "@thr",
+    )
+    .unwrap();
+    let s0 = fix.emails[0].subject.as_ref().unwrap();
+    let s1 = fix.emails[1].subject.as_ref().unwrap();
+    let s2 = fix.emails[2].subject.as_ref().unwrap();
+    assert!(!s0.starts_with("Re: "));
+    assert_eq!(s1, &format!("Re: {s0}"));
+    assert_eq!(s2, &format!("Re: {s0}"));
+}
+
+#[test]
+fn bulk_threads_seed_determinism() {
+    let script = r#"
+        fixture({ name = "thr" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        bulk_threads({ count = 10, mailbox = "mb", seed = 42 })
+    "#;
+    let a = lua::load_source(script, "@thr").unwrap();
+    let b = lua::load_source(script, "@thr").unwrap();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn bulk_threads_received_at_monotonic_within_and_across_threads() {
+    let fix = lua::load_source(
+        r#"
+        fixture({ name = "thr" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        bulk_threads({
+            count = 3,
+            mailbox = "mb",
+            messages_per_thread = 2,
+            thread_interval_seconds = 7200,
+            reply_interval_seconds = 600,
+        })
+        "#,
+        "@thr",
+    )
+    .unwrap();
+    // Within each thread, the second message is 600s after the first.
+    // Each thread starts 7200s after the previous.
+    let ts: Vec<_> = fix.emails.iter().map(|e| e.received_at).collect();
+    assert_eq!((ts[1] - ts[0]).num_seconds(), 600);
+    assert_eq!((ts[3] - ts[2]).num_seconds(), 600);
+    assert_eq!((ts[2] - ts[0]).num_seconds(), 7200);
+}
+
+#[test]
+fn bulk_threads_zero_messages_per_thread_errors() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "thr" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        bulk_threads({ count = 1, mailbox = "mb", messages_per_thread = 0 })
+        "#,
+        "@thr",
+    )
+    .unwrap_err();
+    assert!(err.contains("messages_per_thread"), "got: {err}");
+}
+
+#[test]
 fn bulk_emails_validates_mailbox_at_normalize_time() {
     // bulk_emails accepts the mailbox id without checking it exists -
     // but normalize() catches the bad reference at the end.

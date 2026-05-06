@@ -93,6 +93,8 @@ fn install_builders(state: &mut State) {
     state.set_global("email");
     state.push_rust_fn(builder_bulk_emails);
     state.set_global("bulk_emails");
+    state.push_rust_fn(builder_bulk_threads);
+    state.set_global("bulk_threads");
 }
 
 // ── Per-builder RustFuncs ───────────────────────────────────────────
@@ -221,6 +223,114 @@ fn pad_width(count: i64) -> usize {
         w += 1;
     }
     w.max(1)
+}
+
+/// Bulk-generate threaded conversations. Each thread gets
+/// `messages_per_thread` messages sharing a `thread_id`, with
+/// `In-Reply-To` and `References` headers chaining replies back to
+/// prior messages. Subjects on replies are prefixed `Re: `; the
+/// first message gets a synthesised subject.
+///
+/// ```lua
+/// bulk_threads({
+///   count = 100,                          -- required: thread count
+///   mailbox = "mb-inbox",                 -- required
+///   messages_per_thread = 3,              -- default 3
+///   seed = 42,                            -- default 42
+///   start_at = "2026-01-01T00:00:00Z",    -- default
+///   thread_interval_seconds = 3600,       -- default (1h between thread starts)
+///   reply_interval_seconds = 300,         -- default (5min between replies)
+///   id_prefix = "thread",                 -- default
+/// })
+/// ```
+fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "bulk_threads")?;
+    let count = read_int(state, 1, "count")?;
+    if count < 0 {
+        return fail(state, "bulk_threads count must be non-negative");
+    }
+    let mailbox = read_string(state, 1, "mailbox")?;
+    let messages_per_thread = read_int_opt(state, 1, "messages_per_thread")?.unwrap_or(3);
+    if messages_per_thread < 1 {
+        return fail(state, "bulk_threads messages_per_thread must be >= 1");
+    }
+    let seed = read_int_opt(state, 1, "seed")?.unwrap_or(42) as u64;
+    let start_at_raw = read_string_opt(state, 1, "start_at")?
+        .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_string());
+    let thread_interval = read_int_opt(state, 1, "thread_interval_seconds")?.unwrap_or(3600);
+    let reply_interval = read_int_opt(state, 1, "reply_interval_seconds")?.unwrap_or(300);
+    let id_prefix = read_string_opt(state, 1, "id_prefix")?
+        .unwrap_or_else(|| "thread".to_string());
+
+    let start = match DateTime::parse_from_rfc3339(&start_at_raw) {
+        Ok(dt) => dt.with_timezone(&Utc),
+        Err(e) => return fail(state, format!("bulk_threads bad start_at: {e}")),
+    };
+
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let messages_per_thread = messages_per_thread as usize;
+    let builder = builder_mut(state)?;
+    builder.emails.reserve(count as usize * messages_per_thread);
+
+    let thread_pad = pad_width(count);
+    let msg_pad = pad_width(messages_per_thread as i64);
+
+    for thread_i in 0..count {
+        let thread_id = format!("{id_prefix}-{thread_i:0pad$}", pad = thread_pad);
+        let thread_start = start + Duration::seconds(thread_i * thread_interval);
+        let first_subject_tmpl = templates::SUBJECT_TEMPLATES
+            [(seed.wrapping_add(thread_i as u64) as usize) % templates::SUBJECT_TEMPLATES.len()];
+        let first_subject = templates::fill_template(first_subject_tmpl, &mut rng);
+
+        let mut prior_message_ids: Vec<String> = Vec::with_capacity(messages_per_thread);
+        for msg_i in 0..messages_per_thread {
+            let msg_id = format!(
+                "{thread_id}-{n:0pad$}",
+                n = msg_i + 1,
+                pad = msg_pad,
+            );
+            let received_at = thread_start + Duration::seconds(msg_i as i64 * reply_interval);
+            let subject = if msg_i == 0 {
+                first_subject.clone()
+            } else {
+                format!("Re: {first_subject}")
+            };
+            let body_tmpl = templates::BODY_TEMPLATES
+                [(seed.wrapping_add(thread_i as u64).wrapping_add(msg_i as u64) as usize)
+                    % templates::BODY_TEMPLATES.len()];
+            let body = templates::fill_template(body_tmpl, &mut rng);
+
+            let (from_name, from_email) = templates::pick_address(&mut rng);
+            let (_, to_email) = templates::pick_address(&mut rng);
+            let message_id_header = format!("<{msg_id}@{}>", templates::DOMAINS[0]);
+
+            let mut email = RawEmail {
+                id: msg_id,
+                thread_id: Some(thread_id.clone()),
+                mailbox_ids: vec![mailbox.clone()],
+                received_at: received_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                from: Some(RawAddress::Full {
+                    name: Some(from_name),
+                    email: from_email,
+                }),
+                to: vec![RawAddress::Bare(to_email)],
+                subject: Some(subject),
+                message_id: vec![message_id_header.clone()],
+                body_text: Some(body),
+                ..Default::default()
+            };
+            if msg_i > 0 {
+                // Reply: In-Reply-To = the immediate parent;
+                // References = the full chain back to the root.
+                email.in_reply_to =
+                    vec![prior_message_ids.last().expect("non-empty").clone()];
+                email.references = prior_message_ids.clone();
+            }
+            prior_message_ids.push(message_id_header);
+            builder.emails.push(email);
+        }
+    }
+    Ok(0)
 }
 
 fn builder_email(state: &mut State) -> dellingr::Result<u8> {

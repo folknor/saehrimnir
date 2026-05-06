@@ -165,11 +165,13 @@ build the same `RawFixture` intermediate and run through the same
 across formats - asserted by `tests/lua_fixture.rs`. Static surface:
 `fixture`, `account`, `mailbox`, `email` builders for hand-authored
 scenarios; `bulk_emails({ count, mailbox, seed, start_at,
-interval_seconds, id_prefix })` for synthetic scale-test fixtures
-(deterministic, byte-stable across runs at the same seed; templates
-in `src/templates.rs`). Dynamic surface (reactive callbacks keyed by
-protocol + command, self-terminating scripts) is the next chunk and
-intentionally not yet implemented.
+interval_seconds, id_prefix })` for synthetic scale-test fixtures;
+`bulk_threads({ count, mailbox, messages_per_thread, seed, ... })`
+for multi-message conversations with proper `In-Reply-To` /
+`References` chaining (deterministic, byte-stable across runs at
+the same seed; templates in `src/templates.rs`). Dynamic surface
+(reactive callbacks keyed by protocol + command, self-terminating
+scripts) is the next chunk and intentionally not yet implemented.
 
 Note: dellingr deliberately omits Lua's unparenthesized function-call
 sugar, so builder calls in `.lua` fixtures are written
