@@ -69,8 +69,10 @@ jmap_port="$(awk '/^READY /{print $2}' "$ready_file")"
 imap_port="$(awk '/^IMAP /{print $2}' "$ready_file")"
 smtp_port="$(awk '/^SMTP /{print $2}' "$ready_file")"
 graph_port="$(awk '/^GRAPH /{print $2}' "$ready_file")"
+gmail_port="$(awk '/^GMAIL /{print $2}' "$ready_file")"
 base="http://127.0.0.1:$jmap_port"
 graph_base="http://127.0.0.1:$graph_port"
+gmail_base="http://127.0.0.1:$gmail_port"
 echo "sentinel:"
 sed 's/^/  /' "$ready_file"
 
@@ -307,6 +309,46 @@ assert "@odata.deltaLink" in d
 assert "$deltatoken=" in d["@odata.deltaLink"]
 print("Graph delta: ok")
 ' "$delta"
+
+echo "=== Gmail profile + labels + threads + history ==="
+profile="$(curl -fsSL "$gmail_base/gmail/v1/users/me/profile" -H 'Authorization: Bearer x')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["emailAddress"] == "test@example.com", d
+assert d["historyId"] == "1", d
+print("Gmail profile: ok")
+' "$profile"
+
+threads="$(curl -fsSL "$gmail_base/gmail/v1/users/me/threads" -H 'Authorization: Bearer x')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+ids = [t["id"] for t in d["threads"]]
+assert ids == ["email-002", "email-001"], ids
+print("Gmail threads: ok")
+' "$threads"
+
+thread="$(curl -fsSL "$gmail_base/gmail/v1/users/me/threads/email-001?format=full" -H 'Authorization: Bearer x')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["id"] == "email-001"
+m = d["messages"][0]
+assert "INBOX" in m["labelIds"]
+assert "UNREAD" in m["labelIds"]
+assert m["payload"]["body"]["data"] == "Rmlyc3QgbWVzc2FnZSBib2R5Lg"
+print("Gmail thread fetch: ok")
+' "$thread"
+
+history="$(curl -fsSL "$gmail_base/gmail/v1/users/me/history?startHistoryId=1" -H 'Authorization: Bearer x')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["history"] == []
+assert d["historyId"] == "1"
+print("Gmail history: ok")
+' "$history"
 
 echo "=== SIGTERM ==="
 kill -TERM "$pid"

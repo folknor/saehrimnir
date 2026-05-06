@@ -31,6 +31,12 @@ pub struct Args {
     #[arg(long = "graph-port", default_value_t = 0)]
     pub graph_port: u16,
 
+    /// Gmail mock port. `0` (default) picks an ephemeral port; the
+    /// chosen port lands in the readiness file under `GMAIL <port>`.
+    /// Mounts `/gmail/v1/users/me/...` endpoints.
+    #[arg(long = "gmail-port", default_value_t = 0)]
+    pub gmail_port: u16,
+
     /// Path to write the readiness sentinel once both listeners are
     /// bound. One line per protocol, e.g.:
     /// `READY 12345\nIMAP 23456\n`.

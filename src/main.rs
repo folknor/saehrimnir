@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use saehrimnir::sentinel::ProtocolPort;
-use saehrimnir::{cli, fixture, graph, imap, routes, sentinel, shutdown, smtp};
+use saehrimnir::{cli, fixture, gmail, graph, imap, routes, sentinel, shutdown, smtp};
 use tokio::sync::watch;
 
 /// Hard budget on graceful drain after SIGTERM. Plan-2 acceptance #6
@@ -47,6 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph_addr = graph_listener.local_addr()?;
     eprintln!("saehrimnir: graph listening on {graph_addr}");
 
+    // Gmail listener.
+    let gmail_listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.gmail_port)).await?;
+    let gmail_addr = gmail_listener.local_addr()?;
+    eprintln!("saehrimnir: gmail listening on {gmail_addr}");
+
     sentinel::write_ready(
         &args.readiness_file,
         &[
@@ -65,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProtocolPort {
                 name: "GRAPH",
                 port: graph_addr.port(),
+            },
+            ProtocolPort {
+                name: "GMAIL",
+                port: gmail_addr.port(),
             },
         ],
     )
@@ -131,6 +141,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_future(),
     );
 
+    // Gmail server.
+    let gmail_app = gmail::router(gmail::AppState {
+        fixture: Arc::clone(&fixture),
+    });
+    let gmail_shutdown_rx = shutdown_rx.clone();
+    let gmail_task = tokio::spawn(
+        axum::serve(gmail_listener, gmail_app)
+            .with_graceful_shutdown(async move {
+                let mut rx = gmail_shutdown_rx;
+                while rx.changed().await.is_ok() {
+                    if *rx.borrow() {
+                        return;
+                    }
+                }
+            })
+            .into_future(),
+    );
+
     shutdown::wait_for_signal().await;
     eprintln!("saehrimnir: shutdown signal received, draining (budget {SHUTDOWN_BUDGET:?})");
     let _ = shutdown_tx.send(true);
@@ -140,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = imap_task.await;
         let _ = smtp_task.await;
         let _ = graph_task.await;
+        let _ = gmail_task.await;
     };
     match tokio::time::timeout(SHUTDOWN_BUDGET, drain).await {
         Ok(()) => {

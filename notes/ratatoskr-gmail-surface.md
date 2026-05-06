@@ -1,0 +1,334 @@
+# Ratatoskr's Gmail REST API client surface
+
+What the v0 Gmail mock has to satisfy. Distilled from
+`<ratatoskr>/crates/gmail/` on 2026-05-06. Source-of-truth lives
+there; this file is a cheat sheet so we don't have to fan out every
+turn.
+
+Mail-sync only for v0. Contacts (People API), Drive uploads, and the
+Calendar runtime are listed at the end so the next reader knows what
+sibling files the module needs to accommodate.
+
+## Connection / transport
+
+- Base URL: `https://www.googleapis.com/gmail/v1/users/me`. Mock
+  serves `/gmail/v1/users/me/...` over plain HTTP.
+- People API base: `https://people.googleapis.com/v1/`. Out of scope
+  for v0 mail; will land alongside contacts.
+- HTTP/1.1, JSON, UTF-8.
+- Bearer auth: `Authorization: Bearer <token>` on every request
+  (`client.rs:306-308`). Refresh on 401; v0 mock never returns 401.
+- Concurrency: 10 worker tasks during initial thread fetch
+  (`sync/mod.rs:90`), 5 during delta sync (`sync/delta.rs:82`). No
+  per-account cap on the wire; v0 mock has no concurrency cap.
+- Retry: 3 attempts on 429 with 1 s initial backoff
+  (`client.rs:14-16`). v0 mock never emits 429.
+
+## Mail-sync endpoints
+
+### Profile
+
+```
+GET /gmail/v1/users/me/profile
+```
+
+Response (`api.rs:14-17`):
+
+```json
+{
+  "emailAddress": "alice@example.com",
+  "messagesTotal": <int>,
+  "threadsTotal": <int>,
+  "historyId": "<u64-as-string>"
+}
+```
+
+The `historyId` is the cursor for the History API; the client stores
+it after every cycle.
+
+### Labels
+
+```
+GET /gmail/v1/users/me/labels
+```
+
+Response (`api.rs:23-26`):
+
+```json
+{
+  "labels": [
+    {
+      "id": "INBOX",
+      "name": "INBOX",
+      "type": "system",
+      "messageListVisibility": "show",
+      "labelListVisibility": "labelShow",
+      "messagesTotal": 42,
+      "messagesUnread": 5,
+      "threadsTotal": 40,
+      "threadsUnread": 3
+    },
+    {
+      "id": "Label_42",
+      "name": "Newsletters",
+      "type": "user",
+      ...
+    }
+  ]
+}
+```
+
+System label IDs ratatoskr recognises (`sync/labels.rs:36-41`):
+
+`INBOX`, `SENT`, `DRAFT`, `TRASH`, `SPAM`, `IMPORTANT`, `STARRED`,
+`UNREAD`. Anything else with `type: "user"` becomes a user-defined
+tag.
+
+### Thread list
+
+```
+GET /gmail/v1/users/me/threads
+    ?q=after:YYYY/M/D
+    &maxResults=100
+    &pageToken=<token>
+```
+
+Query (`sync/mod.rs:169-176`):
+
+- `q`: free-form Gmail search query. The mail-sync code only ever
+  emits `after:YYYY/M/D` (no quoting; the date comes from the
+  account's `days_back` config).
+- `maxResults`: page size, default 100.
+- `pageToken`: opaque continuation cursor.
+
+Response:
+
+```json
+{
+  "threads": [
+    {"id": "<thread-id>", "snippet": "...", "historyId": "<u64>"},
+    ...
+  ],
+  "nextPageToken": "<opaque>",
+  "resultSizeEstimate": 42
+}
+```
+
+`nextPageToken` absent on the last page.
+
+### Thread fetch (full detail)
+
+```
+GET /gmail/v1/users/me/threads/{threadId}?format=full
+```
+
+Returns a `GmailThread` with nested `messages[]`. Each message has
+the wire shape described under "Message model" below
+(`api.rs:103-111`, `storage.rs:25`).
+
+### Message attachment fetch
+
+```
+GET /gmail/v1/users/me/messages/{messageId}/attachments/{attachmentId}
+```
+
+Returns `{ "data": "<base64url>", "size": <int> }` (`api.rs:184-195`).
+v0 fixtures carry no attachments, so any call gets a 404 with the
+canonical Gmail error envelope.
+
+### History (incremental sync)
+
+```
+GET /gmail/v1/users/me/history
+    ?startHistoryId=<u64>
+    &maxResults=500
+    &historyTypes=messageAdded
+    &historyTypes=messageDeleted
+    &historyTypes=labelAdded
+    &historyTypes=labelRemoved
+    &pageToken=<opaque>
+```
+
+Response (`types.rs:101-124`):
+
+```json
+{
+  "history": [
+    {
+      "id": "<u64>",
+      "messagesAdded":   [{"message": <GmailMessage>}, ...],
+      "messagesDeleted": [{"message": <GmailMessage>}, ...],
+      "labelsAdded":     [{"message": <GmailMessage>, "labelIds": [...]}, ...],
+      "labelsRemoved":   [{"message": <GmailMessage>, "labelIds": [...]}, ...]
+    }
+  ],
+  "historyId": "<u64>",
+  "nextPageToken": "<opaque>"
+}
+```
+
+The client persists `historyId` between cycles. A 404 on this
+endpoint (or an error mentioning `historyId`) triggers a full
+re-sync (`sync/delta.rs:180-182`). v0 fixtures are read-only, so the
+mock returns an empty `history[]` and the same `historyId`.
+
+### SendAs / signatures (out of scope for read-only mail sync)
+
+```
+GET /gmail/v1/users/me/settings/sendAs
+PUT /gmail/v1/users/me/settings/sendAs/{email}
+```
+
+Used for signature sync. v0 mock emits an empty `sendAs[]` so the
+write path never fires; bidirectional signature sync is a v1
+concern.
+
+## Message model
+
+`types.rs:10-24`:
+
+```json
+{
+  "id": "<opaque>",
+  "threadId": "<opaque>",
+  "labelIds": ["INBOX", "UNREAD", "Label_42"],
+  "snippet": "first 100 chars of body",
+  "historyId": "<u64>",
+  "internalDate": "<unix-ms-as-string>",
+  "sizeEstimate": <bytes>,
+  "payload": <MimePart>,
+  "raw": null
+}
+```
+
+`internalDate` is Unix milliseconds as a quoted string, not ISO 8601
+(`parse.rs:79-83`).
+
+### MIME payload tree
+
+`types.rs:27-38`:
+
+```json
+{
+  "partId": "0",
+  "mimeType": "multipart/alternative",
+  "filename": "",
+  "headers": [
+    {"name": "From", "value": "..."},
+    {"name": "Subject", "value": "..."},
+    ...
+  ],
+  "body": {"size": 0, "data": null, "attachmentId": null},
+  "parts": [
+    {
+      "partId": "0.0",
+      "mimeType": "text/plain",
+      "headers": [...],
+      "body": {"size": 13, "data": "<base64url of body>", "attachmentId": null}
+    }
+  ]
+}
+```
+
+Headers ratatoskr looks up case-insensitively (`parse.rs:121-123`):
+
+`From`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`, `Message-ID`,
+`References`, `In-Reply-To`, `List-Unsubscribe`,
+`List-Unsubscribe-Post`, `Disposition-Notification-To`,
+`Authentication-Results`.
+
+Body data: base64url without padding (`=` chars stripped). Decoded
+via `decode_base64url_nopad()` (`parse.rs:269-275`).
+
+Special MIME types:
+
+- `text/x-amp-html`: skipped by parser (`parse.rs:231` JMAP analogue;
+  same skip logic in Gmail parse).
+- `text/vnd.google.email-reaction+json`: emoji reactions, payload is
+  small JSON (`parse.rs:247-266`). v0 mock does not emit these.
+
+### Attachment parts
+
+A part is treated as an attachment when:
+
+- `body.attachmentId` is non-null, AND
+- the part has either a `filename` attribute or a `Content-ID`
+  header.
+
+The client deduplicates attachments by `attachmentId` when the same
+blob appears in multiple parts (`parse.rs:152-184`). v0 fixtures
+have no attachments; the payload is always a single `text/plain`
+leaf.
+
+## Label semantics
+
+`labelIds` on a message drives every keyword/folder relationship the
+client cares about (`parse.rs:98-99`):
+
+- `UNREAD` -> not read; absence means read.
+- `STARRED` -> starred / flagged.
+- `IMPORTANT` -> important flag (v1 concern; v0 doesn't emit).
+- System container labels (`INBOX`, `SENT`, `DRAFT`, `TRASH`, `SPAM`)
+  -> the message lives in that container.
+- Anything else -> user tag.
+
+Mapping from saehrimnir's fixture:
+
+- Fixture mailbox role -> Gmail system label id, applied to every
+  email in that mailbox:
+  | role       | label   |
+  |------------|---------|
+  | inbox      | INBOX   |
+  | sent       | SENT    |
+  | drafts     | DRAFT   |
+  | trash      | TRASH   |
+  | junk       | SPAM    |
+  | important  | IMPORTANT |
+  | archive    | (no label - Gmail's "archive" means "no INBOX") |
+- No-role fixture mailboxes -> user labels with id `Label_<mb-id>`.
+- Fixture `keywords`:
+  - `$seen` absent -> add `UNREAD` to labelIds.
+  - `$flagged` -> add `STARRED`.
+  - `$draft` -> add `DRAFT`.
+  - non-`$`-prefixed keywords -> become user labels with id
+    `Label_<keyword>`.
+
+## Pagination
+
+All list endpoints use `nextPageToken` cursors. The client treats
+them as opaque strings (`api.rs:90`). v0 mock uses `t.<offset>` and
+follows the same shape for thread list and history.
+
+## Wire-format strictness
+
+- camelCase everywhere (`types.rs:11` uses
+  `#[serde(rename_all = "camelCase")]`).
+- `internalDate` and `historyId`: numeric values quoted as strings.
+- `labelIds`: array of strings, never null.
+- `body.data`: base64url, no padding.
+- 401 triggers token refresh; v0 never emits.
+- 404 with `historyId` mentioned triggers full re-sync; v0 never
+  emits 404 on the history endpoint with a valid token (we just
+  return empty).
+
+## Constants worth knowing
+
+- `INITIAL_THREAD_FETCH_WORKERS = 10` (`sync/mod.rs:90`).
+- `DELTA_THREAD_FETCH_WORKERS = 5` (`sync/delta.rs:82`).
+- `HISTORY_MAX_RESULTS = 500` (`api.rs:209`).
+- Thread list page size default: 100 (`sync/mod.rs:172`).
+- Contact full-sync runs on the 20th delta cycle
+  (`sync/delta.rs:48-60`).
+
+## Out of scope for v0 - resource categories to scaffold for later
+
+| Module                              | What it syncs                                    |
+|-------------------------------------|--------------------------------------------------|
+| `contacts/google_contacts.rs`       | People API connections                           |
+| `contacts/other_contacts.rs`        | People API otherContacts                         |
+| `gdrive.rs`                         | Resumable file uploads + sharing                 |
+| (separate Calendar runtime)         | calendar.googleapis.com Calendars/events         |
+
+The v0 module structure (`src/gmail/`) keeps mail handlers in
+`mail.rs` and reserves room for sibling files - `contacts.rs`,
+`drive.rs`, etc. - without router restructuring.

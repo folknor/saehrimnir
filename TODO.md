@@ -48,10 +48,24 @@ order the next fixture is likely to need it:
 - Webhooks / change notifications (`webhooks.rs`).
 - Autodiscover (`autodiscover.rs`).
 
-## Next: Gmail
+## Now: Gmail - what's left
 
-Google's REST API. Same shape as Graph - HTTP + JSON. Surface scout
-of `<ratatoskr>/crates/gmail/src/`, plan doc, then code.
+v0 mail-sync surface is complete. Future Gmail work:
+
+- People API contacts (`<ratatoskr>/crates/gmail/src/contacts/`).
+  Different base URL (`https://people.googleapis.com/v1/`); will
+  need either a `people.googleapis.com`-shaped listener or a
+  separate `--people-port`. Lean toward separate listener.
+- Google Drive resumable uploads
+  (`<ratatoskr>/crates/gmail/src/gdrive.rs`). Needed once the
+  submission paths grow attachments large enough to spill out of
+  inline.
+- Calendar lives in a separate `CalendarRuntime` in ratatoskr; not
+  part of Gmail mail sync. Will land as its own surface scout when
+  needed.
+- SendAs / signatures bidirectional sync. v0 emits an empty
+  `sendAs[]`; once a fixture grows `[account.signature]` we honour
+  it both ways.
 
 ## Open questions still pending
 

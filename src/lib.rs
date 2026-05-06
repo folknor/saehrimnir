@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod fixture;
+pub mod gmail;
 pub mod graph;
 pub mod imap;
 pub mod jmap;

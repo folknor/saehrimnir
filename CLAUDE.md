@@ -27,6 +27,9 @@ per-protocol surface docs.
   Graph (mail-sync only in v0; the doc lists future resource
   categories so the module structure can accept them).
 - `notes/graph-plan.md` - implementation plan for the Graph layer.
+- `notes/ratatoskr-gmail-surface.md` - same shape, for Gmail's REST
+  API.
+- `notes/gmail-plan.md` - implementation plan for the Gmail layer.
 - `notes/jmap-client-fork.md` - pointer to the local jmap-client fork.
 - `notes/fixture-format.md` - TOML fixture shape and validation rules.
 - `TODO.md` - implementation steps still pending, with the design
@@ -78,11 +81,18 @@ checking whether the fact is already in `notes/`.
   envelope), `mail.rs` (mail-sync handlers). Sibling files for
   calendar / contacts / drive / groups / EWS land here when those
   surfaces are scouted.
+- `src/gmail/` - Gmail REST mock. `mod.rs` (router, AppState,
+  catchall 404), `mail.rs` (profile, labels, threads, history,
+  attachments stub, MIME payload builder, hand-rolled base64url).
+  Sibling files for People-API contacts / Drive uploads land here
+  later.
 - `tests/api.rs` - JMAP integration tests via
   `tower::ServiceExt::oneshot`.
 - `tests/imap.rs` - IMAP integration tests over a duplex stream.
 - `tests/smtp.rs` - SMTP integration tests over a duplex stream.
 - `tests/graph.rs` - Graph integration tests via
+  `tower::ServiceExt::oneshot`.
+- `tests/gmail.rs` - Gmail integration tests via
   `tower::ServiceExt::oneshot`.
 - `fixtures/jmap-small.toml` - canonical v0 fixture (despite the
   name, both protocols read from it).
@@ -115,7 +125,15 @@ returns the Graph error envelope so unimplemented resources are
 visibly out-of-scope. Module is laid out as a directory so calendar/
 contacts/drive/groups/EWS drop in as siblings later.
 
-Gmail: queued.
+Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`
++ `/labels` + `/threads` (list paginated by `nextPageToken`, with
+`q=after:YYYY/M/D` filtering) + `/threads/{id}` (full MIME payload
+projection of fixture emails into Gmail's nested mimePart shape) +
+`/history` (read-only no-op since fixtures don't change) +
+`/messages/{id}/attachments/{aid}` (404 stub) + `/settings/sendAs`
+(empty list). Catchall returns Gmail error envelope. Module
+structure leaves room for People-API contacts and Drive sibling
+files.
 
 ## Rules
 
