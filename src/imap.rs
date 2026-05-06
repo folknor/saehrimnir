@@ -505,6 +505,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         match sub.as_str() {
             "SEARCH" => self.cmd_uid_search(tag, rest).await,
             "FETCH" => self.cmd_uid_fetch(tag, rest).await,
+            "STORE" => self.cmd_uid_store(tag, rest).await,
             other => {
                 self.write_line(&format!(
                     "{tag} BAD UID {other} not implemented in v0"
@@ -589,6 +590,70 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     async fn write_response(&mut self, payload: &str) -> std::io::Result<()> {
         self.writer.write_all(payload.as_bytes()).await?;
         self.writer.flush().await
+    }
+
+    /// `UID STORE <set> <flag-op> <flags>` - flag writeback. v0
+    /// fixtures are read-only, so this is a no-op that *acts* as if
+    /// the flags were applied: emits a `* <seq> FETCH (UID x FLAGS
+    /// (...))` for each matched message with the post-op flag set,
+    /// then a tagged OK. The mutation does not persist - subsequent
+    /// fetches still see the fixture's keywords. Good enough for
+    /// ratatoskr's writeback path to complete cleanly without
+    /// erroring.
+    async fn cmd_uid_store(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        let (uid_set_str, after) = match split_after_set(args) {
+            Some(p) => p,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID STORE expects <set> <flag-op> <flags>"))
+                    .await;
+            }
+        };
+        let set = match parse_uid_set(uid_set_str) {
+            Some(s) => s,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID STORE bad sequence-set"))
+                    .await;
+            }
+        };
+        let store_op = match parse_store_op(after) {
+            Some(op) => op,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID STORE bad flag list"))
+                    .await;
+            }
+        };
+
+        let selected_id = self
+            .selected
+            .clone()
+            .expect("Selected state requires selected mailbox");
+        let lines: Vec<String> = mailbox_messages(&self.fixture, &selected_id)
+            .into_iter()
+            .filter(|(uid, _)| set.matches(*uid))
+            .map(|(uid, email)| {
+                let flags = store_op.apply(email);
+                if store_op.silent {
+                    String::new()
+                } else {
+                    format!(
+                        "* {seq} FETCH (UID {uid} FLAGS ({flags}))\r\n",
+                        seq = uid,
+                    )
+                }
+            })
+            .collect();
+
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            self.write_response(&line).await?;
+        }
+        self.write_line(&format!("{tag} OK UID STORE completed"))
+            .await
     }
 
     async fn cmd_uid_search(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
@@ -966,6 +1031,82 @@ fn split_after_set(s: &str) -> Option<(&str, &str)> {
     let s = s.trim_start();
     let (set, rest) = s.split_once(' ')?;
     Some((set.trim(), rest.trim_start()))
+}
+
+/// Parsed `STORE`/`UID STORE` flag-op argument tail.
+#[derive(Debug)]
+struct StoreOp {
+    kind: StoreKind,
+    flags: Vec<String>,
+    silent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreKind {
+    /// `+FLAGS`: union with existing flags.
+    Add,
+    /// `-FLAGS`: subtract from existing flags.
+    Remove,
+    /// `FLAGS`: replace existing flags entirely.
+    Replace,
+}
+
+impl StoreOp {
+    /// Compute the post-op flag-token list as it would appear on the
+    /// wire if the mutation had taken effect. Existing fixture
+    /// keywords project through `flags_for`; the requested flags are
+    /// taken verbatim (already in IMAP wire form like `\Seen` or a
+    /// custom keyword like `important`).
+    fn apply(&self, email: &Email) -> String {
+        let existing = flags_for(email);
+        let existing_set: std::collections::BTreeSet<String> = if existing.is_empty() {
+            std::collections::BTreeSet::new()
+        } else {
+            existing.split_whitespace().map(str::to_string).collect()
+        };
+        let requested: std::collections::BTreeSet<String> =
+            self.flags.iter().cloned().collect();
+        let merged: std::collections::BTreeSet<String> = match self.kind {
+            StoreKind::Add => existing_set.union(&requested).cloned().collect(),
+            StoreKind::Remove => existing_set.difference(&requested).cloned().collect(),
+            StoreKind::Replace => requested,
+        };
+        merged.into_iter().collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn parse_store_op(s: &str) -> Option<StoreOp> {
+    let s = s.trim();
+    let (op_token, rest) = s.split_once(' ')?;
+    let op_upper = op_token.to_ascii_uppercase();
+    let (op_word, silent) = if let Some(stripped) = op_upper.strip_suffix(".SILENT") {
+        (stripped.to_string(), true)
+    } else {
+        (op_upper, false)
+    };
+    let kind = match op_word.as_str() {
+        "+FLAGS" => StoreKind::Add,
+        "-FLAGS" => StoreKind::Remove,
+        "FLAGS" => StoreKind::Replace,
+        _ => return None,
+    };
+    let flags = parse_flag_list(rest.trim())?;
+    Some(StoreOp { kind, flags, silent })
+}
+
+/// Parse a flag list in either `(\Seen \Flagged)` or
+/// `\Seen \Flagged` shape. Returns the list of flag tokens.
+fn parse_flag_list(s: &str) -> Option<Vec<String>> {
+    let s = s.trim();
+    let inner = if let Some(stripped) = s.strip_prefix('(') {
+        stripped.strip_suffix(')')?.trim()
+    } else {
+        s
+    };
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(inner.split_whitespace().map(str::to_string).collect())
 }
 
 /// Split the FETCH attribute list from any trailing modifier list.
@@ -1922,6 +2063,136 @@ mod tests {
         .await;
         // Body for our test fixture is just "x".
         assert!(out.contains("BODY[TEXT] {1}\r\nx)"), "got: {out:?}");
+    }
+
+    // ── UID STORE tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn uid_store_add_seen_emits_fetch_with_combined_flags() {
+        // fixture_with_folders: e1 has $seen, e2 has nothing.
+        // After +FLAGS (\Seen \Draft) both end up with \Seen and
+        // \Draft.
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\n\
+              b SELECT \"INBOX\"\r\n\
+              c UID STORE 1:2 +FLAGS (\\Seen \\Draft)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(
+            out.contains("* 1 FETCH (UID 1 FLAGS (\\Draft \\Seen))"),
+            "e1 line missing: {out:?}"
+        );
+        assert!(
+            out.contains("* 2 FETCH (UID 2 FLAGS (\\Draft \\Seen))"),
+            "e2 line missing: {out:?}"
+        );
+        assert!(out.contains("c OK UID STORE completed"));
+    }
+
+    #[tokio::test]
+    async fn uid_store_remove_subtracts_flags() {
+        // -FLAGS (\Seen) on e1 (which has only \Seen) leaves an
+        // empty flag list.
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\n\
+              b SELECT \"INBOX\"\r\n\
+              c UID STORE 1 -FLAGS (\\Seen)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(
+            out.contains("* 1 FETCH (UID 1 FLAGS ())"),
+            "got: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn uid_store_replace_overwrites_flag_set() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\n\
+              b SELECT \"INBOX\"\r\n\
+              c UID STORE 1 FLAGS (\\Answered)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(
+            out.contains("* 1 FETCH (UID 1 FLAGS (\\Answered))"),
+            "got: {out:?}"
+        );
+        // The replace dropped the \Seen e1 had; the FETCH line should
+        // show only \Answered. Not asserting on the broader output
+        // because SELECT's untagged FLAGS list legitimately mentions
+        // \Seen.
+    }
+
+    #[tokio::test]
+    async fn uid_store_silent_skips_fetch_lines() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\n\
+              b SELECT \"INBOX\"\r\n\
+              c UID STORE 1:2 +FLAGS.SILENT (\\Seen)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(!out.contains("* 1 FETCH"));
+        assert!(!out.contains("* 2 FETCH"));
+        assert!(out.contains("c OK UID STORE completed"));
+    }
+
+    #[tokio::test]
+    async fn uid_store_custom_keyword_passes_through() {
+        // Keywords without a backslash prefix are custom, allowed by
+        // PERMANENTFLAGS \*. Just round-trips.
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\n\
+              b SELECT \"INBOX\"\r\n\
+              c UID STORE 2 +FLAGS (label_important)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(
+            out.contains("* 2 FETCH (UID 2 FLAGS (label_important))"),
+            "got: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn uid_store_pre_select_is_bad() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nc UID STORE 1 +FLAGS (\\Seen)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("c BAD UID requires SELECT"));
+    }
+
+    #[tokio::test]
+    async fn uid_store_bad_op_returns_bad() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\n\
+              b SELECT \"INBOX\"\r\n\
+              c UID STORE 1 NONSENSE (\\Seen)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("c BAD UID STORE bad flag list"));
+    }
+
+    #[test]
+    fn parse_store_op_handles_three_kinds_and_silent() {
+        let p = parse_store_op("+FLAGS (\\Seen)").unwrap();
+        assert_eq!(p.kind, StoreKind::Add);
+        assert!(!p.silent);
+        assert_eq!(p.flags, vec!["\\Seen".to_string()]);
+
+        let p = parse_store_op("-FLAGS.SILENT (\\Flagged)").unwrap();
+        assert_eq!(p.kind, StoreKind::Remove);
+        assert!(p.silent);
+
+        let p = parse_store_op("FLAGS \\Answered").unwrap();
+        assert_eq!(p.kind, StoreKind::Replace);
+        assert_eq!(p.flags, vec!["\\Answered".to_string()]);
     }
 
     #[test]

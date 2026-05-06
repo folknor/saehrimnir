@@ -5,15 +5,17 @@ Running task list. Per-protocol design notes live alongside in
 
 ## Now: IMAP - what's left
 
-Most of the v0 IMAP surface has landed. Still pending:
+The v0 IMAP surface is complete. Open follow-ups:
 
-- Stretch: `STORE FLAGS` no-op acknowledgement so ratatoskr's flag
-  writeback path completes (not load-bearing for read-only sync).
 - 200-message FETCH batching boundary. The current handler emits all
   matched FETCH responses in one go. Ratatoskr's client batches
   client-side (CHUNK_SIZE=200), so the wire boundary is invisible to
   it; flagged as a v1 thing if we ever want to test the batch
   boundary explicitly.
+- Streaming `UID FETCH` to avoid materialising the full response set
+  before writing. Today's loop builds a `Vec<String>` first; at huge
+  N (think `bulk_emails(count=1_000_000)`) that's enough memory to
+  matter. Refactor when a fixture forces it.
 
 Done in this session:
 1. Listener bootstrap, greeting, CAPABILITY, NOOP, LOGOUT.
@@ -93,10 +95,6 @@ v0 mail-sync surface is complete. Future Gmail work:
   sweep needs `Project::Saehrimnir` to land in brokkr's enum first,
   or the file would fail brokkr's parse-time validation. Until then,
   rely on `brokkr check`'s no-toml fallback.
-- A subprocess + reqwest test that exercises the sentinel + SIGTERM
-  path end-to-end. The `tests/api.rs` suite covers the wire format
-  via `tower::ServiceExt::oneshot`; a single subprocess-shaped test
-  would close the gap currently filled only by `scripts/smoke.sh`.
 - Plan-3 / ratatoskr wiring. From saehrimnir's side this just needs
   jmap-client + ratatoskr's IMAP client to talk to us cleanly. Two
   observable behaviours we should re-verify once plan-3 lights up:

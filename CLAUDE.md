@@ -101,6 +101,14 @@ checking whether the fact is already in `notes/`.
 - `tests/lua_fixture.rs` - asserts the Lua loader produces a
   `Fixture` byte-identical to the equivalent TOML fixture, plus
   error paths.
+- `tests/scale.rs` - 10k-email scale-correctness tests against
+  `fixtures/jmap-bulk.lua`. Verifies pagination through the four
+  protocol layers (JMAP `Email/query`, Graph `messages` and
+  `messages/delta`, Gmail `threads`) without drops or dupes.
+- `tests/lifecycle.rs` - subprocess test that spawns the actual
+  binary, polls for the readiness sentinel, hits a real network
+  endpoint, sends SIGTERM, asserts a clean exit. Closes the
+  coverage gap that `scripts/smoke.sh` covers manually.
 - `fixtures/jmap-small.toml` and `fixtures/jmap-small.lua` - the
   canonical v0 scenario in both authoring formats. Asserted
   equivalent by `tests/lua_fixture.rs`.
@@ -116,9 +124,12 @@ JMAP: complete for v0 (session resource, `Mailbox/get`, `Email/query`,
 IMAP: complete for v0's read path (greeting, `CAPABILITY`, `LOGIN`/
 `AUTHENTICATE`, `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT`/`EXAMINE`/
 `CLOSE`, `UID SEARCH`, `UID FETCH` with full RFC 822 body emission,
-CONDSTORE `CHANGEDSINCE`). Integration test in `tests/imap.rs` drives
-the full initial-sync transcript. Stretch: `STORE` no-op for the
-flag-writeback path (not load-bearing for read-only sync).
+CONDSTORE `CHANGEDSINCE`). Plus `UID STORE` as a non-persistent
+no-op: emits the post-op FETCH untagged update and a tagged OK so
+ratatoskr's flag-writeback path completes cleanly without erroring;
+the mutation does not persist (subsequent fetches see the fixture's
+keywords unchanged). Integration test in `tests/imap.rs` drives the
+full initial-sync transcript.
 
 SMTP: complete for v0's submission path (greeting, EHLO,
 AUTH PLAIN/LOGIN/XOAUTH2/OAUTHBEARER, MAIL FROM, RCPT TO, DATA with
