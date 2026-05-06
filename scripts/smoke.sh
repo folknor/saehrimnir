@@ -65,9 +65,11 @@ if [[ ! -f "$ready_file" ]]; then
     exit 1
 fi
 
-port="$(awk '{print $2}' "$ready_file")"
-base="http://127.0.0.1:$port"
-echo "sentinel: $(cat "$ready_file")"
+jmap_port="$(awk '/^READY /{print $2}' "$ready_file")"
+imap_port="$(awk '/^IMAP /{print $2}' "$ready_file")"
+base="http://127.0.0.1:$jmap_port"
+echo "sentinel:"
+sed 's/^/  /' "$ready_file"
 
 echo "=== GET / ==="
 curl -fsSL "$base/"
@@ -189,6 +191,19 @@ assert mr[1]["type"] == "unknownMethod", mr
 assert mr[2] == "c1", mr
 print("unknownMethod: ok")
 ' "$unk"
+
+echo "=== IMAP greeting + CAPABILITY + LOGOUT ==="
+imap_out="$(printf 'a1 CAPABILITY\r\nq LOGOUT\r\n' | nc -w 2 127.0.0.1 "$imap_port")"
+python3 -c '
+import sys
+out = sys.argv[1]
+assert "* OK saehrimnir IMAP4rev1 ready" in out, out
+assert "* CAPABILITY IMAP4REV1 CONDSTORE QRESYNC" in out, out
+assert "a1 OK CAPABILITY completed" in out, out
+assert "* BYE saehrimnir signing off" in out, out
+assert "q OK LOGOUT completed" in out, out
+print("IMAP bootstrap: ok")
+' "$imap_out"
 
 echo "=== SIGTERM ==="
 kill -TERM "$pid"

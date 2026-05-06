@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use saehrimnir::{cli, fixture, routes, sentinel, shutdown};
+use saehrimnir::sentinel::ProtocolPort;
+use saehrimnir::{cli, fixture, imap, routes, sentinel, shutdown};
+use tokio::sync::watch;
 
 /// Hard budget on graceful drain after SIGTERM. Plan-2 acceptance #6
 /// requires a clean shutdown within ~1 second.
@@ -19,43 +21,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fixture.mailboxes.len(),
         fixture.emails.len()
     );
+    let fixture = Arc::new(fixture);
 
-    let state = routes::AppState {
-        fixture: Arc::new(fixture),
-    };
-    let app = routes::router(state);
+    // JMAP listener.
+    let jmap_listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.jmap_port)).await?;
+    let jmap_addr = jmap_listener.local_addr()?;
+    eprintln!("saehrimnir: jmap listening on {jmap_addr}");
 
-    let bind_addr = format!("127.0.0.1:{}", args.port);
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    let local_addr = listener.local_addr()?;
-    eprintln!("saehrimnir: listening on {local_addr}");
+    // IMAP listener.
+    let imap_listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.imap_port)).await?;
+    let imap_addr = imap_listener.local_addr()?;
+    eprintln!("saehrimnir: imap listening on {imap_addr}");
 
-    sentinel::write_ready(&args.readiness_file, local_addr.port()).await?;
+    sentinel::write_ready(
+        &args.readiness_file,
+        &[
+            ProtocolPort {
+                name: "READY",
+                port: jmap_addr.port(),
+            },
+            ProtocolPort {
+                name: "IMAP",
+                port: imap_addr.port(),
+            },
+        ],
+    )
+    .await?;
     eprintln!(
         "saehrimnir: readiness sentinel written: {}",
         args.readiness_file.display()
     );
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(
-        axum::serve(listener, app)
+    let app = routes::router(routes::AppState {
+        fixture: Arc::clone(&fixture),
+    });
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // JMAP server via axum + watch-driven graceful shutdown.
+    let jmap_shutdown_rx = shutdown_rx.clone();
+    let jmap_task = tokio::spawn(
+        axum::serve(jmap_listener, app)
             .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
+                let mut rx = jmap_shutdown_rx;
+                while rx.changed().await.is_ok() {
+                    if *rx.borrow() {
+                        return;
+                    }
+                }
             })
             .into_future(),
     );
 
+    // IMAP server.
+    let imap_shutdown_rx = shutdown_rx.clone();
+    let imap_fixture = Arc::clone(&fixture);
+    let imap_task = tokio::spawn(async move {
+        imap::serve(imap_listener, imap_fixture, imap_shutdown_rx).await
+    });
+
     shutdown::wait_for_signal().await;
     eprintln!("saehrimnir: shutdown signal received, draining (budget {SHUTDOWN_BUDGET:?})");
-    let _ = shutdown_tx.send(());
+    let _ = shutdown_tx.send(true);
 
-    match tokio::time::timeout(SHUTDOWN_BUDGET, server).await {
-        Ok(Ok(Ok(()))) => {
+    let drain = async move {
+        let _ = jmap_task.await;
+        let _ = imap_task.await;
+    };
+    match tokio::time::timeout(SHUTDOWN_BUDGET, drain).await {
+        Ok(()) => {
             eprintln!("saehrimnir: clean shutdown");
             Ok(())
         }
-        Ok(Ok(Err(e))) => Err(e.into()),
-        Ok(Err(e)) => Err(format!("server task panicked: {e}").into()),
         Err(_) => {
             eprintln!("saehrimnir: shutdown budget exceeded, exiting");
             Ok(())

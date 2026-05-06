@@ -2,22 +2,27 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// Deterministic mock JMAP server.
+/// Deterministic mock email-protocol server.
 ///
-/// Loads a fixture, binds a TCP port, writes a readiness sentinel, and
-/// serves JMAP until SIGTERM. Designed to be spawned by brokkr's
+/// Loads a fixture, binds one TCP port per protocol, writes a readiness
+/// sentinel, and serves until SIGTERM. Designed to be spawned by brokkr's
 /// `[ratatoskr]` sync commands.
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// TCP port to listen on. `0` (default) picks an ephemeral port; the
-    /// chosen port is written to the readiness file.
-    #[arg(long, default_value_t = 0)]
-    pub port: u16,
+    /// JMAP HTTP port. `0` (default) picks an ephemeral port; the
+    /// chosen port lands in the readiness file under `READY <port>`.
+    #[arg(long = "jmap-port", alias = "port", default_value_t = 0)]
+    pub jmap_port: u16,
 
-    /// Path to write `READY <port>\n` once the listener is bound. Brokkr
-    /// watches this via `wait_for_sentinel` to know when to launch the
-    /// process that drives the workload.
+    /// IMAP TCP port. `0` (default) picks an ephemeral port; the
+    /// chosen port lands in the readiness file under `IMAP <port>`.
+    #[arg(long = "imap-port", default_value_t = 0)]
+    pub imap_port: u16,
+
+    /// Path to write the readiness sentinel once both listeners are
+    /// bound. One line per protocol, e.g.:
+    /// `READY 12345\nIMAP 23456\n`.
     #[arg(long)]
     pub readiness_file: PathBuf,
 

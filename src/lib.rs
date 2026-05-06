@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod fixture;
+pub mod imap;
 pub mod jmap;
 pub mod routes;
 pub mod sentinel;

@@ -1,16 +1,26 @@
 # Sæhrimnir
 
-Deterministic mock JMAP server. Test peer for ratatoskr's sync code,
-spawned by brokkr's `[ratatoskr]` sync commands. Plan-2 of a
-three-plan effort: `notes/plan.md` is the verbatim plan.
+Deterministic mock email-protocol server. Test peer for ratatoskr's
+sync code, spawned by brokkr's `[ratatoskr]` sync commands. Originally
+scoped to JMAP only; now growing to cover every protocol ratatoskr's
+sync code talks to (JMAP, IMAP, SMTP, Microsoft Graph, Gmail), all
+backed by one shared TOML fixture.
+
+JMAP is implemented; IMAP is in progress; SMTP / Graph / Gmail are
+queued. See `TODO.md` for the running task list and `notes/` for
+per-protocol surface docs.
 
 ## Where to read
 
-- `notes/plan.md` - verbatim v0 plan.
+- `notes/plan.md` - the original JMAP-only v0 plan. Background
+  reading; superseded for scope but still accurate for the JMAP
+  layer's design decisions.
 - `notes/orchestration.md` - how brokkr drives us: lifecycle,
   sentinel, env vars, brokkr.toml fields.
 - `notes/ratatoskr-client-surface.md` - what the JMAP client expects
   on the wire, with `crates/jmap/src/...:LL` citations.
+- `notes/ratatoskr-imap-surface.md` - same shape, for IMAP.
+- `notes/imap-plan.md` - implementation plan for the IMAP layer.
 - `notes/jmap-client-fork.md` - pointer to the local jmap-client fork.
 - `notes/fixture-format.md` - TOML fixture shape and validation rules.
 - `TODO.md` - implementation steps still pending, with the design
@@ -26,11 +36,15 @@ checking whether the fact is already in `notes/`.
   derive entirely from the fixture; no clocks, no random IDs, no
   unsorted iteration. Output uses `serde_json::Map` (BTreeMap-backed)
   for stable key ordering.
-- No auth in v0: the listener accepts any request.
-- JMAP only in v0; IMAP later.
-- Out-of-scope methods (`Email/changes`, `Mailbox/changes`,
+- No auth in v0: every protocol accepts any credential. Bearer,
+  basic, LOGIN, XOAUTH2, OAUTHBEARER all return success without
+  validating.
+- One shared fixture per process. Each protocol projects its own wire
+  shape from the same canonical types in `src/fixture.rs`.
+- Out-of-scope JMAP methods (`Email/changes`, `Mailbox/changes`,
   `Email/set`, `EmailSubmission/set`, push, etc.) return
-  `unknownMethod`.
+  `unknownMethod`. Out-of-scope IMAP commands (write paths, IDLE,
+  NOTIFY, etc.) return `BAD`.
 - The session must NOT advertise `urn:ietf:params:jmap:principals`.
   It would pull the client into `Principal/get` and
   `ShareNotification` paths the mock cannot satisfy.
@@ -40,25 +54,33 @@ checking whether the fact is already in `notes/`.
 - `src/main.rs` - runtime entry. Loads fixture, binds listener,
   writes sentinel, serves until SIGTERM with a 1-second graceful
   budget.
-- `src/cli.rs` - clap CLI: `--port`, `--readiness-file`,
-  `--fixture`, `--log-file`.
-- `src/fixture.rs` - TOML loader, validator, canonical types.
+- `src/cli.rs` - clap CLI flags.
+- `src/fixture.rs` - TOML loader, validator, canonical types shared
+  by every protocol layer.
 - `src/sentinel.rs` - atomic readiness-file write (temp + rename).
 - `src/shutdown.rs` - SIGTERM/SIGINT handler.
 - `src/lib.rs` - library surface; `main.rs` keeps just the runtime.
-- `src/routes.rs` - axum router, `AppState`, route handlers.
-- `src/jmap.rs` - request envelope, dispatcher, per-method handlers.
-- `tests/api.rs` - integration tests via `tower::ServiceExt::oneshot`.
-- `fixtures/jmap-small.toml` - canonical v0 fixture.
+- `src/routes.rs` - axum router, `AppState`, JMAP HTTP route handlers.
+- `src/jmap.rs` - JMAP request envelope, dispatcher, per-method
+  handlers.
+- `src/imap/` - IMAP listener, connection state machine, command
+  dispatcher, RFC 822 emit. (In progress.)
+- `tests/api.rs` - JMAP integration tests via
+  `tower::ServiceExt::oneshot`.
+- `fixtures/jmap-small.toml` - canonical v0 fixture (despite the
+  name, both protocols read from it).
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status
 
-Bootstrap through plan-2 step 8 has landed: HTTP listener, readiness
-sentinel, SIGTERM, fixture loader, `/jmap/session`, the `POST /jmap/api`
-envelope, the three load-bearing methods (`Mailbox/get`, `Email/query`,
-`Email/get`), and integration tests. Step 9 (ratatoskr wiring) is plan-3
-work. See `TODO.md` for the open questions.
+JMAP: complete for v0 (session resource, `Mailbox/get`, `Email/query`,
+`Email/get`, full integration test coverage).
+
+IMAP: surface scouted (`notes/ratatoskr-imap-surface.md`), plan
+written (`notes/imap-plan.md`), implementation underway.
+
+SMTP / Graph / Gmail: queued. Each will follow the JMAP/IMAP pattern
+(scout the client surface, plan, implement).
 
 ## Rules
 

@@ -67,10 +67,13 @@ Plan 3 wires whatever name is configured; we don't hardcode it.
 - **Trigger:** atomic write the moment the TCP listener is bound.
   Write-temp-then-rename, so a reader can't catch us mid-write with
   an empty file.
-- **Content:** `READY <port>\n` - single line, single newline. Plan 2
-  spells it that way; brokkr's `wait_for_sentinel` doesn't parse the
-  content (it's presence-only) but the calling code in plan 3 reads
-  the file to extract the port.
+- **Content:** one line per protocol, each `<NAME> <port>\n`. JMAP is
+  always present (`READY <port>\n` - the historical name kept for
+  back-compat), then one line per other protocol (`IMAP <port>\n`,
+  later `SMTP`, `GRAPH`, `GMAIL`). Brokkr's `wait_for_sentinel`
+  doesn't parse the content (it's presence-only); plan-3-side code
+  reads the file and picks the port for the protocol it cares
+  about.
 - **Brokkr's watcher:** polls the path until it appears or a backstop
   fires. Returns `Appeared` or `BackstopExpired` as first-class
   outcomes. No inotify; polling is fine.
