@@ -67,6 +67,7 @@ fi
 
 jmap_port="$(awk '/^READY /{print $2}' "$ready_file")"
 imap_port="$(awk '/^IMAP /{print $2}' "$ready_file")"
+smtp_port="$(awk '/^SMTP /{print $2}' "$ready_file")"
 base="http://127.0.0.1:$jmap_port"
 echo "sentinel:"
 sed 's/^/  /' "$ready_file"
@@ -252,6 +253,21 @@ assert "First message body." in body or "Reply body." in body, body
 assert "c OK UID FETCH completed" in out, out
 print("IMAP UID FETCH: ok")
 ' "$imap_out2"
+
+echo "=== SMTP submission ==="
+smtp_out="$(printf 'EHLO me.local\r\nAUTH PLAIN AGFsaWNlAGh1bnRlcg==\r\nMAIL FROM:<alice@example.com>\r\nRCPT TO:<bob@example.com>\r\nDATA\r\nFrom: <alice@example.com>\r\nTo: <bob@example.com>\r\nSubject: smoke\r\n\r\nbody\r\n.\r\nQUIT\r\n' | nc -w 2 127.0.0.1 "$smtp_port")"
+python3 -c '
+import sys
+out = sys.argv[1]
+assert "220 saehrimnir ESMTP ready" in out, out
+assert "250-saehrimnir greets you" in out, out
+assert "250 AUTH PLAIN LOGIN XOAUTH2" in out, out
+assert "235 authentication accepted" in out, out
+assert "354 send data" in out, out
+assert "250 OK queued" in out, out
+assert "221 saehrimnir bye" in out, out
+print("SMTP submission: ok")
+' "$smtp_out"
 
 echo "=== SIGTERM ==="
 kill -TERM "$pid"

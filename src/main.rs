@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use saehrimnir::sentinel::ProtocolPort;
-use saehrimnir::{cli, fixture, imap, routes, sentinel, shutdown};
+use saehrimnir::{cli, fixture, imap, routes, sentinel, shutdown, smtp};
 use tokio::sync::watch;
 
 /// Hard budget on graceful drain after SIGTERM. Plan-2 acceptance #6
@@ -35,6 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let imap_addr = imap_listener.local_addr()?;
     eprintln!("saehrimnir: imap listening on {imap_addr}");
 
+    // SMTP listener.
+    let smtp_listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.smtp_port)).await?;
+    let smtp_addr = smtp_listener.local_addr()?;
+    eprintln!("saehrimnir: smtp listening on {smtp_addr}");
+
     sentinel::write_ready(
         &args.readiness_file,
         &[
@@ -45,6 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProtocolPort {
                 name: "IMAP",
                 port: imap_addr.port(),
+            },
+            ProtocolPort {
+                name: "SMTP",
+                port: smtp_addr.port(),
             },
         ],
     )
@@ -82,6 +92,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         imap::serve(imap_listener, imap_fixture, imap_shutdown_rx).await
     });
 
+    // SMTP server. The submission log is process-scoped (cleared at
+    // exit). When plan-3 wants test-side introspection we will hand
+    // out an Arc clone or expose it via a debug HTTP route.
+    let smtp_log = smtp::SubmissionLog::new();
+    let smtp_shutdown_rx = shutdown_rx.clone();
+    let smtp_log_clone = smtp_log.clone();
+    let smtp_task = tokio::spawn(async move {
+        smtp::serve(smtp_listener, smtp_log_clone, smtp_shutdown_rx).await
+    });
+    let _ = smtp_log; // currently no readers in production.
+
     shutdown::wait_for_signal().await;
     eprintln!("saehrimnir: shutdown signal received, draining (budget {SHUTDOWN_BUDGET:?})");
     let _ = shutdown_tx.send(true);
@@ -89,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let drain = async move {
         let _ = jmap_task.await;
         let _ = imap_task.await;
+        let _ = smtp_task.await;
     };
     match tokio::time::timeout(SHUTDOWN_BUDGET, drain).await {
         Ok(()) => {

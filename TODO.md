@@ -28,13 +28,6 @@ Done in this session:
    initial-sync transcript plus a literal-block byte-accuracy check
    and a determinism check across two runs.
 
-## Next: SMTP
-
-Smaller scope - submission only, no delivery. Surface scout of
-`<ratatoskr>/crates/smtp/src/` first, then a plan doc, then code.
-SMTP shares no abstractions with the read protocols; it will need a
-"submitted message buffer" so tests can assert what got sent.
-
 ## Next: Microsoft Graph
 
 JSON-over-HTTPS like JMAP, so the axum infrastructure carries over.

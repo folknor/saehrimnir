@@ -21,6 +21,8 @@ per-protocol surface docs.
   on the wire, with `crates/jmap/src/...:LL` citations.
 - `notes/ratatoskr-imap-surface.md` - same shape, for IMAP.
 - `notes/imap-plan.md` - implementation plan for the IMAP layer.
+- `notes/ratatoskr-smtp-surface.md` - same shape, for SMTP.
+- `notes/smtp-plan.md` - implementation plan for the SMTP layer.
 - `notes/jmap-client-fork.md` - pointer to the local jmap-client fork.
 - `notes/fixture-format.md` - TOML fixture shape and validation rules.
 - `TODO.md` - implementation steps still pending, with the design
@@ -63,10 +65,14 @@ checking whether the fact is already in `notes/`.
 - `src/routes.rs` - axum router, `AppState`, JMAP HTTP route handlers.
 - `src/jmap.rs` - JMAP request envelope, dispatcher, per-method
   handlers.
-- `src/imap/` - IMAP listener, connection state machine, command
-  dispatcher, RFC 822 emit. (In progress.)
+- `src/imap.rs` - IMAP listener, connection state machine, command
+  dispatcher, RFC 822 emit.
+- `src/smtp.rs` - SMTP submission listener + in-memory submission
+  capture log.
 - `tests/api.rs` - JMAP integration tests via
   `tower::ServiceExt::oneshot`.
+- `tests/imap.rs` - IMAP integration tests over a duplex stream.
+- `tests/smtp.rs` - SMTP integration tests over a duplex stream.
 - `fixtures/jmap-small.toml` - canonical v0 fixture (despite the
   name, both protocols read from it).
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
@@ -83,7 +89,13 @@ CONDSTORE `CHANGEDSINCE`). Integration test in `tests/imap.rs` drives
 the full initial-sync transcript. Stretch: `STORE` no-op for the
 flag-writeback path (not load-bearing for read-only sync).
 
-SMTP / Graph / Gmail: queued. Each will follow the JMAP/IMAP pattern
+SMTP: complete for v0's submission path (greeting, EHLO,
+AUTH PLAIN/LOGIN/XOAUTH2/OAUTHBEARER, MAIL FROM, RCPT TO, DATA with
+dot-stuffing reversal, RSET, NOOP, QUIT). Submissions captured in an
+in-memory `SubmissionLog` that tests read directly. Integration tests
+in `tests/smtp.rs`.
+
+Graph / Gmail: queued. Each will follow the JMAP/IMAP/SMTP pattern
 (scout the client surface, plan, implement).
 
 ## Rules

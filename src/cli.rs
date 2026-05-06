@@ -20,6 +20,11 @@ pub struct Args {
     #[arg(long = "imap-port", default_value_t = 0)]
     pub imap_port: u16,
 
+    /// SMTP submission port. `0` (default) picks an ephemeral port;
+    /// the chosen port lands in the readiness file under `SMTP <port>`.
+    #[arg(long = "smtp-port", default_value_t = 0)]
+    pub smtp_port: u16,
+
     /// Path to write the readiness sentinel once both listeners are
     /// bound. One line per protocol, e.g.:
     /// `READY 12345\nIMAP 23456\n`.
