@@ -9,7 +9,8 @@
 //! v0 scope (see `notes/imap-plan.md`): plaintext only, accept any
 //! credential. Currently implemented: greeting, `CAPABILITY`, `NOOP`,
 //! `LOGOUT`, `LOGIN`, `AUTHENTICATE` (PLAIN / XOAUTH2 / OAUTHBEARER),
-//! `ENABLE QRESYNC`. Everything else returns tagged `BAD`.
+//! `ENABLE QRESYNC`, `LIST`, `STATUS`. Everything else returns
+//! tagged `BAD`.
 
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use tokio::io::{
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::fixture::Fixture;
+use crate::fixture::{Fixture, Mailbox, Role};
 
 /// Greeting line emitted as soon as the connection is accepted, before
 /// the client says anything. Per RFC 3501 sec 7.1, an `* OK` greeting
@@ -87,12 +88,12 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _ = fixture; // consumed by later steps; threaded through now.
     let (reader, writer) = tokio::io::split(stream);
     let mut conn = Conn {
         reader: BufReader::new(reader),
         writer,
         state: State::NotAuthenticated,
+        fixture,
     };
 
     conn.write_line(GREETING.trim_end_matches("\r\n")).await?;
@@ -119,6 +120,7 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     reader: BufReader<ReadHalf<S>>,
     writer: WriteHalf<S>,
     state: State,
+    fixture: Arc<Fixture>,
 }
 
 enum ReadOutcome {
@@ -192,6 +194,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "LOGIN" => self.cmd_login(parsed.tag, parsed.args).await,
             "AUTHENTICATE" => self.cmd_authenticate(parsed.tag, parsed.args).await,
             "ENABLE" => self.cmd_enable(parsed.tag, parsed.args).await,
+            "LIST" => self.cmd_list(parsed.tag, parsed.args).await,
+            "STATUS" => self.cmd_status(parsed.tag, parsed.args).await,
             other => {
                 self.write_line(&format!(
                     "{} BAD {other} not implemented in v0",
@@ -310,6 +314,321 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
         self.write_line(&format!("{tag} OK ENABLE completed")).await
     }
+
+    async fn cmd_list(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !self.is_authenticated() {
+            return self
+                .write_line(&format!("{tag} BAD LIST requires authentication"))
+                .await;
+        }
+        let (reference, pattern) = match parse_two_astrings(args) {
+            Some(p) => p,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD LIST expects \"reference\" \"pattern\""))
+                    .await;
+            }
+        };
+        // RFC 3501 sec 6.3.8: empty pattern with empty reference asks
+        // for the hierarchy delimiter only.
+        if pattern.is_empty() {
+            self.write_line("* LIST (\\Noselect) \"/\" \"\"").await?;
+            return self
+                .write_line(&format!("{tag} OK LIST completed"))
+                .await;
+        }
+        // We accept both `*` and exact-name patterns; everything else
+        // falls back to substring matching, which is enough for
+        // ratatoskr (it only ever sends `*`).
+        let _ = reference; // hierarchy reference is unused in v0.
+        let entries = list_mailboxes(&self.fixture);
+        for e in &entries {
+            if !pattern_matches(&pattern, &e.path) {
+                continue;
+            }
+            let attrs = if e.attributes.is_empty() {
+                String::new()
+            } else {
+                e.attributes.join(" ")
+            };
+            self.write_line(&format!("* LIST ({attrs}) \"/\" \"{}\"", e.path))
+                .await?;
+        }
+        self.write_line(&format!("{tag} OK LIST completed")).await
+    }
+
+    async fn cmd_status(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !self.is_authenticated() {
+            return self
+                .write_line(&format!("{tag} BAD STATUS requires authentication"))
+                .await;
+        }
+        let parsed = match parse_status_args(args) {
+            Some(p) => p,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD STATUS expects \"name\" (item ...)"))
+                    .await;
+            }
+        };
+        let entries = list_mailboxes(&self.fixture);
+        let entry = entries.iter().find(|e| e.path.eq_ignore_ascii_case(&parsed.name));
+        let Some(entry) = entry else {
+            return self
+                .write_line(&format!("{tag} NO STATUS unknown mailbox"))
+                .await;
+        };
+        let counts = mailbox_counts(&self.fixture, &entry.fixture_id);
+        let mut items = Vec::with_capacity(parsed.items.len());
+        for item in &parsed.items {
+            let pair = match item.to_ascii_uppercase().as_str() {
+                "MESSAGES" => format!("MESSAGES {}", counts.exists),
+                "UNSEEN" => format!("UNSEEN {}", counts.unseen),
+                "RECENT" => "RECENT 0".to_string(),
+                "UIDNEXT" => format!("UIDNEXT {}", counts.uidnext),
+                "UIDVALIDITY" => "UIDVALIDITY 1".to_string(),
+                "HIGHESTMODSEQ" => "HIGHESTMODSEQ 1".to_string(),
+                _ => continue,
+            };
+            items.push(pair);
+        }
+        self.write_line(&format!(
+            "* STATUS \"{}\" ({})",
+            entry.path,
+            items.join(" ")
+        ))
+        .await?;
+        self.write_line(&format!("{tag} OK STATUS completed")).await
+    }
+
+    fn is_authenticated(&self) -> bool {
+        matches!(self.state, State::Authenticated | State::Selected)
+    }
+}
+
+// ── Mailbox projection ──────────────────────────────────────────────
+
+/// IMAP wire view of a fixture mailbox.
+#[derive(Debug)]
+struct ListEntry {
+    /// The fixture mailbox id this entry came from. Used to look up
+    /// counts.
+    fixture_id: String,
+    /// Wire-visible path, including parent chain joined by `/`. Inbox
+    /// is forced to `INBOX` (uppercase) regardless of fixture casing.
+    path: String,
+    /// IMAP attributes (e.g. `\Inbox`, `\Sent`). Each entry already
+    /// includes the leading backslash.
+    attributes: Vec<String>,
+}
+
+fn list_mailboxes(fixture: &Fixture) -> Vec<ListEntry> {
+    let by_id: std::collections::HashMap<&str, &Mailbox> =
+        fixture.mailboxes.iter().map(|m| (m.id.as_str(), m)).collect();
+    fixture
+        .mailboxes
+        .iter()
+        .map(|m| {
+            let path = mailbox_path(m, &by_id);
+            let attributes = role_attributes(m.role);
+            ListEntry {
+                fixture_id: m.id.clone(),
+                path,
+                attributes,
+            }
+        })
+        .collect()
+}
+
+fn mailbox_path(m: &Mailbox, by_id: &std::collections::HashMap<&str, &Mailbox>) -> String {
+    if m.role == Some(Role::Inbox) {
+        return "INBOX".to_string();
+    }
+    let mut chain: Vec<&str> = vec![m.name.as_str()];
+    let mut cur = m;
+    while let Some(parent_id) = cur.parent_id.as_deref() {
+        let Some(parent) = by_id.get(parent_id) else {
+            break;
+        };
+        chain.push(parent.name.as_str());
+        cur = parent;
+    }
+    chain.reverse();
+    chain.join("/")
+}
+
+fn role_attributes(role: Option<Role>) -> Vec<String> {
+    match role {
+        Some(Role::Inbox) => vec!["\\Inbox".to_string()],
+        Some(Role::Archive) => vec!["\\Archive".to_string()],
+        Some(Role::Drafts) => vec!["\\Drafts".to_string()],
+        Some(Role::Sent) => vec!["\\Sent".to_string()],
+        Some(Role::Trash) => vec!["\\Trash".to_string()],
+        Some(Role::Junk) => vec!["\\Junk".to_string()],
+        Some(Role::Important) => vec!["\\Important".to_string()],
+        None => vec![],
+    }
+}
+
+#[derive(Debug)]
+struct Counts {
+    exists: u64,
+    unseen: u64,
+    uidnext: u64,
+}
+
+fn mailbox_counts(fixture: &Fixture, mailbox_id: &str) -> Counts {
+    let in_box: Vec<_> = fixture
+        .emails
+        .iter()
+        .filter(|e| e.mailbox_ids.iter().any(|id| id == mailbox_id))
+        .collect();
+    let exists = in_box.len() as u64;
+    let unseen = in_box
+        .iter()
+        .filter(|e| !e.keywords.iter().any(|k| k == "$seen"))
+        .count() as u64;
+    Counts {
+        exists,
+        unseen,
+        uidnext: exists + 1,
+    }
+}
+
+// ── Tiny IMAP-arg parsers ───────────────────────────────────────────
+
+/// Parse exactly two astrings (either quoted or atom), returning their
+/// raw string contents. Returns `None` on syntax error.
+fn parse_two_astrings(args: &str) -> Option<(String, String)> {
+    let mut p = AstringParser { s: args, i: 0 };
+    let a = p.next_astring()?;
+    p.skip_spaces();
+    let b = p.next_astring()?;
+    p.skip_spaces();
+    if p.i != p.s.len() {
+        return None;
+    }
+    Some((a, b))
+}
+
+#[derive(Debug)]
+struct StatusArgs {
+    name: String,
+    items: Vec<String>,
+}
+
+fn parse_status_args(args: &str) -> Option<StatusArgs> {
+    let mut p = AstringParser { s: args, i: 0 };
+    let name = p.next_astring()?;
+    p.skip_spaces();
+    if !p.consume('(') {
+        return None;
+    }
+    let mut items = Vec::new();
+    p.skip_spaces();
+    while !p.consume(')') {
+        let item = p.next_atom()?;
+        items.push(item);
+        p.skip_spaces();
+        if p.eof() {
+            return None;
+        }
+    }
+    Some(StatusArgs { name, items })
+}
+
+struct AstringParser<'a> {
+    s: &'a str,
+    i: usize,
+}
+
+impl<'a> AstringParser<'a> {
+    fn eof(&self) -> bool {
+        self.i >= self.s.len()
+    }
+    fn skip_spaces(&mut self) {
+        while self.i < self.s.len() && self.s.as_bytes()[self.i] == b' ' {
+            self.i += 1;
+        }
+    }
+    fn consume(&mut self, c: char) -> bool {
+        self.skip_spaces();
+        if self.s[self.i..].starts_with(c) {
+            self.i += c.len_utf8();
+            true
+        } else {
+            false
+        }
+    }
+    fn next_astring(&mut self) -> Option<String> {
+        self.skip_spaces();
+        if self.eof() {
+            return None;
+        }
+        let bytes = self.s.as_bytes();
+        if bytes[self.i] == b'"' {
+            self.i += 1;
+            let start = self.i;
+            while self.i < bytes.len() && bytes[self.i] != b'"' {
+                // No escape handling in v0; ratatoskr never sends
+                // backslashes inside quoted folder names.
+                self.i += 1;
+            }
+            if self.i >= bytes.len() {
+                return None;
+            }
+            let s = self.s[start..self.i].to_string();
+            self.i += 1; // closing quote
+            Some(s)
+        } else {
+            self.next_atom()
+        }
+    }
+    fn next_atom(&mut self) -> Option<String> {
+        self.skip_spaces();
+        if self.eof() {
+            return None;
+        }
+        let bytes = self.s.as_bytes();
+        let start = self.i;
+        while self.i < bytes.len() {
+            let b = bytes[self.i];
+            if b == b' ' || b == b'(' || b == b')' || b == b'"' {
+                break;
+            }
+            self.i += 1;
+        }
+        if start == self.i {
+            None
+        } else {
+            Some(self.s[start..self.i].to_string())
+        }
+    }
+}
+
+/// Match an IMAP LIST pattern. v0 supports `*` (match anything) and
+/// exact strings; the `%` non-hierarchy wildcard is not implemented
+/// because ratatoskr never sends it.
+fn pattern_matches(pattern: &str, candidate: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern == candidate {
+        return true;
+    }
+    // Allow trailing `*` and leading `*` so things like `Inbox*`
+    // continue to work on whatever the client decides to throw.
+    if let Some(prefix) = pattern.strip_suffix('*')
+        && candidate.starts_with(prefix)
+    {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix('*')
+        && candidate.ends_with(suffix)
+    {
+        return true;
+    }
+    false
 }
 
 fn strip_crlf(s: &str) -> &str {
@@ -348,6 +667,7 @@ fn parse_command_line(line: &str) -> Option<Parsed<'_>> {
 mod tests {
     use super::*;
     use crate::fixture::{Account, Fixture};
+    use chrono::TimeZone;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn fixture() -> Arc<Fixture> {
@@ -360,6 +680,79 @@ mod tests {
             },
             mailboxes: vec![],
             emails: vec![],
+        })
+    }
+
+    fn fixture_with_folders() -> Arc<Fixture> {
+        use crate::fixture::{Body, Email, Mailbox};
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        let mk_email = |id: &str, mailbox: &str, seen: bool| Email {
+            id: id.into(),
+            thread_id: format!("t-{id}"),
+            mailbox_ids: vec![mailbox.into()],
+            keywords: if seen { vec!["$seen".into()] } else { vec![] },
+            size: 1,
+            received_at: ts,
+            sent_at: ts,
+            from: None,
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            reply_to: vec![],
+            subject: None,
+            preview: None,
+            message_id: vec![],
+            in_reply_to: vec![],
+            references: vec![],
+            has_attachment: false,
+            body: Body::Text("x".into()),
+        };
+        Arc::new(Fixture {
+            name: "f".into(),
+            state: "s1".into(),
+            account: Account {
+                id: "a".into(),
+                name: "a@b".into(),
+            },
+            mailboxes: vec![
+                Mailbox {
+                    id: "mb-inbox".into(),
+                    name: "Inbox".into(),
+                    role: Some(Role::Inbox),
+                    parent_id: None,
+                    sort_order: Some(0),
+                    is_subscribed: true,
+                },
+                Mailbox {
+                    id: "mb-archive".into(),
+                    name: "Archive".into(),
+                    role: Some(Role::Archive),
+                    parent_id: None,
+                    sort_order: Some(1),
+                    is_subscribed: true,
+                },
+                Mailbox {
+                    id: "mb-projects".into(),
+                    name: "Projects".into(),
+                    role: None,
+                    parent_id: None,
+                    sort_order: Some(2),
+                    is_subscribed: true,
+                },
+                Mailbox {
+                    id: "mb-rust".into(),
+                    name: "Rust".into(),
+                    role: None,
+                    parent_id: Some("mb-projects".into()),
+                    sort_order: Some(3),
+                    is_subscribed: true,
+                },
+            ],
+            emails: vec![
+                mk_email("e1", "mb-inbox", true),
+                mk_email("e2", "mb-inbox", false),
+                mk_email("e3", "mb-archive", true),
+            ],
         })
     }
 
@@ -390,9 +783,12 @@ mod tests {
     /// server emitted in response to `script`, after closing the client
     /// half so the server's read loop terminates.
     async fn run_script(script: &[u8]) -> String {
+        run_script_with(script, fixture()).await
+    }
+
+    async fn run_script_with(script: &[u8], fix: Arc<Fixture>) -> String {
         let (server, mut client) = tokio::io::duplex(8192);
         let (_tx, rx) = watch::channel(false);
-        let fix = fixture();
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
             serve_connection(server, fix, &mut rx).await
@@ -553,6 +949,115 @@ mod tests {
     async fn enable_pre_auth_is_bad() {
         let out = run_script(b"a ENABLE QRESYNC\r\n").await;
         assert!(out.contains("a BAD ENABLE requires authentication"));
+    }
+
+    // ── LIST / STATUS tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_pre_auth_is_bad() {
+        let out = run_script(b"a LIST \"\" \"*\"\r\n").await;
+        assert!(out.contains("a BAD LIST requires authentication"));
+    }
+
+    #[tokio::test]
+    async fn list_emits_every_fixture_mailbox_with_attributes() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb LIST \"\" \"*\"\r\nq LOGOUT\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        // Inbox is forced to "INBOX" and tagged \Inbox.
+        assert!(
+            out.contains("* LIST (\\Inbox) \"/\" \"INBOX\"\r\n"),
+            "got: {out:?}"
+        );
+        assert!(out.contains("* LIST (\\Archive) \"/\" \"Archive\"\r\n"));
+        // Plain folders carry no attributes; nested ones use `/`.
+        assert!(out.contains("* LIST () \"/\" \"Projects\"\r\n"));
+        assert!(out.contains("* LIST () \"/\" \"Projects/Rust\"\r\n"));
+        assert!(out.contains("b OK LIST completed"));
+    }
+
+    #[tokio::test]
+    async fn list_empty_pattern_returns_delimiter_only() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb LIST \"\" \"\"\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("* LIST (\\Noselect) \"/\" \"\"\r\n"));
+        assert!(out.contains("b OK LIST completed"));
+    }
+
+    #[tokio::test]
+    async fn list_exact_pattern_matches_one_folder() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb LIST \"\" \"INBOX\"\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("* LIST (\\Inbox) \"/\" \"INBOX\"\r\n"));
+        assert!(!out.contains("Archive"));
+    }
+
+    #[tokio::test]
+    async fn status_returns_messages_unseen_uids() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb STATUS \"INBOX\" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        // Inbox has two emails (one $seen, one not). UIDNEXT = exists+1.
+        assert!(
+            out.contains("* STATUS \"INBOX\" (MESSAGES 2 UNSEEN 1 UIDNEXT 3 UIDVALIDITY 1 HIGHESTMODSEQ 1)"),
+            "got: {out:?}"
+        );
+        assert!(out.contains("b OK STATUS completed"));
+    }
+
+    #[tokio::test]
+    async fn status_unknown_mailbox_returns_no() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb STATUS \"Ghost\" (MESSAGES)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("b NO STATUS unknown mailbox"));
+    }
+
+    #[tokio::test]
+    async fn status_pre_auth_is_bad() {
+        let out = run_script(b"a STATUS \"INBOX\" (MESSAGES)\r\n").await;
+        assert!(out.contains("a BAD STATUS requires authentication"));
+    }
+
+    #[test]
+    fn parse_two_astrings_handles_quoted_and_atom() {
+        assert_eq!(
+            parse_two_astrings("\"\" \"*\""),
+            Some(("".to_string(), "*".to_string()))
+        );
+        assert_eq!(
+            parse_two_astrings("ref pat"),
+            Some(("ref".to_string(), "pat".to_string()))
+        );
+        assert_eq!(parse_two_astrings("\"unterminated"), None);
+    }
+
+    #[test]
+    fn parse_status_args_extracts_name_and_items() {
+        let p = parse_status_args("\"INBOX\" (MESSAGES UNSEEN)").unwrap();
+        assert_eq!(p.name, "INBOX");
+        assert_eq!(p.items, vec!["MESSAGES".to_string(), "UNSEEN".to_string()]);
+    }
+
+    #[test]
+    fn pattern_matches_handles_star() {
+        assert!(pattern_matches("*", "anything"));
+        assert!(pattern_matches("INBOX", "INBOX"));
+        assert!(pattern_matches("Inbox*", "Inbox/Sub"));
+        assert!(pattern_matches("*Sub", "Inbox/Sub"));
+        assert!(!pattern_matches("INBOX", "Inbox"));
     }
 
     #[tokio::test]

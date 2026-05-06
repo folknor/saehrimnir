@@ -192,8 +192,8 @@ assert mr[2] == "c1", mr
 print("unknownMethod: ok")
 ' "$unk"
 
-echo "=== IMAP CAPABILITY + LOGIN + ENABLE + LOGOUT ==="
-imap_out="$(printf 'a1 CAPABILITY\r\nb1 LOGIN "alice" "hunter2"\r\nc1 ENABLE QRESYNC\r\nq LOGOUT\r\n' | nc -w 2 127.0.0.1 "$imap_port")"
+echo "=== IMAP full bootstrap + LIST + STATUS ==="
+imap_out="$(printf 'a1 CAPABILITY\r\nb1 LOGIN "alice" "hunter2"\r\nc1 ENABLE QRESYNC\r\nd1 LIST "" "*"\r\ne1 STATUS "INBOX" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ)\r\nq LOGOUT\r\n' | nc -w 2 127.0.0.1 "$imap_port")"
 python3 -c '
 import sys
 out = sys.argv[1]
@@ -203,9 +203,16 @@ assert "a1 OK CAPABILITY completed" in out, out
 assert "b1 OK [CAPABILITY IMAP4REV1 CONDSTORE QRESYNC] LOGIN completed" in out, out
 assert "* ENABLED QRESYNC" in out, out
 assert "c1 OK ENABLE completed" in out, out
+# LIST emits one untagged per fixture mailbox, with role-derived attrs.
+assert "* LIST (\\Inbox) \"/\" \"INBOX\"" in out, out
+assert "* LIST (\\Archive) \"/\" \"Archive\"" in out, out
+assert "d1 OK LIST completed" in out, out
+# STATUS: jmap-small fixture has 2 emails in inbox, both unseen.
+assert "* STATUS \"INBOX\" (MESSAGES 2 UNSEEN 2 UIDNEXT 3 UIDVALIDITY 1 HIGHESTMODSEQ 1)" in out, out
+assert "e1 OK STATUS completed" in out, out
 assert "* BYE saehrimnir signing off" in out, out
 assert "q OK LOGOUT completed" in out, out
-print("IMAP auth + enable: ok")
+print("IMAP auth + LIST + STATUS: ok")
 ' "$imap_out"
 
 echo "=== SIGTERM ==="
