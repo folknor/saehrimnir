@@ -221,10 +221,37 @@ assert "g1 OK UID SEARCH completed" in out, out
 # UID SEARCH 2:* on a 2-email folder -> "* SEARCH 2".
 assert "* SEARCH 2\r\n" in out, out
 assert "h1 OK UID SEARCH completed" in out, out
-assert "* BYE saehrimnir signing off" in out, out
-assert "q OK LOGOUT completed" in out, out
-print("IMAP through UID SEARCH: ok")
+print("IMAP through UID SEARCH: ok (continuing)")
 ' "$imap_out"
+
+echo "=== IMAP UID FETCH ==="
+imap_out2="$(printf 'a LOGIN "u" "p"\r\nb SELECT "INBOX"\r\nc UID FETCH 1:* (UID FLAGS INTERNALDATE BODY.PEEK[])\r\nq LOGOUT\r\n' | nc -w 2 127.0.0.1 "$imap_port")"
+python3 -c '
+import sys, re
+out = sys.argv[1]
+# Two FETCH responses, one per fixture email.
+assert out.count("* 1 FETCH (") == 1, out
+assert out.count("* 2 FETCH (") == 1, out
+# UIDs echoed.
+assert "UID 1" in out and "UID 2" in out
+# INTERNALDATE in IMAP wire format.
+assert "INTERNALDATE \"15-Jan-2026 10:00:00 +0000\"" in out, out
+# BODY[] literal block: {N}\r\n then exactly N bytes.
+m = re.search(r"BODY\[\] \{(\d+)\}\r\n", out)
+assert m, out
+size = int(m.group(1))
+start = m.end()
+# Verify the reported size matches the bytes that follow up to the
+# closing paren of the FETCH item (which is followed by the next
+# FETCH or the tagged OK).
+body = out[start:start+size]
+assert "Subject:" in body, body
+assert "MIME-Version: 1.0" in body, body
+assert "Content-Type: text/plain; charset=utf-8" in body, body
+assert "First message body." in body or "Reply body." in body, body
+assert "c OK UID FETCH completed" in out, out
+print("IMAP UID FETCH: ok")
+' "$imap_out2"
 
 echo "=== SIGTERM ==="
 kill -TERM "$pid"

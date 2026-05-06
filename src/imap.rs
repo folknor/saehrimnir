@@ -10,8 +10,7 @@
 //! credential. Currently implemented: greeting, `CAPABILITY`, `NOOP`,
 //! `LOGOUT`, `LOGIN`, `AUTHENTICATE` (PLAIN / XOAUTH2 / OAUTHBEARER),
 //! `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT` / `EXAMINE`,
-//! `UID SEARCH`. `UID FETCH` is next. Everything else returns tagged
-//! `BAD`.
+//! `UID SEARCH`, `UID FETCH`. Everything else returns tagged `BAD`.
 
 use std::sync::Arc;
 
@@ -23,7 +22,7 @@ use tokio::sync::watch;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
-use crate::fixture::{Email, Fixture, Mailbox, Role};
+use crate::fixture::{Address, Body, Email, Fixture, Mailbox, Role};
 
 /// Greeting line emitted as soon as the connection is accepted, before
 /// the client says anything. Per RFC 3501 sec 7.1, an `* OK` greeting
@@ -503,6 +502,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         let rest = parts.next().unwrap_or("").trim();
         match sub.as_str() {
             "SEARCH" => self.cmd_uid_search(tag, rest).await,
+            "FETCH" => self.cmd_uid_fetch(tag, rest).await,
             other => {
                 self.write_line(&format!(
                     "{tag} BAD UID {other} not implemented in v0"
@@ -510,6 +510,83 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 .await
             }
         }
+    }
+
+    async fn cmd_uid_fetch(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        // Args: "<uid-set> (<attr>...)" or "<uid-set> <attr>" or
+        // "<uid-set> (<attrs>) (CHANGEDSINCE <modseq>)" - the
+        // CHANGEDSINCE modifier lands in step 6 but we accept the
+        // syntax now and ignore the modseq because HIGHESTMODSEQ is
+        // pinned at 1 (so CHANGEDSINCE 0 returns everything,
+        // CHANGEDSINCE 1+ returns nothing - see imap-plan.md).
+        let (uid_set_str, after_set) = match split_after_set(args) {
+            Some(p) => p,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID FETCH expects <set> <attrs>"))
+                    .await;
+            }
+        };
+        let set = match parse_uid_set(uid_set_str) {
+            Some(s) => s,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID FETCH bad sequence-set"))
+                    .await;
+            }
+        };
+        let (attrs_str, modifiers_str) = split_attrs_and_modifiers(after_set);
+        let attrs = match parse_fetch_attrs(attrs_str) {
+            Some(a) => a,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID FETCH bad attribute list"))
+                    .await;
+            }
+        };
+        let changedsince = match parse_changedsince(modifiers_str) {
+            Ok(v) => v,
+            Err(()) => {
+                return self
+                    .write_line(&format!("{tag} BAD UID FETCH bad modifier list"))
+                    .await;
+            }
+        };
+
+        let selected_id = self
+            .selected
+            .clone()
+            .expect("Selected state requires selected mailbox");
+        // Snapshot the rendered FETCH lines up front so the immutable
+        // borrow on self.fixture can drop before we start writing.
+        let lines: Vec<String> = if changedsince_matches(changedsince) {
+            mailbox_messages(&self.fixture, &selected_id)
+                .into_iter()
+                .filter(|(uid, _)| set.matches(*uid))
+                .map(|(uid, email)| {
+                    // In v0 nothing is ever expunged, so a message's
+                    // sequence number equals its UID.
+                    fetch_response_line(uid, uid, email, &attrs)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        for line in lines {
+            self.write_response(&line).await?;
+        }
+        self.write_line(&format!("{tag} OK UID FETCH completed"))
+            .await
+    }
+
+    /// Like `write_line` but accepts a payload that may contain CRLFs
+    /// inside an IMAP literal block. The full payload is written as
+    /// one shot (no extra trailing CRLF appended by us; the caller's
+    /// payload already terminates the FETCH response).
+    async fn write_response(&mut self, payload: &str) -> std::io::Result<()> {
+        self.writer.write_all(payload.as_bytes()).await?;
+        self.writer.flush().await
     }
 
     async fn cmd_uid_search(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
@@ -831,6 +908,335 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 fn parse_imap_date(s: &str) -> Option<NaiveDate> {
     let s = s.trim_matches('"');
     NaiveDate::parse_from_str(s, "%d-%b-%Y").ok()
+}
+
+// ── UID FETCH helpers ───────────────────────────────────────────────
+
+/// One entry in an RFC 3501 sequence-set.
+#[derive(Debug, Clone, Copy)]
+enum UidSetItem {
+    Single(u32),
+    /// `lo:hi`, where `hi == None` means `*`.
+    Range(u32, Option<u32>),
+}
+
+#[derive(Debug)]
+struct UidSet(Vec<UidSetItem>);
+
+impl UidSet {
+    fn matches(&self, uid: u32) -> bool {
+        self.0.iter().any(|item| match item {
+            UidSetItem::Single(n) => *n == uid,
+            UidSetItem::Range(lo, hi) => uid >= *lo && hi.is_none_or(|h| uid <= h),
+        })
+    }
+}
+
+fn parse_uid_set(s: &str) -> Option<UidSet> {
+    let mut items = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        if let Some((lo, hi)) = part.split_once(':') {
+            let lo: u32 = lo.parse().ok()?;
+            let hi = if hi == "*" {
+                None
+            } else {
+                Some(hi.parse().ok()?)
+            };
+            items.push(UidSetItem::Range(lo, hi));
+        } else {
+            items.push(UidSetItem::Single(part.parse().ok()?));
+        }
+    }
+    if items.is_empty() {
+        None
+    } else {
+        Some(UidSet(items))
+    }
+}
+
+/// Strip the leading sequence-set token (everything up to the first
+/// space) and return `(set, rest)`.
+fn split_after_set(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    let (set, rest) = s.split_once(' ')?;
+    Some((set.trim(), rest.trim_start()))
+}
+
+/// Split the FETCH attribute list from any trailing modifier list.
+/// `(UID FLAGS) (CHANGEDSINCE 0)` -> (`(UID FLAGS)`, `(CHANGEDSINCE 0)`).
+/// `(UID FLAGS)` -> (`(UID FLAGS)`, `""`).
+fn split_attrs_and_modifiers(s: &str) -> (&str, &str) {
+    let s = s.trim();
+    if !s.starts_with('(') {
+        // Bare attribute name like `UID`.
+        return (s, "");
+    }
+    let mut depth = 0i32;
+    let mut end = 0usize;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if end == 0 {
+        return (s, "");
+    }
+    let attrs = &s[..end];
+    let rest = s[end..].trim_start();
+    (attrs, rest)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FetchAttr {
+    Uid,
+    Flags,
+    InternalDate,
+    Rfc822Size,
+    /// `BODY[]` or `BODY.PEEK[]`. We treat them identically because
+    /// v0 does not implement flag side-effects.
+    BodyFull,
+    /// `BODY[HEADER]` or `.PEEK[HEADER]`.
+    BodyHeader,
+    /// `BODY[TEXT]` or `.PEEK[TEXT]`.
+    BodyText,
+}
+
+fn parse_fetch_attrs(s: &str) -> Option<Vec<FetchAttr>> {
+    let s = s.trim();
+    let inner = if let Some(stripped) = s.strip_prefix('(') {
+        stripped.strip_suffix(')')?
+    } else {
+        s
+    };
+    let mut out = Vec::new();
+    for raw in inner.split_whitespace() {
+        let attr = match raw.to_ascii_uppercase().as_str() {
+            "UID" => FetchAttr::Uid,
+            "FLAGS" => FetchAttr::Flags,
+            "INTERNALDATE" => FetchAttr::InternalDate,
+            "RFC822.SIZE" => FetchAttr::Rfc822Size,
+            "RFC822" | "BODY[]" | "BODY.PEEK[]" => FetchAttr::BodyFull,
+            "BODY[HEADER]" | "BODY.PEEK[HEADER]" | "RFC822.HEADER" => FetchAttr::BodyHeader,
+            "BODY[TEXT]" | "BODY.PEEK[TEXT]" | "RFC822.TEXT" => FetchAttr::BodyText,
+            _ => return None,
+        };
+        if !out.contains(&attr) {
+            out.push(attr);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Returns `Ok(Some(modseq))` if the modifiers contained
+/// `CHANGEDSINCE n`, `Ok(None)` if no modifiers were present, or
+/// `Err(())` on parse failure.
+fn parse_changedsince(modifiers: &str) -> Result<Option<u64>, ()> {
+    let m = modifiers.trim();
+    if m.is_empty() {
+        return Ok(None);
+    }
+    let inner = m.strip_prefix('(').and_then(|s| s.strip_suffix(')')).ok_or(())?;
+    let mut it = inner.split_whitespace();
+    let key = it.next().ok_or(())?;
+    if !key.eq_ignore_ascii_case("CHANGEDSINCE") {
+        return Err(());
+    }
+    let val: u64 = it.next().ok_or(())?.parse().map_err(|_| ())?;
+    if it.next().is_some() {
+        return Err(());
+    }
+    Ok(Some(val))
+}
+
+/// With `HIGHESTMODSEQ` pinned at 1, `CHANGEDSINCE 0` returns
+/// everything (modseq strictly greater than 0 includes our 1) and
+/// `CHANGEDSINCE 1+` returns nothing.
+fn changedsince_matches(modseq: Option<u64>) -> bool {
+    match modseq {
+        None => true,
+        Some(n) => n < 1,
+    }
+}
+
+/// Render a single `* <seq> FETCH (...)` response line. The returned
+/// string already terminates with `\r\n` and may contain CRLFs inside
+/// an IMAP literal block.
+fn fetch_response_line(seq: u32, uid: u32, email: &Email, attrs: &[FetchAttr]) -> String {
+    let mut out = format!("* {seq} FETCH (");
+    let mut first = true;
+    for attr in attrs {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        match attr {
+            FetchAttr::Uid => {
+                out.push_str(&format!("UID {uid}"));
+            }
+            FetchAttr::Flags => {
+                out.push_str(&format!("FLAGS ({})", flags_for(email)));
+            }
+            FetchAttr::InternalDate => {
+                out.push_str(&format!(
+                    "INTERNALDATE \"{}\"",
+                    email.received_at.format("%d-%b-%Y %H:%M:%S %z")
+                ));
+            }
+            FetchAttr::Rfc822Size => {
+                let body = render_rfc822(email);
+                out.push_str(&format!("RFC822.SIZE {}", body.len()));
+            }
+            FetchAttr::BodyFull => {
+                let body = render_rfc822(email);
+                out.push_str(&format!("BODY[] {{{}}}\r\n{}", body.len(), body));
+            }
+            FetchAttr::BodyHeader => {
+                let head = render_rfc822_headers(email);
+                out.push_str(&format!("BODY[HEADER] {{{}}}\r\n{}", head.len(), head));
+            }
+            FetchAttr::BodyText => {
+                let text = render_rfc822_text_body(email);
+                out.push_str(&format!("BODY[TEXT] {{{}}}\r\n{}", text.len(), text));
+            }
+        }
+    }
+    out.push_str(")\r\n");
+    out
+}
+
+/// Map fixture keywords to IMAP flag tokens. `$seen` -> `\Seen`,
+/// `$flagged` -> `\Flagged`. Anything else is a custom keyword and
+/// passes through verbatim.
+fn flags_for(email: &Email) -> String {
+    let mut tokens: Vec<String> = email
+        .keywords
+        .iter()
+        .map(|k| match k.as_str() {
+            "$seen" => "\\Seen".to_string(),
+            "$flagged" => "\\Flagged".to_string(),
+            "$draft" => "\\Draft".to_string(),
+            "$answered" => "\\Answered".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    tokens.sort();
+    tokens.join(" ")
+}
+
+// ── RFC 822 emission ────────────────────────────────────────────────
+//
+// Hand-rolled to keep the dep surface small (per notes/plan.md). v0
+// fixtures are ASCII-only, so we don't need RFC 2047 encoded-words or
+// header line folding. When fixtures grow non-ASCII subjects or
+// multipart bodies, this is the moment to swap in `mail-builder`.
+
+fn render_rfc822(email: &Email) -> String {
+    let mut out = render_rfc822_headers(email);
+    out.push_str("\r\n");
+    out.push_str(&render_rfc822_text_body(email));
+    out
+}
+
+fn render_rfc822_headers(email: &Email) -> String {
+    let mut out = String::new();
+    if let Some(from) = &email.from {
+        push_header(&mut out, "From", &format_address(from));
+    }
+    if !email.to.is_empty() {
+        push_header(&mut out, "To", &format_address_list(&email.to));
+    }
+    if !email.cc.is_empty() {
+        push_header(&mut out, "Cc", &format_address_list(&email.cc));
+    }
+    if !email.bcc.is_empty() {
+        push_header(&mut out, "Bcc", &format_address_list(&email.bcc));
+    }
+    if !email.reply_to.is_empty() {
+        push_header(&mut out, "Reply-To", &format_address_list(&email.reply_to));
+    }
+    push_header(
+        &mut out,
+        "Date",
+        &email.sent_at.to_rfc2822(),
+    );
+    if let Some(subject) = &email.subject {
+        push_header(&mut out, "Subject", subject);
+    }
+    if !email.message_id.is_empty() {
+        push_header(&mut out, "Message-ID", &email.message_id.join(" "));
+    }
+    if !email.in_reply_to.is_empty() {
+        push_header(&mut out, "In-Reply-To", &email.in_reply_to.join(" "));
+    }
+    if !email.references.is_empty() {
+        push_header(&mut out, "References", &email.references.join(" "));
+    }
+    push_header(&mut out, "MIME-Version", "1.0");
+    push_header(
+        &mut out,
+        "Content-Type",
+        "text/plain; charset=utf-8",
+    );
+    push_header(&mut out, "Content-Transfer-Encoding", "8bit");
+    out
+}
+
+fn render_rfc822_text_body(email: &Email) -> String {
+    match &email.body {
+        Body::Text(t) => normalize_crlf(t),
+    }
+}
+
+fn push_header(out: &mut String, name: &str, value: &str) {
+    out.push_str(name);
+    out.push_str(": ");
+    out.push_str(value);
+    out.push_str("\r\n");
+}
+
+fn format_address(a: &Address) -> String {
+    match &a.name {
+        Some(name) => format!("{name} <{}>", a.email),
+        None => format!("<{}>", a.email),
+    }
+}
+
+fn format_address_list(xs: &[Address]) -> String {
+    xs.iter()
+        .map(format_address)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Force every `\n` to `\r\n` so the RFC 822 wire body has consistent
+/// line endings, which matters for the literal-block byte count.
+fn normalize_crlf(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev = '\0';
+    for c in s.chars() {
+        if c == '\n' && prev != '\r' {
+            out.push('\r');
+        }
+        out.push(c);
+        prev = c;
+    }
+    out
 }
 
 /// Match an IMAP LIST pattern. v0 supports `*` (match anything) and
@@ -1421,6 +1827,184 @@ mod tests {
         ));
         // Bogus criteria fall through.
         assert!(parse_uid_search("FROM \"alice\"").is_none());
+    }
+
+    // ── UID FETCH tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn uid_fetch_emits_uid_flags_internaldate_and_body() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID FETCH 1:* (UID FLAGS INTERNALDATE BODY.PEEK[])\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        // Each FETCH response starts with "* <seq> FETCH (".
+        assert!(out.contains("* 1 FETCH ("), "got: {out:?}");
+        assert!(out.contains("* 2 FETCH ("), "got: {out:?}");
+        // UID is echoed.
+        assert!(out.contains("UID 1"));
+        assert!(out.contains("UID 2"));
+        // e1 has $seen; e2 doesn't.
+        assert!(out.contains("FLAGS (\\Seen)"));
+        assert!(out.contains("FLAGS ()"));
+        // INTERNALDATE quoted in IMAP date-time format.
+        assert!(out.contains("INTERNALDATE \"15-Jan-2026 10:00:00 +0000\""));
+        // BODY[] payload is wrapped in a literal {N}\r\n<bytes>.
+        assert!(out.contains("BODY[] {"));
+        // Headers we synthesize.
+        assert!(out.contains("MIME-Version: 1.0"));
+        assert!(out.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(out.contains("c OK UID FETCH completed"));
+    }
+
+    #[tokio::test]
+    async fn uid_fetch_range_filters_to_uid_window() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID FETCH 2:* (UID)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("* 2 FETCH (UID 2)"));
+        assert!(!out.contains("* 1 FETCH"));
+    }
+
+    #[tokio::test]
+    async fn uid_fetch_changedsince_zero_returns_all() {
+        // With HIGHESTMODSEQ pinned at 1, CHANGEDSINCE 0 returns
+        // everything. CHANGEDSINCE 1 returns nothing.
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID FETCH 1:* (FLAGS) (CHANGEDSINCE 0)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("* 1 FETCH"));
+        assert!(out.contains("* 2 FETCH"));
+        assert!(out.contains("c OK UID FETCH completed"));
+
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID FETCH 1:* (FLAGS) (CHANGEDSINCE 1)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(!out.contains("* 1 FETCH"));
+        assert!(!out.contains("* 2 FETCH"));
+        assert!(out.contains("c OK UID FETCH completed"));
+    }
+
+    #[tokio::test]
+    async fn uid_fetch_pre_select_is_bad() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nc UID FETCH 1:* (UID)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("c BAD UID requires SELECT"));
+    }
+
+    #[tokio::test]
+    async fn uid_fetch_bad_attr_returns_bad() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID FETCH 1:* (NOSUCHATTR)\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("c BAD UID FETCH bad attribute list"));
+    }
+
+    #[tokio::test]
+    async fn uid_fetch_body_text_returns_just_the_body() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID FETCH 1 (BODY.PEEK[TEXT])\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        // Body for our test fixture is just "x".
+        assert!(out.contains("BODY[TEXT] {1}\r\nx)"), "got: {out:?}");
+    }
+
+    #[test]
+    fn parse_uid_set_handles_single_range_and_combo() {
+        let s = parse_uid_set("1").unwrap();
+        assert!(s.matches(1) && !s.matches(2));
+        let s = parse_uid_set("1:3").unwrap();
+        assert!(s.matches(1) && s.matches(3) && !s.matches(4));
+        let s = parse_uid_set("5:*").unwrap();
+        assert!(!s.matches(4) && s.matches(5) && s.matches(999_999));
+        let s = parse_uid_set("1,3,5:7").unwrap();
+        assert!(s.matches(1) && !s.matches(2) && s.matches(3));
+        assert!(s.matches(5) && s.matches(7) && !s.matches(8));
+    }
+
+    #[test]
+    fn parse_fetch_attrs_recognises_the_v0_set() {
+        let a = parse_fetch_attrs("(UID FLAGS INTERNALDATE BODY.PEEK[])").unwrap();
+        assert_eq!(
+            a,
+            vec![
+                FetchAttr::Uid,
+                FetchAttr::Flags,
+                FetchAttr::InternalDate,
+                FetchAttr::BodyFull
+            ]
+        );
+        // De-duplicated.
+        let a = parse_fetch_attrs("(UID UID FLAGS)").unwrap();
+        assert_eq!(a.len(), 2);
+        // Bare attribute (no parens) also works.
+        let a = parse_fetch_attrs("FLAGS").unwrap();
+        assert_eq!(a, vec![FetchAttr::Flags]);
+    }
+
+    #[test]
+    fn split_attrs_and_modifiers_isolates_changedsince() {
+        let (a, m) = split_attrs_and_modifiers("(UID FLAGS) (CHANGEDSINCE 5)");
+        assert_eq!(a, "(UID FLAGS)");
+        assert_eq!(m, "(CHANGEDSINCE 5)");
+        let (a, m) = split_attrs_and_modifiers("(UID)");
+        assert_eq!(a, "(UID)");
+        assert_eq!(m, "");
+    }
+
+    #[test]
+    fn render_rfc822_includes_load_bearing_headers() {
+        use crate::fixture::{Address, Body};
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        let e = Email {
+            id: "e1".into(),
+            thread_id: "t1".into(),
+            mailbox_ids: vec!["mb".into()],
+            keywords: vec![],
+            size: 0,
+            received_at: ts,
+            sent_at: ts,
+            from: Some(Address {
+                name: Some("Alice".into()),
+                email: "alice@example.com".into(),
+            }),
+            to: vec![Address {
+                name: None,
+                email: "bob@example.com".into(),
+            }],
+            cc: vec![],
+            bcc: vec![],
+            reply_to: vec![],
+            subject: Some("Hello".into()),
+            preview: None,
+            message_id: vec!["<e1@x>".into()],
+            in_reply_to: vec![],
+            references: vec![],
+            has_attachment: false,
+            body: Body::Text("hi\nthere".into()),
+        };
+        let r = render_rfc822(&e);
+        assert!(r.contains("From: Alice <alice@example.com>\r\n"));
+        assert!(r.contains("To: <bob@example.com>\r\n"));
+        assert!(r.contains("Subject: Hello\r\n"));
+        assert!(r.contains("Message-ID: <e1@x>\r\n"));
+        assert!(r.contains("MIME-Version: 1.0\r\n"));
+        assert!(r.contains("Content-Type: text/plain; charset=utf-8\r\n"));
+        // Header/body separator.
+        assert!(r.contains("8bit\r\n\r\nhi\r\nthere"));
     }
 
     #[tokio::test]

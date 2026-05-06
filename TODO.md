@@ -3,30 +3,30 @@
 Running task list. Per-protocol design notes live alongside in
 `notes/`; this file just tracks what's next.
 
-## Now: IMAP
+## Now: IMAP - what's left
 
-See `notes/imap-plan.md` for the design and implementation order. The
-short version, in commit-sized chunks:
+Most of the v0 IMAP surface has landed. Still pending:
 
-1. Listener bootstrap. `--imap-port` flag, sentinel format change,
-   IMAP listener accepting one connection at a time, server greeting,
-   `CAPABILITY`, `NOOP`, `LOGOUT`. No auth, no folders.
-2. Auth + `ENABLE`. `LOGIN`, `AUTHENTICATE PLAIN`, `XOAUTH2`,
-   `OAUTHBEARER` all accept anything. `ENABLE QRESYNC` echoes back.
-3. Folder listing. `LIST "" "*"` from fixture mailboxes with
-   special-use attributes. `STATUS folder (MESSAGES UNSEEN)` per
-   folder.
-4. `SELECT` + `UID SEARCH`. EXISTS / UIDVALIDITY=1 / UIDNEXT /
-   FLAGS / PERMANENTFLAGS / HIGHESTMODSEQ=1. Implement the three
-   SEARCH shapes (`ALL`, `<n>:*`, `SINCE <date>`).
-5. `UID FETCH (UID FLAGS INTERNALDATE BODY.PEEK[])` - render the
-   fixture emails as RFC 822, batch responses by 200.
-6. CONDSTORE / CHANGEDSINCE. With HIGHESTMODSEQ pinned at 1, the two
-   relevant CHANGEDSINCE values (0 and 1) collapse to "all" and
-   "none" respectively.
-7. Integration tests. `tests/imap.rs` driving a duplex stream.
-8. Stretch: `STORE FLAGS` no-op acknowledgement so ratatoskr's flag
-   writeback path completes.
+- Stretch: `STORE FLAGS` no-op acknowledgement so ratatoskr's flag
+  writeback path completes (not load-bearing for read-only sync).
+- 200-message FETCH batching boundary. The current handler emits all
+  matched FETCH responses in one go. Ratatoskr's client batches
+  client-side (CHUNK_SIZE=200), so the wire boundary is invisible to
+  it; flagged as a v1 thing if we ever want to test the batch
+  boundary explicitly.
+
+Done in this session:
+1. Listener bootstrap, greeting, CAPABILITY, NOOP, LOGOUT.
+2. LOGIN, AUTHENTICATE PLAIN/XOAUTH2/OAUTHBEARER, ENABLE QRESYNC.
+3. LIST + STATUS with role-derived special-use attributes.
+4. SELECT/EXAMINE/CLOSE, UID SEARCH ALL/range/SINCE.
+5. UID FETCH with the four ratatoskr attributes (UID FLAGS
+   INTERNALDATE BODY.PEEK[]) plus BODY[HEADER]/BODY[TEXT]/RFC822.SIZE
+   for free.
+6. CONDSTORE / CHANGEDSINCE - works because HIGHESTMODSEQ is pinned.
+7. Integration test in `tests/imap.rs` exercising the full
+   initial-sync transcript plus a literal-block byte-accuracy check
+   and a determinism check across two runs.
 
 ## Next: SMTP
 

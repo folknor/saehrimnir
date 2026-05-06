@@ -76,8 +76,12 @@ checking whether the fact is already in `notes/`.
 JMAP: complete for v0 (session resource, `Mailbox/get`, `Email/query`,
 `Email/get`, full integration test coverage).
 
-IMAP: surface scouted (`notes/ratatoskr-imap-surface.md`), plan
-written (`notes/imap-plan.md`), implementation underway.
+IMAP: complete for v0's read path (greeting, `CAPABILITY`, `LOGIN`/
+`AUTHENTICATE`, `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT`/`EXAMINE`/
+`CLOSE`, `UID SEARCH`, `UID FETCH` with full RFC 822 body emission,
+CONDSTORE `CHANGEDSINCE`). Integration test in `tests/imap.rs` drives
+the full initial-sync transcript. Stretch: `STORE` no-op for the
+flag-writeback path (not load-bearing for read-only sync).
 
 SMTP / Graph / Gmail: queued. Each will follow the JMAP/IMAP pattern
 (scout the client surface, plan, implement).
