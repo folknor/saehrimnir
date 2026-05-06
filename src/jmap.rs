@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::fixture::{Fixture, Mailbox};
+use crate::fixture::{Address, Body, Email, Fixture, Mailbox};
 
 /// Wire-level request envelope.
 #[derive(Debug, Deserialize)]
@@ -62,7 +62,10 @@ fn dispatch(fixture: &Fixture, name: &str, args: &Value) -> (String, Value) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
-        // step 7: "Email/get"
+        "Email/get" => match email_get(fixture, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
         _ => (
             "error".to_string(),
             json!({
@@ -390,6 +393,257 @@ fn parse_filter(raw: Option<&Value>) -> Result<Filter, Value> {
         "type": "unsupportedFilter",
         "description": "v0 supports only {after} or {inMailbox}",
     }))
+}
+
+// ── Email/get ───────────────────────────────────────────────────────
+
+/// RFC 8621 §4.2. Always returns the full RFC 8621 §4.1 property set;
+/// the request's `properties` / `bodyProperties` lists are honoured by
+/// the client tolerantly (extra keys are ignored), so emitting
+/// everything is simpler than honouring the projection. The two custom
+/// `header:*:asText` keys ratatoskr asks for are always present and
+/// always `null` in v0.
+fn email_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = args.get("accountId").and_then(Value::as_str).ok_or_else(|| {
+        json!({
+            "type": "invalidArguments",
+            "description": "missing accountId",
+        })
+    })?;
+    if account_id != fixture.account.id {
+        return Err(json!({
+            "type": "accountNotFound",
+            "description": format!("account {account_id:?} not found"),
+        }));
+    }
+
+    let fetch_text = args
+        .get("fetchTextBodyValues")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let fetch_html = args
+        .get("fetchHtmlBodyValues")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let fetch_all = args
+        .get("fetchAllBodyValues")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let (list, not_found) = match args.get("ids") {
+        // Empty `ids` is the canonical shape ratatoskr's get_email_state
+        // call uses purely to read a state token. Return an empty list,
+        // not all emails.
+        Some(Value::Array(requested)) => {
+            let mut list = Vec::with_capacity(requested.len());
+            let mut not_found = Vec::new();
+            for v in requested {
+                let Some(id) = v.as_str() else {
+                    return Err(json!({
+                        "type": "invalidArguments",
+                        "description": "ids must be an array of strings",
+                    }));
+                };
+                match fixture.emails.iter().find(|e| e.id == id) {
+                    Some(e) => list.push(serialize_email(e, fetch_text, fetch_html, fetch_all)),
+                    None => not_found.push(Value::String(id.to_string())),
+                }
+            }
+            (Value::Array(list), Value::Array(not_found))
+        }
+        None | Some(Value::Null) => {
+            // RFC: null = "all emails". Bound by maxObjectsInGet (500 in
+            // our session capabilities). v0 fixtures stay well under
+            // that, so no truncation logic.
+            let all = fixture
+                .emails
+                .iter()
+                .map(|e| serialize_email(e, fetch_text, fetch_html, fetch_all))
+                .collect::<Vec<_>>();
+            (Value::Array(all), Value::Array(vec![]))
+        }
+        Some(_) => {
+            return Err(json!({
+                "type": "invalidArguments",
+                "description": "ids must be an array or null",
+            }));
+        }
+    };
+
+    let mut out = Map::new();
+    out.insert(
+        "accountId".to_string(),
+        Value::String(fixture.account.id.clone()),
+    );
+    out.insert("state".to_string(), Value::String(fixture.state.clone()));
+    out.insert("list".to_string(), list);
+    out.insert("notFound".to_string(), not_found);
+    Ok(Value::Object(out))
+}
+
+fn serialize_email(e: &Email, fetch_text: bool, fetch_html: bool, fetch_all: bool) -> Value {
+    let mut obj = Map::new();
+    obj.insert("id".to_string(), Value::String(e.id.clone()));
+    obj.insert(
+        "blobId".to_string(),
+        Value::String(format!("blob-{}", e.id)),
+    );
+    obj.insert("threadId".to_string(), Value::String(e.thread_id.clone()));
+    obj.insert("size".to_string(), Value::Number(e.size.into()));
+    obj.insert(
+        "receivedAt".to_string(),
+        Value::Number(e.received_at.timestamp().into()),
+    );
+    obj.insert(
+        "sentAt".to_string(),
+        Value::Number(e.sent_at.timestamp().into()),
+    );
+
+    obj.insert("mailboxIds".to_string(), bool_map(&e.mailbox_ids));
+    obj.insert("keywords".to_string(), bool_map(&e.keywords));
+
+    obj.insert("messageId".to_string(), string_array_or_null(&e.message_id));
+    obj.insert(
+        "inReplyTo".to_string(),
+        string_array_or_null(&e.in_reply_to),
+    );
+    obj.insert(
+        "references".to_string(),
+        string_array_or_null(&e.references),
+    );
+
+    obj.insert(
+        "from".to_string(),
+        match &e.from {
+            Some(a) => Value::Array(vec![serialize_address(a)]),
+            None => Value::Null,
+        },
+    );
+    obj.insert("to".to_string(), serialize_address_list(&e.to));
+    obj.insert("cc".to_string(), serialize_address_list(&e.cc));
+    obj.insert("bcc".to_string(), serialize_address_list(&e.bcc));
+    obj.insert("replyTo".to_string(), serialize_address_list(&e.reply_to));
+
+    obj.insert(
+        "subject".to_string(),
+        match &e.subject {
+            Some(s) => Value::String(s.clone()),
+            None => Value::Null,
+        },
+    );
+    obj.insert(
+        "preview".to_string(),
+        match &e.preview {
+            Some(s) => Value::String(s.clone()),
+            None => Value::Null,
+        },
+    );
+    obj.insert("hasAttachment".to_string(), Value::Bool(e.has_attachment));
+
+    let (text_body, html_body, body_values) =
+        body_parts_and_values(e, fetch_text, fetch_html, fetch_all);
+    obj.insert("textBody".to_string(), text_body);
+    obj.insert("htmlBody".to_string(), html_body);
+    if let Some(bv) = body_values {
+        obj.insert("bodyValues".to_string(), bv);
+    }
+    obj.insert("attachments".to_string(), Value::Array(vec![]));
+
+    // Custom-header keys ratatoskr requests; always present, always
+    // null until a fixture cares.
+    for k in [
+        "header:List-Unsubscribe:asText",
+        "header:List-Unsubscribe-Post:asText",
+        "header:Disposition-Notification-To:asText",
+    ] {
+        obj.insert(k.to_string(), Value::Null);
+    }
+
+    Value::Object(obj)
+}
+
+fn body_parts_and_values(
+    e: &Email,
+    fetch_text: bool,
+    fetch_html: bool,
+    fetch_all: bool,
+) -> (Value, Value, Option<Value>) {
+    match &e.body {
+        Body::Text(text) => {
+            let part_id = format!("{}:text", e.id);
+            let blob_id = format!("blob-{}-text", e.id);
+            let size = i64::try_from(text.len()).unwrap_or(i64::MAX);
+            let part = body_part_text(&part_id, &blob_id, size);
+            let text_body = Value::Array(vec![part]);
+            let html_body = Value::Array(vec![]);
+            let body_values = if fetch_text || fetch_all {
+                let mut bv = Map::new();
+                bv.insert(
+                    part_id,
+                    json!({
+                        "value": text,
+                        "isEncodingProblem": false,
+                        "isTruncated": false,
+                    }),
+                );
+                Some(Value::Object(bv))
+            } else if fetch_html {
+                // Empty bodyValues map (no html parts to fetch).
+                Some(Value::Object(Map::new()))
+            } else {
+                None
+            };
+            (text_body, html_body, body_values)
+        }
+    }
+}
+
+fn body_part_text(part_id: &str, blob_id: &str, size: i64) -> Value {
+    json!({
+        "partId": part_id,
+        "blobId": blob_id,
+        "type": "text/plain",
+        "size": size,
+        "charset": "utf-8",
+        "disposition": null,
+        "language": null,
+        "location": null,
+        "subParts": null,
+        "headers": [],
+        "name": null,
+        "cid": null,
+    })
+}
+
+fn bool_map(ids: &[String]) -> Value {
+    let mut m = Map::new();
+    for id in ids {
+        m.insert(id.clone(), Value::Bool(true));
+    }
+    Value::Object(m)
+}
+
+fn string_array_or_null(xs: &[String]) -> Value {
+    if xs.is_empty() {
+        Value::Null
+    } else {
+        Value::Array(xs.iter().map(|s| Value::String(s.clone())).collect())
+    }
+}
+
+fn serialize_address(a: &Address) -> Value {
+    json!({
+        "name": a.name.clone().map(Value::String).unwrap_or(Value::Null),
+        "email": a.email,
+    })
+}
+
+fn serialize_address_list(xs: &[Address]) -> Value {
+    if xs.is_empty() {
+        Value::Null
+    } else {
+        Value::Array(xs.iter().map(serialize_address).collect())
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -767,5 +1021,183 @@ mod tests {
         // "no error".
         let r = email_query(&f, &json!({"accountId": "acct", "limit": 1_000_000})).unwrap();
         assert_eq!(r.get("ids").unwrap().as_array().unwrap().len(), 5);
+    }
+
+    // ── Email/get tests ─────────────────────────────────────────────
+
+    fn fix_for_get() -> Fixture {
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        let sent = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 9, 59, 50).unwrap();
+        Fixture {
+            name: "g".into(),
+            state: "s1".into(),
+            account: Account {
+                id: "acct".into(),
+                name: "a@b".into(),
+            },
+            mailboxes: vec![Mailbox {
+                id: "mb-inbox".into(),
+                name: "Inbox".into(),
+                role: Some(Role::Inbox),
+                parent_id: None,
+                sort_order: Some(0),
+                is_subscribed: true,
+            }],
+            emails: vec![Email {
+                id: "e1".into(),
+                thread_id: "t1".into(),
+                mailbox_ids: vec!["mb-inbox".into()],
+                keywords: vec!["$seen".into(), "$flagged".into()],
+                size: 5,
+                received_at: ts,
+                sent_at: sent,
+                from: Some(Address {
+                    name: Some("Alice".into()),
+                    email: "alice@example.com".into(),
+                }),
+                to: vec![Address {
+                    name: None,
+                    email: "bob@example.com".into(),
+                }],
+                cc: vec![],
+                bcc: vec![],
+                reply_to: vec![],
+                subject: Some("hi".into()),
+                preview: None,
+                message_id: vec!["<e1@example.com>".into()],
+                in_reply_to: vec![],
+                references: vec![],
+                has_attachment: false,
+                body: Body::Text("hello".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn email_get_returns_state_for_empty_ids() {
+        let f = fix_for_get();
+        let resp = email_get(&f, &json!({"accountId": "acct", "ids": []})).unwrap();
+        assert_eq!(resp.get("state").unwrap(), "s1");
+        assert!(resp.get("list").unwrap().as_array().unwrap().is_empty());
+        assert!(resp.get("notFound").unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn email_get_full_shape() {
+        let f = fix_for_get();
+        let resp = email_get(
+            &f,
+            &json!({
+                "accountId": "acct",
+                "ids": ["e1"],
+                "fetchTextBodyValues": true,
+            }),
+        )
+        .unwrap();
+        let item = &resp.get("list").unwrap().as_array().unwrap()[0];
+
+        assert_eq!(item.get("id").unwrap(), "e1");
+        assert_eq!(item.get("threadId").unwrap(), "t1");
+        assert_eq!(item.get("blobId").unwrap(), "blob-e1");
+        assert_eq!(item.get("size").unwrap(), 5);
+        assert_eq!(item.get("subject").unwrap(), "hi");
+        assert_eq!(item.get("hasAttachment").unwrap(), false);
+
+        // Timestamps as unix seconds (not RFC3339 strings).
+        assert_eq!(
+            item.get("receivedAt").unwrap().as_i64().unwrap(),
+            chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap().timestamp()
+        );
+        assert!(item.get("sentAt").unwrap().as_i64().unwrap()
+            < item.get("receivedAt").unwrap().as_i64().unwrap());
+
+        // mailboxIds + keywords are maps to true.
+        let mb = item.get("mailboxIds").unwrap().as_object().unwrap();
+        assert_eq!(mb.get("mb-inbox").unwrap(), true);
+        let kw = item.get("keywords").unwrap().as_object().unwrap();
+        assert_eq!(kw.get("$seen").unwrap(), true);
+        assert_eq!(kw.get("$flagged").unwrap(), true);
+
+        // Addresses: from is an array even though there's one entry.
+        let from = item.get("from").unwrap().as_array().unwrap();
+        assert_eq!(from[0].get("name").unwrap(), "Alice");
+        assert_eq!(from[0].get("email").unwrap(), "alice@example.com");
+        // null name when fixture omits it.
+        let to = item.get("to").unwrap().as_array().unwrap();
+        assert!(to[0].get("name").unwrap().is_null());
+
+        // Empty address lists serialize as null (parser tolerates both).
+        assert!(item.get("cc").unwrap().is_null());
+        assert!(item.get("bcc").unwrap().is_null());
+
+        // Header references are null when empty.
+        assert!(item.get("inReplyTo").unwrap().is_null());
+        assert!(item.get("references").unwrap().is_null());
+        let mid = item.get("messageId").unwrap().as_array().unwrap();
+        assert_eq!(mid[0], "<e1@example.com>");
+
+        // Body part shape.
+        let tb = item.get("textBody").unwrap().as_array().unwrap();
+        assert_eq!(tb.len(), 1);
+        let part = &tb[0];
+        assert_eq!(part.get("partId").unwrap(), "e1:text");
+        assert_eq!(part.get("type").unwrap(), "text/plain");
+        assert_eq!(part.get("charset").unwrap(), "utf-8");
+        assert_eq!(part.get("size").unwrap(), 5);
+        assert!(item.get("htmlBody").unwrap().as_array().unwrap().is_empty());
+
+        // bodyValues populated because fetchTextBodyValues was true.
+        let bv = item.get("bodyValues").unwrap().as_object().unwrap();
+        let entry = bv.get("e1:text").unwrap();
+        assert_eq!(entry.get("value").unwrap(), "hello");
+        assert_eq!(entry.get("isEncodingProblem").unwrap(), false);
+        assert_eq!(entry.get("isTruncated").unwrap(), false);
+
+        // Attachments empty array.
+        assert_eq!(item.get("attachments").unwrap().as_array().unwrap().len(), 0);
+
+        // The three custom-header keys are always present, always null.
+        for k in [
+            "header:List-Unsubscribe:asText",
+            "header:List-Unsubscribe-Post:asText",
+            "header:Disposition-Notification-To:asText",
+        ] {
+            assert!(item.get(k).unwrap().is_null(), "{k} not null");
+        }
+    }
+
+    #[test]
+    fn email_get_omits_body_values_when_not_requested() {
+        let f = fix_for_get();
+        let resp = email_get(&f, &json!({"accountId": "acct", "ids": ["e1"]})).unwrap();
+        let item = &resp.get("list").unwrap().as_array().unwrap()[0];
+        assert!(item.get("bodyValues").is_none());
+    }
+
+    #[test]
+    fn email_get_reports_not_found() {
+        let f = fix_for_get();
+        let resp = email_get(
+            &f,
+            &json!({"accountId": "acct", "ids": ["e1", "ghost"]}),
+        )
+        .unwrap();
+        assert_eq!(resp.get("list").unwrap().as_array().unwrap().len(), 1);
+        let nf = resp.get("notFound").unwrap().as_array().unwrap();
+        assert_eq!(nf, &vec![Value::String("ghost".into())]);
+    }
+
+    #[test]
+    fn email_get_null_ids_returns_all() {
+        let f = fix_for_get();
+        let resp = email_get(&f, &json!({"accountId": "acct", "ids": null})).unwrap();
+        assert_eq!(resp.get("list").unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn email_get_unknown_account_errors() {
+        let f = fix_for_get();
+        let err = email_get(&f, &json!({"accountId": "nope", "ids": []})).unwrap_err();
+        assert_eq!(err.get("type").unwrap(), "accountNotFound");
     }
 }

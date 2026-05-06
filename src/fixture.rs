@@ -4,10 +4,6 @@
 //! enforces the invariants documented in `notes/fixture-format.md`. The
 //! returned [`Fixture`] is read-only and feeds every JMAP response.
 
-// Routes that consume these fields land in step 4+. Quiet the dead-code
-// warnings until then rather than scatter per-field allows.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::Path;
 

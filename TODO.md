@@ -4,51 +4,6 @@ Plan for the next sessions. Tracks the suggested implementation order
 from `notes/plan.md`, with the design decisions already worked out so
 the next session can drop straight into code.
 
-## Step 7: `Email/get`
-
-Request args (RFC 8621 section 4.2): `accountId`, `ids: [String]`,
-`properties: [String] | null`, `bodyProperties: [String] | null`,
-`fetchTextBodyValues: bool`, `fetchHtmlBodyValues: bool`,
-`fetchAllBodyValues: bool`.
-
-Response args: `accountId`, `state`, `list`, `notFound`.
-
-Per-email JSON: full RFC 8621 section 4.1 shape. Source-of-truth for
-what the client actually reads is the property list at
-`crates/jmap/src/parse.rs:35-63` and the parser at `:72-197`. Mock
-should always return:
-
-- `id`, `blobId` (derive `"blob-<email-id>"`; never read by the
-  parser for our path but RFC requires it), `threadId`, `size`,
-  `receivedAt`, `sentAt`.
-- `mailboxIds`. Object `{<id>: true}`. Map, not array.
-- `keywords`. Object `{<kw>: true}`. Map.
-- `messageId`, `inReplyTo`, `references`. Arrays of strings or null
-  if empty.
-- `from`, `to`, `cc`, `bcc`, `replyTo`. Array of `{name, email}`
-  (name may be null). `from` is an array on the wire even though the
-  parser reads `.first()`.
-- `subject`, `preview`, `hasAttachment`.
-- `textBody`, `htmlBody`. Arrays of `EmailBodyPart`. For `body_text`
-  fixtures emit one part `{partId, blobId, type: "text/plain", size,
-  charset: "utf-8", disposition: null, language: null, location: null,
-  subParts: null, headers: [], name: null, cid: null}`. `partId`
-  derivation: `"<email-id>:text"`. `htmlBody` empty array.
-- `bodyValues`. Map keyed by `partId`, value `{value,
-  isEncodingProblem: false, isTruncated: false}`. Only emit when
-  `fetchTextBodyValues` / `fetchHtmlBodyValues` was true.
-- `attachments`. Array of `EmailBodyPart`. Empty for v0 (no
-  attachment body sources).
-- Custom-header property keys requested by ratatoskr
-  (`header:List-Unsubscribe:asText`,
-  `header:List-Unsubscribe-Post:asText`,
-  `header:Disposition-Notification-To:asText`). Always emit them;
-  `null` is fine. Source: `parse.rs:59-63`.
-
-When the client sends `Email/get` with `ids: []`, return `state` and
-empty list. Mandatory: `get_email_state` calls this purely for the
-state token (`sync/mod.rs:236-258`).
-
 ## Step 8: Integration test
 
 Two viable shapes:
@@ -101,8 +56,6 @@ binary in plan 3 runs, divergences will be visible.
 
 ## Cosmetic and housekeeping
 
-- The `#![allow(dead_code)]` in `src/fixture.rs` should come off when
-  step 7 lands. Every field will have a consumer by then.
 - A `brokkr.toml` with `project = "saehrimnir"` plus a `[[check]]`
   sweep needs `Project::Saehrimnir` to land in brokkr's enum first,
   or the file would fail brokkr's parse-time validation. Until then,

@@ -132,6 +132,46 @@ assert result["queryState"] == "fixture-state"
 print("Email/query: ok ({} ids)".format(len(result["ids"])))
 ' "$eq"
 
+echo "=== POST /jmap/api Email/get ==="
+eg="$(curl -fsSL -H 'Content-Type: application/json' -X POST "$base/jmap/api" --data '{
+  "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+  "methodCalls": [
+    ["Email/get", {"accountId": "account-1", "ids": ["email-001"], "fetchTextBodyValues": true}, "g0"],
+    ["Email/get", {"accountId": "account-1", "ids": []}, "g1"]
+  ]
+}')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+mr = d["methodResponses"]
+assert len(mr) == 2, mr
+
+# First call: full email shape.
+r0 = mr[0][1]
+assert mr[0][0] == "Email/get" and mr[0][2] == "g0"
+item = r0["list"][0]
+assert item["id"] == "email-001"
+assert item["blobId"] == "blob-email-001"
+assert item["threadId"] == "email-001"
+assert isinstance(item["receivedAt"], int)
+assert item["mailboxIds"] == {"mbx-inbox": True}
+assert item["from"] == [{"name": None, "email": "alice@example.com"}]
+assert item["textBody"][0]["partId"] == "email-001:text"
+assert item["bodyValues"]["email-001:text"]["value"] == "First message body."
+assert item["attachments"] == []
+for k in ("header:List-Unsubscribe:asText",
+         "header:List-Unsubscribe-Post:asText",
+         "header:Disposition-Notification-To:asText"):
+    assert k in item and item[k] is None, k
+
+# Second call: empty ids -> state-token-only response.
+r1 = mr[1][1]
+assert mr[1][2] == "g1"
+assert r1["state"] == "fixture-state"
+assert r1["list"] == []
+print("Email/get: ok")
+' "$eg"
+
 echo "=== POST /jmap/api unknownMethod ==="
 unk="$(curl -fsSL -H 'Content-Type: application/json' -X POST "$base/jmap/api" --data '{
   "using": [],

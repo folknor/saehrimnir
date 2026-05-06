@@ -52,12 +52,12 @@ checking whether the fact is already in `notes/`.
 
 ## Status
 
-Bootstrap through plan-2 step 6 has landed: HTTP listener, readiness
+Bootstrap through plan-2 step 7 has landed: HTTP listener, readiness
 sentinel, SIGTERM, fixture loader, `/jmap/session`, the `POST /jmap/api`
-envelope, `Mailbox/get`, and `Email/query` (with `after` / `inMailbox`
-filters and deterministic `receivedAt`-desc / id-lex sort). Steps 7
-(Email/get), 8 (integration tests), and 9 (ratatoskr wiring) are still
-pending. See `TODO.md` for the design decisions worked out per step.
+envelope, and the three load-bearing methods - `Mailbox/get`,
+`Email/query`, and `Email/get`. Steps 8 (integration tests) and 9
+(ratatoskr wiring) are still pending. See `TODO.md` for the design
+decisions worked out per step.
 
 ## Rules
 
