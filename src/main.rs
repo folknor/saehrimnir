@@ -1,12 +1,12 @@
 mod cli;
 mod fixture;
+mod routes;
 mod sentinel;
 mod shutdown;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{Router, routing::get};
 use clap::Parser;
 
 /// Hard budget on graceful drain after SIGTERM. Plan-2 acceptance #6
@@ -24,9 +24,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fixture.mailboxes.len(),
         fixture.emails.len()
     );
-    let _fixture: Arc<fixture::Fixture> = Arc::new(fixture);
 
-    let app = Router::new().route("/", get(|| async { "saehrimnir\n" }));
+    let state = routes::AppState {
+        fixture: Arc::new(fixture),
+    };
+    let app = routes::router(state);
 
     let bind_addr = format!("127.0.0.1:{}", args.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
