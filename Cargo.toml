@@ -1,0 +1,19 @@
+[package]
+name = "saehrimnir"
+version = "0.0.0"
+edition = "2024"
+description = "Deterministic mock JMAP server for testing ratatoskr's sync code."
+license = "Apache-2.0 OR MIT"
+
+[[bin]]
+name = "saehrimnir"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util", "net", "sync", "time"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
