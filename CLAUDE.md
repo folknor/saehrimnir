@@ -4,7 +4,7 @@ Deterministic mock email-protocol server. Test peer for ratatoskr's
 sync code, spawned by brokkr's `[ratatoskr]` sync commands. Originally
 scoped to JMAP only; now growing to cover every protocol ratatoskr's
 sync code talks to (JMAP, IMAP, SMTP, Microsoft Graph, Gmail), all
-backed by one shared TOML fixture.
+backed by one shared fixture authored as either TOML or Lua.
 
 All five protocols are implemented for v0. See `TODO.md` for what's
 left per protocol (mostly future fixture-format growth and sibling
@@ -14,7 +14,8 @@ resource modules), and `notes/` for the per-protocol surface docs.
 
 - `notes/orchestration.md` - how brokkr drives us: lifecycle,
   sentinel, env vars, brokkr.toml fields.
-- `notes/fixture-format.md` - TOML fixture shape and validation rules.
+- `notes/fixture-format.md` - fixture shape and validation rules,
+  shared by the TOML and Lua loaders.
 - `notes/ratatoskr-jmap-surface.md` - what the JMAP client expects
   on the wire, with `crates/jmap/src/...:LL` citations.
 - `notes/ratatoskr-imap-surface.md` - same shape, for IMAP.
@@ -55,8 +56,16 @@ checking whether the fact is already in `notes/`.
   writes sentinel, serves until SIGTERM with a 1-second graceful
   budget.
 - `src/cli.rs` - clap CLI flags.
-- `src/fixture.rs` - TOML loader, validator, canonical types shared
-  by every protocol layer.
+- `src/fixture.rs` - canonical types (`Fixture`, `Account`, `Mailbox`,
+  `Email`, ...), shared `RawFixture`-shaped intermediate, the
+  `normalize` cross-reference validator, and the TOML loader. The
+  public `load(path)` dispatches to `lua::load` for `.lua` files,
+  TOML otherwise.
+- `src/lua.rs` - dellingr-backed Lua scenario loader. Exposes the
+  `fixture` / `account` / `mailbox` / `email` builder `RustFunc`s,
+  accumulates into a `Builder` in user_data, and hands the
+  `RawFixture` to `fixture::normalize` so validation is shared with
+  the TOML path.
 - `src/sentinel.rs` - atomic readiness-file write (temp + rename).
 - `src/shutdown.rs` - SIGTERM/SIGINT handler.
 - `src/lib.rs` - library surface; `main.rs` keeps just the runtime.
@@ -85,8 +94,12 @@ checking whether the fact is already in `notes/`.
   `tower::ServiceExt::oneshot`.
 - `tests/gmail.rs` - Gmail integration tests via
   `tower::ServiceExt::oneshot`.
-- `fixtures/jmap-small.toml` - canonical v0 fixture (despite the
-  name, both protocols read from it).
+- `tests/lua_fixture.rs` - asserts the Lua loader produces a
+  `Fixture` byte-identical to the equivalent TOML fixture, plus
+  error paths.
+- `fixtures/jmap-small.toml` and `fixtures/jmap-small.lua` - the
+  canonical v0 scenario in both authoring formats. Asserted
+  equivalent by `tests/lua_fixture.rs`.
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status
@@ -125,6 +138,22 @@ projection of fixture emails into Gmail's nested mimePart shape) +
 (empty list). Catchall returns Gmail error envelope. Module
 structure leaves room for People-API contacts and Drive sibling
 files.
+
+Lua fixture loader: wired via [dellingr](https://crates.io/crates/dellingr),
+a pure-Rust deterministic sandboxed Lua VM with cost-bounded
+execution. The public `fixture::load` dispatches by extension: `.lua`
+goes through `src/lua.rs`, anything else parses as TOML. Both paths
+build the same `RawFixture` intermediate and run through the same
+`normalize` validator, so the resulting `Fixture` is byte-identical
+across formats - asserted by `tests/lua_fixture.rs`. Currently only
+the static-fixture surface is exposed (`fixture`, `account`,
+`mailbox`, `email` builders). Dynamic surface (reactive callbacks
+keyed by protocol + command, self-terminating scripts) is the next
+chunk and intentionally not yet implemented.
+
+Note: dellingr deliberately omits Lua's unparenthesized function-call
+sugar, so builder calls in `.lua` fixtures are written
+`mailbox({...})` not `mailbox{...}`.
 
 ## Rules
 

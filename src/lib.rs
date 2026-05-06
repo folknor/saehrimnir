@@ -11,6 +11,7 @@ pub mod gmail;
 pub mod graph;
 pub mod imap;
 pub mod jmap;
+pub mod lua;
 pub mod routes;
 pub mod sentinel;
 pub mod shutdown;

@@ -6,8 +6,8 @@ fixture-driven test peer that comes up identical on every spawn.
 
 Used by ratatoskr's sync tests, orchestrated by brokkr. Started life
 as a JMAP-only mock and has grown to cover every protocol
-ratatoskr's sync code talks to. One TOML fixture in, five wire
-shapes out, byte-stable across runs.
+ratatoskr's sync code talks to. One fixture in (TOML or Lua), five
+wire shapes out, byte-stable across runs.
 
 ## Protocols
 
@@ -26,6 +26,30 @@ State tokens are pinned for the lifetime of a fixture (`fixture-state`
 for JMAP, `1` for IMAP HIGHESTMODSEQ and Gmail historyId, `s.0` /
 `d.1` for Graph cursors).
 
+## Fixtures
+
+Two equivalent authoring formats, dispatched by file extension:
+
+- **TOML** (`fixtures/<name>.toml`): plain declarative config. Easy
+  to read and diff. Static only.
+- **Lua** (`fixtures/<name>.lua`): Lua script run through
+  [dellingr](https://crates.io/crates/dellingr), a pure-Rust
+  deterministic sandboxed Lua VM with cost-bounded execution. The
+  script populates the same in-memory `Fixture` shape via four
+  builders - `fixture({...})`, `account({...})`, `mailbox({...})`,
+  `email({...})` - and runs through the same cross-reference
+  validation pass as the TOML loader. Both produce a byte-identical
+  `Fixture`; `fixtures/jmap-small.{toml,lua}` are the canonical
+  example pair.
+
+Lua exists as the on-ramp for upcoming dynamic features (reactive
+callbacks per protocol command, scenario-driven state mutations,
+self-terminating scripts). v0 only exercises the static
+fixture-builder surface; the dynamic surface is the next chunk of
+work. Note that dellingr deliberately omits Lua's unparenthesized
+function-call sugar, so builder calls are written `mailbox({...})`
+not `mailbox{...}`.
+
 ## Where to read
 
 - `CLAUDE.md` - project rules, layout, and the `brokkr check` /
@@ -33,8 +57,8 @@ for JMAP, `1` for IMAP HIGHESTMODSEQ and Gmail historyId, `s.0` /
 - `TODO.md` - per-protocol task list, what's done and what's left.
 - `notes/orchestration.md` - how brokkr drives us: lifecycle,
   sentinel, env vars.
-- `notes/fixture-format.md` - TOML fixture shape and validation
-  rules.
+- `notes/fixture-format.md` - fixture shape and validation rules
+  (shared by the TOML and Lua loaders).
 - `notes/ratatoskr-{jmap,imap,smtp,graph,gmail}-surface.md` - per-
   protocol cheat sheets distilled from ratatoskr's client code, with
   `crates/<proto>/src/...:LL` citations.
@@ -74,7 +98,10 @@ clean exit within the 1-second graceful-shutdown budget.
 ## Status
 
 JMAP, IMAP read path, SMTP submission, Graph mail-sync, and Gmail
-mail-sync are complete for v0. Future increments grow the fixture
-format (calendar events, contacts, attachments, drive files,
-incremental-sync change scripts) and add sibling resource modules
-inside `src/graph/` and `src/gmail/`. See `TODO.md`.
+mail-sync are complete for v0. The Lua fixture loader (via dellingr)
+is wired but currently only exposes the static-fixture surface;
+reactive callbacks for dynamic scenarios are the next chunk. Future
+increments grow the fixture shape (calendar events, contacts,
+attachments, drive files), add sibling resource modules inside
+`src/graph/` and `src/gmail/`, and expose the dynamic Lua surface.
+See `TODO.md`.

@@ -10,7 +10,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fixture {
     pub name: String,
     pub state: String,
@@ -19,13 +19,13 @@ pub struct Fixture {
     pub emails: Vec<Email>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mailbox {
     pub id: String,
     pub name: String,
@@ -73,7 +73,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Email {
     pub id: String,
     pub thread_id: String,
@@ -96,95 +96,98 @@ pub struct Email {
     pub body: Body,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Address {
     pub name: Option<String>,
     pub email: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
     /// Inline plain-text body. The default for v0 fixtures.
     Text(String),
 }
 
 // ── Raw types for serde deserialization ─────────────────────────────
+//
+// These also serve as the in-memory shape the Lua loader builds up
+// before handing off to `normalize` for cross-reference validation.
 
-#[derive(Debug, Deserialize)]
-struct RawFixture {
-    name: String,
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawFixture {
+    pub(crate) name: String,
     #[serde(default)]
-    state: Option<String>,
-    account: RawAccount,
+    pub(crate) state: Option<String>,
+    pub(crate) account: RawAccount,
     #[serde(default, rename = "mailbox")]
-    mailboxes: Vec<RawMailbox>,
+    pub(crate) mailboxes: Vec<RawMailbox>,
     #[serde(default, rename = "email")]
-    emails: Vec<RawEmail>,
+    pub(crate) emails: Vec<RawEmail>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawAccount {
-    id: String,
-    name: String,
-    is_personal: bool,
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawAccount {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) is_personal: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawMailbox {
-    id: String,
-    name: String,
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawMailbox {
+    pub(crate) id: String,
+    pub(crate) name: String,
     #[serde(default)]
-    role: Option<String>,
+    pub(crate) role: Option<String>,
     #[serde(default)]
-    parent_id: Option<String>,
+    pub(crate) parent_id: Option<String>,
     #[serde(default)]
-    sort_order: Option<i64>,
+    pub(crate) sort_order: Option<i64>,
     #[serde(default)]
-    is_subscribed: Option<bool>,
+    pub(crate) is_subscribed: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawEmail {
-    id: String,
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawEmail {
+    pub(crate) id: String,
     #[serde(default)]
-    thread_id: Option<String>,
-    mailbox_ids: Vec<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) mailbox_ids: Vec<String>,
     #[serde(default)]
-    keywords: Vec<String>,
+    pub(crate) keywords: Vec<String>,
     #[serde(default)]
-    size: Option<i64>,
-    received_at: String,
+    pub(crate) size: Option<i64>,
+    pub(crate) received_at: String,
     #[serde(default)]
-    sent_at: Option<String>,
+    pub(crate) sent_at: Option<String>,
     #[serde(default)]
-    from: Option<RawAddress>,
+    pub(crate) from: Option<RawAddress>,
     #[serde(default)]
-    to: Vec<RawAddress>,
+    pub(crate) to: Vec<RawAddress>,
     #[serde(default)]
-    cc: Vec<RawAddress>,
+    pub(crate) cc: Vec<RawAddress>,
     #[serde(default)]
-    bcc: Vec<RawAddress>,
+    pub(crate) bcc: Vec<RawAddress>,
     #[serde(default)]
-    reply_to: Vec<RawAddress>,
+    pub(crate) reply_to: Vec<RawAddress>,
     #[serde(default)]
-    subject: Option<String>,
+    pub(crate) subject: Option<String>,
     #[serde(default)]
-    preview: Option<String>,
+    pub(crate) preview: Option<String>,
     #[serde(default)]
-    message_id: Vec<String>,
+    pub(crate) message_id: Vec<String>,
     #[serde(default)]
-    in_reply_to: Vec<String>,
+    pub(crate) in_reply_to: Vec<String>,
     #[serde(default)]
-    references: Vec<String>,
+    pub(crate) references: Vec<String>,
     #[serde(default)]
-    has_attachment: Option<bool>,
+    pub(crate) has_attachment: Option<bool>,
     #[serde(default)]
-    body_text: Option<String>,
+    pub(crate) body_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum RawAddress {
+pub(crate) enum RawAddress {
     Bare(String),
     Full {
         #[serde(default)]
@@ -204,15 +207,22 @@ impl From<RawAddress> for Address {
 
 // ── Loader ──────────────────────────────────────────────────────────
 
+/// Public entry point. Dispatches by extension: `.lua` files go through
+/// the dellingr-backed scenario loader; everything else is parsed as
+/// TOML.
 pub fn load(path: &Path) -> Result<Fixture, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    let raw: RawFixture =
-        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    normalize(raw)
+    if path.extension().is_some_and(|e| e == "lua") {
+        crate::lua::load(path)
+    } else {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let raw: RawFixture =
+            toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+        normalize(raw)
+    }
 }
 
-fn normalize(raw: RawFixture) -> Result<Fixture, String> {
+pub(crate) fn normalize(raw: RawFixture) -> Result<Fixture, String> {
     if !raw.account.is_personal {
         return Err("account.is_personal must be true (v0 supports one personal account)".into());
     }
