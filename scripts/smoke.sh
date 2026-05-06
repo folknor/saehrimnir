@@ -192,17 +192,20 @@ assert mr[2] == "c1", mr
 print("unknownMethod: ok")
 ' "$unk"
 
-echo "=== IMAP greeting + CAPABILITY + LOGOUT ==="
-imap_out="$(printf 'a1 CAPABILITY\r\nq LOGOUT\r\n' | nc -w 2 127.0.0.1 "$imap_port")"
+echo "=== IMAP CAPABILITY + LOGIN + ENABLE + LOGOUT ==="
+imap_out="$(printf 'a1 CAPABILITY\r\nb1 LOGIN "alice" "hunter2"\r\nc1 ENABLE QRESYNC\r\nq LOGOUT\r\n' | nc -w 2 127.0.0.1 "$imap_port")"
 python3 -c '
 import sys
 out = sys.argv[1]
 assert "* OK saehrimnir IMAP4rev1 ready" in out, out
 assert "* CAPABILITY IMAP4REV1 CONDSTORE QRESYNC" in out, out
 assert "a1 OK CAPABILITY completed" in out, out
+assert "b1 OK [CAPABILITY IMAP4REV1 CONDSTORE QRESYNC] LOGIN completed" in out, out
+assert "* ENABLED QRESYNC" in out, out
+assert "c1 OK ENABLE completed" in out, out
 assert "* BYE saehrimnir signing off" in out, out
 assert "q OK LOGOUT completed" in out, out
-print("IMAP bootstrap: ok")
+print("IMAP auth + enable: ok")
 ' "$imap_out"
 
 echo "=== SIGTERM ==="
