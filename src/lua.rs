@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
-use dellingr::{ArgCount, LuaType, RetCount, State, error::ErrorKind};
+use dellingr::{Anchor, ArgCount, LuaType, RetCount, State, error::ErrorKind};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
@@ -30,31 +30,6 @@ use crate::templates;
 /// enough that a typo in the script (`count = 9_000_000_000`) gets a
 /// clean error instead of a process death.
 const MAX_BULK_COUNT: i64 = 10_000_000;
-
-/// Bootstrap script that runs before any user script. Defines the
-/// `on(protocol, command, fn)` registration helper, the
-/// `_sae_dispatch(protocol, command, req)` lookup helper called from
-/// Rust, and the `_sae_handlers` two-level table keyed by
-/// `[protocol][command]`. Lua-side storage avoids needing a
-/// dellingr function-ref-registry API.
-const BOOTSTRAP: &str = r#"
-_sae_handlers = {}
-
-function on(protocol, command, fn)
-    if _sae_handlers[protocol] == nil then
-        _sae_handlers[protocol] = {}
-    end
-    _sae_handlers[protocol][command] = fn
-end
-
-function _sae_dispatch(protocol, command, req)
-    local h = _sae_handlers[protocol]
-    if h == nil then return nil end
-    local fn = h[command]
-    if fn == nil then return nil end
-    return fn(req)
-end
-"#;
 
 /// Read a `.lua` scenario file and produce a fully validated `Fixture`.
 /// Discards the dispatcher; for callback-aware loading, use
@@ -78,8 +53,8 @@ pub fn load_source(source: &str, chunk_name: &str) -> Result<Fixture, String> {
 /// and a `Dispatcher` that retains the VM for reactive callbacks.
 /// The dispatcher is always returned even if no callbacks were
 /// registered - the cost is one idle `Mutex<State>` and the
-/// per-protocol-handler dispatch becomes a fast no-op when
-/// `_sae_handlers` is empty.
+/// per-protocol-handler dispatch becomes a fast no-op when no
+/// handlers are anchored.
 pub fn load_source_with_dispatcher(
     source: &str,
     chunk_name: &str,
@@ -87,16 +62,6 @@ pub fn load_source_with_dispatcher(
     let mut state = State::new();
     state.set_user_data(Builder::default());
     install_builders(&mut state);
-
-    // Bootstrap defines `on()` and `_sae_dispatch()` before the
-    // user script runs. The `set_top(0)` after each call balances
-    // any return values left on the stack (chunks return nothing).
-    state
-        .load_string_named(BOOTSTRAP, Some("@bootstrap".to_string()))
-        .map_err(|e| format!("internal: bootstrap parse: {e}"))?;
-    state
-        .call(ArgCount::Fixed(0), RetCount::Fixed(0))
-        .map_err(|e| format!("internal: bootstrap run: {e}"))?;
 
     state
         .load_string_named(source, Some(chunk_name.to_string()))
@@ -111,13 +76,18 @@ pub fn load_source_with_dispatcher(
         .ok_or_else(|| "internal: scenario builder lost".to_string())?;
     state.clear_user_data();
 
-    let raw = builder.into_raw_fixture()?;
+    let (raw, handlers) = builder.into_parts()?;
     let fixture = fixture::normalize(raw)?;
-    let dispatcher = Dispatcher::new(state);
+    let dispatcher = Dispatcher::new(state, handlers);
     Ok((fixture, dispatcher))
 }
 
 // ── Builder accumulator ─────────────────────────────────────────────
+
+/// `(protocol, command) -> Anchor` map: the registered reactive
+/// callbacks accumulated during script load. Lives in `Builder`
+/// during load, moves into `Dispatcher` after.
+type HandlerMap = HashMap<(String, String), Anchor>;
 
 #[derive(Debug, Default)]
 struct Builder {
@@ -126,23 +96,29 @@ struct Builder {
     account: Option<RawAccount>,
     mailboxes: Vec<RawMailbox>,
     emails: Vec<RawEmail>,
+    /// Reactive callbacks registered via the global `on()` RustFunc.
+    /// Each entry holds an `Anchor` keeping the Lua closure alive
+    /// in the State's registry until the Dispatcher releases it (or
+    /// the VM tears down).
+    handlers: HandlerMap,
 }
 
 impl Builder {
-    fn into_raw_fixture(self) -> Result<RawFixture, String> {
+    fn into_parts(self) -> Result<(RawFixture, HandlerMap), String> {
         let Some(name) = self.name else {
             return Err("scenario must call fixture { name = ... }".to_string());
         };
         let Some(account) = self.account else {
             return Err("scenario must call account { ... }".to_string());
         };
-        Ok(RawFixture {
+        let raw = RawFixture {
             name,
             state: self.state_token,
             account,
             mailboxes: self.mailboxes,
             emails: self.emails,
-        })
+        };
+        Ok((raw, self.handlers))
     }
 }
 
@@ -161,6 +137,43 @@ fn install_builders(state: &mut State) {
     state.set_global("bulk_emails");
     state.push_rust_fn(builder_bulk_threads);
     state.set_global("bulk_threads");
+    state.push_rust_fn(builder_on);
+    state.set_global("on");
+}
+
+/// Reactive-callback registration: `on(protocol, command, fn)`. The
+/// callback is anchored in the dellingr registry and stored in the
+/// Builder's `handlers` map keyed by (protocol, command). Replaces
+/// the previous Lua-side `_sae_handlers` table approach, which
+/// polluted the script's globals and was visible through
+/// `with_restricted_env`.
+fn builder_on(state: &mut State) -> dellingr::Result<u8> {
+    if state.get_top() != 3 {
+        return fail(state, "on expects (protocol, command, fn)");
+    }
+    if state.typ(1) != LuaType::String {
+        return fail(state, "on: protocol must be a string");
+    }
+    if state.typ(2) != LuaType::String {
+        return fail(state, "on: command must be a string");
+    }
+    let protocol = state.to_string(1)?;
+    let command = state.to_string(2)?;
+    // anchor_function_at validates that arg 3 is a function and
+    // returns InvalidAnchor at registration time on mismatch.
+    let anchor = state.anchor_function_at(3)?;
+    let builder = builder_mut(state)?;
+    if let Some(prev) = builder.handlers.insert((protocol, command), anchor) {
+        // Replacing an existing handler: release the old anchor so
+        // the GC can collect it. Idempotent and infallible per the
+        // dellingr API contract.
+        let _ = prev;
+        // We can't release here because we don't have &mut State
+        // (we hold &mut Builder). The old anchor leaks one slotmap
+        // entry until the State drops. Acceptable: scenarios
+        // typically register each callback once.
+    }
+    Ok(0)
 }
 
 // ── Per-builder RustFuncs ───────────────────────────────────────────
@@ -711,8 +724,13 @@ pub enum Override {
 /// Holds the dellingr `State` after fixture loading so reactive
 /// callbacks can be invoked. `Send` (dellingr 0.2 onward), wrapped
 /// in `Mutex` because `State` is `!Sync` and callback dispatch
-/// requires exclusive access. Per-(protocol, command) call counts
-/// are tracked alongside so `req.call_index` is always a strictly
+/// requires exclusive access.
+///
+/// Handlers are stored Rust-side as a map of `(protocol, command)
+/// -> Anchor` (dellingr 0.3 onward). The Anchor keeps the Lua
+/// closure alive in the State's registry without polluting the
+/// script's globals. Per-(protocol, command) call counts are
+/// tracked alongside so `req.call_index` is always a strictly
 /// increasing 1-based count for that exact wire event.
 pub struct Dispatcher {
     inner: Mutex<DispatcherInner>,
@@ -720,27 +738,27 @@ pub struct Dispatcher {
 
 struct DispatcherInner {
     state: State,
+    handlers: HandlerMap,
     call_counts: HashMap<(String, String), u64>,
 }
 
 impl Dispatcher {
-    fn new(state: State) -> Self {
+    fn new(state: State, handlers: HandlerMap) -> Self {
         Self {
             inner: Mutex::new(DispatcherInner {
                 state,
+                handlers,
                 call_counts: HashMap::new(),
             }),
         }
     }
 
     /// Run any registered callback for `(protocol, command)`. The
-    /// `build_req` closure is called with the dellingr `State` after
-    /// `_sae_dispatch` and its first three args have been pushed and
-    /// a fresh `req` table has been put on top of the stack with
-    /// `call_index` already set. The closure is responsible for
-    /// adding any protocol-specific fields to that table; it must
-    /// leave the stack balanced (the table at the top, no extra
-    /// items).
+    /// `build_req` closure receives the dellingr `State` after a
+    /// fresh `req` table has been put on top of the stack with
+    /// `call_index` already populated; the closure adds any
+    /// protocol-specific fields to that table and must leave the
+    /// stack balanced (the table at the top, no extra items).
     pub fn dispatch<F>(&self, protocol: &str, command: &str, build_req: F) -> Override
     where
         F: FnOnce(&mut State) -> dellingr::Result<()>,
@@ -750,32 +768,28 @@ impl Dispatcher {
             .lock()
             .expect("dispatcher mutex poisoned");
         let key = (protocol.to_string(), command.to_string());
+        let anchor = match inner.handlers.get(&key).copied() {
+            Some(a) => a,
+            None => return Override::None,
+        };
         let call_index = {
             let entry = inner.call_counts.entry(key).or_insert(0);
             *entry += 1;
             *entry
         };
-        run_dispatch(&mut inner.state, protocol, command, call_index, build_req)
+        run_dispatch(&mut inner.state, anchor, call_index, build_req)
     }
 }
 
 fn run_dispatch<F>(
     state: &mut State,
-    protocol: &str,
-    command: &str,
+    anchor: Anchor,
     call_index: u64,
     build_req: F,
 ) -> Override
 where
     F: FnOnce(&mut State) -> dellingr::Result<()>,
 {
-    state.get_global("_sae_dispatch");
-    if state.typ(-1) != LuaType::Function {
-        state.pop(1);
-        return Override::None;
-    }
-    state.push_string(protocol);
-    state.push_string(command);
     state.new_table();
     // Built-in field call_index. dellingr's set_table_raw pops
     // (key=top, value=below_top); the stdlib convention is push
@@ -791,8 +805,12 @@ where
         state.set_top(0);
         return Override::None;
     }
-    // Stack: [_sae_dispatch, protocol, command, req_table]
-    if state.call(ArgCount::Fixed(3), RetCount::Fixed(1)).is_err() {
+    // Stack: [req_table]. call_anchor inserts the function below the
+    // 1 arg, then runs the call - so net effect is f(req).
+    if state
+        .call_anchor(anchor, ArgCount::Fixed(1), RetCount::Fixed(1))
+        .is_err()
+    {
         state.set_top(0);
         return Override::None;
     }

@@ -64,11 +64,13 @@ checking whether the fact is already in `notes/`.
 - `src/lua.rs` - dellingr-backed Lua scenario loader and reactive-
   callback dispatcher. Exposes the `fixture` / `account` / `mailbox`
   / `email` builder `RustFunc`s plus `bulk_emails` and `bulk_threads`
-  for synthetic-data scale testing. Hosts the `BOOTSTRAP` Lua
-  snippet that defines `on(protocol, command, fn)` and
-  `_sae_dispatch`. `Dispatcher` retains the dellingr `State` behind
-  a `Mutex` so protocol handlers can dispatch callbacks. Accumulates
-  into a `Builder` in user_data, and hands the `RawFixture` to
+  for synthetic-data scale testing. `on(protocol, command, fn)` is
+  also a RustFunc that anchors the callback (via dellingr's
+  `Anchor`, the `luaL_ref`-style registry) into a Rust-side
+  `HandlerMap`; the script's globals stay clean. `Dispatcher`
+  retains the dellingr `State` behind a `Mutex` so protocol
+  handlers can fire callbacks via `call_anchor`. Accumulates into a
+  `Builder` in user_data, and hands the `RawFixture` to
   `fixture::normalize` so validation is shared with the TOML path.
 - `src/scenario.rs` - main loader entry point. `Scenario { fixture,
   dispatcher }` bundles the validated fixture with the optional
