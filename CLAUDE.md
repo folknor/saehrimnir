@@ -17,7 +17,7 @@ per-protocol surface docs.
   layer's design decisions.
 - `notes/orchestration.md` - how brokkr drives us: lifecycle,
   sentinel, env vars, brokkr.toml fields.
-- `notes/ratatoskr-client-surface.md` - what the JMAP client expects
+- `notes/ratatoskr-jmap-surface.md` - what the JMAP client expects
   on the wire, with `crates/jmap/src/...:LL` citations.
 - `notes/ratatoskr-imap-surface.md` - same shape, for IMAP.
 - `notes/imap-plan.md` - implementation plan for the IMAP layer.

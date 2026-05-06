@@ -34,7 +34,7 @@ async fn root() -> &'static str {
 /// Session resource per RFC 8620 §2.
 ///
 /// Capabilities are deliberately limited to `core` + `mail` (see
-/// `notes/ratatoskr-client-surface.md` - advertising `principals`
+/// `notes/ratatoskr-jmap-surface.md` - advertising `principals`
 /// pulls the client into `Principal/get` and `ShareNotification`
 /// paths the mock can't satisfy in v0).
 async fn session(State(state): State<AppState>) -> Json<Value> {
