@@ -6,8 +6,8 @@
 //!
 //! The module is laid out as a directory so calendar/contacts/drive/
 //! groups/EWS can drop in as sibling files when their surfaces are
-//! scouted - see `notes/graph-plan.md` and the resource-category
-//! table in `notes/ratatoskr-graph-surface.md`.
+//! scouted - see the resource-category table in
+//! `notes/ratatoskr-graph-surface.md`.
 
 pub mod mail;
 pub mod odata;

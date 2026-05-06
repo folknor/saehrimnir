@@ -6,34 +6,25 @@ scoped to JMAP only; now growing to cover every protocol ratatoskr's
 sync code talks to (JMAP, IMAP, SMTP, Microsoft Graph, Gmail), all
 backed by one shared TOML fixture.
 
-JMAP is implemented; IMAP is in progress; SMTP / Graph / Gmail are
-queued. See `TODO.md` for the running task list and `notes/` for
-per-protocol surface docs.
+All five protocols are implemented for v0. See `TODO.md` for what's
+left per protocol (mostly future fixture-format growth and sibling
+resource modules), and `notes/` for the per-protocol surface docs.
 
 ## Where to read
 
-- `notes/plan.md` - the original JMAP-only v0 plan. Background
-  reading; superseded for scope but still accurate for the JMAP
-  layer's design decisions.
 - `notes/orchestration.md` - how brokkr drives us: lifecycle,
   sentinel, env vars, brokkr.toml fields.
+- `notes/fixture-format.md` - TOML fixture shape and validation rules.
 - `notes/ratatoskr-jmap-surface.md` - what the JMAP client expects
   on the wire, with `crates/jmap/src/...:LL` citations.
 - `notes/ratatoskr-imap-surface.md` - same shape, for IMAP.
-- `notes/imap-plan.md` - implementation plan for the IMAP layer.
 - `notes/ratatoskr-smtp-surface.md` - same shape, for SMTP.
-- `notes/smtp-plan.md` - implementation plan for the SMTP layer.
 - `notes/ratatoskr-graph-surface.md` - same shape, for Microsoft
-  Graph (mail-sync only in v0; the doc lists future resource
-  categories so the module structure can accept them).
-- `notes/graph-plan.md` - implementation plan for the Graph layer.
+  Graph (mail-sync only in v0; the doc also lists the resource
+  categories we'll need to scaffold for later).
 - `notes/ratatoskr-gmail-surface.md` - same shape, for Gmail's REST
   API.
-- `notes/gmail-plan.md` - implementation plan for the Gmail layer.
-- `notes/jmap-client-fork.md` - pointer to the local jmap-client fork.
-- `notes/fixture-format.md` - TOML fixture shape and validation rules.
-- `TODO.md` - implementation steps still pending, with the design
-  decisions worked out per step.
+- `TODO.md` - what's left, per protocol.
 
 The notes are the source of truth. Do not refer to siblings
 (`../ratatoskr`, `../jmap-client`, `../brokkr`) without first

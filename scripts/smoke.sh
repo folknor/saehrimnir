@@ -65,7 +65,7 @@ if [[ ! -f "$ready_file" ]]; then
     exit 1
 fi
 
-jmap_port="$(awk '/^READY /{print $2}' "$ready_file")"
+jmap_port="$(awk '/^JMAP /{print $2}' "$ready_file")"
 imap_port="$(awk '/^IMAP /{print $2}' "$ready_file")"
 smtp_port="$(awk '/^SMTP /{print $2}' "$ready_file")"
 graph_port="$(awk '/^GRAPH /{print $2}' "$ready_file")"

@@ -6,11 +6,13 @@
 //! spawns one task per accepted socket and stops accepting when the
 //! shared shutdown future fires.
 //!
-//! v0 scope (see `notes/imap-plan.md`): plaintext only, accept any
-//! credential. Currently implemented: greeting, `CAPABILITY`, `NOOP`,
-//! `LOGOUT`, `LOGIN`, `AUTHENTICATE` (PLAIN / XOAUTH2 / OAUTHBEARER),
-//! `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT` / `EXAMINE`,
-//! `UID SEARCH`, `UID FETCH`. Everything else returns tagged `BAD`.
+//! v0 scope: plaintext only, accept any credential. Currently
+//! implemented: greeting, `CAPABILITY`, `NOOP`, `LOGOUT`, `LOGIN`,
+//! `AUTHENTICATE` (PLAIN / XOAUTH2 / OAUTHBEARER), `ENABLE QRESYNC`,
+//! `LIST`, `STATUS`, `SELECT` / `EXAMINE`, `UID SEARCH`, `UID FETCH`.
+//! Everything else returns tagged `BAD`. See
+//! `notes/ratatoskr-imap-surface.md` for what the client expects on
+//! the wire.
 
 use std::sync::Arc;
 
@@ -518,7 +520,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // CHANGEDSINCE modifier lands in step 6 but we accept the
         // syntax now and ignore the modseq because HIGHESTMODSEQ is
         // pinned at 1 (so CHANGEDSINCE 0 returns everything,
-        // CHANGEDSINCE 1+ returns nothing - see imap-plan.md).
+        // CHANGEDSINCE 1+ returns nothing).
         let (uid_set_str, after_set) = match split_after_set(args) {
             Some(p) => p,
             None => {
@@ -1141,7 +1143,7 @@ fn flags_for(email: &Email) -> String {
 
 // ── RFC 822 emission ────────────────────────────────────────────────
 //
-// Hand-rolled to keep the dep surface small (per notes/plan.md). v0
+// Hand-rolled to keep the dep surface small. v0
 // fixtures are ASCII-only, so we don't need RFC 2047 encoded-words or
 // header line folding. When fixtures grow non-ASCII subjects or
 // multipart bodies, this is the moment to swap in `mail-builder`.

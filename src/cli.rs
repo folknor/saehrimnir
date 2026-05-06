@@ -11,7 +11,7 @@ use clap::Parser;
 #[command(version, about, long_about = None)]
 pub struct Args {
     /// JMAP HTTP port. `0` (default) picks an ephemeral port; the
-    /// chosen port lands in the readiness file under `READY <port>`.
+    /// chosen port lands in the readiness file under `JMAP <port>`.
     #[arg(long = "jmap-port", alias = "port", default_value_t = 0)]
     pub jmap_port: u16,
 
@@ -37,9 +37,9 @@ pub struct Args {
     #[arg(long = "gmail-port", default_value_t = 0)]
     pub gmail_port: u16,
 
-    /// Path to write the readiness sentinel once both listeners are
+    /// Path to write the readiness sentinel once every listener is
     /// bound. One line per protocol, e.g.:
-    /// `READY 12345\nIMAP 23456\n`.
+    /// `JMAP 12345\nIMAP 23456\nSMTP 34567\nGRAPH 45678\nGMAIL 56789\n`.
     #[arg(long)]
     pub readiness_file: PathBuf,
 

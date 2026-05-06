@@ -15,8 +15,8 @@ so the next person can re-verify after the client drifts.
   not need a `.well-known` route**; the configured endpoint is hit as
   the session URL.
   Source: `crates/jmap/src/client.rs:319-326`.
-- Auth is bearer (OAuth) or basic. v0 ignores credentials entirely
-  per plan.md; the listener accepts any header.
+- Auth is bearer (OAuth) or basic. v0 ignores credentials entirely;
+  the listener accepts any header.
 
 ## Session resource
 
@@ -156,8 +156,7 @@ Per mailbox (`crates/jmap/src/sync/mailbox.rs:36-95`):
   the wrapping `Mailbox/get` response.
 
 Counts (`totalEmails`, `unreadEmails`, etc.) and `sortOrder` are not
-read by the parser even though plan.md mentions them. Returning them
-is fine; omitting them is fine.
+read by the parser, but the mock still emits them. Either way works.
 
 ## `Email/query` shape
 
@@ -256,9 +255,10 @@ recorded here so we don't have to fan out again. Full detail in
 `orchestration.md`.
 
 - **Readiness sentinel.** Brokkr's `wait_for_sentinel` is
-  presence-only (returns `Appeared` / `BackstopExpired`). Plan 2's
-  `READY <port>\n` content is for plan-3-side port extraction, not
-  for the watcher. Atomic write (temp + rename) required.
+  presence-only (returns `Appeared` / `BackstopExpired`). The
+  sentinel's `JMAP <port>\n` line content is for plan-3-side port
+  extraction, not for the watcher. Atomic write (temp + rename)
+  required.
 - **Endpoint env var name.** Default `RATATOSKR_TEST_JMAP_ENDPOINT`,
   overridable via `[ratatoskr] test_endpoint_env_jmap` in
   ratatoskr's brokkr.toml. We don't read it; the harness binary

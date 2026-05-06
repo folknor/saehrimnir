@@ -5,9 +5,10 @@
 //! `AsyncRead + AsyncWrite`. Captured submissions land in the shared
 //! [`SubmissionLog`] which the test harness reads directly.
 //!
-//! v0 scope (see `notes/smtp-plan.md`): plaintext only, accept any
-//! credential, one message per connection. STARTTLS, CHUNKING, DSN,
-//! and PIPELINING are deliberately not advertised.
+//! v0 scope: plaintext only, accept any credential, one message per
+//! connection. STARTTLS, CHUNKING, DSN, and PIPELINING are
+//! deliberately not advertised. See
+//! `notes/ratatoskr-smtp-surface.md` for the wire surface.
 
 use std::sync::{Arc, Mutex};
 
@@ -33,8 +34,9 @@ pub struct Submission {
     /// line starting `..` is collapsed to a single leading `.`).
     pub data: Vec<u8>,
     /// Wall-clock time the mock saw the submission complete. Not
-    /// byte-stable - determinism only covers the submission contents,
-    /// per `notes/smtp-plan.md`.
+    /// byte-stable - the determinism contract covers only the
+    /// submission contents (from / recipients / data), not the
+    /// timestamp.
     pub received_at: DateTime<Utc>,
 }
 

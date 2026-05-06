@@ -5,9 +5,9 @@ every evening and resurrected every morning - fitting for a
 fixture-driven test peer that comes up identical on every spawn.
 
 Used by ratatoskr's sync tests, orchestrated by brokkr. Started life
-as a JMAP-only mock (plan-2 of a three-plan effort, `notes/plan.md`)
-and has grown to cover every protocol ratatoskr's sync code talks to.
-One TOML fixture in, five wire shapes out, byte-stable across runs.
+as a JMAP-only mock and has grown to cover every protocol
+ratatoskr's sync code talks to. One TOML fixture in, five wire
+shapes out, byte-stable across runs.
 
 ## Protocols
 
@@ -31,7 +31,6 @@ for JMAP, `1` for IMAP HIGHESTMODSEQ and Gmail historyId, `s.0` /
 - `CLAUDE.md` - project rules, layout, and the `brokkr check` /
   `scripts/smoke.sh` workflow.
 - `TODO.md` - per-protocol task list, what's done and what's left.
-- `notes/plan.md` - the original JMAP-only v0 plan.
 - `notes/orchestration.md` - how brokkr drives us: lifecycle,
   sentinel, env vars.
 - `notes/fixture-format.md` - TOML fixture shape and validation
@@ -39,23 +38,26 @@ for JMAP, `1` for IMAP HIGHESTMODSEQ and Gmail historyId, `s.0` /
 - `notes/ratatoskr-{jmap,imap,smtp,graph,gmail}-surface.md` - per-
   protocol cheat sheets distilled from ratatoskr's client code, with
   `crates/<proto>/src/...:LL` citations.
-- `notes/{imap,smtp,graph,gmail}-plan.md` - per-protocol
-  implementation plans with the design decisions worked out.
 
 ## Running
 
+The binary is `saehrimnir` (ASCII transliteration so `cargo`,
+filesystems, and shells stay sane). After `cargo build` it lives at
+`target/<profile>/saehrimnir`:
+
 ```sh
-cargo run -- \
-    --readiness-file /tmp/sae.ready \
+saehrimnir \
+    --readiness-file .smoke/ready \
     --fixture fixtures/jmap-small.toml
 ```
 
-Each protocol takes its own `--<proto>-port`; passing `0` (the
-default) picks an ephemeral port. The chosen ports land in the
-readiness sentinel, one line per protocol:
+Each protocol takes its own `--<proto>-port` (`--jmap-port`,
+`--imap-port`, `--smtp-port`, `--graph-port`, `--gmail-port`);
+passing `0` (the default) picks an ephemeral port. The chosen ports
+land in the readiness sentinel, one line per protocol:
 
 ```
-READY 38779
+JMAP 38779
 IMAP 37445
 SMTP 44037
 GRAPH 43603

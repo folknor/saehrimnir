@@ -6,8 +6,8 @@ use tokio::fs;
 /// One line of the readiness sentinel: `<name> <port>`.
 #[derive(Debug, Clone, Copy)]
 pub struct ProtocolPort {
-    /// Wire name as it appears in the sentinel. JMAP is historically
-    /// `READY` for back-compat; everything else is the protocol name.
+    /// Wire name as it appears in the sentinel: the protocol name
+    /// in upper-case (`JMAP`, `IMAP`, `SMTP`, `GRAPH`, `GMAIL`).
     pub name: &'static str,
     pub port: u16,
 }

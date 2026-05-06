@@ -67,10 +67,10 @@ Plan 3 wires whatever name is configured; we don't hardcode it.
 - **Trigger:** atomic write the moment the TCP listener is bound.
   Write-temp-then-rename, so a reader can't catch us mid-write with
   an empty file.
-- **Content:** one line per protocol, each `<NAME> <port>\n`. JMAP is
-  always present (`READY <port>\n` - the historical name kept for
-  back-compat), then one line per other protocol (`IMAP <port>\n`,
-  later `SMTP`, `GRAPH`, `GMAIL`). Brokkr's `wait_for_sentinel`
+- **Content:** one line per protocol, each `<NAME> <port>\n`, with
+  `<NAME>` upper-case: `JMAP`, `IMAP`, `SMTP`, `GRAPH`, `GMAIL`.
+  Every line is always present (we bind every listener, even when
+  the test only cares about one). Brokkr's `wait_for_sentinel`
   doesn't parse the content (it's presence-only); plan-3-side code
   reads the file and picks the port for the protocol it cares
   about.
@@ -177,20 +177,20 @@ We do not write into the harness binary's artefact dir
   `brokkr serve` for nidhogg" but defers the implementation. For us,
   the practical effect: brokkr will run `cargo build --release` from
   our project root before invoking us. No feature sweeps required.
-- **`--imap` / `--jmap` selection in `brokkr mock-serve`.** Plan 3
-  defines flags to choose which protocol; plan 2 is JMAP-only for
-  v0. When IMAP lands (later), the cleanest split is two separate
-  binaries (`sæhrimnir-jmap`, `sæhrimnir-imap`) - keeps each CLI
-  small. Either way, `brokkr mock-serve --jmap` for v0 just spawns
-  us with a fixture flag.
+- **Per-protocol port flags in `brokkr mock-serve`.** We bind one
+  listener per protocol on its own port - `--jmap-port`,
+  `--imap-port`, `--smtp-port`, `--graph-port`, `--gmail-port` - and
+  the sentinel reports each one on its own line. `brokkr mock-serve`
+  just spawns us once with a fixture flag and reads whichever ports
+  it cares about out of the sentinel.
 - **Per-fixture run-dir keying.** Plan 3 currently keys on script
   name; fixture-as-path-component is deferred. Not our concern.
 
 ## What we should ignore
 
 - Marker FIFOs, `BROKKR_MARKER_FIFO`, brokkr's sidecar - all
-  unrelated to plan 2. Those are concerns of the harness binary,
-  not ours.
+  unrelated to us. Those are concerns of the harness binary, not
+  ours.
 - Lua / dellingr / `ServiceClient`. Live entirely in ratatoskr's
   `app` crate. We don't depend on or know about them.
 

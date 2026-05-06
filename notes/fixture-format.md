@@ -1,11 +1,9 @@
-# Fixture format (working draft)
+# Fixture format
 
 The TOML shape sæhrimnir loads at startup. v0 supports exactly one
-fixture per process. Plan-2 sketched the shape; this doc tightens it
-where the client surface dictates a specific decision.
-
-The format will refine during implementation. Treat this as the
-"current best understanding" - open questions are flagged inline.
+fixture per process. Open questions are flagged inline; the format
+will grow as new protocol surfaces (calendar, contacts, attachments,
+drive files) need fixture-side data.
 
 ## Top level
 
@@ -27,10 +25,9 @@ name = "test@example.com"
 is_personal = true   # MUST be true for v0; false triggers shared-account paths
 ```
 
-`name` is a fixture identifier that brokkr's plan-3 `--fixture` flag
-resolves against. Whether the resolution is `<fixtures_dir>/<name>.toml`
-or via a manifest is a plan-3 detail; sæhrimnir just consumes whatever
-file path it's handed.
+`name` is a fixture identifier brokkr resolves against (typically
+`<fixtures_dir>/<name>.toml`); sæhrimnir just consumes whatever file
+path it's handed via `--fixture`.
 
 ## Mailboxes
 

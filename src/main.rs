@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.readiness_file,
         &[
             ProtocolPort {
-                name: "READY",
+                name: "JMAP",
                 port: jmap_addr.port(),
             },
             ProtocolPort {
