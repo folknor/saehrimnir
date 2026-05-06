@@ -9,8 +9,9 @@
 //! v0 scope (see `notes/imap-plan.md`): plaintext only, accept any
 //! credential. Currently implemented: greeting, `CAPABILITY`, `NOOP`,
 //! `LOGOUT`, `LOGIN`, `AUTHENTICATE` (PLAIN / XOAUTH2 / OAUTHBEARER),
-//! `ENABLE QRESYNC`, `LIST`, `STATUS`. Everything else returns
-//! tagged `BAD`.
+//! `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT` / `EXAMINE`,
+//! `UID SEARCH`. `UID FETCH` is next. Everything else returns tagged
+//! `BAD`.
 
 use std::sync::Arc;
 
@@ -20,7 +21,9 @@ use tokio::io::{
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::fixture::{Fixture, Mailbox, Role};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+
+use crate::fixture::{Email, Fixture, Mailbox, Role};
 
 /// Greeting line emitted as soon as the connection is accepted, before
 /// the client says anything. Per RFC 3501 sec 7.1, an `* OK` greeting
@@ -38,7 +41,6 @@ pub const CAPABILITIES: &str = "IMAP4REV1 CONDSTORE QRESYNC";
 enum State {
     NotAuthenticated,
     Authenticated,
-    #[allow(dead_code)] // wired up in step 4 (SELECT)
     Selected,
     Logout,
 }
@@ -94,6 +96,7 @@ where
         writer,
         state: State::NotAuthenticated,
         fixture,
+        selected: None,
     };
 
     conn.write_line(GREETING.trim_end_matches("\r\n")).await?;
@@ -121,6 +124,10 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     writer: WriteHalf<S>,
     state: State,
     fixture: Arc<Fixture>,
+    /// Fixture id of the currently selected mailbox, if any. Set by
+    /// SELECT/EXAMINE, cleared on CLOSE/UNSELECT (which we don't yet
+    /// handle).
+    selected: Option<String>,
 }
 
 enum ReadOutcome {
@@ -196,6 +203,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "ENABLE" => self.cmd_enable(parsed.tag, parsed.args).await,
             "LIST" => self.cmd_list(parsed.tag, parsed.args).await,
             "STATUS" => self.cmd_status(parsed.tag, parsed.args).await,
+            "SELECT" => self.cmd_select(parsed.tag, parsed.args, true).await,
+            "EXAMINE" => self.cmd_select(parsed.tag, parsed.args, false).await,
+            "UID" => self.cmd_uid(parsed.tag, parsed.args).await,
+            "CLOSE" => self.cmd_close(parsed.tag).await,
             other => {
                 self.write_line(&format!(
                     "{} BAD {other} not implemented in v0",
@@ -404,6 +415,135 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     fn is_authenticated(&self) -> bool {
         matches!(self.state, State::Authenticated | State::Selected)
     }
+
+    async fn cmd_select(
+        &mut self,
+        tag: &str,
+        args: &str,
+        read_write: bool,
+    ) -> std::io::Result<()> {
+        if !self.is_authenticated() {
+            return self
+                .write_line(&format!("{tag} BAD SELECT requires authentication"))
+                .await;
+        }
+        let name = match parse_one_astring(args) {
+            Some(n) => n,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD SELECT expects \"name\""))
+                    .await;
+            }
+        };
+        let entries = list_mailboxes(&self.fixture);
+        let entry = entries.iter().find(|e| e.path.eq_ignore_ascii_case(&name));
+        let Some(entry) = entry else {
+            // Per RFC, on NO SELECT the connection drops back to
+            // Authenticated state.
+            self.state = State::Authenticated;
+            self.selected = None;
+            return self
+                .write_line(&format!("{tag} NO SELECT unknown mailbox"))
+                .await;
+        };
+
+        let counts = mailbox_counts(&self.fixture, &entry.fixture_id);
+        let first_unseen_idx = mailbox_messages(&self.fixture, &entry.fixture_id)
+            .iter()
+            .position(|(_, e)| !e.keywords.iter().any(|k| k == "$seen"));
+        let entry_id = entry.fixture_id.clone();
+
+        // Untagged responses, RFC 3501 sec 6.3.1. Order does not
+        // matter, but we emit a stable order for byte-determinism.
+        self.write_line(&format!("* {} EXISTS", counts.exists)).await?;
+        self.write_line("* 0 RECENT").await?;
+        self.write_line("* FLAGS (\\Seen \\Flagged \\Draft \\Answered \\Deleted)")
+            .await?;
+        self.write_line(
+            "* OK [PERMANENTFLAGS (\\Seen \\Flagged \\Draft \\Answered \\Deleted \\*)] flags writable",
+        )
+        .await?;
+        if let Some(idx) = first_unseen_idx {
+            self.write_line(&format!("* OK [UNSEEN {}] first unseen", idx + 1))
+                .await?;
+        }
+        self.write_line("* OK [UIDVALIDITY 1] folder identity")
+            .await?;
+        self.write_line(&format!("* OK [UIDNEXT {}] predicted next UID", counts.uidnext))
+            .await?;
+        self.write_line("* OK [HIGHESTMODSEQ 1] modseq pinned").await?;
+
+        let access = if read_write { "READ-WRITE" } else { "READ-ONLY" };
+        let verb = if read_write { "SELECT" } else { "EXAMINE" };
+        self.state = State::Selected;
+        self.selected = Some(entry_id);
+        self.write_line(&format!("{tag} OK [{access}] {verb} completed"))
+            .await
+    }
+
+    async fn cmd_close(&mut self, tag: &str) -> std::io::Result<()> {
+        if self.state != State::Selected {
+            return self
+                .write_line(&format!("{tag} BAD CLOSE requires SELECT"))
+                .await;
+        }
+        self.selected = None;
+        self.state = State::Authenticated;
+        self.write_line(&format!("{tag} OK CLOSE completed")).await
+    }
+
+    async fn cmd_uid(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if self.state != State::Selected {
+            return self
+                .write_line(&format!("{tag} BAD UID requires SELECT"))
+                .await;
+        }
+        let mut parts = args.splitn(2, ' ');
+        let sub = parts.next().unwrap_or("").to_ascii_uppercase();
+        let rest = parts.next().unwrap_or("").trim();
+        match sub.as_str() {
+            "SEARCH" => self.cmd_uid_search(tag, rest).await,
+            other => {
+                self.write_line(&format!(
+                    "{tag} BAD UID {other} not implemented in v0"
+                ))
+                .await
+            }
+        }
+    }
+
+    async fn cmd_uid_search(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        let selected_id = self.selected.clone().expect("Selected state requires selected mailbox");
+        let messages = mailbox_messages(&self.fixture, &selected_id);
+        let matches = match parse_uid_search(args) {
+            Some(m) => m,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID SEARCH unsupported criteria"))
+                    .await;
+            }
+        };
+        let mut hits: Vec<u32> = messages
+            .iter()
+            .filter(|(uid, e)| matches.matches(*uid, e))
+            .map(|(uid, _)| *uid)
+            .collect();
+        hits.sort_unstable();
+
+        let line = if hits.is_empty() {
+            "* SEARCH".to_string()
+        } else {
+            let mut s = String::from("* SEARCH");
+            for u in &hits {
+                s.push(' ');
+                s.push_str(&u.to_string());
+            }
+            s
+        };
+        self.write_line(&line).await?;
+        self.write_line(&format!("{tag} OK UID SEARCH completed"))
+            .await
+    }
 }
 
 // ── Mailbox projection ──────────────────────────────────────────────
@@ -477,6 +617,22 @@ struct Counts {
     uidnext: u64,
 }
 
+/// Yield `(uid, email)` pairs for emails in `mailbox_id`, in fixture
+/// declaration order. UIDs are 1-based per the determinism contract:
+/// the first email declared in a fixture mailbox is UID 1, the second
+/// is UID 2, etc. Membership is by `mailbox_ids` containment, not by
+/// declaration position, so the order is stable across fixture edits
+/// that don't reorder existing emails.
+fn mailbox_messages<'a>(fixture: &'a Fixture, mailbox_id: &str) -> Vec<(u32, &'a Email)> {
+    fixture
+        .emails
+        .iter()
+        .filter(|e| e.mailbox_ids.iter().any(|id| id == mailbox_id))
+        .enumerate()
+        .map(|(i, e)| (i as u32 + 1, e))
+        .collect()
+}
+
 fn mailbox_counts(fixture: &Fixture, mailbox_id: &str) -> Counts {
     let in_box: Vec<_> = fixture
         .emails
@@ -496,6 +652,18 @@ fn mailbox_counts(fixture: &Fixture, mailbox_id: &str) -> Counts {
 }
 
 // ── Tiny IMAP-arg parsers ───────────────────────────────────────────
+
+/// Parse exactly one astring, returning its raw content. Returns
+/// `None` on empty input or trailing junk.
+fn parse_one_astring(args: &str) -> Option<String> {
+    let mut p = AstringParser { s: args, i: 0 };
+    let a = p.next_astring()?;
+    p.skip_spaces();
+    if p.i != p.s.len() {
+        return None;
+    }
+    Some(a)
+}
 
 /// Parse exactly two astrings (either quoted or atom), returning their
 /// raw string contents. Returns `None` on syntax error.
@@ -604,6 +772,65 @@ impl<'a> AstringParser<'a> {
             Some(self.s[start..self.i].to_string())
         }
     }
+}
+
+/// IMAP search criteria the v0 mock understands. ratatoskr only sends
+/// these three shapes (`notes/ratatoskr-imap-surface.md`); everything
+/// else maps to `BAD`.
+#[derive(Debug)]
+enum SearchCriteria {
+    All,
+    UidRange { lo: u32, hi: Option<u32> },
+    Since(DateTime<Utc>),
+}
+
+impl SearchCriteria {
+    fn matches(&self, uid: u32, email: &Email) -> bool {
+        match self {
+            SearchCriteria::All => true,
+            SearchCriteria::UidRange { lo, hi } => uid >= *lo && hi.is_none_or(|h| uid <= h),
+            SearchCriteria::Since(ts) => email.received_at >= *ts,
+        }
+    }
+}
+
+fn parse_uid_search(args: &str) -> Option<SearchCriteria> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("ALL") {
+        return Some(SearchCriteria::All);
+    }
+    // SINCE <date>
+    if let Some(rest) = strip_prefix_ci(trimmed, "SINCE ") {
+        let date = parse_imap_date(rest.trim())?;
+        let dt = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?);
+        return Some(SearchCriteria::Since(dt));
+    }
+    // <lo>:<hi> or <lo>:* (UID set; v0 only supports a single range).
+    if let Some((lo, hi)) = trimmed.split_once(':') {
+        let lo: u32 = lo.parse().ok()?;
+        let hi = if hi == "*" {
+            None
+        } else {
+            Some(hi.parse().ok()?)
+        };
+        return Some(SearchCriteria::UidRange { lo, hi });
+    }
+    None
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Parse an IMAP date string `dd-Mmm-yyyy` (RFC 3501 sec 9). The mock
+/// accepts both quoted and unquoted forms.
+fn parse_imap_date(s: &str) -> Option<NaiveDate> {
+    let s = s.trim_matches('"');
+    NaiveDate::parse_from_str(s, "%d-%b-%Y").ok()
 }
 
 /// Match an IMAP LIST pattern. v0 supports `*` (match anything) and
@@ -1058,6 +1285,142 @@ mod tests {
         assert!(pattern_matches("Inbox*", "Inbox/Sub"));
         assert!(pattern_matches("*Sub", "Inbox/Sub"));
         assert!(!pattern_matches("INBOX", "Inbox"));
+    }
+
+    // ── SELECT / UID SEARCH tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn select_inbox_emits_required_untagged_responses() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nq LOGOUT\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        // Inbox has 2 emails, one $seen.
+        assert!(out.contains("* 2 EXISTS\r\n"), "got: {out:?}");
+        assert!(out.contains("* 0 RECENT\r\n"));
+        assert!(out.contains("* FLAGS (\\Seen \\Flagged \\Draft \\Answered \\Deleted)\r\n"));
+        assert!(out.contains("* OK [PERMANENTFLAGS"));
+        assert!(out.contains("* OK [UIDVALIDITY 1]"));
+        assert!(out.contains("* OK [UIDNEXT 3]"));
+        assert!(out.contains("* OK [HIGHESTMODSEQ 1]"));
+        // First unseen is the second email (e2; e1 has $seen).
+        assert!(out.contains("* OK [UNSEEN 2]"));
+        assert!(out.contains("b OK [READ-WRITE] SELECT completed"));
+    }
+
+    #[tokio::test]
+    async fn examine_returns_read_only() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb EXAMINE \"INBOX\"\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("b OK [READ-ONLY] EXAMINE completed"));
+    }
+
+    #[tokio::test]
+    async fn select_unknown_mailbox_returns_no_and_drops_to_authenticated() {
+        // After NO SELECT, UID SEARCH (which requires Selected) should
+        // also reject.
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"Ghost\"\r\nc UID SEARCH ALL\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("b NO SELECT unknown mailbox"));
+        assert!(out.contains("c BAD UID requires SELECT"));
+    }
+
+    #[tokio::test]
+    async fn uid_search_all_returns_uids_in_ascending_order() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID SEARCH ALL\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("* SEARCH 1 2\r\n"), "got: {out:?}");
+        assert!(out.contains("c OK UID SEARCH completed"));
+    }
+
+    #[tokio::test]
+    async fn uid_search_range_filters_to_lo_hi() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID SEARCH 2:*\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("* SEARCH 2\r\n"), "got: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn uid_search_empty_match_emits_bare_search_line() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID SEARCH 99:*\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("* SEARCH\r\n"));
+        assert!(out.contains("c OK UID SEARCH completed"));
+    }
+
+    #[tokio::test]
+    async fn uid_search_since_uses_received_at() {
+        // Fixture timestamps are 2026-01-15. Anything later returns
+        // empty.
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID SEARCH SINCE 16-Jan-2026\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("* SEARCH\r\n"));
+
+        // Anything earlier returns both UIDs.
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID SEARCH SINCE 1-Jan-2026\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("* SEARCH 1 2"));
+    }
+
+    #[tokio::test]
+    async fn close_returns_to_authenticated() {
+        let out = run_script_with(
+            b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc CLOSE\r\nd UID SEARCH ALL\r\n",
+            fixture_with_folders(),
+        )
+        .await;
+        assert!(out.contains("c OK CLOSE completed"));
+        assert!(out.contains("d BAD UID requires SELECT"));
+    }
+
+    #[tokio::test]
+    async fn select_pre_auth_is_bad() {
+        let out = run_script(b"a SELECT \"INBOX\"\r\n").await;
+        assert!(out.contains("a BAD SELECT requires authentication"));
+    }
+
+    #[test]
+    fn parse_uid_search_recognises_all_range_and_since() {
+        assert!(matches!(
+            parse_uid_search("ALL"),
+            Some(SearchCriteria::All)
+        ));
+        assert!(matches!(
+            parse_uid_search("1:*"),
+            Some(SearchCriteria::UidRange { lo: 1, hi: None })
+        ));
+        assert!(matches!(
+            parse_uid_search("3:7"),
+            Some(SearchCriteria::UidRange { lo: 3, hi: Some(7) })
+        ));
+        assert!(matches!(
+            parse_uid_search("SINCE 1-Jan-2026"),
+            Some(SearchCriteria::Since(_))
+        ));
+        // Bogus criteria fall through.
+        assert!(parse_uid_search("FROM \"alice\"").is_none());
     }
 
     #[tokio::test]

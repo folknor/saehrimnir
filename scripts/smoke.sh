@@ -192,8 +192,8 @@ assert mr[2] == "c1", mr
 print("unknownMethod: ok")
 ' "$unk"
 
-echo "=== IMAP full bootstrap + LIST + STATUS ==="
-imap_out="$(printf 'a1 CAPABILITY\r\nb1 LOGIN "alice" "hunter2"\r\nc1 ENABLE QRESYNC\r\nd1 LIST "" "*"\r\ne1 STATUS "INBOX" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ)\r\nq LOGOUT\r\n' | nc -w 2 127.0.0.1 "$imap_port")"
+echo "=== IMAP full bootstrap + LIST + STATUS + SELECT + UID SEARCH ==="
+imap_out="$(printf 'a1 CAPABILITY\r\nb1 LOGIN "alice" "hunter2"\r\nc1 ENABLE QRESYNC\r\nd1 LIST "" "*"\r\ne1 STATUS "INBOX" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ)\r\nf1 SELECT "INBOX"\r\ng1 UID SEARCH ALL\r\nh1 UID SEARCH 2:*\r\nq LOGOUT\r\n' | nc -w 2 127.0.0.1 "$imap_port")"
 python3 -c '
 import sys
 out = sys.argv[1]
@@ -203,16 +203,27 @@ assert "a1 OK CAPABILITY completed" in out, out
 assert "b1 OK [CAPABILITY IMAP4REV1 CONDSTORE QRESYNC] LOGIN completed" in out, out
 assert "* ENABLED QRESYNC" in out, out
 assert "c1 OK ENABLE completed" in out, out
-# LIST emits one untagged per fixture mailbox, with role-derived attrs.
 assert "* LIST (\\Inbox) \"/\" \"INBOX\"" in out, out
 assert "* LIST (\\Archive) \"/\" \"Archive\"" in out, out
 assert "d1 OK LIST completed" in out, out
-# STATUS: jmap-small fixture has 2 emails in inbox, both unseen.
 assert "* STATUS \"INBOX\" (MESSAGES 2 UNSEEN 2 UIDNEXT 3 UIDVALIDITY 1 HIGHESTMODSEQ 1)" in out, out
 assert "e1 OK STATUS completed" in out, out
+# SELECT - should emit the canonical untagged set.
+assert "* 2 EXISTS" in out, out
+assert "* 0 RECENT" in out, out
+assert "* OK [UIDVALIDITY 1]" in out, out
+assert "* OK [UIDNEXT 3]" in out, out
+assert "* OK [HIGHESTMODSEQ 1]" in out, out
+assert "f1 OK [READ-WRITE] SELECT completed" in out, out
+# UID SEARCH ALL with two emails -> "* SEARCH 1 2".
+assert "* SEARCH 1 2" in out, out
+assert "g1 OK UID SEARCH completed" in out, out
+# UID SEARCH 2:* on a 2-email folder -> "* SEARCH 2".
+assert "* SEARCH 2\r\n" in out, out
+assert "h1 OK UID SEARCH completed" in out, out
 assert "* BYE saehrimnir signing off" in out, out
 assert "q OK LOGOUT completed" in out, out
-print("IMAP auth + LIST + STATUS: ok")
+print("IMAP through UID SEARCH: ok")
 ' "$imap_out"
 
 echo "=== SIGTERM ==="
