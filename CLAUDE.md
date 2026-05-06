@@ -23,6 +23,10 @@ per-protocol surface docs.
 - `notes/imap-plan.md` - implementation plan for the IMAP layer.
 - `notes/ratatoskr-smtp-surface.md` - same shape, for SMTP.
 - `notes/smtp-plan.md` - implementation plan for the SMTP layer.
+- `notes/ratatoskr-graph-surface.md` - same shape, for Microsoft
+  Graph (mail-sync only in v0; the doc lists future resource
+  categories so the module structure can accept them).
+- `notes/graph-plan.md` - implementation plan for the Graph layer.
 - `notes/jmap-client-fork.md` - pointer to the local jmap-client fork.
 - `notes/fixture-format.md` - TOML fixture shape and validation rules.
 - `TODO.md` - implementation steps still pending, with the design
@@ -69,10 +73,17 @@ checking whether the fact is already in `notes/`.
   dispatcher, RFC 822 emit.
 - `src/smtp.rs` - SMTP submission listener + in-memory submission
   capture log.
+- `src/graph/` - Microsoft Graph mock. `mod.rs` (router, AppState,
+  catchall 404), `odata.rs` (query parsing, pagination cursors,
+  envelope), `mail.rs` (mail-sync handlers). Sibling files for
+  calendar / contacts / drive / groups / EWS land here when those
+  surfaces are scouted.
 - `tests/api.rs` - JMAP integration tests via
   `tower::ServiceExt::oneshot`.
 - `tests/imap.rs` - IMAP integration tests over a duplex stream.
 - `tests/smtp.rs` - SMTP integration tests over a duplex stream.
+- `tests/graph.rs` - Graph integration tests via
+  `tower::ServiceExt::oneshot`.
 - `fixtures/jmap-small.toml` - canonical v0 fixture (despite the
   name, both protocols read from it).
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
@@ -95,8 +106,16 @@ dot-stuffing reversal, RSET, NOOP, QUIT). Submissions captured in an
 in-memory `SubmissionLog` that tests read directly. Integration tests
 in `tests/smtp.rs`.
 
-Graph / Gmail: queued. Each will follow the JMAP/IMAP/SMTP pattern
-(scout the client surface, plan, implement).
+Graph: complete for v0's mail-sync path. `/v1.0/me/mailFolders`
+(list, by-id, by-well-known-alias, childFolders), `/v1.0/me/
+mailFolders/{id}/messages` (with `$top`/`$skip`/`$skiptoken`/
+`$filter`), `/v1.0/me/mailFolders/{id}/messages/delta` (initial
+dump, follow-up no-op, `$deltatoken=latest` shortcut). Catchall
+returns the Graph error envelope so unimplemented resources are
+visibly out-of-scope. Module is laid out as a directory so calendar/
+contacts/drive/groups/EWS drop in as siblings later.
+
+Gmail: queued.
 
 ## Rules
 

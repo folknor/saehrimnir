@@ -68,7 +68,9 @@ fi
 jmap_port="$(awk '/^READY /{print $2}' "$ready_file")"
 imap_port="$(awk '/^IMAP /{print $2}' "$ready_file")"
 smtp_port="$(awk '/^SMTP /{print $2}' "$ready_file")"
+graph_port="$(awk '/^GRAPH /{print $2}' "$ready_file")"
 base="http://127.0.0.1:$jmap_port"
+graph_base="http://127.0.0.1:$graph_port"
 echo "sentinel:"
 sed 's/^/  /' "$ready_file"
 
@@ -268,6 +270,43 @@ assert "250 OK queued" in out, out
 assert "221 saehrimnir bye" in out, out
 print("SMTP submission: ok")
 ' "$smtp_out"
+
+echo "=== Graph mailFolders + messages + delta ==="
+folders="$(curl -fsSL "$graph_base/v1.0/me/mailFolders" -H 'Authorization: Bearer x')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+v = d["value"]
+ids = [f["id"] for f in v]
+assert ids == ["mbx-inbox", "mbx-archive"], ids
+assert v[0]["wellKnownName"] == "inbox"
+assert v[0]["totalItemCount"] == 2
+print("Graph mailFolders: ok")
+' "$folders"
+
+inbox_msgs="$(curl -fsSL "$graph_base/v1.0/me/mailFolders/inbox/messages" -H 'Authorization: Bearer x')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+ids = [m["id"] for m in d["value"]]
+assert ids == ["email-002", "email-001"], ids
+m0 = d["value"][0]
+assert m0["body"]["contentType"] == "text"
+assert m0["body"]["content"] == "Reply body."
+assert m0["from"]["emailAddress"]["address"] == "carol@example.com"
+assert m0["receivedDateTime"].endswith("Z")
+print("Graph messages: ok")
+' "$inbox_msgs"
+
+delta="$(curl -fsSL "$graph_base/v1.0/me/mailFolders/inbox/messages/delta" -H 'Authorization: Bearer x')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert len(d["value"]) == 2
+assert "@odata.deltaLink" in d
+assert "$deltatoken=" in d["@odata.deltaLink"]
+print("Graph delta: ok")
+' "$delta"
 
 echo "=== SIGTERM ==="
 kill -TERM "$pid"

@@ -28,13 +28,25 @@ Done in this session:
    initial-sync transcript plus a literal-block byte-accuracy check
    and a determinism check across two runs.
 
-## Next: Microsoft Graph
+## Now: Microsoft Graph - what's left
 
-JSON-over-HTTPS like JMAP, so the axum infrastructure carries over.
-New surface scout (`<ratatoskr>/crates/graph/src/`), new plan doc,
-new dispatcher. EWS (Exchange Web Services) is in
-`graph/src/ews/` - flag whether it is also exercised by ratatoskr's
-sync path; if so it lands here too.
+v0 mail-sync surface is complete. Future Graph work, in roughly the
+order the next fixture is likely to need it:
+
+- Calendar sync (`<ratatoskr>/crates/graph/src/calendar_sync.rs`).
+  Will need `[[calendar]]` and `[[event]]` fixture entries.
+- Contact sync (`contact_sync.rs`). Will need `[[contact]]` /
+  `[[contact_folder]]` fixture entries.
+- Master category list (`label_sync.rs`).
+- Group enumeration (`group_sync.rs`).
+- OneDrive resumable upload sessions (`onedrive.rs`) - needed once
+  the SMTP / Graph submit paths grow attachments.
+- Public-folder sync via EWS (`ews/`, `public_folder_sync.rs`).
+  Different protocol (SOAP), separate `src/ews.rs` module.
+- Shared mailbox sync via `/users/{id}/...` paths
+  (`shared_mailbox_sync.rs`). Needs multi-account fixtures.
+- Webhooks / change notifications (`webhooks.rs`).
+- Autodiscover (`autodiscover.rs`).
 
 ## Next: Gmail
 
