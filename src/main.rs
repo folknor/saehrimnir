@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use saehrimnir::sentinel::ProtocolPort;
-use saehrimnir::{cli, fixture, gmail, graph, imap, routes, sentinel, shutdown, smtp};
+use saehrimnir::{cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp};
 use tokio::sync::watch;
 
 /// Hard budget on graceful drain after SIGTERM. Plan-2 acceptance #6
@@ -14,14 +14,16 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(1);
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = cli::Args::parse();
 
-    let fixture = fixture::load(&args.fixture).map_err(|e| format!("fixture: {e}"))?;
+    let scenario = scenario::load(&args.fixture).map_err(|e| format!("fixture: {e}"))?;
     eprintln!(
-        "saehrimnir: fixture {:?} loaded ({} mailboxes, {} emails)",
-        fixture.name,
-        fixture.mailboxes.len(),
-        fixture.emails.len()
+        "saehrimnir: fixture {:?} loaded ({} mailboxes, {} emails, dispatcher: {})",
+        scenario.fixture.name,
+        scenario.fixture.mailboxes.len(),
+        scenario.fixture.emails.len(),
+        if scenario.dispatcher.is_some() { "yes" } else { "no" },
     );
-    let fixture = Arc::new(fixture);
+    let fixture = Arc::clone(&scenario.fixture);
+    let dispatcher = scenario.dispatcher.clone();
 
     // JMAP listener.
     let jmap_listener =
@@ -105,11 +107,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_future(),
     );
 
-    // IMAP server.
+    // IMAP server. Threads the optional Lua dispatcher so reactive
+    // callbacks (currently UID FETCH) can fire.
     let imap_shutdown_rx = shutdown_rx.clone();
     let imap_fixture = Arc::clone(&fixture);
+    let imap_dispatcher = dispatcher.clone();
     let imap_task = tokio::spawn(async move {
-        imap::serve(imap_listener, imap_fixture, imap_shutdown_rx).await
+        imap::serve(imap_listener, imap_fixture, imap_dispatcher, imap_shutdown_rx).await
     });
 
     // SMTP server. The submission log is process-scoped (cleared at

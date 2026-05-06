@@ -52,6 +52,7 @@ enum State {
 pub async fn serve(
     listener: TcpListener,
     fixture: Arc<Fixture>,
+    dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -66,9 +67,10 @@ pub async fn serve(
                 match accept {
                     Ok((stream, peer)) => {
                         let fix = Arc::clone(&fixture);
+                        let disp = dispatcher.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, fix, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, fix, disp, &mut sd).await {
                                 eprintln!("saehrimnir: imap connection {peer}: {e}");
                             }
                         });
@@ -82,10 +84,14 @@ pub async fn serve(
     }
 }
 
-/// Drive a single IMAP connection.
+/// Drive a single IMAP connection. `dispatcher` is `None` for
+/// callback-free scenarios (TOML fixtures or Lua scenarios that
+/// registered no `on()` handlers); when present, protocol commands
+/// consult it before generating their default responses.
 pub async fn serve_connection<S>(
     stream: S,
     fixture: Arc<Fixture>,
+    dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -97,6 +103,7 @@ where
         writer,
         state: State::NotAuthenticated,
         fixture,
+        dispatcher,
         selected: None,
     };
 
@@ -125,6 +132,7 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     writer: WriteHalf<S>,
     state: State,
     fixture: Arc<Fixture>,
+    dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     /// Fixture id of the currently selected mailbox, if any. Set by
     /// SELECT/EXAMINE, cleared on CLOSE/UNSELECT (which we don't yet
     /// handle).
@@ -560,6 +568,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .selected
             .clone()
             .expect("Selected state requires selected mailbox");
+
+        // Reactive callback: a registered `on("imap", "UID FETCH",
+        // ...)` handler can override the response. `nil` return =
+        // pass through; a `{status = "...", message = "..."}` table
+        // = emit just the tagged response (no FETCH untagged
+        // updates).
+        if let Some(d) = &self.dispatcher {
+            let uid_set_owned = uid_set_str.to_string();
+            let attrs_owned = attrs_str.to_string();
+            let mailbox = selected_id.clone();
+            let result = d.dispatch("imap", "UID FETCH", move |state| {
+                crate::lua::req_set_str(state, "uid_set", &uid_set_owned)?;
+                crate::lua::req_set_str(state, "attrs", &attrs_owned)?;
+                crate::lua::req_set_str(state, "mailbox", &mailbox)?;
+                Ok(())
+            });
+            if let crate::lua::Override::Tagged { status, message } = result {
+                return self
+                    .write_line(&format!("{tag} {status} {message}"))
+                    .await;
+            }
+        }
+
         // Snapshot the rendered FETCH lines up front so the immutable
         // borrow on self.fixture can drop before we start writing.
         let lines: Vec<String> = if changedsince_matches(changedsince) {
@@ -1567,7 +1598,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, &mut rx).await
+            serve_connection(server, fix, None, &mut rx).await
         });
 
         client.write_all(script).await.unwrap();
@@ -2287,7 +2318,7 @@ mod tests {
         let fix = fixture();
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, &mut rx).await
+            serve_connection(server, fix, None, &mut rx).await
         });
 
         // Read greeting first so the server is parked on the read.

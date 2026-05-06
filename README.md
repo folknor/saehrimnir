@@ -42,11 +42,15 @@ Two equivalent authoring formats, dispatched by file extension:
   `Fixture`; `fixtures/jmap-small.{toml,lua}` are the canonical
   example pair.
 
-Lua exists as the on-ramp for upcoming dynamic features (reactive
-callbacks per protocol command, scenario-driven state mutations,
-self-terminating scripts). v0 only exercises the static
-fixture-builder surface; the dynamic surface is the next chunk of
-work. Note that dellingr deliberately omits Lua's unparenthesized
+Lua scenarios can also register reactive callbacks via
+`on(protocol, command, function)`. The protocol layer consults the
+script before generating its default response; the callback receives
+a `req` table with `call_index` plus protocol-specific fields, and
+can return `{ status = "NO", message = "..." }` to override the wire
+response (or `nil` to pass through). Currently wired for IMAP `UID
+FETCH`; other commands fan out as scenarios demand them.
+
+Note that dellingr deliberately omits Lua's unparenthesized
 function-call sugar, so builder calls are written `mailbox({...})`
 not `mailbox{...}`.
 

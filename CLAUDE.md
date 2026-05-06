@@ -61,11 +61,19 @@ checking whether the fact is already in `notes/`.
   `normalize` cross-reference validator, and the TOML loader. The
   public `load(path)` dispatches to `lua::load` for `.lua` files,
   TOML otherwise.
-- `src/lua.rs` - dellingr-backed Lua scenario loader. Exposes the
-  `fixture` / `account` / `mailbox` / `email` builder `RustFunc`s
-  plus `bulk_emails` for synthetic-data scale testing. Accumulates
+- `src/lua.rs` - dellingr-backed Lua scenario loader and reactive-
+  callback dispatcher. Exposes the `fixture` / `account` / `mailbox`
+  / `email` builder `RustFunc`s plus `bulk_emails` and `bulk_threads`
+  for synthetic-data scale testing. Hosts the `BOOTSTRAP` Lua
+  snippet that defines `on(protocol, command, fn)` and
+  `_sae_dispatch`. `Dispatcher` retains the dellingr `State` behind
+  a `Mutex` so protocol handlers can dispatch callbacks. Accumulates
   into a `Builder` in user_data, and hands the `RawFixture` to
   `fixture::normalize` so validation is shared with the TOML path.
+- `src/scenario.rs` - main loader entry point. `Scenario { fixture,
+  dispatcher }` bundles the validated fixture with the optional
+  callback dispatcher. `scenario::load(path)` dispatches by
+  extension.
 - `src/templates.rs` - synthetic data pools (names, domains,
   projects, teams, topics) and a `fill_template` primitive used by
   `bulk_emails`. Lifted from `<ratatoskr>/crates/dev-seed/src/
@@ -158,24 +166,42 @@ files.
 
 Lua fixture loader: wired via [dellingr](https://crates.io/crates/dellingr),
 a pure-Rust deterministic sandboxed Lua VM with cost-bounded
-execution. The public `fixture::load` dispatches by extension: `.lua`
-goes through `src/lua.rs`, anything else parses as TOML. Both paths
-build the same `RawFixture` intermediate and run through the same
-`normalize` validator, so the resulting `Fixture` is byte-identical
-across formats - asserted by `tests/lua_fixture.rs`. Static surface:
-`fixture`, `account`, `mailbox`, `email` builders for hand-authored
-scenarios; `bulk_emails({ count, mailbox, seed, start_at,
-interval_seconds, id_prefix })` for synthetic scale-test fixtures;
-`bulk_threads({ count, mailbox, messages_per_thread, seed, ... })`
-for multi-message conversations with proper `In-Reply-To` /
+execution. The main entry point is `scenario::load(path)` which
+dispatches by extension: `.lua` goes through `src/lua.rs` and
+retains the dellingr `State` as a `Dispatcher` for reactive
+callbacks; anything else parses as TOML and the dispatcher is
+`None`. The legacy `fixture::load` keeps returning a bare `Fixture`
+for tests that don't care about callbacks.
+
+Static surface: `fixture`, `account`, `mailbox`, `email` builders
+for hand-authored scenarios; `bulk_emails({ count, mailbox, seed,
+start_at, interval_seconds, id_prefix })` for synthetic scale-test
+fixtures; `bulk_threads({ count, mailbox, messages_per_thread, seed,
+... })` for multi-message conversations with proper `In-Reply-To` /
 `References` chaining (deterministic, byte-stable across runs at
-the same seed; templates in `src/templates.rs`). Dynamic surface
-(reactive callbacks keyed by protocol + command, self-terminating
-scripts) is the next chunk and intentionally not yet implemented.
+the same seed; templates in `src/templates.rs`).
+
+Dynamic surface: scripts register callbacks via
+`on(protocol, command, function)`; the protocol layer consults the
+`Dispatcher` before generating its default response. The callback
+receives a `req` table with `call_index` (1-based per (protocol,
+command)) plus protocol-specific fields. Returning a table with
+`{ status = "...", message = "..." }` overrides the response; `nil`
+or no return = pass through. Currently wired for IMAP `UID FETCH`
+only - the dispatcher Mutex<State> + AppState plumbing exists for
+all protocols, individual commands fan out as fixtures need them.
+
+`Dispatcher` is `Arc<Mutex<State>>`-shaped (dellingr 0.2 made
+`State: Send`); the mutex covers brief synchronous Lua calls and is
+never held across `.await`. Per-(protocol, command) call counts
+are tracked alongside so `req.call_index` is strictly increasing.
 
 Note: dellingr deliberately omits Lua's unparenthesized function-call
 sugar, so builder calls in `.lua` fixtures are written
-`mailbox({...})` not `mailbox{...}`.
+`mailbox({...})` not `mailbox{...}`. Also: `dellingr::set_table_raw`
+takes `(key=top, value=below_top)` order - push value FIRST, then
+key on top, then call. Different from standard Lua C API
+(`lua_settable` pops key from -2, value from -1).
 
 ## Rules
 

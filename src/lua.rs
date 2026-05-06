@@ -1,16 +1,20 @@
-//! Lua-driven fixture loader, backed by dellingr.
+//! Lua-driven fixture loader and reactive-callback dispatcher,
+//! backed by dellingr.
 //!
-//! v0 surface: a script can call the global builders `fixture {...}`,
-//! `account {...}`, `mailbox {...}`, and `email {...}` to populate the
-//! same `RawFixture` shape the TOML loader produces. The script runs
-//! once at process start; after it returns, the accumulated state is
-//! handed to [`fixture::normalize`] for cross-reference validation.
+//! Static surface: the script calls global builders `fixture {...}`,
+//! `account {...}`, `mailbox {...}`, `email {...}` (plus
+//! `bulk_emails` / `bulk_threads` for synthetic data) to populate
+//! the same `RawFixture` shape the TOML loader produces.
 //!
-//! Reactive callbacks (`on(protocol, command, function)` style) are
-//! deliberately NOT yet wired - this commit just proves we can embed
-//! dellingr and produce a `Fixture` byte-identical to what TOML would.
+//! Dynamic surface: the script registers callbacks via
+//! `on(protocol, command, function)`. Each protocol's handler
+//! consults [`Dispatcher::dispatch`] before generating its default
+//! response; the callback can return a table to override the wire
+//! response, or `nil` to pass through.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 use dellingr::{ArgCount, LuaType, RetCount, State, error::ErrorKind};
@@ -27,7 +31,31 @@ use crate::templates;
 /// clean error instead of a process death.
 const MAX_BULK_COUNT: i64 = 10_000_000;
 
+/// Bootstrap script that runs before any user script. Defines the
+/// `on(protocol, command, fn)` registration helper, the
+/// `_sae_dispatch(protocol, command, req)` lookup helper called from
+/// Rust, and the `_sae_handlers` table that holds the registered
+/// handlers keyed by `protocol .. "/" .. command`. Lua-side storage
+/// avoids needing a dellingr function-ref-registry API; flat
+/// single-level keying sidesteps nested-table indexing edge cases
+/// in the VM.
+const BOOTSTRAP: &str = r#"
+_sae_handlers = {}
+
+function on(protocol, command, fn)
+    _sae_handlers[protocol .. "/" .. command] = fn
+end
+
+function _sae_dispatch(protocol, command, req)
+    local fn = _sae_handlers[protocol .. "/" .. command]
+    if fn == nil then return nil end
+    return fn(req)
+end
+"#;
+
 /// Read a `.lua` scenario file and produce a fully validated `Fixture`.
+/// Discards the dispatcher; for callback-aware loading, use
+/// [`crate::scenario::load`].
 pub fn load(path: &Path) -> Result<Fixture, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -35,12 +63,37 @@ pub fn load(path: &Path) -> Result<Fixture, String> {
     load_source(&source, &chunk_name)
 }
 
-/// Run a Lua source string through the same pipeline as
-/// [`load`]. Useful for tests that want to skip the file-system dance.
+/// Test-friendly entry point: parse and execute a Lua source string,
+/// returning only the validated `Fixture`. The dispatcher is built
+/// internally and dropped before return; for callback-aware loading
+/// use [`load_source_with_dispatcher`].
 pub fn load_source(source: &str, chunk_name: &str) -> Result<Fixture, String> {
+    load_source_with_dispatcher(source, chunk_name).map(|(f, _)| f)
+}
+
+/// Run a Lua source string and produce both the validated `Fixture`
+/// and a `Dispatcher` that retains the VM for reactive callbacks.
+/// The dispatcher is always returned even if no callbacks were
+/// registered - the cost is one idle `Mutex<State>` and the
+/// per-protocol-handler dispatch becomes a fast no-op when
+/// `_sae_handlers` is empty.
+pub fn load_source_with_dispatcher(
+    source: &str,
+    chunk_name: &str,
+) -> Result<(Fixture, Dispatcher), String> {
     let mut state = State::new();
     state.set_user_data(Builder::default());
     install_builders(&mut state);
+
+    // Bootstrap defines `on()` and `_sae_dispatch()` before the
+    // user script runs. The `set_top(0)` after each call balances
+    // any return values left on the stack (chunks return nothing).
+    state
+        .load_string_named(BOOTSTRAP, Some("@bootstrap".to_string()))
+        .map_err(|e| format!("internal: bootstrap parse: {e}"))?;
+    state
+        .call(ArgCount::Fixed(0), RetCount::Fixed(0))
+        .map_err(|e| format!("internal: bootstrap run: {e}"))?;
 
     state
         .load_string_named(source, Some(chunk_name.to_string()))
@@ -53,9 +106,12 @@ pub fn load_source(source: &str, chunk_name: &str) -> Result<Fixture, String> {
         .user_data_mut::<Builder>()
         .map(std::mem::take)
         .ok_or_else(|| "internal: scenario builder lost".to_string())?;
+    state.clear_user_data();
 
     let raw = builder.into_raw_fixture()?;
-    fixture::normalize(raw)
+    let fixture = fixture::normalize(raw)?;
+    let dispatcher = Dispatcher::new(state);
+    Ok((fixture, dispatcher))
 }
 
 // ── Builder accumulator ─────────────────────────────────────────────
@@ -627,4 +683,190 @@ fn read_address_table_at_top(state: &mut State, key: &str) -> dellingr::Result<R
     let email = state.to_string(-1)?;
     state.pop(1);
     Ok(RawAddress::Full { name, email })
+}
+
+// ── Reactive callback dispatcher ────────────────────────────────────
+
+/// Override the protocol layer's default response for a request.
+/// Returned from [`Dispatcher::dispatch`].
+#[derive(Debug, Clone)]
+pub enum Override {
+    /// No handler matched (or the handler returned `nil`). Caller
+    /// uses the default behaviour.
+    None,
+    /// Replace the response with a tagged status + message. For IMAP
+    /// this becomes `<tag> <status> <message>`. For HTTP protocols
+    /// it could map to a status code in v1.
+    Tagged {
+        /// Status token, e.g. `"NO"`, `"BAD"`, or `"OK"` for IMAP.
+        status: String,
+        /// Human-readable message tail.
+        message: String,
+    },
+}
+
+/// Holds the dellingr `State` after fixture loading so reactive
+/// callbacks can be invoked. `Send` (dellingr 0.2 onward), wrapped
+/// in `Mutex` because `State` is `!Sync` and callback dispatch
+/// requires exclusive access. Per-(protocol, command) call counts
+/// are tracked alongside so `req.call_index` is always a strictly
+/// increasing 1-based count for that exact wire event.
+pub struct Dispatcher {
+    inner: Mutex<DispatcherInner>,
+}
+
+struct DispatcherInner {
+    state: State,
+    call_counts: HashMap<(String, String), u64>,
+}
+
+impl Dispatcher {
+    fn new(state: State) -> Self {
+        Self {
+            inner: Mutex::new(DispatcherInner {
+                state,
+                call_counts: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Run any registered callback for `(protocol, command)`. The
+    /// `build_req` closure is called with the dellingr `State` after
+    /// `_sae_dispatch` and its first three args have been pushed and
+    /// a fresh `req` table has been put on top of the stack with
+    /// `call_index` already set. The closure is responsible for
+    /// adding any protocol-specific fields to that table; it must
+    /// leave the stack balanced (the table at the top, no extra
+    /// items).
+    pub fn dispatch<F>(&self, protocol: &str, command: &str, build_req: F) -> Override
+    where
+        F: FnOnce(&mut State) -> dellingr::Result<()>,
+    {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("dispatcher mutex poisoned");
+        let key = (protocol.to_string(), command.to_string());
+        let call_index = {
+            let entry = inner.call_counts.entry(key).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        run_dispatch(&mut inner.state, protocol, command, call_index, build_req)
+    }
+}
+
+fn run_dispatch<F>(
+    state: &mut State,
+    protocol: &str,
+    command: &str,
+    call_index: u64,
+    build_req: F,
+) -> Override
+where
+    F: FnOnce(&mut State) -> dellingr::Result<()>,
+{
+    state.get_global("_sae_dispatch");
+    if state.typ(-1) != LuaType::Function {
+        state.pop(1);
+        return Override::None;
+    }
+    state.push_string(protocol);
+    state.push_string(command);
+    state.new_table();
+    // Built-in field call_index. dellingr's set_table_raw pops
+    // (key=top, value=below_top); the stdlib convention is push
+    // VALUE first, KEY on top, then call - see lua_std/table.rs's
+    // add_fn! macro.
+    state.push_number(call_index as f64);
+    state.push_string("call_index");
+    if state.set_table_raw(-3).is_err() {
+        state.set_top(0);
+        return Override::None;
+    }
+    if build_req(state).is_err() {
+        state.set_top(0);
+        return Override::None;
+    }
+    // Stack: [_sae_dispatch, protocol, command, req_table]
+    if state.call(ArgCount::Fixed(3), RetCount::Fixed(1)).is_err() {
+        state.set_top(0);
+        return Override::None;
+    }
+    // Stack: [result]
+    let out = decode_override(state);
+    state.pop(1);
+    out
+}
+
+fn decode_override(state: &mut State) -> Override {
+    match state.typ(-1) {
+        LuaType::Nil => Override::None,
+        LuaType::Table => {
+            // Capture the table's absolute index BEFORE the field
+            // lookups push their keys onto the stack - using -1 here
+            // would shift to point at the just-pushed key after
+            // push_string runs.
+            let table_idx = state.get_top() as isize;
+            let status = field_string(state, table_idx, "status")
+                .unwrap_or_else(|| "BAD".to_string());
+            let message = field_string(state, table_idx, "message")
+                .unwrap_or_else(|| "scripted".to_string());
+            Override::Tagged { status, message }
+        }
+        // Anything else (number, string, bool, function) is treated
+        // as "weird, don't override." The script is misshapen but
+        // the test peer should not crash.
+        _ => Override::None,
+    }
+}
+
+/// Read `t[key]` as a string. `t` MUST be either a positive absolute
+/// stack index or already adjusted to account for pushes; passing a
+/// negative relative index that points at the table is unsafe
+/// because pushing the key shifts the relative position.
+fn field_string(state: &mut State, t: isize, key: &str) -> Option<String> {
+    state.push_string(key);
+    if state.get_table_raw(t).is_err() {
+        return None;
+    }
+    let result = if state.typ(-1) == LuaType::String {
+        state.to_string(-1).ok()
+    } else {
+        None
+    };
+    state.pop(1);
+    result
+}
+
+// ── Stack-builder helpers for per-protocol req tables ───────────────
+//
+// These are exposed so each protocol's dispatch site can populate
+// a `req` table on top of the dellingr stack with one-liners
+// instead of inlining the push/set_table_raw dance.
+
+/// Set `req[key] = value` where the table is at the top of the
+/// stack. Pops nothing (the table stays on top).
+///
+/// Note: dellingr's `set_table_raw` pops `(key=top, value=below_top)`.
+/// We push value first then key on top, matching the stdlib
+/// `add_fn!` convention in `lua_std/table.rs`.
+pub fn req_set_str(state: &mut State, key: &str, value: &str) -> dellingr::Result<()> {
+    state.push_string(value);
+    state.push_string(key);
+    state.set_table_raw(-3)
+}
+
+/// Set `req[key] = value` (number) where the table is at the top of
+/// the stack.
+pub fn req_set_int(state: &mut State, key: &str, value: i64) -> dellingr::Result<()> {
+    state.push_number(value as f64);
+    state.push_string(key);
+    state.set_table_raw(-3)
+}
+
+/// Wrap a [`Dispatcher`] in `Arc` for sharing across protocol
+/// listeners.
+pub fn into_arc(d: Dispatcher) -> Arc<Dispatcher> {
+    Arc::new(d)
 }

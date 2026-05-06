@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use saehrimnir::{fixture, imap};
+use saehrimnir::{fixture, imap, lua};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
@@ -16,7 +16,7 @@ async fn run_with_fixture(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, &mut rx).await
+        imap::serve_connection(server, fix, None, &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -155,4 +155,159 @@ async fn deterministic_two_runs_emit_identical_bytes() {
     let a = run_with_fixture(script).await;
     let b = run_with_fixture(script).await;
     assert_eq!(a, b);
+}
+
+// ── Reactive-callback tests ────────────────────────────────────────
+
+async fn run_with_lua_scenario(scenario: &str, imap_script: &[u8]) -> String {
+    let (fix, dispatcher) =
+        lua::load_source_with_dispatcher(scenario, "@cb-test").unwrap();
+    let fix = Arc::new(fix);
+    let dispatcher = Some(Arc::new(dispatcher));
+    let (server, mut client) = tokio::io::duplex(64 * 1024);
+    let (_tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        imap::serve_connection(server, fix, dispatcher, &mut rx).await
+    });
+    client.write_all(imap_script).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    task.await.unwrap().unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
+#[tokio::test]
+async fn uid_fetch_callback_overrides_with_tagged_no() {
+    // Scenario: third UID FETCH returns NO. First two pass through
+    // to the default handler (which emits FETCH responses).
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb-inbox"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "hi",
+        })
+        on("imap", "UID FETCH", function(req)
+            if req.call_index == 3 then
+                return { status = "NO", message = "transient failure" }
+            end
+        end)
+    "#;
+    let imap_script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c1 UID FETCH 1 (UID)\r\n\
+        c2 UID FETCH 1 (UID)\r\n\
+        c3 UID FETCH 1 (UID)\r\n\
+        c4 UID FETCH 1 (UID)\r\n\
+        q LOGOUT\r\n";
+    let out = run_with_lua_scenario(scenario, imap_script).await;
+
+    // Calls 1 and 2: default (FETCH untagged + tagged OK).
+    assert!(out.contains("c1 OK UID FETCH completed"), "got: {out:?}");
+    assert!(out.contains("c2 OK UID FETCH completed"));
+    // Call 3: overridden to NO, no FETCH untagged emitted.
+    assert!(
+        out.contains("c3 NO transient failure"),
+        "missing override on call 3: {out:?}"
+    );
+    // Call 4: back to default behaviour.
+    assert!(out.contains("c4 OK UID FETCH completed"));
+}
+
+#[tokio::test]
+async fn uid_fetch_callback_pass_through_returns_default() {
+    // Scenario registers a handler but it always returns nil -
+    // every FETCH should behave normally.
+    let scenario = r#"
+        fixture({ name = "passthrough" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb-inbox"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "hi",
+        })
+        on("imap", "UID FETCH", function(req)
+            -- always pass through
+            return nil
+        end)
+    "#;
+    let imap_script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID FETCH 1 (UID)\r\n\
+        q LOGOUT\r\n";
+    let out = run_with_lua_scenario(scenario, imap_script).await;
+    assert!(out.contains("* 1 FETCH (UID 1)"));
+    assert!(out.contains("c OK UID FETCH completed"));
+}
+
+#[tokio::test]
+async fn uid_fetch_callback_sees_request_fields() {
+    // Scenario inspects req.uid_set, req.attrs, req.mailbox and
+    // emits a status that echoes them back. Validates that the
+    // dispatcher populates the req table with the IMAP-specific
+    // fields the protocol layer pushes.
+    let scenario = r#"
+        fixture({ name = "echo" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb-inbox"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "hi",
+        })
+        on("imap", "UID FETCH", function(req)
+            return {
+                status = "NO",
+                message = "set=" .. req.uid_set ..
+                    " attrs=" .. req.attrs ..
+                    " mb=" .. req.mailbox,
+            }
+        end)
+    "#;
+    let imap_script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID FETCH 1:5 (UID FLAGS)\r\n\
+        q LOGOUT\r\n";
+    let out = run_with_lua_scenario(scenario, imap_script).await;
+    assert!(
+        out.contains("c NO set=1:5 attrs=(UID FLAGS) mb=mb-inbox"),
+        "got: {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn uid_fetch_no_handler_passes_through_silently() {
+    // Scenario has a dispatcher (it's a Lua scenario) but no
+    // on("imap", "UID FETCH", ...) registered. Should behave
+    // identically to a TOML scenario.
+    let scenario = r#"
+        fixture({ name = "no-handler" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb-inbox"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "hi",
+        })
+    "#;
+    let imap_script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID FETCH 1 (UID)\r\n\
+        q LOGOUT\r\n";
+    let out = run_with_lua_scenario(scenario, imap_script).await;
+    assert!(out.contains("* 1 FETCH (UID 1)"));
+    assert!(out.contains("c OK UID FETCH completed"));
 }

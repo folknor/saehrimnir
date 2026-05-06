@@ -8,6 +8,81 @@ use std::path::Path;
 use saehrimnir::{fixture, lua};
 
 #[test]
+fn dispatcher_invokes_registered_callback() {
+    // Smallest dispatcher smoke test: load a scenario that
+    // registers `on("test", "ping", ...)`, then dispatch a "test"/
+    // "ping" event and verify the callback fired.
+    let (_fixture, dispatcher) = lua::load_source_with_dispatcher(
+        r#"
+        fixture({ name = "cb" })
+        account({ id = "a", name = "a@b" })
+        on("test", "ping", function(req)
+            return { status = "PONG", message = "hello" }
+        end)
+        "#,
+        "@cb",
+    )
+    .unwrap();
+
+    let result = dispatcher.dispatch("test", "ping", |_state| Ok(()));
+    match result {
+        lua::Override::Tagged { status, message } => {
+            assert_eq!(status, "PONG");
+            assert_eq!(message, "hello");
+        }
+        lua::Override::None => panic!("dispatch returned None - handler never fired"),
+    }
+}
+
+#[test]
+fn dispatcher_returns_none_when_no_handler_registered() {
+    let (_fixture, dispatcher) = lua::load_source_with_dispatcher(
+        r#"
+        fixture({ name = "no-cb" })
+        account({ id = "a", name = "a@b" })
+        "#,
+        "@no-cb",
+    )
+    .unwrap();
+
+    let result = dispatcher.dispatch("test", "ping", |_state| Ok(()));
+    assert!(matches!(result, lua::Override::None));
+}
+
+#[test]
+fn dispatcher_call_index_increments_per_protocol_command() {
+    // Each dispatch increments req.call_index for that exact
+    // (protocol, command) pair. The script branches on it to
+    // return distinguishable status tokens.
+    let (_fixture, dispatcher) = lua::load_source_with_dispatcher(
+        r#"
+        fixture({ name = "ix" })
+        account({ id = "a", name = "a@b" })
+        on("test", "ping", function(req)
+            if req.call_index == 1 then
+                return { status = "FIRST", message = "x" }
+            elseif req.call_index == 2 then
+                return { status = "SECOND", message = "x" }
+            else
+                return { status = "LATER", message = "x" }
+            end
+        end)
+        "#,
+        "@ix",
+    )
+    .unwrap();
+
+    let expected = ["FIRST", "SECOND", "LATER", "LATER"];
+    for want in expected {
+        let result = dispatcher.dispatch("test", "ping", |_state| Ok(()));
+        match result {
+            lua::Override::Tagged { status, .. } => assert_eq!(status, want),
+            lua::Override::None => panic!("dispatch returned None"),
+        }
+    }
+}
+
+#[test]
 fn lua_fixture_matches_equivalent_toml() {
     let from_toml = fixture::load(Path::new("fixtures/jmap-small.toml")).unwrap();
     let from_lua = fixture::load(Path::new("fixtures/jmap-small.lua")).unwrap();

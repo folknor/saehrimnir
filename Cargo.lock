@@ -260,8 +260,6 @@ dependencies = [
 [[package]]
 name = "dellingr"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c294d5612804b87cb9f1e159a7b5dd9a5ee4115191adc12e54374e8e73364ac2"
 dependencies = [
  "hotpath",
  "indexmap",

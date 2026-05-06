@@ -13,6 +13,7 @@ pub mod imap;
 pub mod jmap;
 pub mod lua;
 pub mod routes;
+pub mod scenario;
 pub mod sentinel;
 pub mod shutdown;
 pub mod smtp;
