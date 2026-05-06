@@ -112,6 +112,26 @@ assert inbox["unreadEmails"] == 2, inbox
 print("Mailbox/get: ok ({} mailboxes)".format(len(ids)))
 ' "$mbx"
 
+echo "=== POST /jmap/api Email/query ==="
+eq="$(curl -fsSL -H 'Content-Type: application/json' -X POST "$base/jmap/api" --data '{
+  "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+  "methodCalls": [["Email/query", {"accountId": "account-1", "calculateTotal": true}, "q0"]]
+}')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+mr = d["methodResponses"][0]
+assert mr[0] == "Email/query", mr
+result = mr[1]
+# Both fixture emails share 2026-01-15 received_at; "email-002" is newer
+# (11:00 vs 10:00) so it should be first.
+assert result["ids"] == ["email-002", "email-001"], result
+assert result["total"] == 2, result
+assert result["canCalculateChanges"] is False
+assert result["queryState"] == "fixture-state"
+print("Email/query: ok ({} ids)".format(len(result["ids"])))
+' "$eq"
+
 echo "=== POST /jmap/api unknownMethod ==="
 unk="$(curl -fsSL -H 'Content-Type: application/json' -X POST "$base/jmap/api" --data '{
   "using": [],

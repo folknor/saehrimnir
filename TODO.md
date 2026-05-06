@@ -4,33 +4,6 @@ Plan for the next sessions. Tracks the suggested implementation order
 from `notes/plan.md`, with the design decisions already worked out so
 the next session can drop straight into code.
 
-## Step 6: `Email/query`
-
-Request args (RFC 8621 section 4.4):
-- `accountId`.
-- `filter`. For v0 accept `{"after": <unix_seconds>}` (received_at >=
-  ts) and `{"inMailbox": <id>}` (used by ratatoskr's helpers for
-  thread-scoped lookups, `crates/jmap/src/helpers.rs:11-21`).
-- `sort`. `[{"property": "receivedAt"}]`. Direction defaults
-  ascending in the wire format; for determinism sort descending by
-  receivedAt with ties broken by `id` lex (per
-  `notes/fixture-format.md` determinism contract).
-- `position`. Int (default 0). Only non-negative values from the
-  client.
-- `limit`. Int (default 50, ratatoskr's `BATCH_SIZE`). Cap server-side
-  at 256.
-- `calculateTotal`. Bool (default false). True only on first page.
-
-Response args: `accountId`, `queryState` (any stable string;
-`fixture.state` reused is fine), `canCalculateChanges: false` (v0),
-`position` (echo request), `ids: [String]`, `total: u64` (only when
-`calculateTotal: true`).
-
-Loop-termination contract (`ratatoskr-client-surface.md`): client loops
-with `position += 50` until a page returns fewer than 50 ids. Do not
-return exactly 50 on the last page or the loop re-queries forever.
-Easy: `let last = (start + limit).min(total);` and slice.
-
 ## Step 7: `Email/get`
 
 Request args (RFC 8621 section 4.2): `accountId`, `ids: [String]`,
