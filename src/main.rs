@@ -1,7 +1,9 @@
 mod cli;
+mod fixture;
 mod sentinel;
 mod shutdown;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{Router, routing::get};
@@ -14,6 +16,15 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(1);
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = cli::Args::parse();
+
+    let fixture = fixture::load(&args.fixture).map_err(|e| format!("fixture: {e}"))?;
+    eprintln!(
+        "saehrimnir: fixture {:?} loaded ({} mailboxes, {} emails)",
+        fixture.name,
+        fixture.mailboxes.len(),
+        fixture.emails.len()
+    );
+    let _fixture: Arc<fixture::Fixture> = Arc::new(fixture);
 
     let app = Router::new().route("/", get(|| async { "saehrimnir\n" }));
 

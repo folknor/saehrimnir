@@ -1,0 +1,485 @@
+//! Fixture loader and validator.
+//!
+//! Reads a TOML fixture, normalises raw values into typed structs, and
+//! enforces the invariants documented in `notes/fixture-format.md`. The
+//! returned [`Fixture`] is read-only and feeds every JMAP response.
+
+// Routes that consume these fields land in step 4+. Quiet the dead-code
+// warnings until then rather than scatter per-field allows.
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
+
+#[derive(Debug, Clone)]
+pub struct Fixture {
+    pub name: String,
+    pub state: String,
+    pub account: Account,
+    pub mailboxes: Vec<Mailbox>,
+    pub emails: Vec<Email>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Mailbox {
+    pub id: String,
+    pub name: String,
+    pub role: Option<Role>,
+    pub parent_id: Option<String>,
+    pub sort_order: Option<i64>,
+    pub is_subscribed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Inbox,
+    Archive,
+    Drafts,
+    Sent,
+    Trash,
+    Junk,
+    Important,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::Archive => "archive",
+            Self::Drafts => "drafts",
+            Self::Sent => "sent",
+            Self::Trash => "trash",
+            Self::Junk => "junk",
+            Self::Important => "important",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "inbox" => Ok(Self::Inbox),
+            "archive" => Ok(Self::Archive),
+            "drafts" => Ok(Self::Drafts),
+            "sent" => Ok(Self::Sent),
+            "trash" => Ok(Self::Trash),
+            "junk" => Ok(Self::Junk),
+            "important" => Ok(Self::Important),
+            other => Err(format!("unknown role {other:?}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Email {
+    pub id: String,
+    pub thread_id: String,
+    pub mailbox_ids: Vec<String>,
+    pub keywords: Vec<String>,
+    pub size: i64,
+    pub received_at: DateTime<Utc>,
+    pub sent_at: DateTime<Utc>,
+    pub from: Option<Address>,
+    pub to: Vec<Address>,
+    pub cc: Vec<Address>,
+    pub bcc: Vec<Address>,
+    pub reply_to: Vec<Address>,
+    pub subject: Option<String>,
+    pub preview: Option<String>,
+    pub message_id: Vec<String>,
+    pub in_reply_to: Vec<String>,
+    pub references: Vec<String>,
+    pub has_attachment: bool,
+    pub body: Body,
+}
+
+#[derive(Debug, Clone)]
+pub struct Address {
+    pub name: Option<String>,
+    pub email: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum Body {
+    /// Inline plain-text body. The default for v0 fixtures.
+    Text(String),
+}
+
+// ── Raw types for serde deserialization ─────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RawFixture {
+    name: String,
+    #[serde(default)]
+    state: Option<String>,
+    account: RawAccount,
+    #[serde(default, rename = "mailbox")]
+    mailboxes: Vec<RawMailbox>,
+    #[serde(default, rename = "email")]
+    emails: Vec<RawEmail>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAccount {
+    id: String,
+    name: String,
+    is_personal: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMailbox {
+    id: String,
+    name: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    sort_order: Option<i64>,
+    #[serde(default)]
+    is_subscribed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEmail {
+    id: String,
+    #[serde(default)]
+    thread_id: Option<String>,
+    mailbox_ids: Vec<String>,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    size: Option<i64>,
+    received_at: String,
+    #[serde(default)]
+    sent_at: Option<String>,
+    #[serde(default)]
+    from: Option<RawAddress>,
+    #[serde(default)]
+    to: Vec<RawAddress>,
+    #[serde(default)]
+    cc: Vec<RawAddress>,
+    #[serde(default)]
+    bcc: Vec<RawAddress>,
+    #[serde(default)]
+    reply_to: Vec<RawAddress>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    preview: Option<String>,
+    #[serde(default)]
+    message_id: Vec<String>,
+    #[serde(default)]
+    in_reply_to: Vec<String>,
+    #[serde(default)]
+    references: Vec<String>,
+    #[serde(default)]
+    has_attachment: Option<bool>,
+    #[serde(default)]
+    body_text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawAddress {
+    Bare(String),
+    Full {
+        #[serde(default)]
+        name: Option<String>,
+        email: String,
+    },
+}
+
+impl From<RawAddress> for Address {
+    fn from(raw: RawAddress) -> Self {
+        match raw {
+            RawAddress::Bare(email) => Self { name: None, email },
+            RawAddress::Full { name, email } => Self { name, email },
+        }
+    }
+}
+
+// ── Loader ──────────────────────────────────────────────────────────
+
+pub fn load(path: &Path) -> Result<Fixture, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let raw: RawFixture =
+        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    normalize(raw)
+}
+
+fn normalize(raw: RawFixture) -> Result<Fixture, String> {
+    if !raw.account.is_personal {
+        return Err("account.is_personal must be true (v0 supports one personal account)".into());
+    }
+
+    let mut mb_ids: HashMap<String, ()> = HashMap::new();
+    for mb in &raw.mailboxes {
+        if mb_ids.insert(mb.id.clone(), ()).is_some() {
+            return Err(format!("duplicate mailbox id {:?}", mb.id));
+        }
+    }
+
+    let mut mailboxes = Vec::with_capacity(raw.mailboxes.len());
+    for mb in raw.mailboxes {
+        let role = mb.role.as_deref().map(Role::parse).transpose()?;
+        if let Some(parent) = &mb.parent_id
+            && !mb_ids.contains_key(parent)
+        {
+            return Err(format!(
+                "mailbox {:?}: parent_id {parent:?} does not exist",
+                mb.id
+            ));
+        }
+        mailboxes.push(Mailbox {
+            is_subscribed: mb.is_subscribed.unwrap_or(true),
+            id: mb.id,
+            name: mb.name,
+            role,
+            parent_id: mb.parent_id,
+            sort_order: mb.sort_order,
+        });
+    }
+    detect_cycles(&mailboxes)?;
+
+    let mut email_ids: HashMap<String, ()> = HashMap::new();
+    for em in &raw.emails {
+        if email_ids.insert(em.id.clone(), ()).is_some() {
+            return Err(format!("duplicate email id {:?}", em.id));
+        }
+    }
+
+    let mut emails = Vec::with_capacity(raw.emails.len());
+    for em in raw.emails {
+        if em.mailbox_ids.is_empty() {
+            return Err(format!("email {:?}: mailbox_ids must not be empty", em.id));
+        }
+        for mid in &em.mailbox_ids {
+            if !mb_ids.contains_key(mid) {
+                return Err(format!(
+                    "email {:?}: mailbox_ids contains unknown {mid:?}",
+                    em.id
+                ));
+            }
+        }
+
+        let body = match em.body_text {
+            Some(t) => Body::Text(t),
+            None => {
+                return Err(format!(
+                    "email {:?}: must declare body_text (body_path/body_html not yet implemented)",
+                    em.id
+                ));
+            }
+        };
+
+        let received_at =
+            parse_ts(&em.received_at).map_err(|e| format!("email {:?} received_at: {e}", em.id))?;
+        let sent_at = match em.sent_at {
+            Some(s) => parse_ts(&s).map_err(|e| format!("email {:?} sent_at: {e}", em.id))?,
+            None => received_at,
+        };
+
+        let size = em.size.unwrap_or_else(|| match &body {
+            Body::Text(s) => i64::try_from(s.len()).unwrap_or(i64::MAX),
+        });
+
+        emails.push(Email {
+            thread_id: em.thread_id.unwrap_or_else(|| em.id.clone()),
+            id: em.id,
+            mailbox_ids: em.mailbox_ids,
+            keywords: em.keywords,
+            size,
+            received_at,
+            sent_at,
+            from: em.from.map(Address::from),
+            to: em.to.into_iter().map(Address::from).collect(),
+            cc: em.cc.into_iter().map(Address::from).collect(),
+            bcc: em.bcc.into_iter().map(Address::from).collect(),
+            reply_to: em.reply_to.into_iter().map(Address::from).collect(),
+            subject: em.subject,
+            preview: em.preview,
+            message_id: em.message_id,
+            in_reply_to: em.in_reply_to,
+            references: em.references,
+            has_attachment: em.has_attachment.unwrap_or(false),
+            body,
+        });
+    }
+
+    Ok(Fixture {
+        name: raw.name,
+        state: raw.state.unwrap_or_else(|| "fixture-state".to_string()),
+        account: Account {
+            id: raw.account.id,
+            name: raw.account.name,
+        },
+        mailboxes,
+        emails,
+    })
+}
+
+fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| format!("invalid RFC3339 timestamp {s:?}: {e}"))
+}
+
+/// Walk parent_id chains starting from each mailbox; report any cycle.
+///
+/// Each parent_id is already validated to exist by the caller, so the
+/// `expect()` below is sound.
+fn detect_cycles(mailboxes: &[Mailbox]) -> Result<(), String> {
+    let by_id: HashMap<&str, &Mailbox> =
+        mailboxes.iter().map(|m| (m.id.as_str(), m)).collect();
+    for start in mailboxes {
+        let mut cur = start;
+        for _ in 0..mailboxes.len() {
+            let Some(parent_id) = &cur.parent_id else {
+                break;
+            };
+            cur = by_id
+                .get(parent_id.as_str())
+                .copied()
+                .expect("parent_id existence validated upstream");
+            if cur.id == start.id {
+                return Err(format!("mailbox parent cycle including {:?}", start.id));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"
+        name = "test"
+
+        [account]
+        id = "a1"
+        name = "alice@example.com"
+        is_personal = true
+
+        [[mailbox]]
+        id = "mb-inbox"
+        name = "Inbox"
+        role = "inbox"
+
+        [[email]]
+        id = "e1"
+        mailbox_ids = ["mb-inbox"]
+        received_at = "2026-01-15T10:00:00Z"
+        from = "alice@example.com"
+        to = ["bob@example.com"]
+        subject = "hi"
+        body_text = "hello"
+    "#;
+
+    fn parse(s: &str) -> Result<Fixture, String> {
+        let raw: RawFixture = toml::from_str(s).map_err(|e| e.to_string())?;
+        normalize(raw)
+    }
+
+    #[test]
+    fn loads_minimal_fixture() {
+        let fix = parse(MINIMAL).unwrap();
+        assert_eq!(fix.name, "test");
+        assert_eq!(fix.account.id, "a1");
+        assert_eq!(fix.mailboxes.len(), 1);
+        assert_eq!(fix.mailboxes[0].role, Some(Role::Inbox));
+        assert!(fix.mailboxes[0].is_subscribed);
+        assert_eq!(fix.emails.len(), 1);
+        assert_eq!(fix.emails[0].thread_id, "e1");
+        assert_eq!(fix.emails[0].mailbox_ids, vec!["mb-inbox".to_string()]);
+        assert_eq!(fix.emails[0].sent_at, fix.emails[0].received_at);
+        assert!(matches!(&fix.emails[0].body, Body::Text(t) if t == "hello"));
+        assert_eq!(fix.emails[0].size, 5);
+        assert_eq!(fix.emails[0].from.as_ref().unwrap().email, "alice@example.com");
+        assert!(fix.emails[0].from.as_ref().unwrap().name.is_none());
+    }
+
+    #[test]
+    fn defaults_state_token() {
+        let fix = parse(MINIMAL).unwrap();
+        assert_eq!(fix.state, "fixture-state");
+    }
+
+    #[test]
+    fn rejects_non_personal_account() {
+        let s = MINIMAL.replace("is_personal = true", "is_personal = false");
+        let err = parse(&s).unwrap_err();
+        assert!(err.contains("is_personal"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_mailbox_ref() {
+        let s = MINIMAL.replace(r#"["mb-inbox"]"#, r#"["nope"]"#);
+        let err = parse(&s).unwrap_err();
+        assert!(err.contains("nope"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_mailbox_id() {
+        let s = format!(
+            r#"{MINIMAL}
+            [[mailbox]]
+            id = "mb-inbox"
+            name = "Inbox-Dup"
+            "#
+        );
+        let err = parse(&s).unwrap_err();
+        assert!(err.contains("duplicate mailbox id"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_role() {
+        let s = MINIMAL.replace(r#"role = "inbox""#, r#"role = "weird""#);
+        let err = parse(&s).unwrap_err();
+        assert!(err.contains("unknown role"), "got: {err}");
+    }
+
+    #[test]
+    fn detects_parent_cycle() {
+        let s = r#"
+            name = "x"
+            [account]
+            id = "a"
+            name = "a@b"
+            is_personal = true
+            [[mailbox]]
+            id = "m1"
+            name = "M1"
+            parent_id = "m2"
+            [[mailbox]]
+            id = "m2"
+            name = "M2"
+            parent_id = "m1"
+        "#;
+        let err = parse(s).unwrap_err();
+        assert!(err.contains("cycle"), "got: {err}");
+    }
+
+    #[test]
+    fn full_address_table_form() {
+        let s = MINIMAL.replace(
+            r#"from = "alice@example.com""#,
+            r#"from = { name = "Alice", email = "alice@example.com" }"#,
+        );
+        let fix = parse(&s).unwrap();
+        let from = fix.emails[0].from.as_ref().unwrap();
+        assert_eq!(from.name.as_deref(), Some("Alice"));
+        assert_eq!(from.email, "alice@example.com");
+    }
+}
