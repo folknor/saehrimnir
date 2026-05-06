@@ -12,9 +12,13 @@
 
 use std::path::Path;
 
+use chrono::{DateTime, Duration, Utc};
 use dellingr::{ArgCount, LuaType, RetCount, State, error::ErrorKind};
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
 
 use crate::fixture::{self, Fixture, RawAccount, RawAddress, RawEmail, RawFixture, RawMailbox};
+use crate::templates;
 
 /// Read a `.lua` scenario file and produce a fully validated `Fixture`.
 pub fn load(path: &Path) -> Result<Fixture, String> {
@@ -87,6 +91,8 @@ fn install_builders(state: &mut State) {
     state.set_global("mailbox");
     state.push_rust_fn(builder_email);
     state.set_global("email");
+    state.push_rust_fn(builder_bulk_emails);
+    state.set_global("bulk_emails");
 }
 
 // ── Per-builder RustFuncs ───────────────────────────────────────────
@@ -133,6 +139,88 @@ fn builder_mailbox(state: &mut State) -> dellingr::Result<u8> {
     };
     builder_mut(state)?.mailboxes.push(mb);
     Ok(0)
+}
+
+/// Bulk-generate synthetic emails directly into the builder, avoiding
+/// per-email Lua allocation overhead. Useful for "test sync against
+/// 100k emails" scenarios. Determinism: same `seed` + same opts ->
+/// same emails out.
+///
+/// ```lua
+/// bulk_emails({
+///   count = 100000,
+///   mailbox = "mb-inbox",
+///   seed = 42,                            -- default 42
+///   start_at = "2026-01-01T00:00:00Z",    -- default
+///   interval_seconds = 60,                -- default (1 email/min)
+///   id_prefix = "bulk",                   -- default
+/// })
+/// ```
+fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "bulk_emails")?;
+    let count = read_int(state, 1, "count")?;
+    if count < 0 {
+        return fail(state, "bulk_emails count must be non-negative");
+    }
+    let mailbox = read_string(state, 1, "mailbox")?;
+    let seed = read_int_opt(state, 1, "seed")?.unwrap_or(42) as u64;
+    let start_at_raw = read_string_opt(state, 1, "start_at")?
+        .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_string());
+    let interval_seconds = read_int_opt(state, 1, "interval_seconds")?.unwrap_or(60);
+    let id_prefix = read_string_opt(state, 1, "id_prefix")?
+        .unwrap_or_else(|| "bulk".to_string());
+
+    let start = match DateTime::parse_from_rfc3339(&start_at_raw) {
+        Ok(dt) => dt.with_timezone(&Utc),
+        Err(e) => return fail(state, format!("bulk_emails bad start_at: {e}")),
+    };
+
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let builder = builder_mut(state)?;
+    builder.emails.reserve(count as usize);
+
+    // Emit ids zero-padded so lex order matches numeric order even at
+    // millions-of-emails scale.
+    let pad = pad_width(count);
+    for i in 0..count {
+        let id = format!("{id_prefix}-{i:0pad$}", pad = pad);
+        let received_at = start + Duration::seconds(i * interval_seconds);
+        let (from_name, from_email) = templates::pick_address(&mut rng);
+        let (_, to_email) = templates::pick_address(&mut rng);
+        let subject_tmpl = templates::SUBJECT_TEMPLATES
+            [(seed.wrapping_add(i as u64) as usize) % templates::SUBJECT_TEMPLATES.len()];
+        let body_tmpl = templates::BODY_TEMPLATES
+            [(seed.wrapping_add(i as u64) as usize) % templates::BODY_TEMPLATES.len()];
+        let subject = templates::fill_template(subject_tmpl, &mut rng);
+        let body = templates::fill_template(body_tmpl, &mut rng);
+
+        builder.emails.push(RawEmail {
+            id: id.clone(),
+            thread_id: Some(id.clone()),
+            mailbox_ids: vec![mailbox.clone()],
+            received_at: received_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            from: Some(RawAddress::Full {
+                name: Some(from_name),
+                email: from_email,
+            }),
+            to: vec![RawAddress::Bare(to_email)],
+            subject: Some(subject),
+            message_id: vec![format!("<{id}@{}>", templates::DOMAINS[0])],
+            body_text: Some(body),
+            ..Default::default()
+        });
+    }
+    Ok(0)
+}
+
+fn pad_width(count: i64) -> usize {
+    let mut n = count.max(1) as u64;
+    let mut w = 0;
+    while n > 0 {
+        n /= 10;
+        w += 1;
+    }
+    w.max(1)
 }
 
 fn builder_email(state: &mut State) -> dellingr::Result<u8> {
@@ -227,6 +315,13 @@ fn read_bool_opt(state: &mut State, t: isize, key: &str) -> dellingr::Result<Opt
     };
     state.pop(1);
     result
+}
+
+fn read_int(state: &mut State, t: isize, key: &str) -> dellingr::Result<i64> {
+    match read_int_opt(state, t, key)? {
+        Some(n) => Ok(n),
+        None => fail(state, format!("missing required field {key:?}")),
+    }
 }
 
 fn read_int_opt(state: &mut State, t: isize, key: &str) -> dellingr::Result<Option<i64>> {

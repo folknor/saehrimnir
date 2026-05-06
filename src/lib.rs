@@ -16,3 +16,4 @@ pub mod routes;
 pub mod sentinel;
 pub mod shutdown;
 pub mod smtp;
+pub mod templates;

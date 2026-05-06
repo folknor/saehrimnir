@@ -681,6 +681,7 @@ dependencies = [
  "clap",
  "dellingr",
  "http-body-util",
+ "rand",
  "serde",
  "serde_json",
  "tokio",

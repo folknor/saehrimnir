@@ -50,6 +50,14 @@ work. Note that dellingr deliberately omits Lua's unparenthesized
 function-call sugar, so builder calls are written `mailbox({...})`
 not `mailbox{...}`.
 
+For scale-testing scenarios (test sync against tens of thousands of
+emails), `bulk_emails({ count = N, mailbox = "...", seed = ... })`
+generates synthetic emails directly into the fixture without going
+through per-email Lua allocation. Templates and pools are lifted from
+ratatoskr's `dev-seed` crate; deterministic via a seeded `SmallRng`.
+`fixtures/jmap-bulk.lua` shows the shape; loads 10k emails in well
+under a second on a modern host.
+
 ## Where to read
 
 - `CLAUDE.md` - project rules, layout, and the `brokkr check` /

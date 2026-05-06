@@ -62,10 +62,14 @@ checking whether the fact is already in `notes/`.
   public `load(path)` dispatches to `lua::load` for `.lua` files,
   TOML otherwise.
 - `src/lua.rs` - dellingr-backed Lua scenario loader. Exposes the
-  `fixture` / `account` / `mailbox` / `email` builder `RustFunc`s,
-  accumulates into a `Builder` in user_data, and hands the
-  `RawFixture` to `fixture::normalize` so validation is shared with
-  the TOML path.
+  `fixture` / `account` / `mailbox` / `email` builder `RustFunc`s
+  plus `bulk_emails` for synthetic-data scale testing. Accumulates
+  into a `Builder` in user_data, and hands the `RawFixture` to
+  `fixture::normalize` so validation is shared with the TOML path.
+- `src/templates.rs` - synthetic data pools (names, domains,
+  projects, teams, topics) and a `fill_template` primitive used by
+  `bulk_emails`. Lifted from `<ratatoskr>/crates/dev-seed/src/
+  templates.rs` and pruned.
 - `src/sentinel.rs` - atomic readiness-file write (temp + rename).
 - `src/shutdown.rs` - SIGTERM/SIGINT handler.
 - `src/lib.rs` - library surface; `main.rs` keeps just the runtime.
@@ -100,6 +104,8 @@ checking whether the fact is already in `notes/`.
 - `fixtures/jmap-small.toml` and `fixtures/jmap-small.lua` - the
   canonical v0 scenario in both authoring formats. Asserted
   equivalent by `tests/lua_fixture.rs`.
+- `fixtures/jmap-bulk.lua` - 10k-email scale fixture demonstrating
+  `bulk_emails`.
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status
@@ -145,11 +151,14 @@ execution. The public `fixture::load` dispatches by extension: `.lua`
 goes through `src/lua.rs`, anything else parses as TOML. Both paths
 build the same `RawFixture` intermediate and run through the same
 `normalize` validator, so the resulting `Fixture` is byte-identical
-across formats - asserted by `tests/lua_fixture.rs`. Currently only
-the static-fixture surface is exposed (`fixture`, `account`,
-`mailbox`, `email` builders). Dynamic surface (reactive callbacks
-keyed by protocol + command, self-terminating scripts) is the next
-chunk and intentionally not yet implemented.
+across formats - asserted by `tests/lua_fixture.rs`. Static surface:
+`fixture`, `account`, `mailbox`, `email` builders for hand-authored
+scenarios; `bulk_emails({ count, mailbox, seed, start_at,
+interval_seconds, id_prefix })` for synthetic scale-test fixtures
+(deterministic, byte-stable across runs at the same seed; templates
+in `src/templates.rs`). Dynamic surface (reactive callbacks keyed by
+protocol + command, self-terminating scripts) is the next chunk and
+intentionally not yet implemented.
 
 Note: dellingr deliberately omits Lua's unparenthesized function-call
 sugar, so builder calls in `.lua` fixtures are written
