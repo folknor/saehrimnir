@@ -16,6 +16,7 @@ use crate::jmap::{self, JmapRequest, JmapResponse};
 #[derive(Clone)]
 pub struct AppState {
     pub fixture: Arc<Fixture>,
+    pub dispatcher: Option<Arc<crate::lua::Dispatcher>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -95,5 +96,5 @@ async fn session(State(state): State<AppState>) -> Json<Value> {
 /// via axum's `Json` extractor, which is the right behaviour per RFC
 /// 8620 §3.6.1.
 async fn api(State(state): State<AppState>, Json(req): Json<JmapRequest>) -> Json<JmapResponse> {
-    Json(jmap::handle(&state.fixture, req))
+    Json(jmap::handle(&state.fixture, state.dispatcher.as_ref(), req))
 }

@@ -13,12 +13,13 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use saehrimnir::{fixture, routes};
+use saehrimnir::{fixture, lua, routes};
 
 fn router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
     routes::router(routes::AppState {
         fixture: Arc::new(fix),
+        dispatcher: None,
     })
 }
 
@@ -347,4 +348,134 @@ async fn responses_are_byte_identical_across_runs() {
         .unwrap()
         .to_bytes();
     assert_eq!(bytes1, bytes2);
+}
+
+// ── Reactive-callback tests ────────────────────────────────────────
+
+fn router_with_lua_scenario(scenario: &str) -> axum::Router {
+    let (fixture, dispatcher) =
+        lua::load_source_with_dispatcher(scenario, "@cb-test").unwrap();
+    routes::router(routes::AppState {
+        fixture: Arc::new(fixture),
+        dispatcher: Some(Arc::new(dispatcher)),
+    })
+}
+
+async fn post_jmap(router: axum::Router, body: Value) -> Value {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/api")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn jmap_email_get_callback_overrides_with_method_error() {
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "x",
+        })
+        on("jmap", "Email/get", function(req)
+            -- Pass the accountId through to verify it landed in req.
+            return { status = "serverFail", message = "acct=" .. req.account_id }
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let v = post_jmap(
+        router,
+        json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [["Email/get", {"accountId": "account-1", "ids": ["e1"]}, "c0"]],
+        }),
+    )
+    .await;
+    let entry = &v["methodResponses"][0];
+    assert_eq!(entry[0], "error");
+    assert_eq!(entry[1]["type"], "serverFail");
+    assert_eq!(entry[1]["description"], "acct=account-1");
+    assert_eq!(entry[2], "c0");
+}
+
+#[tokio::test]
+async fn jmap_callback_call_index_increments_per_method() {
+    // call_index counts per (protocol, command), so two Email/get
+    // calls plus an Email/query call should give Email/get a count
+    // of 1 then 2, while Email/query stays at 1.
+    let scenario = r#"
+        fixture({ name = "ix" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        on("jmap", "Email/get", function(req)
+            return { status = "EG", message = tostring(req.call_index) }
+        end)
+        on("jmap", "Email/query", function(req)
+            return { status = "EQ", message = tostring(req.call_index) }
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let v = post_jmap(
+        router,
+        json!({
+            "using": [],
+            "methodCalls": [
+                ["Email/get",   {"accountId": "account-1", "ids": []}, "a"],
+                ["Email/query", {"accountId": "account-1"},            "b"],
+                ["Email/get",   {"accountId": "account-1", "ids": []}, "c"],
+            ],
+        }),
+    )
+    .await;
+    let mr = v["methodResponses"].as_array().unwrap();
+    assert_eq!(mr[0][1]["type"], "EG");
+    assert_eq!(mr[0][1]["description"], "1");
+    assert_eq!(mr[1][1]["type"], "EQ");
+    assert_eq!(mr[1][1]["description"], "1");
+    assert_eq!(mr[2][1]["type"], "EG");
+    assert_eq!(mr[2][1]["description"], "2");
+}
+
+#[tokio::test]
+async fn jmap_callback_nil_return_passes_through() {
+    let scenario = r#"
+        fixture({ name = "passthrough" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "hi",
+        })
+        on("jmap", "Email/get", function(req)
+            return nil
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let v = post_jmap(
+        router,
+        json!({
+            "using": [],
+            "methodCalls": [["Email/get", {"accountId": "account-1", "ids": ["e1"]}, "c"]],
+        }),
+    )
+    .await;
+    let entry = &v["methodResponses"][0];
+    // No override - method runs normally, returns Email/get result.
+    assert_eq!(entry[0], "Email/get");
+    let item = &entry[1]["list"][0];
+    assert_eq!(item["id"], "e1");
 }

@@ -31,6 +31,7 @@ fn bulk_fixture() -> Arc<fixture::Fixture> {
 fn jmap_router() -> axum::Router {
     routes::router(routes::AppState {
         fixture: bulk_fixture(),
+        dispatcher: None,
     })
 }
 

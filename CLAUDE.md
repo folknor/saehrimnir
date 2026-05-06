@@ -188,8 +188,12 @@ receives a `req` table with `call_index` (1-based per (protocol,
 command)) plus protocol-specific fields. Returning a table with
 `{ status = "...", message = "..." }` overrides the response; `nil`
 or no return = pass through. Currently wired for IMAP `UID FETCH`
-only - the dispatcher Mutex<State> + AppState plumbing exists for
-all protocols, individual commands fan out as fixtures need them.
+and JMAP method calls (any method - `Mailbox/get`, `Email/query`,
+`Email/get`, etc.). For JMAP, the override maps to a method-level
+JMAP error: the `methodResponses` entry becomes
+`("error", {"type": status, "description": message}, callId)`.
+Other protocols' AppState plumbing is in place; individual commands
+fan out as fixtures need them.
 
 `Dispatcher` is `Arc<Mutex<State>>`-shaped (dellingr 0.2 made
 `State: Send`); the mutex covers brief synchronous Lua calls and is
@@ -201,7 +205,12 @@ sugar, so builder calls in `.lua` fixtures are written
 `mailbox({...})` not `mailbox{...}`. Also: `dellingr::set_table_raw`
 takes `(key=top, value=below_top)` order - push value FIRST, then
 key on top, then call. Different from standard Lua C API
-(`lua_settable` pops key from -2, value from -1).
+(`lua_settable` pops key from -2, value from -1). And: `get_table_raw`
+called via the public `State` API consumes the top key BEFORE
+checking the table index, so passing a relative `i = -1` (which
+points at the key, not the table) panics with an out-of-bounds
+on the now-shifted stack. Capture the table's absolute index via
+`state.get_top()` before pushing the key.
 
 ## Rules
 

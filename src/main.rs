@@ -88,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = routes::router(routes::AppState {
         fixture: Arc::clone(&fixture),
+        dispatcher: dispatcher.clone(),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

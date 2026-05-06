@@ -34,20 +34,23 @@ const MAX_BULK_COUNT: i64 = 10_000_000;
 /// Bootstrap script that runs before any user script. Defines the
 /// `on(protocol, command, fn)` registration helper, the
 /// `_sae_dispatch(protocol, command, req)` lookup helper called from
-/// Rust, and the `_sae_handlers` table that holds the registered
-/// handlers keyed by `protocol .. "/" .. command`. Lua-side storage
-/// avoids needing a dellingr function-ref-registry API; flat
-/// single-level keying sidesteps nested-table indexing edge cases
-/// in the VM.
+/// Rust, and the `_sae_handlers` two-level table keyed by
+/// `[protocol][command]`. Lua-side storage avoids needing a
+/// dellingr function-ref-registry API.
 const BOOTSTRAP: &str = r#"
 _sae_handlers = {}
 
 function on(protocol, command, fn)
-    _sae_handlers[protocol .. "/" .. command] = fn
+    if _sae_handlers[protocol] == nil then
+        _sae_handlers[protocol] = {}
+    end
+    _sae_handlers[protocol][command] = fn
 end
 
 function _sae_dispatch(protocol, command, req)
-    local fn = _sae_handlers[protocol .. "/" .. command]
+    local h = _sae_handlers[protocol]
+    if h == nil then return nil end
+    local fn = h[command]
     if fn == nil then return nil end
     return fn(req)
 end

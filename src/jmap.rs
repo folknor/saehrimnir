@@ -39,10 +39,14 @@ pub type MethodResponse = (String, Value, String);
 /// Process every method call in a request envelope and produce the
 /// response envelope. Errors per call land inside `methodResponses` as
 /// `("error", {...}, callId)`; the envelope itself is always 200.
-pub fn handle(fixture: &Fixture, req: JmapRequest) -> JmapResponse {
+pub fn handle(
+    fixture: &Fixture,
+    dispatcher: Option<&std::sync::Arc<crate::lua::Dispatcher>>,
+    req: JmapRequest,
+) -> JmapResponse {
     let mut responses = Vec::with_capacity(req.method_calls.len());
     for (name, args, call_id) in req.method_calls {
-        let (out_name, out_args) = dispatch(fixture, &name, &args);
+        let (out_name, out_args) = dispatch(fixture, dispatcher, &name, &args);
         responses.push((out_name, out_args, call_id));
     }
     JmapResponse {
@@ -52,7 +56,35 @@ pub fn handle(fixture: &Fixture, req: JmapRequest) -> JmapResponse {
     }
 }
 
-fn dispatch(fixture: &Fixture, name: &str, args: &Value) -> (String, Value) {
+fn dispatch(
+    fixture: &Fixture,
+    dispatcher: Option<&std::sync::Arc<crate::lua::Dispatcher>>,
+    name: &str,
+    args: &Value,
+) -> (String, Value) {
+    // Reactive callback: a registered handler can override the
+    // method response. v0 surfaces `accountId` to the script; future
+    // expansions can populate `ids`, `filter`, etc. once we agree
+    // on a pushing convention for nested values.
+    if let Some(d) = dispatcher {
+        let account_id = args
+            .get("accountId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let result = d.dispatch("jmap", name, move |state| {
+            if let Some(a) = &account_id {
+                crate::lua::req_set_str(state, "account_id", a)?;
+            }
+            Ok(())
+        });
+        if let crate::lua::Override::Tagged { status, message } = result {
+            return (
+                "error".to_string(),
+                json!({"type": status, "description": message}),
+            );
+        }
+    }
+
     match name {
         "Mailbox/get" => match mailbox_get(fixture, args) {
             Ok(v) => (name.to_string(), v),
@@ -804,7 +836,7 @@ mod tests {
     #[test]
     fn dispatch_unknown_method_returns_error() {
         let f = fix();
-        let (name, body) = dispatch(&f, "Email/import", &json!({}));
+        let (name, body) = dispatch(&f, None, "Email/import", &json!({}));
         assert_eq!(name, "error");
         assert_eq!(body.get("type").unwrap(), "unknownMethod");
     }
@@ -817,7 +849,7 @@ mod tests {
             method_calls: vec![("Mailbox/get".into(), json!({"accountId": "acct"}), "c0".into())],
             created_ids: None,
         };
-        let resp = handle(&f, req);
+        let resp = handle(&f, None, req);
         assert_eq!(resp.session_state, "s1");
         assert_eq!(resp.method_responses.len(), 1);
         let (name, _args, call_id) = &resp.method_responses[0];
@@ -836,7 +868,7 @@ mod tests {
             ],
             created_ids: None,
         };
-        let resp = handle(&f, req);
+        let resp = handle(&f, None, req);
         assert_eq!(resp.method_responses[0].0, "Mailbox/get");
         assert_eq!(resp.method_responses[0].2, "a");
         assert_eq!(resp.method_responses[1].0, "error");
