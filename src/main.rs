@@ -1,14 +1,8 @@
-mod cli;
-mod fixture;
-mod jmap;
-mod routes;
-mod sentinel;
-mod shutdown;
-
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use saehrimnir::{cli, fixture, routes, sentinel, shutdown};
 
 /// Hard budget on graceful drain after SIGTERM. Plan-2 acceptance #6
 /// requires a clean shutdown within ~1 second.

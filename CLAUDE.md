@@ -45,19 +45,20 @@ checking whether the fact is already in `notes/`.
 - `src/fixture.rs` - TOML loader, validator, canonical types.
 - `src/sentinel.rs` - atomic readiness-file write (temp + rename).
 - `src/shutdown.rs` - SIGTERM/SIGINT handler.
+- `src/lib.rs` - library surface; `main.rs` keeps just the runtime.
 - `src/routes.rs` - axum router, `AppState`, route handlers.
 - `src/jmap.rs` - request envelope, dispatcher, per-method handlers.
+- `tests/api.rs` - integration tests via `tower::ServiceExt::oneshot`.
 - `fixtures/jmap-small.toml` - canonical v0 fixture.
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status
 
-Bootstrap through plan-2 step 7 has landed: HTTP listener, readiness
+Bootstrap through plan-2 step 8 has landed: HTTP listener, readiness
 sentinel, SIGTERM, fixture loader, `/jmap/session`, the `POST /jmap/api`
-envelope, and the three load-bearing methods - `Mailbox/get`,
-`Email/query`, and `Email/get`. Steps 8 (integration tests) and 9
-(ratatoskr wiring) are still pending. See `TODO.md` for the design
-decisions worked out per step.
+envelope, the three load-bearing methods (`Mailbox/get`, `Email/query`,
+`Email/get`), and integration tests. Step 9 (ratatoskr wiring) is plan-3
+work. See `TODO.md` for the open questions.
 
 ## Rules
 

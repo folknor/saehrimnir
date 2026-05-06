@@ -25,7 +25,10 @@ fi
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-tmp="$(mktemp -d -t saehrimnir-smoke-XXXXXX)"
+# Per CLAUDE.md bash rules: data lives in the project, not /tmp.
+tmp="$repo_root/.smoke"
+rm -rf "$tmp"
+mkdir -p "$tmp"
 ready_file="$tmp/ready"
 pid=""
 

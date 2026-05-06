@@ -4,23 +4,6 @@ Plan for the next sessions. Tracks the suggested implementation order
 from `notes/plan.md`, with the design decisions already worked out so
 the next session can drop straight into code.
 
-## Step 8: Integration test
-
-Two viable shapes:
-
-1. Pure axum: use `tower::ServiceExt::oneshot` to fire requests
-   directly at the Router without binding a port. Fastest, no
-   subprocess. Lives in `tests/api.rs`. Need a `lib.rs` to expose
-   `routes::router` and `fixture::load`. Minor refactor: split
-   `main.rs` into `main.rs` (just the runtime) plus `lib.rs`
-   (everything else as `pub mod`s).
-2. Subprocess + reqwest: spawn the binary, wait for sentinel, hit it
-   with reqwest. Closer to production but slower and trickier to
-   clean up.
-
-Lean toward option 1 for unit-test-speed coverage of the wire format,
-plus a single option-2 shaped test that exercises sentinel + SIGTERM.
-
 ## Step 9: Wire to ratatoskr
 
 This is plan-3 work in brokkr. From sæhrimnir's side, we need to
@@ -60,7 +43,7 @@ binary in plan 3 runs, divergences will be visible.
   sweep needs `Project::Saehrimnir` to land in brokkr's enum first,
   or the file would fail brokkr's parse-time validation. Until then,
   rely on `brokkr check`'s no-toml fallback.
-- `scripts/smoke.sh` writes its readiness file under `mktemp -d`,
-  which lands in `/tmp`. CLAUDE.md bash rules say data lives in the
-  project; move the tmpdir to a `.smoke/` directory under the repo
-  root next time the script gets touched.
+- A subprocess + reqwest test that exercises the sentinel + SIGTERM
+  path end-to-end. The `tests/api.rs` suite covers the wire format
+  via `tower::ServiceExt::oneshot`; a single subprocess-shaped test
+  would close the gap currently filled only by `scripts/smoke.sh`.
