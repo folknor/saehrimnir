@@ -28,6 +28,28 @@ use crate::fixture::Fixture;
 #[derive(Clone)]
 pub struct AppState {
     pub fixture: Arc<Fixture>,
+    pub dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+}
+
+/// Consult the Lua dispatcher for `("graph", command)` and convert
+/// any `Override::Tagged` into a Graph 400 error response. Returns
+/// `None` when no override fired (caller proceeds with default
+/// behaviour).
+///
+/// `build_req` populates the `req` table with command-specific
+/// fields. The dispatcher pre-populates `call_index`.
+pub fn maybe_override(
+    state: &AppState,
+    command: &str,
+    build_req: impl FnOnce(&mut dellingr::State) -> dellingr::Result<()>,
+) -> Option<Response> {
+    let d = state.dispatcher.as_ref()?;
+    match d.dispatch("graph", command, build_req) {
+        crate::lua::Override::Tagged { status, message } => {
+            Some(error(StatusCode::BAD_REQUEST, &status, &message))
+        }
+        crate::lua::Override::None => None,
+    }
 }
 
 /// Build the Graph router. v0 mounts mail handlers under

@@ -43,6 +43,9 @@ pub fn router() -> Router<AppState> {
 // ── Profile / Labels ────────────────────────────────────────────────
 
 async fn profile(State(state): State<AppState>) -> Response {
+    if let Some(r) = super::maybe_override(&state, "profile", |_s| Ok(())) {
+        return r;
+    }
     let f = &state.fixture;
     ok_json(json!({
         "emailAddress": f.account.name,
@@ -60,6 +63,9 @@ fn unique_thread_count(f: &Fixture) -> usize {
 }
 
 async fn list_labels(State(state): State<AppState>) -> Response {
+    if let Some(r) = super::maybe_override(&state, "list_labels", |_s| Ok(())) {
+        return r;
+    }
     let mut labels = Vec::new();
 
     // System labels are always present, even if no fixture mailbox
@@ -201,6 +207,9 @@ async fn list_threads(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    if let Some(r) = super::maybe_override(&state, "list_threads", |_s| Ok(())) {
+        return r;
+    }
     let q = parse_query(raw.as_deref());
     let max = q
         .max_results
@@ -312,6 +321,12 @@ async fn get_thread(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
 ) -> Response {
+    let thread_id_owned = thread_id.clone();
+    if let Some(r) = super::maybe_override(&state, "get_thread", move |s| {
+        crate::lua::req_set_str(s, "thread_id", &thread_id_owned)
+    }) {
+        return r;
+    }
     let mut messages: Vec<&Email> = state
         .fixture
         .emails
@@ -444,7 +459,10 @@ fn format_address_list(xs: &[Address]) -> String {
 
 // ── History ─────────────────────────────────────────────────────────
 
-async fn history(State(_state): State<AppState>) -> Response {
+async fn history(State(state): State<AppState>) -> Response {
+    if let Some(r) = super::maybe_override(&state, "history", |_s| Ok(())) {
+        return r;
+    }
     // v0 fixtures are read-only; the History endpoint always returns
     // an empty change list paired with the same historyId. The
     // request's startHistoryId is intentionally ignored - any value

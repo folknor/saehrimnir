@@ -50,6 +50,9 @@ async fn list_folders(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    if let Some(r) = super::maybe_override(&state, "list_folders", |_s| Ok(())) {
+        return r;
+    }
     let q = odata::OdataQuery::parse(raw.as_deref());
     let host = host_or_default(&headers);
 
@@ -98,6 +101,12 @@ async fn get_folder(
     State(state): State<AppState>,
     Path(folder): Path<String>,
 ) -> Response {
+    let folder_owned = folder.clone();
+    if let Some(r) = super::maybe_override(&state, "get_folder", move |s| {
+        crate::lua::req_set_str(s, "folder", &folder_owned)
+    }) {
+        return r;
+    }
     let Some(m) = resolve_folder(&state.fixture, &folder) else {
         return error(
             StatusCode::NOT_FOUND,
@@ -123,6 +132,12 @@ async fn list_child_folders(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let folder_owned = folder.clone();
+    if let Some(r) = super::maybe_override(&state, "list_child_folders", move |s| {
+        crate::lua::req_set_str(s, "folder", &folder_owned)
+    }) {
+        return r;
+    }
     let Some(parent) = resolve_folder(&state.fixture, &folder) else {
         return error(
             StatusCode::NOT_FOUND,
@@ -177,6 +192,12 @@ async fn list_messages(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let folder_owned = folder.clone();
+    if let Some(r) = super::maybe_override(&state, "list_messages", move |s| {
+        crate::lua::req_set_str(s, "folder", &folder_owned)
+    }) {
+        return r;
+    }
     let Some(m) = resolve_folder(&state.fixture, &folder) else {
         return error(
             StatusCode::NOT_FOUND,
@@ -231,6 +252,12 @@ async fn delta_messages(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let folder_owned = folder.clone();
+    if let Some(r) = super::maybe_override(&state, "delta_messages", move |s| {
+        crate::lua::req_set_str(s, "folder", &folder_owned)
+    }) {
+        return r;
+    }
     let Some(m) = resolve_folder(&state.fixture, &folder) else {
         return error(
             StatusCode::NOT_FOUND,

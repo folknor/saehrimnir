@@ -1,7 +1,9 @@
 //! End-to-end SMTP test driving `serve_connection` over a duplex
 //! stream and asserting on the captured submission log.
 
+use saehrimnir::lua;
 use saehrimnir::smtp::{self, SubmissionLog};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
@@ -12,7 +14,7 @@ async fn run_with_log(script: &[u8]) -> (String, SubmissionLog) {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, &mut rx).await
+        smtp::serve_connection(server, log_clone, None, &mut rx).await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -113,4 +115,73 @@ async fn auth_attribute_round_trips() {
     let snap = log.snapshot();
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0].auth_mechanism.as_deref(), Some("XOAUTH2"));
+}
+
+// ── Reactive-callback tests ────────────────────────────────────────
+
+async fn run_with_dispatcher(
+    scenario: &str,
+    script: &[u8],
+) -> (String, SubmissionLog) {
+    let log = SubmissionLog::new();
+    let log_clone = log.clone();
+    let (_fixture, dispatcher) =
+        lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
+    let dispatcher = Some(Arc::new(dispatcher));
+
+    let (server, mut client) = tokio::io::duplex(64 * 1024);
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        smtp::serve_connection(server, log_clone, dispatcher, &mut rx).await
+    });
+    client.write_all(script).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    task.await.unwrap().unwrap();
+    (String::from_utf8(buf).unwrap(), log)
+}
+
+#[tokio::test]
+async fn rcpt_callback_can_inject_452() {
+    // Script rejects the second RCPT with a 452 (mailbox full /
+    // rate-limit class). Other commands pass through.
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "a", name = "a@b" })
+        on("smtp", "RCPT", function(req)
+            if req.call_index == 2 then
+                return { status = "452", message = "rate limit" }
+            end
+        end)
+    "#;
+    let (out, _log) = run_with_dispatcher(
+        scenario,
+        b"EHLO me\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nRCPT TO:<e@f>\r\nQUIT\r\n",
+    )
+    .await;
+    // First RCPT default OK, second rejected.
+    assert!(out.contains("250 OK"));
+    assert!(out.contains("452 rate limit"), "got: {out:?}");
+}
+
+#[tokio::test]
+async fn data_callback_can_reject_submission() {
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "a", name = "a@b" })
+        on("smtp", "DATA", function(req)
+            return { status = "552", message = "message too large" }
+        end)
+    "#;
+    let (out, log) = run_with_dispatcher(
+        scenario,
+        b"EHLO me\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\nx\r\n.\r\nQUIT\r\n",
+    )
+    .await;
+    assert!(out.contains("552 message too large"), "got: {out:?}");
+    // Submission was rejected before DATA body was consumed, so
+    // nothing in the log.
+    assert!(log.snapshot().is_empty());
 }

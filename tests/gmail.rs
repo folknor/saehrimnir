@@ -11,12 +11,13 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use saehrimnir::{fixture, gmail};
+use saehrimnir::{fixture, gmail, lua};
 
 fn router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
     gmail::router(gmail::AppState {
         fixture: Arc::new(fix),
+        dispatcher: None,
     })
 }
 
@@ -227,4 +228,69 @@ async fn unimplemented_paths_return_gmail_shaped_404() {
     let (status, v) = get_json("/gmail/v1/users/me/drafts").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
+}
+
+// ── Reactive-callback tests ────────────────────────────────────────
+
+fn router_with_lua_scenario(scenario: &str) -> axum::Router {
+    let (fixture, dispatcher) =
+        lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
+    gmail::router(gmail::AppState {
+        fixture: Arc::new(fixture),
+        dispatcher: Some(Arc::new(dispatcher)),
+    })
+}
+
+async fn get_json_via(router: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn list_threads_callback_overrides() {
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        on("gmail", "list_threads", function(req)
+            return { status = "rateLimitExceeded", message = "synthetic" }
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let (status, v) = get_json_via(router, "/gmail/v1/users/me/threads").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["errors"][0]["reason"], "rateLimitExceeded");
+}
+
+#[tokio::test]
+async fn get_thread_callback_passes_thread_id_to_script() {
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        on("gmail", "get_thread", function(req)
+            return { status = "notFound", message = "asked for " .. req.thread_id }
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let (status, v) = get_json_via(
+        router,
+        "/gmail/v1/users/me/threads/abc-123?format=full",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
+    assert_eq!(v["error"]["message"], "asked for abc-123");
 }

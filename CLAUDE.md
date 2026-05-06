@@ -187,13 +187,31 @@ Dynamic surface: scripts register callbacks via
 receives a `req` table with `call_index` (1-based per (protocol,
 command)) plus protocol-specific fields. Returning a table with
 `{ status = "...", message = "..." }` overrides the response; `nil`
-or no return = pass through. Currently wired for IMAP `UID FETCH`
-and JMAP method calls (any method - `Mailbox/get`, `Email/query`,
-`Email/get`, etc.). For JMAP, the override maps to a method-level
-JMAP error: the `methodResponses` entry becomes
-`("error", {"type": status, "description": message}, callId)`.
-Other protocols' AppState plumbing is in place; individual commands
-fan out as fixtures need them.
+or no return = pass through.
+
+Wired across all five protocols. Per-protocol override semantics
+for `Override::Tagged { status, message }`:
+
+- **IMAP** (`UID FETCH`): tagged response `<tag> <status> <message>`,
+  no FETCH untagged emitted. Status is typically `NO`/`BAD`/`OK`.
+- **JMAP** (any method): method-level error envelope -
+  `("error", {"type": status, "description": message}, callId)`
+  inside `methodResponses`.
+- **Microsoft Graph** (`list_folders`, `get_folder`,
+  `list_child_folders`, `list_messages`, `delta_messages`):
+  HTTP 400 with `{"error": {"code": status, "message": message}}`.
+- **Gmail** (`profile`, `list_labels`, `list_threads`, `get_thread`,
+  `history`): HTTP 400 with the Gmail error envelope (status maps to
+  `errors[0].reason`, message to `error.message`).
+- **SMTP** (`MAIL`, `RCPT`, `DATA`): wire response `<code> <message>\r\n`
+  where `code` is parsed from the `status` field as a `u16` (e.g.
+  `"452"` for rate-limited rejection, `"552"` for body-too-large);
+  non-numeric status falls back to `550`. The DATA body is not
+  consumed when the override fires before `354`.
+
+Per-(protocol, command) `call_index` is a built-in `req` field;
+protocol-specific extras (`uid_set`, `attrs`, `mailbox`, `folder`,
+`thread_id`, `account_id`, `payload`) are populated where natural.
 
 `Dispatcher` is `Arc<Mutex<State>>`-shaped (dellingr 0.2 made
 `State: Send`); the mutex covers brief synchronous Lua calls and is

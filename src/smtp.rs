@@ -70,6 +70,7 @@ pub const GREETING: &str = "220 saehrimnir ESMTP ready\r\n";
 pub async fn serve(
     listener: TcpListener,
     log: SubmissionLog,
+    dispatcher: Option<std::sync::Arc<crate::lua::Dispatcher>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -84,9 +85,10 @@ pub async fn serve(
                 match accept {
                     Ok((stream, peer)) => {
                         let log = log.clone();
+                        let disp = dispatcher.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, log, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, log, disp, &mut sd).await {
                                 eprintln!("saehrimnir: smtp connection {peer}: {e}");
                             }
                         });
@@ -100,11 +102,16 @@ pub async fn serve(
     }
 }
 
-/// Drive a single SMTP connection. Generic over the byte stream so
-/// tests can wire up a duplex without binding a port.
+/// Drive a single SMTP connection. `dispatcher` is `None` for
+/// callback-free scenarios; when present, AUTH / MAIL / RCPT / DATA
+/// consult it before applying default behaviour. An
+/// `Override::Tagged { status, message }` becomes a wire response
+/// `<status> <message>`, where `status` is interpreted as the SMTP
+/// numeric code (e.g. `"452"`).
 pub async fn serve_connection<S>(
     stream: S,
     log: SubmissionLog,
+    dispatcher: Option<std::sync::Arc<crate::lua::Dispatcher>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -116,6 +123,7 @@ where
         writer,
         state: SmtpState::default(),
         log,
+        dispatcher,
     };
     conn.write_str(GREETING).await?;
     loop {
@@ -150,6 +158,7 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     writer: WriteHalf<S>,
     state: SmtpState,
     log: SubmissionLog,
+    dispatcher: Option<std::sync::Arc<crate::lua::Dispatcher>>,
 }
 
 enum ReadOutcome {
@@ -159,6 +168,29 @@ enum ReadOutcome {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
+    /// Consult the Lua dispatcher for `("smtp", command)`. Returns
+    /// `Some((code, message))` if the script overrode the response;
+    /// the SMTP-side caller should write `<code> <message>\r\n`
+    /// and skip the default behaviour. `code` is parsed from the
+    /// override's `status` field (which is the SMTP numeric code as
+    /// a string, e.g. `"452"`); a non-numeric status falls back to
+    /// `550` (permanent server error) so the client at least gets
+    /// a sensible-shaped failure.
+    fn maybe_override(&self, command: &str, payload: &str) -> Option<(u16, String)> {
+        let d = self.dispatcher.as_ref()?;
+        let payload_owned = payload.to_string();
+        let result = d.dispatch("smtp", command, move |s| {
+            crate::lua::req_set_str(s, "payload", &payload_owned)
+        });
+        match result {
+            crate::lua::Override::Tagged { status, message } => {
+                let code = status.parse::<u16>().unwrap_or(550);
+                Some((code, message))
+            }
+            crate::lua::Override::None => None,
+        }
+    }
+
     async fn write_str(&mut self, s: &str) -> std::io::Result<()> {
         self.writer.write_all(s.as_bytes()).await?;
         self.writer.flush().await
@@ -282,6 +314,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             Some(p) => p.trim().to_string(),
             None => return self.write_line(501, "expected MAIL FROM:<addr>").await,
         };
+        if let Some((code, msg)) = self.maybe_override("MAIL", &payload) {
+            return self.write_str(&format!("{code} {msg}\r\n")).await;
+        }
         self.state.from = Some(payload);
         self.state.rcpts.clear();
         self.write_line(250, "OK").await
@@ -295,6 +330,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             Some(p) => p.trim().to_string(),
             None => return self.write_line(501, "expected RCPT TO:<addr>").await,
         };
+        if let Some((code, msg)) = self.maybe_override("RCPT", &payload) {
+            return self.write_str(&format!("{code} {msg}\r\n")).await;
+        }
         self.state.rcpts.push(payload);
         self.write_line(250, "OK").await
     }
@@ -304,6 +342,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             return self
                 .write_line(503, "DATA requires MAIL FROM + at least one RCPT TO")
                 .await;
+        }
+        if let Some((code, msg)) = self.maybe_override("DATA", "") {
+            return self.write_str(&format!("{code} {msg}\r\n")).await;
         }
         self.write_line(354, "send data, terminate with <CRLF>.<CRLF>")
             .await?;
@@ -395,7 +436,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, &mut rx).await
+            serve_connection(server, log_clone, None, &mut rx).await
         });
         client.write_all(script).await.unwrap();
         client.shutdown().await.unwrap();
@@ -539,7 +580,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, &mut rx).await
+            serve_connection(server, log_clone, None, &mut rx).await
         });
         let mut greet = vec![0u8; GREETING.len()];
         client.read_exact(&mut greet).await.unwrap();

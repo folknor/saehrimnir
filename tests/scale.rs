@@ -38,12 +38,14 @@ fn jmap_router() -> axum::Router {
 fn graph_router() -> axum::Router {
     graph::router(graph::AppState {
         fixture: bulk_fixture(),
+        dispatcher: None,
     })
 }
 
 fn gmail_router() -> axum::Router {
     gmail::router(gmail::AppState {
         fixture: bulk_fixture(),
+        dispatcher: None,
     })
 }
 

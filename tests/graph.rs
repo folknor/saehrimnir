@@ -11,12 +11,13 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use saehrimnir::{fixture, graph};
+use saehrimnir::{fixture, graph, lua};
 
 fn router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
     graph::router(graph::AppState {
         fixture: Arc::new(fix),
+        dispatcher: None,
     })
 }
 
@@ -250,4 +251,81 @@ async fn child_folders_for_top_level_folder() {
     let (status, v) = get_json("/v1.0/me/mailFolders/inbox/childFolders").await;
     assert_eq!(status, StatusCode::OK);
     assert!(v["value"].as_array().unwrap().is_empty());
+}
+
+// ── Reactive-callback tests ────────────────────────────────────────
+
+fn router_with_lua_scenario(scenario: &str) -> axum::Router {
+    let (fixture, dispatcher) =
+        lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
+    graph::router(graph::AppState {
+        fixture: Arc::new(fixture),
+        dispatcher: Some(Arc::new(dispatcher)),
+    })
+}
+
+async fn get_json_via(router: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::HOST, "127.0.0.1:9999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn list_messages_callback_overrides_with_400() {
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mbx-inbox", name = "Inbox", role = "inbox" })
+        on("graph", "list_messages", function(req)
+            return { status = "ServerError", message = "synthetic " .. req.folder }
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let (status, v) =
+        get_json_via(router, "/v1.0/me/mailFolders/inbox/messages").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "ServerError");
+    assert_eq!(v["error"]["message"], "synthetic inbox");
+}
+
+#[tokio::test]
+async fn delta_messages_callback_call_index_increments() {
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mbx-inbox", name = "Inbox", role = "inbox" })
+        on("graph", "delta_messages", function(req)
+            if req.call_index == 2 then
+                return { status = "Throttled", message = "second call denied" }
+            end
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    // First call passes through (default delta dump).
+    let (s1, v1) = get_json_via(
+        router.clone(),
+        "/v1.0/me/mailFolders/inbox/messages/delta",
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    assert!(v1.get("@odata.deltaLink").is_some());
+    // Second call gets the override.
+    let (s2, v2) = get_json_via(
+        router,
+        "/v1.0/me/mailFolders/inbox/messages/delta",
+    )
+    .await;
+    assert_eq!(s2, StatusCode::BAD_REQUEST);
+    assert_eq!(v2["error"]["code"], "Throttled");
 }

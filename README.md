@@ -46,9 +46,11 @@ Lua scenarios can also register reactive callbacks via
 `on(protocol, command, function)`. The protocol layer consults the
 script before generating its default response; the callback receives
 a `req` table with `call_index` plus protocol-specific fields, and
-can return `{ status = "NO", message = "..." }` to override the wire
-response (or `nil` to pass through). Currently wired for IMAP `UID
-FETCH`; other commands fan out as scenarios demand them.
+can return `{ status = "...", message = "..." }` to override the
+wire response (or `nil` to pass through). Wired across all five
+protocols - IMAP `UID FETCH`, JMAP method calls, Graph mail
+endpoints, Gmail mail endpoints, SMTP `MAIL`/`RCPT`/`DATA` - with
+per-protocol mapping documented in CLAUDE.md.
 
 Note that dellingr deliberately omits Lua's unparenthesized
 function-call sugar, so builder calls are written `mailbox({...})`

@@ -123,14 +123,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let smtp_log = smtp::SubmissionLog::new();
     let smtp_shutdown_rx = shutdown_rx.clone();
     let smtp_log_clone = smtp_log.clone();
+    let smtp_dispatcher = dispatcher.clone();
     let smtp_task = tokio::spawn(async move {
-        smtp::serve(smtp_listener, smtp_log_clone, smtp_shutdown_rx).await
+        smtp::serve(smtp_listener, smtp_log_clone, smtp_dispatcher, smtp_shutdown_rx).await
     });
     let _ = smtp_log; // currently no readers in production.
 
     // Microsoft Graph server.
     let graph_app = graph::router(graph::AppState {
         fixture: Arc::clone(&fixture),
+        dispatcher: dispatcher.clone(),
     });
     let graph_shutdown_rx = shutdown_rx.clone();
     let graph_task = tokio::spawn(
@@ -149,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Gmail server.
     let gmail_app = gmail::router(gmail::AppState {
         fixture: Arc::clone(&fixture),
+        dispatcher: dispatcher.clone(),
     });
     let gmail_shutdown_rx = shutdown_rx.clone();
     let gmail_task = tokio::spawn(
