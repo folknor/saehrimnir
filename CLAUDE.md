@@ -222,14 +222,11 @@ are tracked alongside so `req.call_index` is strictly increasing.
 
 Note: dellingr deliberately omits Lua's unparenthesized function-call
 sugar, so builder calls in `.lua` fixtures are written
-`mailbox({...})` not `mailbox{...}`. Also: `dellingr::set_table_raw`
-takes `(key=top, value=below_top)` order - push value FIRST, then
-key on top, then call. Different from standard Lua C API
-(`lua_settable` pops key from -2, value from -1). And: `get_table_raw`
-called via the public `State` API consumes the top key BEFORE
-checking the table index, so passing a relative `i = -1` (which
-points at the key, not the table) panics with an out-of-bounds
-on the now-shifted stack. Capture the table's absolute index via
+`mailbox({...})` not `mailbox{...}`. Also: `get_table_raw` called
+via the public `State` API consumes the top key BEFORE checking
+the table index, so passing a relative `i = -1` (which points at
+the key, not the table) panics with an out-of-bounds on the
+now-shifted stack. Capture the table's absolute index via
 `state.get_top()` before pushing the key.
 
 ## Rules

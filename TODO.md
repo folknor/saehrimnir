@@ -3,34 +3,56 @@
 Running task list. Per-protocol design notes live alongside in
 `notes/`; this file just tracks what's next.
 
-## Now: IMAP - what's left
+## Lua dynamic surface
 
-The v0 IMAP surface is complete. Open follow-ups:
+Phase 2 callbacks (`on(protocol, command, fn)`) are wired across all
+five protocols, mapped via `Override::Tagged { status, message }`.
+What's left on the Lua side:
 
-- 200-message FETCH batching boundary. The current handler emits all
-  matched FETCH responses in one go. Ratatoskr's client batches
-  client-side (CHUNK_SIZE=200), so the wire boundary is invisible to
-  it; flagged as a v1 thing if we ever want to test the batch
-  boundary explicitly.
-- Streaming `UID FETCH` to avoid materialising the full response set
-  before writing. Today's loop builds a `Vec<String>` first; at huge
-  N (think `bulk_emails(count=1_000_000)`) that's enough memory to
-  matter. Refactor when a fixture forces it.
+- `wait(ms)` Lua helper for latency injection inside callbacks.
+  Implementation is `std::thread::sleep` from a RustFunc - fine
+  inside a callback because the dispatch already holds the
+  `Mutex<State>` and runs synchronously on whichever tokio worker
+  the protocol handler landed on. Multiple connections each get
+  their own dispatch lock turn, so a long sleep on one connection
+  doesn't stall the others' protocol handling (they just queue
+  briefly on the dispatcher mutex).
+- `mock_done()` / `mock_fail("reason")` for self-terminating
+  scripts. Calling either signals the runtime to exit cleanly
+  (code 0) or with a reported failure (non-zero, message to
+  stderr). Lets brokkr observe scenario success/failure via exit
+  code instead of polling.
+- Pushing structured request data to the `req` table. Currently we
+  push only flat strings/ints; a fixture wanting to react to
+  `Email/get`'s `ids` array needs us to push a Lua table from a
+  `Vec<String>`. Small helper, blocked on no test forcing it yet.
+- Anchor release on handler overwrite. `builder_on` only holds
+  `&mut Builder`, not `&mut State`, so re-registering the same
+  `(protocol, command)` orphans the previous Anchor. Fixable by
+  pulling state access into builder_on (refactor user_data shape)
+  or by tracking pending releases and applying them at load
+  finalization. Acceptable today since real scenarios register
+  once.
+- SMTP `cmd_auth` callback hook. Skipped from the initial fanout
+  because AUTH-time fault injection isn't a common scenario; the
+  helper exists, adding the hook is one line if a fixture wants
+  it.
+- Gmail `get_attachment` and `send_as` callback hooks. Skipped
+  because both are stubs. Wire when a fixture needs them.
 
-Done in this session:
-1. Listener bootstrap, greeting, CAPABILITY, NOOP, LOGOUT.
-2. LOGIN, AUTHENTICATE PLAIN/XOAUTH2/OAUTHBEARER, ENABLE QRESYNC.
-3. LIST + STATUS with role-derived special-use attributes.
-4. SELECT/EXAMINE/CLOSE, UID SEARCH ALL/range/SINCE.
-5. UID FETCH with the four ratatoskr attributes (UID FLAGS
-   INTERNALDATE BODY.PEEK[]) plus BODY[HEADER]/BODY[TEXT]/RFC822.SIZE
-   for free.
-6. CONDSTORE / CHANGEDSINCE - works because HIGHESTMODSEQ is pinned.
-7. Integration test in `tests/imap.rs` exercising the full
-   initial-sync transcript plus a literal-block byte-accuracy check
-   and a determinism check across two runs.
+## IMAP
 
-## Now: Microsoft Graph - what's left
+- Streaming `UID FETCH` to avoid materialising the full response
+  set before writing. Today's loop builds a `Vec<String>` first;
+  at huge N (think `bulk_emails(count=1_000_000)`) that's enough
+  memory to matter. Refactor when a fixture forces it.
+- 200-message FETCH batching boundary. The current handler emits
+  all matched FETCH responses in one go. Ratatoskr's client
+  batches client-side (`CHUNK_SIZE = 200`), so the wire boundary
+  is invisible to it; flagged as a v1 thing if we ever want to
+  test the batch boundary explicitly.
+
+## Microsoft Graph
 
 v0 mail-sync surface is complete. Future Graph work, in roughly the
 order the next fixture is likely to need it:
@@ -50,7 +72,7 @@ order the next fixture is likely to need it:
 - Webhooks / change notifications (`webhooks.rs`).
 - Autodiscover (`autodiscover.rs`).
 
-## Now: Gmail - what's left
+## Gmail
 
 v0 mail-sync surface is complete. Future Gmail work:
 
@@ -69,25 +91,33 @@ v0 mail-sync surface is complete. Future Gmail work:
   `sendAs[]`; once a fixture grows `[account.signature]` we honour
   it both ways.
 
-## Open questions still pending
+## Fixture format growth
 
-- HTML-only bodies. Add `body_html` to the fixture format as a
-  parallel option to `body_text`? Reserved in fixture-format.md but
-  not implemented. Will become more pressing once IMAP needs to
-  render the wire body and Graph wants HTML rendering.
-- Multipart MIME via `body_path`. Deferred until a fixture needs it.
-  IMAP forces this question because BODY[] has to emit a real
-  multipart/mixed when there are attachments.
-- Multi-account fixtures. v0 enforces `is_personal = true` and
-  exactly one account. Lifting requires per-protocol tweaks to
-  surface multiple accounts.
-- Failure injection. Plan 2 reserves `[fault]` blocks for v1. Slow
-  responses, retryable errors, network-level errors. Useful for all
-  protocols once the happy paths land.
-- Incremental sync. JMAP `Email/changes` / `Mailbox/changes`,
-  IMAP UIDVALIDITY bumps and HIGHESTMODSEQ advancement, Graph delta
-  tokens. All require fixture-side `[[change]]` entries that advance
-  state tokens. Out of scope until every happy path lands.
+Each item below requires both fixture-side schema work and at
+least one protocol layer's projection layer to consume it. Mostly
+unblocked - we just haven't needed them yet.
+
+- `body_html` parallel to `body_text`. Reserved in
+  `notes/fixture-format.md`; not implemented. Pressing once IMAP
+  needs to render an HTML wire body or Graph wants HTML rendering.
+- Multipart MIME via `body_path`. Same constraint - IMAP forces
+  this when a fixture grows attachments because `BODY[]` must emit
+  a real multipart/mixed.
+- Attachments. Need fixture-side `[[email.attachment]]` (or Lua
+  builder), then projection to JMAP `attachments[]`, IMAP
+  `BODYSTRUCTURE` + `BODY[]` parts, Graph `attachments`, Gmail
+  parts under the payload tree.
+- Multi-account. v0 enforces `is_personal = true` and exactly one
+  account. Lifting requires per-protocol tweaks to surface multiple
+  accounts (JMAP session resource, Graph `/users/{id}/...` paths,
+  IMAP per-connection account context).
+- Incremental sync change scripts. `[[change]]` entries (or a Lua
+  equivalent) that advance state tokens between phases - JMAP
+  state, IMAP UIDVALIDITY/HIGHESTMODSEQ bumps, Graph deltatokens,
+  Gmail historyId. Out of scope until every happy path lands.
+- `bulk_mailboxes` builder for hierarchical folder generation.
+  Complements `bulk_emails` / `bulk_threads`. Useful for
+  exercising client-side folder-tree logic at scale.
 
 ## Cosmetic and housekeeping
 
@@ -95,9 +125,12 @@ v0 mail-sync surface is complete. Future Gmail work:
   sweep needs `Project::Saehrimnir` to land in brokkr's enum first,
   or the file would fail brokkr's parse-time validation. Until then,
   rely on `brokkr check`'s no-toml fallback.
+- `dellingr = { path = "../dellingr" }` in Cargo.toml. Flip back to
+  a versioned dep once dellingr 0.3 (Anchor) ships to crates.io.
 - Plan-3 / ratatoskr wiring. From saehrimnir's side this just needs
-  jmap-client + ratatoskr's IMAP client to talk to us cleanly. Two
-  observable behaviours we should re-verify once plan-3 lights up:
-  whether jmap-client follows a relative `apiUrl` and whether
+  jmap-client + ratatoskr's IMAP/Graph/Gmail/SMTP clients to talk
+  to us cleanly. Behaviours worth re-verifying when plan-3 lights
+  up: whether jmap-client follows a relative `apiUrl`, whether
   ratatoskr's IMAP client tolerates our exact greeting/CAPABILITY
-  ordering.
+  ordering, whether Gmail's q-parser mismatch (we only honour
+  `after:YYYY/M/D`) trips any internal-sync code path.

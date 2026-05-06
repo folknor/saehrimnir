@@ -791,12 +791,11 @@ where
     F: FnOnce(&mut State) -> dellingr::Result<()>,
 {
     state.new_table();
-    // Built-in field call_index. dellingr's set_table_raw pops
-    // (key=top, value=below_top); the stdlib convention is push
-    // VALUE first, KEY on top, then call - see lua_std/table.rs's
-    // add_fn! macro.
-    state.push_number(call_index as f64);
+    // Built-in field call_index. dellingr's set_table_raw uses the
+    // standard Lua C API order: push KEY first, then VALUE on top,
+    // then call - matching `lua_settable`.
     state.push_string("call_index");
+    state.push_number(call_index as f64);
     if state.set_table_raw(-3).is_err() {
         state.set_top(0);
         return Override::None;
@@ -867,22 +866,20 @@ fn field_string(state: &mut State, t: isize, key: &str) -> Option<String> {
 // instead of inlining the push/set_table_raw dance.
 
 /// Set `req[key] = value` where the table is at the top of the
-/// stack. Pops nothing (the table stays on top).
-///
-/// Note: dellingr's `set_table_raw` pops `(key=top, value=below_top)`.
-/// We push value first then key on top, matching the stdlib
-/// `add_fn!` convention in `lua_std/table.rs`.
+/// stack. Pops nothing (the table stays on top). Uses the standard
+/// Lua C API order: push KEY first, then VALUE on top, then call
+/// `set_table_raw` - matching `lua_settable`.
 pub fn req_set_str(state: &mut State, key: &str, value: &str) -> dellingr::Result<()> {
-    state.push_string(value);
     state.push_string(key);
+    state.push_string(value);
     state.set_table_raw(-3)
 }
 
 /// Set `req[key] = value` (number) where the table is at the top of
 /// the stack.
 pub fn req_set_int(state: &mut State, key: &str, value: i64) -> dellingr::Result<()> {
-    state.push_number(value as f64);
     state.push_string(key);
+    state.push_number(value as f64);
     state.set_table_raw(-3)
 }
 
