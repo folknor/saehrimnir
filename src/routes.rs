@@ -7,10 +7,11 @@
 
 use std::sync::Arc;
 
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{Json, Router, extract::State, routing::{get, post}};
 use serde_json::{Value, json};
 
 use crate::fixture::Fixture;
+use crate::jmap::{self, JmapRequest, JmapResponse};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -22,6 +23,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(root))
         .route("/.well-known/jmap", get(session))
         .route("/jmap/session", get(session))
+        .route("/jmap/api", post(api))
         .with_state(state)
 }
 
@@ -32,7 +34,7 @@ async fn root() -> &'static str {
 /// Session resource per RFC 8620 §2.
 ///
 /// Capabilities are deliberately limited to `core` + `mail` (see
-/// `notes/ratatoskr-client-surface.md` — advertising `principals`
+/// `notes/ratatoskr-client-surface.md` - advertising `principals`
 /// pulls the client into `Principal/get` and `ShareNotification`
 /// paths the mock can't satisfy in v0).
 async fn session(State(state): State<AppState>) -> Json<Value> {
@@ -86,4 +88,12 @@ async fn session(State(state): State<AppState>) -> Json<Value> {
         "eventSourceUrl": "/jmap/eventsource/?types={types}&closeafter={closeafter}&ping={ping}",
         "state": fixture.state
     }))
+}
+
+/// JMAP method-call endpoint. Always 200; per-call errors land in the
+/// envelope's `methodResponses`. JSON parse failures bubble up as 400
+/// via axum's `Json` extractor, which is the right behaviour per RFC
+/// 8620 §3.6.1.
+async fn api(State(state): State<AppState>, Json(req): Json<JmapRequest>) -> Json<JmapResponse> {
+    Json(jmap::handle(&state.fixture, req))
 }

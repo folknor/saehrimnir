@@ -89,6 +89,44 @@ if [[ "$session" != "$wk" ]]; then
 fi
 echo "match"
 
+echo "=== POST /jmap/api Mailbox/get ==="
+mbx="$(curl -fsSL -H 'Content-Type: application/json' -X POST "$base/jmap/api" --data '{
+  "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+  "methodCalls": [["Mailbox/get", {"accountId": "account-1"}, "c0"]]
+}')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["sessionState"] == "fixture-state", d
+mr = d["methodResponses"]
+assert len(mr) == 1, mr
+assert mr[0][0] == "Mailbox/get", mr
+assert mr[0][2] == "c0", mr
+result = mr[0][1]
+assert result["accountId"] == "account-1", result
+ids = [m["id"] for m in result["list"]]
+assert ids == ["mbx-inbox", "mbx-archive"], ids
+inbox = result["list"][0]
+assert inbox["totalEmails"] == 2, inbox
+assert inbox["unreadEmails"] == 2, inbox
+print("Mailbox/get: ok ({} mailboxes)".format(len(ids)))
+' "$mbx"
+
+echo "=== POST /jmap/api unknownMethod ==="
+unk="$(curl -fsSL -H 'Content-Type: application/json' -X POST "$base/jmap/api" --data '{
+  "using": [],
+  "methodCalls": [["Email/import", {}, "c1"]]
+}')"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+mr = d["methodResponses"][0]
+assert mr[0] == "error", mr
+assert mr[1]["type"] == "unknownMethod", mr
+assert mr[2] == "c1", mr
+print("unknownMethod: ok")
+' "$unk"
+
 echo "=== SIGTERM ==="
 kill -TERM "$pid"
 wait "$pid"

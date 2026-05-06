@@ -9,9 +9,9 @@ have to read both ~800-line plans cold.
 
 For a sync test, brokkr spawns two children, in order:
 
-1. **sæhrimnir** (us) — the mock JMAP server. Writes a readiness
+1. **sæhrimnir** (us) - the mock JMAP server. Writes a readiness
    sentinel when bound. Serves JMAP from a fixture. Exits on SIGTERM.
-2. **harness binary** — `app --test-harness <script.lua>`, the
+2. **harness binary** - `app --test-harness <script.lua>`, the
    ratatoskr-side runtime that hosts the Lua VM + `ServiceClient`
    userdata. Reads the mock's endpoint via env var, drives sync over
    JSON-RPC against the Service it spawns internally.
@@ -67,7 +67,7 @@ Plan 3 wires whatever name is configured; we don't hardcode it.
 - **Trigger:** atomic write the moment the TCP listener is bound.
   Write-temp-then-rename, so a reader can't catch us mid-write with
   an empty file.
-- **Content:** `READY <port>\n` — single line, single newline. Plan 2
+- **Content:** `READY <port>\n` - single line, single newline. Plan 2
   spells it that way; brokkr's `wait_for_sentinel` doesn't parse the
   content (it's presence-only) but the calling code in plan 3 reads
   the file to extract the port.
@@ -80,7 +80,7 @@ Plan 3 wires whatever name is configured; we don't hardcode it.
 
 **None mandated by brokkr.** All inputs come via CLI flags:
 `--fixture`, `--port`, `--readiness-file`, `--log-file`. We should not
-read environment for fixture data — keeps the CLI the single source
+read environment for fixture data - keeps the CLI the single source
 of truth and makes manual `brokkr mock-serve` invocations debuggable.
 
 (The harness binary, separately, gets `RATATOSKR_TEST_*_ENDPOINT`
@@ -110,7 +110,7 @@ sync_script_dir = "crates/app/tests/sync-harness"
 
 Implications for us:
 
-- Brokkr builds us on demand via `cargo_build` from our project root —
+- Brokkr builds us on demand via `cargo_build` from our project root -
   same model as `brokkr serve` for nidhogg.
 - Fixture file paths resolve at `<fixtures_dir>/<name>.toml`. The
   fixture's `name = "..."` field is informational; the filename is
@@ -124,12 +124,12 @@ plus a `[[check]]` sweep so `brokkr check` works inside this repo.
 
 Per-run, under `.brokkr/ratatoskr/sync/<test>/run-N/`:
 
-- `mock-server.stderr` — our stderr, captured verbatim. Default log
+- `mock-server.stderr` - our stderr, captured verbatim. Default log
   channel.
-- `proc-at-failure-mock.txt` — `/proc/<our-pid>/{status,wchan,syscall,stack}`,
+- `proc-at-failure-mock.txt` - `/proc/<our-pid>/{status,wchan,syscall,stack}`,
   taken at failure-declaration time by brokkr's `snapshot_proc`. We
   don't write this; brokkr does.
-- `exit-mock.txt` — our exit code, signal, wait time. Brokkr writes.
+- `exit-mock.txt` - our exit code, signal, wait time. Brokkr writes.
 
 Our own outputs go to wherever the CLI flags point:
 
@@ -177,7 +177,7 @@ We do not write into the harness binary's artefact dir
 - **`--imap` / `--jmap` selection in `brokkr mock-serve`.** Plan 3
   defines flags to choose which protocol; plan 2 is JMAP-only for
   v0. When IMAP lands (later), the cleanest split is two separate
-  binaries (`sæhrimnir-jmap`, `sæhrimnir-imap`) — keeps each CLI
+  binaries (`sæhrimnir-jmap`, `sæhrimnir-imap`) - keeps each CLI
   small. Either way, `brokkr mock-serve --jmap` for v0 just spawns
   us with a fixture flag.
 - **Per-fixture run-dir keying.** Plan 3 currently keys on script
@@ -185,13 +185,13 @@ We do not write into the harness binary's artefact dir
 
 ## What we should ignore
 
-- Marker FIFOs, `BROKKR_MARKER_FIFO`, brokkr's sidecar — all
+- Marker FIFOs, `BROKKR_MARKER_FIFO`, brokkr's sidecar - all
   unrelated to plan 2. Those are concerns of the harness binary,
   not ours.
 - Lua / dellingr / `ServiceClient`. Live entirely in ratatoskr's
   `app` crate. We don't depend on or know about them.
 
 (Brokkr does take a one-shot `/proc` snapshot of us at failure time
-via its standalone `snapshot_proc` primitive — written into
-`proc-at-failure-mock.txt` — but it reads from outside; we don't
+via its standalone `snapshot_proc` primitive - written into
+`proc-at-failure-mock.txt` - but it reads from outside; we don't
 participate.)

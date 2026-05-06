@@ -5,7 +5,7 @@ fixture per process. Plan-2 sketched the shape; this doc tightens it
 where the client surface dictates a specific decision.
 
 The format will refine during implementation. Treat this as the
-"current best understanding" — open questions are flagged inline.
+"current best understanding" - open questions are flagged inline.
 
 ## Top level
 
@@ -20,7 +20,7 @@ state = "fixture-state"
 [account]
 id = "account-1"
 # Used as both the JMAP account name and the address ratatoskr stores
-# in its accounts row. Should be an email-shaped string — the client
+# in its accounts row. Should be an email-shaped string - the client
 # falls back to it when principals lookup fails (out of scope for v0,
 # but cheap to satisfy).
 name = "test@example.com"
@@ -101,19 +101,19 @@ data_path = "blobs/report.pdf"  # optional; resolved during /jmap/download (out 
 
 Two mutually exclusive options:
 
-- `body_text` — inline string. Becomes a single `text/plain` body
+- `body_text` - inline string. Becomes a single `text/plain` body
   part with a synthetic `partId`. Cheap, deterministic, hand-editable.
   **Default for v0.** Most fixtures will use this.
 
-- `body_path` — relative path to an `.eml` file under the fixture
+- `body_path` - relative path to an `.eml` file under the fixture
   directory. The mock parses the MIME tree to extract `text/plain`,
   `text/html`, attachments, headers. Useful for round-tripping real
-  messages. **Implementation deferred until a fixture needs it** — v0
+  messages. **Implementation deferred until a fixture needs it** - v0
   can ship with `body_text` only and add `body_path` when the first
   test actually requires real MIME.
 
 Open question: HTML-only bodies. Add `body_html` as a third option,
-or require `.eml`? Lean toward adding `body_html` as a parallel field —
+or require `.eml`? Lean toward adding `body_html` as a parallel field -
 many fixture cases will be "single text/html part" with no need for
 full MIME.
 
@@ -128,7 +128,7 @@ fixtures debuggable.
 
 ISO-8601 in. Stored as Unix seconds internally, emitted as Unix seconds
 on the wire (per RFC 8621). Sub-second precision is dropped. The mock
-never reads system time — every timestamp on the wire comes from the
+never reads system time - every timestamp on the wire comes from the
 fixture.
 
 ### Address shape
@@ -136,7 +136,7 @@ fixture.
 Per `crates/jmap/src/parse.rs:200-207`, the client expects each
 address as `{name, email}`. Fixtures accept two forms:
 
-- A bare string `"alice@example.com"` — interpreted as
+- A bare string `"alice@example.com"` - interpreted as
   `{name: null, email: "alice@example.com"}`.
 - A table `{name = "Alice", email = "alice@example.com"}`.
 

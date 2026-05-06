@@ -46,16 +46,18 @@ checking whether the fact is already in `notes/`.
 - `src/sentinel.rs` - atomic readiness-file write (temp + rename).
 - `src/shutdown.rs` - SIGTERM/SIGINT handler.
 - `src/routes.rs` - axum router, `AppState`, route handlers.
+- `src/jmap.rs` - request envelope, dispatcher, per-method handlers.
 - `fixtures/jmap-small.toml` - canonical v0 fixture.
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status
 
-Bootstrap through plan-2 step 4 has landed: HTTP listener, readiness
-sentinel, SIGTERM, fixture loader, and `/jmap/session` work. Steps 5
-(Mailbox/get + envelope), 6 (Email/query), 7 (Email/get), 8
-(integration tests), and 9 (ratatoskr wiring) are still pending. See
-`TODO.md` for the design decisions worked out per step.
+Bootstrap through plan-2 step 5 has landed: HTTP listener, readiness
+sentinel, SIGTERM, fixture loader, `/jmap/session`, and the
+`POST /jmap/api` envelope with `Mailbox/get` work. Steps 6
+(Email/query), 7 (Email/get), 8 (integration tests), and 9 (ratatoskr
+wiring) are still pending. See `TODO.md` for the design decisions
+worked out per step.
 
 ## Rules
 

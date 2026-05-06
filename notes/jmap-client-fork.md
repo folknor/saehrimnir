@@ -7,7 +7,7 @@ reference after RFC 8620/8621.
 
 ## Where it lives
 
-`/home/folk/Programs/jmap-client` — sibling to `ratatoskr/` and this
+`/home/folk/Programs/jmap-client` - sibling to `ratatoskr/` and this
 repo. Used by `<ratatoskr>/crates/jmap/` as a path dependency.
 
 ## Provenance
@@ -34,10 +34,10 @@ default = ["tls-rustls", "websockets", "mail", "calendars", "contacts",
 
 Notable things ratatoskr inherits by default:
 
-- `mail` — `Email`, `Mailbox`, `Thread`, `EmailSubmission`.
-- `calendars`, `contacts`, `blob`, `quota` — the wider mail-adjacent
+- `mail` - `Email`, `Mailbox`, `Thread`, `EmailSubmission`.
+- `calendars`, `contacts`, `blob`, `quota` - the wider mail-adjacent
   surface. None are exercised by `jmap_initial_sync`.
-- `websockets` — present but ratatoskr's sync code is HTTP-only.
+- `websockets` - present but ratatoskr's sync code is HTTP-only.
 
 The mock can ignore everything outside `mail` for v0.
 
@@ -46,19 +46,19 @@ The mock can ignore everything outside `mail` for v0.
 The directories under `jmap-client/src/` map roughly 1:1 to JMAP type
 families. Reading order if we ever need to verify wire shapes by hand:
 
-- `core/` — capabilities, errors, query (`Filter`, `Comparator`),
+- `core/` - capabilities, errors, query (`Filter`, `Comparator`),
   request/response framing, session.
-- `email/` — `Email`, `EmailGet`, `EmailQuery`, `EmailChanges`,
+- `email/` - `Email`, `EmailGet`, `EmailQuery`, `EmailChanges`,
   `EmailSet`, `EmailBodyPart`, `HeaderValue`, `Property` enum.
-- `mailbox/` — `Mailbox`, `MailboxGet`, `MailboxRights`, `Role`.
+- `mailbox/` - `Mailbox`, `MailboxGet`, `MailboxRights`, `Role`.
 - `thread/`, `blob/`, `quota/`, `identity/`, `address_book/`,
   `calendar/`, `calendar_event/`, `contact_card/`, `principal/`,
   `share_notification/`, `email_submission/`, `participant_identity/`,
   `push_subscription/`, `sieve/`, `vacation_response/`,
-  `event_source/` — out of scope for v0.
-- `client.rs`, `client_ws.rs`, `transport_reqwest.rs` — HTTP/WS
+  `event_source/` - out of scope for v0.
+- `client.rs`, `client_ws.rs`, `transport_reqwest.rs` - HTTP/WS
   transport. Reqwest under the hood; not relevant to the mock.
-- `tests.rs` — integration-style tests. Useful as a wire-format
+- `tests.rs` - integration-style tests. Useful as a wire-format
   reference if a hand-rolled JSON shape ever drifts from what the
   client deserializes.
 
@@ -69,7 +69,7 @@ A non-exhaustive list, drawn from `crates/jmap/src/`:
 - `Client::new() -> ClientBuilder`
 - `ClientBuilder::credentials(Credentials)`,
   `Credentials::basic(user, pass)`, `Credentials::bearer(token)`
-- `ClientBuilder::connect(&jmap_url) -> Client` — sends the session
+- `ClientBuilder::connect(&jmap_url) -> Client` - sends the session
   request.
 - `Client::session()` -> session resource accessors:
   `accounts()`, `account(id)`, `has_capability(uri)`,
@@ -109,7 +109,7 @@ A non-exhaustive list, drawn from `crates/jmap/src/`:
 ## When to read this crate's source vs the RFCs
 
 - **Read jmap-client for:** field naming when the RFC is ambiguous
-  (e.g. `myRights` vs `my_rights` over the wire — JMAP spec says
+  (e.g. `myRights` vs `my_rights` over the wire - JMAP spec says
   camelCase, but verifying the serde `rename_all` is fastest in the
   source); whether optional fields are serialized as `null` vs
   omitted; the exact strings used in custom-header property keys

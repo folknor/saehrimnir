@@ -1,7 +1,7 @@
 # sæhrimnir
 
 Deterministic mock JMAP server. The boar that's slaughtered every
-evening and resurrected every morning — fitting for a fixture-driven
+evening and resurrected every morning - fitting for a fixture-driven
 test peer that comes up identical on every spawn.
 
 Used by ratatoskr's sync tests, orchestrated by brokkr. Plan-2 of a

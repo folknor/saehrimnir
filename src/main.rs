@@ -1,5 +1,6 @@
 mod cli;
 mod fixture;
+mod jmap;
 mod routes;
 mod sentinel;
 mod shutdown;
