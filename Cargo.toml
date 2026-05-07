@@ -14,17 +14,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1.2"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-# Path dep against the local dellingr checkout while the Send-fy /
-# function-ref-registry FRs land. Flip back to a versioned dep once
-# the next release ships to crates.io.
-dellingr = { path = "../dellingr" }
+dellingr = "0.2"
 rand = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json"] }
 libc = "0.2"
