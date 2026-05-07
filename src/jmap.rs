@@ -270,6 +270,9 @@ const QUERY_LIMIT_DEFAULT: u64 = 50;
 /// `{"inMailbox": <id>}` filter conditions; sort is hard-wired to
 /// `receivedAt` descending with `id` lexicographic as tiebreaker so
 /// the wire output is byte-stable for a given fixture.
+// `expect()` calls inside this fn are bounds-checked one line above
+// each use - they cannot panic and aren't wire errors to surface.
+#[allow(clippy::unwrap_in_result)]
 fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = args.get("accountId").and_then(Value::as_str).ok_or_else(|| {
         json!({
@@ -301,7 +304,7 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
             "description": "negative position not supported in v0",
         }));
     }
-    let position = position as u64;
+    let position = u64::try_from(position).expect("position non-negative checked above");
 
     let limit = match args.get("limit") {
         None | Some(Value::Null) => QUERY_LIMIT_DEFAULT,
@@ -318,7 +321,9 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
                     "description": "limit must be non-negative",
                 }));
             }
-            (n as u64).min(QUERY_LIMIT_CAP)
+            u64::try_from(n)
+                .expect("limit non-negative checked above")
+                .min(QUERY_LIMIT_CAP)
         }
     };
 
@@ -342,8 +347,10 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     });
 
     let total = matches.len() as u64;
-    let start = position.min(total) as usize;
-    let end = (position + limit).min(total) as usize;
+    // start/end are bounded by `total = matches.len()` which already
+    // fits in usize (it came from a Vec).
+    let start = usize::try_from(position.min(total)).expect("start <= matches.len()");
+    let end = usize::try_from((position + limit).min(total)).expect("end <= matches.len()");
     let ids: Vec<Value> = matches[start..end]
         .iter()
         .map(|e| Value::String(e.id.clone()))

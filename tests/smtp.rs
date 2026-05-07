@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! End-to-end SMTP test driving `serve_connection` over a duplex
 //! stream and asserting on the captured submission log.
 

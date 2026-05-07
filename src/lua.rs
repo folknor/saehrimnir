@@ -24,6 +24,15 @@ use rand::rngs::SmallRng;
 use crate::fixture::{self, Fixture, RawAccount, RawAddress, RawEmail, RawFixture, RawMailbox};
 use crate::templates;
 
+/// `i64` range bounds expressed as `f64`. These constants encode the
+/// fact that `i64::MIN` and `i64::MAX` are not exactly representable
+/// as `f64`, but the conversion is well-defined for the
+/// containment-check pattern below.
+#[allow(clippy::cast_precision_loss)]
+const I64_MIN_F64: f64 = i64::MIN as f64;
+#[allow(clippy::cast_precision_loss)]
+const I64_MAX_F64: f64 = i64::MAX as f64;
+
 /// Hard cap on `count` for the bulk builders. Above this we'd be
 /// allocating gigabytes of `RawEmail`s; failure mode is OOM. The cap
 /// is high enough to permit "test sync at scale" scenarios but low
@@ -188,10 +197,13 @@ fn builder_wait(state: &mut State) -> dellingr::Result<u8> {
         return fail(state, "wait: ms must be a number");
     }
     let ms = state.to_number(1)?;
-    if !ms.is_finite() || ms < 0.0 {
+    if !ms.is_finite() || ms < 0.0 || ms > u64::MAX as f64 {
         return fail(state, "wait: ms must be a non-negative finite number");
     }
-    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    // Bounds-checked above: 0 <= ms <= u64::MAX, finite.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ms_u64 = ms as u64;
+    std::thread::sleep(std::time::Duration::from_millis(ms_u64));
     Ok(0)
 }
 
@@ -324,6 +336,17 @@ fn builder_mailbox(state: &mut State) -> dellingr::Result<u8> {
 ///   id_prefix = "bulk",                   -- default
 /// })
 /// ```
+//
+// Casts inside the loop body are validated up-front (`count` capped
+// at `MAX_BULK_COUNT`, sign-checked) and the seed is intentionally
+// reinterpreted as `u64` for `SmallRng`. Suppressing the cast lints
+// avoids per-iteration `try_from` checks that wouldn't catch
+// anything the bounds-check above doesn't already reject.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
     require_one_table_arg(state, "bulk_emails")?;
     let count = read_int(state, 1, "count")?;
@@ -374,7 +397,7 @@ fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
     // millions-of-emails scale.
     let pad = pad_width(count);
     for i in 0..count {
-        let id = format!("{id_prefix}-{i:0pad$}", pad = pad);
+        let id = format!("{id_prefix}-{i:0pad$}");
         let received_at = start + Duration::seconds(i * interval_seconds);
         let (from_name, from_email) = templates::pick_address(&mut rng);
         let (_, to_email) = templates::pick_address(&mut rng);
@@ -405,6 +428,8 @@ fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
 }
 
 fn pad_width(count: i64) -> usize {
+    // count.max(1) >= 1, so the cast is safe.
+    #[allow(clippy::cast_sign_loss)]
     let mut n = count.max(1) as u64;
     let mut w = 0;
     while n > 0 {
@@ -432,6 +457,15 @@ fn pad_width(count: i64) -> usize {
 ///   id_prefix = "thread",                 -- default
 /// })
 /// ```
+//
+// Same cast story as `builder_bulk_emails`: `count` and
+// `messages_per_thread` are bounded above; the seed is
+// intentionally reinterpreted as `u64`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
     require_one_table_arg(state, "bulk_threads")?;
     let count = read_int(state, 1, "count")?;
@@ -488,7 +522,7 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
     let msg_pad = pad_width(messages_per_thread as i64);
 
     for thread_i in 0..count {
-        let thread_id = format!("{id_prefix}-{thread_i:0pad$}", pad = thread_pad);
+        let thread_id = format!("{id_prefix}-{thread_i:0thread_pad$}");
         let thread_start = start + Duration::seconds(thread_i * thread_interval);
         let first_subject_tmpl = templates::SUBJECT_TEMPLATES
             [(seed.wrapping_add(thread_i as u64) as usize) % templates::SUBJECT_TEMPLATES.len()];
@@ -496,11 +530,8 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
 
         let mut prior_message_ids: Vec<String> = Vec::with_capacity(messages_per_thread);
         for msg_i in 0..messages_per_thread {
-            let msg_id = format!(
-                "{thread_id}-{n:0pad$}",
-                n = msg_i + 1,
-                pad = msg_pad,
-            );
+            let n = msg_i + 1;
+            let msg_id = format!("{thread_id}-{n:0msg_pad$}");
             let received_at = thread_start + Duration::seconds(msg_i as i64 * reply_interval);
             let subject = if msg_i == 0 {
                 first_subject.clone()
@@ -661,6 +692,14 @@ fn read_int_opt(state: &mut State, t: isize, key: &str) -> dellingr::Result<Opti
                 state.pop(1);
                 return fail(state, msg);
             }
+            // f64 -> i64 cast bounded by the i64 range check above.
+            #[allow(clippy::cast_possible_truncation)]
+            if !(I64_MIN_F64..=I64_MAX_F64).contains(&n) {
+                let msg = format!("field {key:?} integer is out of i64 range");
+                state.pop(1);
+                return fail(state, msg);
+            }
+            #[allow(clippy::cast_possible_truncation)]
             Ok(Some(n as i64))
         }
         _ => fail(state, format!("field {key:?} must be a number")),
@@ -701,6 +740,11 @@ fn read_string_array_opt(
 
 /// Read an array of strings whose table is at the top of the stack.
 /// Does not pop the table; caller pops.
+//
+// `state.get_top()` returns `usize` but the dellingr table-index API
+// takes `isize`. The Lua stack top is bounded by the runtime's stack
+// limit (a few hundred at most), so the cast is safe.
+#[allow(clippy::cast_possible_wrap)]
 fn read_string_array_at_top(state: &mut State, key: &str) -> dellingr::Result<Vec<String>> {
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
@@ -749,6 +793,8 @@ fn read_address_array_opt(
     result
 }
 
+// Same stack-top cast story as `read_string_array_at_top`.
+#[allow(clippy::cast_possible_wrap)]
 fn read_address_array_at_top(
     state: &mut State,
     key: &str,
@@ -776,6 +822,9 @@ fn read_address_array_at_top(
 
 /// Read a `{name = ?, email = ...}` table at the stack top into a
 /// `RawAddress::Full`. Does not pop the table; caller pops.
+//
+// Same stack-top cast story as `read_string_array_at_top`.
+#[allow(clippy::cast_possible_wrap)]
 fn read_address_table_at_top(state: &mut State, key: &str) -> dellingr::Result<RawAddress> {
     let t = state.get_top() as isize;
     let name = read_string_opt(state, t, "name")?;
@@ -967,7 +1016,9 @@ fn decode_override(state: &mut State) -> Override {
             // Capture the table's absolute index BEFORE the field
             // lookups push their keys onto the stack - using -1 here
             // would shift to point at the just-pushed key after
-            // push_string runs.
+            // push_string runs. Stack top is bounded so usize -> isize
+            // is safe.
+            #[allow(clippy::cast_possible_wrap)]
             let table_idx = state.get_top() as isize;
             let status = field_string(state, table_idx, "status")
                 .unwrap_or_else(|| "BAD".to_string());

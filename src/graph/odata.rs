@@ -208,7 +208,7 @@ fn encode_form(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'$' => {
-                out.push(b as char)
+                out.push(b as char);
             }
             b' ' => out.push('+'),
             other => out.push_str(&format!("%{other:02X}")),

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! End-to-end Gmail mail-sync tests against the canonical fixture,
 //! driven via `tower::ServiceExt::oneshot` (no socket bind).
 

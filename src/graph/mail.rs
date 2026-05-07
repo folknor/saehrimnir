@@ -587,8 +587,12 @@ fn host_or_default(headers: &HeaderMap) -> String {
 }
 
 fn next_offset(offset: u32, top: u32, total: u64) -> Option<u32> {
-    let next = offset as u64 + top as u64;
-    if next < total { Some(next as u32) } else { None }
+    let next = u64::from(offset) + u64::from(top);
+    if next < total {
+        u32::try_from(next).ok()
+    } else {
+        None
+    }
 }
 
 /// Parse the only `$filter` shape ratatoskr emits during initial mail

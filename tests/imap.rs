@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! End-to-end IMAP test driving `serve_connection` over a duplex
 //! stream. Mirrors the full initial-sync transcript ratatoskr would
 //! issue against the canonical fixture.

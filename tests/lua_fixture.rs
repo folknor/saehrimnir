@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! End-to-end test that the Lua scenario loader produces a `Fixture`
 //! byte-identical to the equivalent TOML fixture. With this guarantee,
 //! any test that validates wire output against the TOML fixture also

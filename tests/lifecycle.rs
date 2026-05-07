@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! End-to-end lifecycle test: spawn the actual binary, wait for the
 //! sentinel, exercise a real network request, send SIGTERM, verify
 //! a clean exit. Closes the gap that `scripts/smoke.sh` covers
@@ -79,7 +81,8 @@ fn parse_jmap_port(sentinel: &str) -> u16 {
 fn send_sigterm(pid: u32) {
     // SAFETY: SIGTERM to a pid we own. Returns -1 on error which we
     // tolerate; the Drop guard will clean up if the kill failed.
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let pid = libc::pid_t::try_from(pid).expect("pid fits in pid_t");
+    unsafe { libc::kill(pid, libc::SIGTERM) };
 }
 
 fn wait_with_timeout(mut child: Child, timeout: Duration) -> std::io::Result<std::process::ExitStatus> {

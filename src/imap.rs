@@ -669,10 +669,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 if store_op.silent {
                     String::new()
                 } else {
-                    format!(
-                        "* {seq} FETCH (UID {uid} FLAGS ({flags}))\r\n",
-                        seq = uid,
-                    )
+                    format!("* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n")
                 }
             })
             .collect();
@@ -804,7 +801,10 @@ fn mailbox_messages<'a>(fixture: &'a Fixture, mailbox_id: &str) -> Vec<(u32, &'a
         .iter()
         .filter(|e| e.mailbox_ids.iter().any(|id| id == mailbox_id))
         .enumerate()
-        .map(|(i, e)| (i as u32 + 1, e))
+        .map(|(i, e)| {
+            let seq = u32::try_from(i + 1).expect("mailbox seq fits in u32");
+            (seq, e)
+        })
         .collect()
 }
 
@@ -1842,7 +1842,7 @@ mod tests {
     fn parse_two_astrings_handles_quoted_and_atom() {
         assert_eq!(
             parse_two_astrings("\"\" \"*\""),
-            Some(("".to_string(), "*".to_string()))
+            Some((String::new(), "*".to_string()))
         );
         assert_eq!(
             parse_two_astrings("ref pat"),

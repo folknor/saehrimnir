@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! End-to-end tests that drive the router via `tower::ServiceExt::oneshot`
 //! without binding a TCP port. Faster than spawning the binary and
 //! sufficient for verifying the wire format - the subprocess + sentinel

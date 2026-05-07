@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 //! Scale-correctness tests against `fixtures/jmap-bulk.lua` (10k
 //! emails in a single inbox plus a hand-authored marker email in
 //! Archive).
@@ -57,7 +59,7 @@ async fn body_json(resp: axum::response::Response) -> Value {
 #[tokio::test]
 async fn jmap_email_query_paginates_through_full_inbox() {
     let router = jmap_router();
-    let mut total_ids = Vec::with_capacity(BULK_TOTAL as usize);
+    let mut total_ids = Vec::with_capacity(usize::try_from(BULK_TOTAL).expect("BULK_TOTAL fits"));
     let mut position = 0u64;
     let limit = 50u64;
     let mut total_reported: Option<u64> = None;

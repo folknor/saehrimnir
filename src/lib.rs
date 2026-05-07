@@ -5,6 +5,11 @@
 //! can drive the router via `tower::ServiceExt::oneshot` without
 //! binding a port.
 
+// `unwrap_used` is denied at the crate level for production safety, but
+// in test code panicking is the assertion mechanism - keep it
+// idiomatic.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 pub mod cli;
 pub mod fixture;
 pub mod gmail;
