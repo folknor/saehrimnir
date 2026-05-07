@@ -436,6 +436,120 @@ fn bulk_emails_validates_mailbox_at_normalize_time() {
 }
 
 #[test]
+fn wait_helper_blocks_for_at_least_the_requested_duration() {
+    let start = std::time::Instant::now();
+    let (_fixture, dispatcher) = lua::load_source_with_dispatcher(
+        r#"
+        fixture({ name = "w" })
+        account({ id = "a", name = "a@b" })
+        on("test", "ping", function(req)
+            wait(50)
+            return { status = "OK", message = "slept" }
+        end)
+        "#,
+        "@wait",
+    )
+    .unwrap();
+    let result = dispatcher.dispatch("test", "ping", |_state| Ok(()));
+    let elapsed = start.elapsed();
+    assert!(matches!(result, lua::Override::Tagged { .. }));
+    assert!(elapsed >= std::time::Duration::from_millis(50), "got: {elapsed:?}");
+}
+
+#[test]
+fn wait_helper_rejects_negative_argument() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "w" })
+        account({ id = "a", name = "a@b" })
+        wait(-1)
+        "#,
+        "@wait-neg",
+    )
+    .unwrap_err();
+    assert!(err.contains("non-negative"), "got: {err}");
+}
+
+#[test]
+fn mock_done_at_load_time_surfaces_via_dispatcher() {
+    let (_fixture, dispatcher) = lua::load_source_with_dispatcher(
+        r#"
+        fixture({ name = "d" })
+        account({ id = "a", name = "a@b" })
+        mock_done()
+        "#,
+        "@done",
+    )
+    .unwrap();
+    assert_eq!(dispatcher.current_exit(), Some(lua::MockExit::Done));
+}
+
+#[test]
+fn mock_fail_at_load_time_surfaces_with_reason() {
+    let (_fixture, dispatcher) = lua::load_source_with_dispatcher(
+        r#"
+        fixture({ name = "f" })
+        account({ id = "a", name = "a@b" })
+        mock_fail("missing fixture preset")
+        "#,
+        "@fail",
+    )
+    .unwrap();
+    assert_eq!(
+        dispatcher.current_exit(),
+        Some(lua::MockExit::Fail("missing fixture preset".to_string()))
+    );
+}
+
+#[test]
+fn mock_done_inside_callback_is_observable_after_dispatch() {
+    let (_fixture, dispatcher) = lua::load_source_with_dispatcher(
+        r#"
+        fixture({ name = "cbd" })
+        account({ id = "a", name = "a@b" })
+        on("test", "ping", function(req)
+            mock_done()
+            return { status = "OK", message = "bye" }
+        end)
+        "#,
+        "@cb-done",
+    )
+    .unwrap();
+    assert_eq!(dispatcher.current_exit(), None);
+    let _ = dispatcher.dispatch("test", "ping", |_state| Ok(()));
+    assert_eq!(dispatcher.current_exit(), Some(lua::MockExit::Done));
+}
+
+#[test]
+fn mock_done_then_mock_fail_first_call_wins() {
+    let (_fixture, dispatcher) = lua::load_source_with_dispatcher(
+        r#"
+        fixture({ name = "fcw" })
+        account({ id = "a", name = "a@b" })
+        mock_done()
+        mock_fail("too late")
+        "#,
+        "@fcw",
+    )
+    .unwrap();
+    assert_eq!(dispatcher.current_exit(), Some(lua::MockExit::Done));
+}
+
+#[test]
+fn mock_fail_requires_string_reason() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "x" })
+        account({ id = "a", name = "a@b" })
+        mock_fail(123)
+        "#,
+        "@bad-fail",
+    )
+    .unwrap_err();
+    assert!(err.contains("reason"), "got: {err}");
+}
+
+#[test]
 fn lua_loader_double_account_call_errors() {
     let err = lua::load_source(
         r#"

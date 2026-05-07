@@ -60,7 +60,7 @@ pub fn load_source_with_dispatcher(
     chunk_name: &str,
 ) -> Result<(Fixture, Dispatcher), String> {
     let mut state = State::new();
-    state.set_user_data(Builder::default());
+    state.set_user_data(LuaExtras::default());
     install_builders(&mut state);
 
     state
@@ -70,11 +70,15 @@ pub fn load_source_with_dispatcher(
         .call(ArgCount::Fixed(0), RetCount::Fixed(0))
         .map_err(|e| format!("run {chunk_name}: {e}"))?;
 
-    let builder = state
-        .user_data_mut::<Builder>()
-        .map(std::mem::take)
-        .ok_or_else(|| "internal: scenario builder lost".to_string())?;
-    state.clear_user_data();
+    // Pull the builder out for normalisation, but leave LuaExtras in
+    // place on the State so dispatch-time `mock_done()` / `mock_fail()`
+    // calls can still record their signal into `extras.exit`.
+    let builder = {
+        let extras = state
+            .user_data_mut::<LuaExtras>()
+            .ok_or_else(|| "internal: scenario extras lost".to_string())?;
+        std::mem::take(&mut extras.builder)
+    };
 
     let (raw, handlers) = builder.into_parts()?;
     let fixture = fixture::normalize(raw)?;
@@ -88,6 +92,29 @@ pub fn load_source_with_dispatcher(
 /// callbacks accumulated during script load. Lives in `Builder`
 /// during load, moves into `Dispatcher` after.
 type HandlerMap = HashMap<(String, String), Anchor>;
+
+/// Self-termination signal raised by the script via `mock_done()` or
+/// `mock_fail(reason)`. Stored on the State's user_data so it can be
+/// observed both at load time and inside callback dispatch. The
+/// runtime drains it and exits with the corresponding status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MockExit {
+    /// Clean termination: process exits 0.
+    Done,
+    /// Fault termination: process exits non-zero, message printed
+    /// to stderr.
+    Fail(String),
+}
+
+/// User-data wrapper installed on the dellingr `State`. Carries the
+/// in-progress `Builder` during script load and the optional
+/// `MockExit` signal both during load and through the dispatcher's
+/// lifetime.
+#[derive(Debug, Default)]
+struct LuaExtras {
+    builder: Builder,
+    exit: Option<MockExit>,
+}
 
 #[derive(Debug, Default)]
 struct Builder {
@@ -139,6 +166,66 @@ fn install_builders(state: &mut State) {
     state.set_global("bulk_threads");
     state.push_rust_fn(builder_on);
     state.set_global("on");
+    state.push_rust_fn(builder_wait);
+    state.set_global("wait");
+    state.push_rust_fn(builder_mock_done);
+    state.set_global("mock_done");
+    state.push_rust_fn(builder_mock_fail);
+    state.set_global("mock_fail");
+}
+
+/// `wait(ms)` blocks the calling thread for `ms` milliseconds. Used
+/// inside callbacks to inject latency. Safe under the dispatcher
+/// `Mutex<State>`: each connection holds the lock only for its own
+/// dispatch turn, so a long sleep on one connection just queues
+/// other connections briefly on the dispatcher mutex rather than
+/// stalling unrelated protocol handling.
+fn builder_wait(state: &mut State) -> dellingr::Result<u8> {
+    if state.get_top() != 1 {
+        return fail(state, "wait expects (ms)");
+    }
+    if state.typ(1) != LuaType::Number {
+        return fail(state, "wait: ms must be a number");
+    }
+    let ms = state.to_number(1)?;
+    if !ms.is_finite() || ms < 0.0 {
+        return fail(state, "wait: ms must be a non-negative finite number");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    Ok(0)
+}
+
+/// `mock_done()` records a clean-exit signal. The runtime observes
+/// it and shuts the listeners down with exit code 0. First call
+/// wins: subsequent calls are no-ops so a chatty script doesn't
+/// override an earlier `mock_fail`.
+fn builder_mock_done(state: &mut State) -> dellingr::Result<u8> {
+    if state.get_top() != 0 {
+        return fail(state, "mock_done expects no arguments");
+    }
+    let extras = extras_mut(state)?;
+    if extras.exit.is_none() {
+        extras.exit = Some(MockExit::Done);
+    }
+    Ok(0)
+}
+
+/// `mock_fail(reason)` records a fault-exit signal. Reason gets
+/// printed to stderr; the runtime returns a non-zero exit code.
+/// First call wins.
+fn builder_mock_fail(state: &mut State) -> dellingr::Result<u8> {
+    if state.get_top() != 1 {
+        return fail(state, "mock_fail expects (reason)");
+    }
+    if state.typ(1) != LuaType::String {
+        return fail(state, "mock_fail: reason must be a string");
+    }
+    let reason = state.to_string(1)?;
+    let extras = extras_mut(state)?;
+    if extras.exit.is_none() {
+        extras.exit = Some(MockExit::Fail(reason));
+    }
+    Ok(0)
 }
 
 /// Reactive-callback registration: `on(protocol, command, fn)`. The
@@ -498,8 +585,12 @@ fn require_one_table_arg(state: &State, name: &str) -> dellingr::Result<()> {
 }
 
 fn builder_mut(state: &mut State) -> dellingr::Result<&mut Builder> {
-    let missing = state.error(ErrorKind::InternalError("builder user_data missing".into()));
-    state.user_data_mut::<Builder>().ok_or(missing)
+    Ok(&mut extras_mut(state)?.builder)
+}
+
+fn extras_mut(state: &mut State) -> dellingr::Result<&mut LuaExtras> {
+    let missing = state.error(ErrorKind::InternalError("extras user_data missing".into()));
+    state.user_data_mut::<LuaExtras>().ok_or(missing)
 }
 
 fn fail<T>(state: &State, msg: impl Into<String>) -> dellingr::Result<T> {
@@ -740,17 +831,29 @@ struct DispatcherInner {
     state: State,
     handlers: HandlerMap,
     call_counts: HashMap<(String, String), u64>,
+    /// Latched mock-exit signal. Drained out of `LuaExtras` after
+    /// load and after each dispatch; sticky once set.
+    exit: Option<MockExit>,
 }
 
 impl Dispatcher {
     fn new(state: State, handlers: HandlerMap) -> Self {
-        Self {
+        let me = Self {
             inner: Mutex::new(DispatcherInner {
                 state,
                 handlers,
                 call_counts: HashMap::new(),
+                exit: None,
             }),
+        };
+        // If the script signalled mock_done() / mock_fail() at load
+        // time, drain it into the dispatcher so observers see it
+        // even before any dispatch happens.
+        {
+            let mut inner = me.inner.lock().expect("dispatcher mutex poisoned");
+            DispatcherInner::drain_exit(&mut inner);
         }
+        me
     }
 
     /// Run any registered callback for `(protocol, command)`. The
@@ -777,7 +880,45 @@ impl Dispatcher {
             *entry += 1;
             *entry
         };
-        run_dispatch(&mut inner.state, anchor, call_index, build_req)
+        let result = run_dispatch(&mut inner.state, anchor, call_index, build_req);
+        DispatcherInner::drain_exit(&mut inner);
+        result
+    }
+
+    /// Snapshot of any pending mock-exit signal. Non-destructive.
+    /// Returns the same value across calls until the runtime acts
+    /// on it.
+    pub fn current_exit(&self) -> Option<MockExit> {
+        self.inner
+            .lock()
+            .expect("dispatcher mutex poisoned")
+            .exit
+            .clone()
+    }
+
+    /// Async future that resolves the first time `mock_done()` or
+    /// `mock_fail()` fires (either at load time or inside a
+    /// callback). Polls the dispatcher mutex every 100ms; a real
+    /// notification channel would be tidier but the runtime only
+    /// awaits this once across the process lifetime.
+    pub async fn wait_for_exit(&self) -> MockExit {
+        loop {
+            if let Some(exit) = self.current_exit() {
+                return exit;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
+impl DispatcherInner {
+    fn drain_exit(inner: &mut Self) {
+        if inner.exit.is_some() {
+            return;
+        }
+        if let Some(extras) = inner.state.user_data_mut::<LuaExtras>() {
+            inner.exit = extras.exit.take();
+        }
     }
 }
 

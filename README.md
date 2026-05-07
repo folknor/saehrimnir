@@ -52,6 +52,20 @@ protocols - IMAP `UID FETCH`, JMAP method calls, Graph mail
 endpoints, Gmail mail endpoints, SMTP `MAIL`/`RCPT`/`DATA` - with
 per-protocol mapping documented in CLAUDE.md.
 
+Inside callbacks (or at script load), three control helpers are
+also available:
+
+- `wait(ms)` - block the current dispatch for `ms` milliseconds.
+  Useful for latency injection. Other connections queue briefly on
+  the dispatcher mutex but unrelated protocol handling continues.
+- `mock_done()` - signal the runtime to shut the listeners down
+  cleanly (exit 0). First call wins, so a chatty script doesn't
+  override an earlier `mock_fail`.
+- `mock_fail("reason")` - signal a fault exit. The reason is
+  printed to stderr; the process returns a non-zero exit code.
+  Lets brokkr observe scenario success/failure via exit code
+  instead of polling.
+
 Note that dellingr deliberately omits Lua's unparenthesized
 function-call sugar, so builder calls are written `mailbox({...})`
 not `mailbox{...}`.
@@ -115,9 +129,9 @@ clean exit within the 1-second graceful-shutdown budget.
 
 JMAP, IMAP read path, SMTP submission, Graph mail-sync, and Gmail
 mail-sync are complete for v0. The Lua fixture loader (via dellingr)
-is wired but currently only exposes the static-fixture surface;
-reactive callbacks for dynamic scenarios are the next chunk. Future
-increments grow the fixture shape (calendar events, contacts,
-attachments, drive files), add sibling resource modules inside
-`src/graph/` and `src/gmail/`, and expose the dynamic Lua surface.
-See `TODO.md`.
+covers both the static-fixture surface (`fixture` / `account` /
+`mailbox` / `email` builders plus `bulk_emails` / `bulk_threads`)
+and the dynamic surface (`on(...)` callbacks, `wait`, `mock_done`,
+`mock_fail`). Future increments grow the fixture shape (calendar
+events, contacts, attachments, drive files) and add sibling resource
+modules inside `src/graph/` and `src/gmail/`. See `TODO.md`.

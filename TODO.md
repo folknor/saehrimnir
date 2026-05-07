@@ -9,19 +9,6 @@ Phase 2 callbacks (`on(protocol, command, fn)`) are wired across all
 five protocols, mapped via `Override::Tagged { status, message }`.
 What's left on the Lua side:
 
-- `wait(ms)` Lua helper for latency injection inside callbacks.
-  Implementation is `std::thread::sleep` from a RustFunc - fine
-  inside a callback because the dispatch already holds the
-  `Mutex<State>` and runs synchronously on whichever tokio worker
-  the protocol handler landed on. Multiple connections each get
-  their own dispatch lock turn, so a long sleep on one connection
-  doesn't stall the others' protocol handling (they just queue
-  briefly on the dispatcher mutex).
-- `mock_done()` / `mock_fail("reason")` for self-terminating
-  scripts. Calling either signals the runtime to exit cleanly
-  (code 0) or with a reported failure (non-zero, message to
-  stderr). Lets brokkr observe scenario success/failure via exit
-  code instead of polling.
 - Pushing structured request data to the `req` table. Currently we
   push only flat strings/ints; a fixture wanting to react to
   `Email/get`'s `ids` array needs us to push a Lua table from a
@@ -125,8 +112,6 @@ unblocked - we just haven't needed them yet.
   sweep needs `Project::Saehrimnir` to land in brokkr's enum first,
   or the file would fail brokkr's parse-time validation. Until then,
   rely on `brokkr check`'s no-toml fallback.
-- `dellingr = { path = "../dellingr" }` in Cargo.toml. Flip back to
-  a versioned dep once dellingr 0.3 (Anchor) ships to crates.io.
 - Plan-3 / ratatoskr wiring. From saehrimnir's side this just needs
   jmap-client + ratatoskr's IMAP/Graph/Gmail/SMTP clients to talk
   to us cleanly. Behaviours worth re-verifying when plan-3 lights

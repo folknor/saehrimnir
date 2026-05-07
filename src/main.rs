@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use saehrimnir::lua::MockExit;
 use saehrimnir::sentinel::ProtocolPort;
 use saehrimnir::{cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp};
 use tokio::sync::watch;
@@ -167,8 +168,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_future(),
     );
 
-    shutdown::wait_for_signal().await;
-    eprintln!("saehrimnir: shutdown signal received, draining (budget {SHUTDOWN_BUDGET:?})");
+    // Race the OS signal handler against any mock_done()/mock_fail()
+    // signal raised by a Lua scenario. If the dispatcher is absent
+    // (TOML fixture or no mock_* call) the mock-exit branch resolves
+    // never, so we fall through to the signal path normally.
+    let mock_exit_dispatcher = dispatcher.clone();
+    let mock_exit_fut = async move {
+        match mock_exit_dispatcher {
+            Some(d) => d.wait_for_exit().await,
+            None => std::future::pending::<MockExit>().await,
+        }
+    };
+    tokio::pin!(mock_exit_fut);
+
+    let mock_exit: Option<MockExit> = tokio::select! {
+        _ = shutdown::wait_for_signal() => {
+            eprintln!("saehrimnir: shutdown signal received, draining (budget {SHUTDOWN_BUDGET:?})");
+            None
+        }
+        exit = &mut mock_exit_fut => {
+            match &exit {
+                MockExit::Done => {
+                    eprintln!("saehrimnir: mock_done() raised, draining (budget {SHUTDOWN_BUDGET:?})");
+                }
+                MockExit::Fail(reason) => {
+                    eprintln!("saehrimnir: mock_fail({reason:?}) raised, draining (budget {SHUTDOWN_BUDGET:?})");
+                }
+            }
+            Some(exit)
+        }
+    };
     let _ = shutdown_tx.send(true);
 
     let drain = async move {
@@ -179,13 +208,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = gmail_task.await;
     };
     match tokio::time::timeout(SHUTDOWN_BUDGET, drain).await {
-        Ok(()) => {
-            eprintln!("saehrimnir: clean shutdown");
-            Ok(())
-        }
-        Err(_) => {
-            eprintln!("saehrimnir: shutdown budget exceeded, exiting");
-            Ok(())
-        }
+        Ok(()) => eprintln!("saehrimnir: clean shutdown"),
+        Err(_) => eprintln!("saehrimnir: shutdown budget exceeded, exiting"),
+    }
+    match mock_exit {
+        Some(MockExit::Fail(reason)) => Err(format!("scenario mock_fail: {reason}").into()),
+        _ => Ok(()),
     }
 }
