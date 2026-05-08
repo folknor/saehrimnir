@@ -422,6 +422,115 @@ fn bulk_threads_count_above_max_errors() {
 }
 
 #[test]
+fn bulk_mailboxes_breadth_first_tree_with_default_branching() {
+    let script = r#"
+        fixture({ name = "tree" })
+        account({ id = "a", name = "a@b" })
+        bulk_mailboxes({ count = 21, branching = 4, seed = 7 })
+    "#;
+    let a = lua::load_source(script, "@tree").unwrap();
+    let b = lua::load_source(script, "@tree").unwrap();
+    assert_eq!(a, b, "same seed -> byte-identical tree");
+    assert_eq!(a.mailboxes.len(), 21);
+    // BFS layout with branching=4: root + 4 children + 16 grandchildren.
+    assert_eq!(a.mailboxes[0].id, "mb-00");
+    assert!(a.mailboxes[0].parent_id.is_none());
+    // First-tier children mb-01..mb-04 all parent root.
+    for i in 1..=4 {
+        assert_eq!(a.mailboxes[i].parent_id.as_deref(), Some("mb-00"));
+    }
+    // mb-05 is the first grandchild; parent (5-1)/4 = 1 -> mb-01.
+    assert_eq!(a.mailboxes[5].parent_id.as_deref(), Some("mb-01"));
+    // Last entry mb-20: parent (20-1)/4 = 4 -> mb-04.
+    assert_eq!(a.mailboxes[20].parent_id.as_deref(), Some("mb-04"));
+    // sort_order is the BFS index.
+    for (i, mb) in a.mailboxes.iter().enumerate() {
+        assert_eq!(mb.sort_order, Some(i64::try_from(i).unwrap()));
+    }
+}
+
+#[test]
+fn bulk_mailboxes_branching_one_is_a_linear_chain() {
+    let script = r#"
+        fixture({ name = "chain" })
+        account({ id = "a", name = "a@b" })
+        bulk_mailboxes({ count = 5, branching = 1 })
+    "#;
+    let f = lua::load_source(script, "@chain").unwrap();
+    assert_eq!(f.mailboxes.len(), 5);
+    assert!(f.mailboxes[0].parent_id.is_none());
+    for i in 1..5 {
+        assert_eq!(
+            f.mailboxes[i].parent_id.as_deref(),
+            Some(f.mailboxes[i - 1].id.as_str()),
+        );
+    }
+}
+
+#[test]
+fn bulk_mailboxes_names_disambiguate_when_count_exceeds_pool() {
+    // PROJECTS has 20 entries; with count > 20 names must include
+    // the index suffix so duplicates don't trip a future fixture
+    // that wants unique display names.
+    let script = r#"
+        fixture({ name = "names" })
+        account({ id = "a", name = "a@b" })
+        bulk_mailboxes({ count = 25 })
+    "#;
+    let f = lua::load_source(script, "@names").unwrap();
+    let names: std::collections::HashSet<_> =
+        f.mailboxes.iter().map(|m| m.name.clone()).collect();
+    assert_eq!(names.len(), 25, "names must be unique across the tree");
+}
+
+#[test]
+fn bulk_mailboxes_branching_zero_errors() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "x" })
+        account({ id = "a", name = "a@b" })
+        bulk_mailboxes({ count = 1, branching = 0 })
+        "#,
+        "@x",
+    )
+    .unwrap_err();
+    assert!(err.contains("branching"), "got: {err}");
+}
+
+#[test]
+fn bulk_mailboxes_count_above_max_errors() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "x" })
+        account({ id = "a", name = "a@b" })
+        bulk_mailboxes({ count = 9000000000 })
+        "#,
+        "@x",
+    )
+    .unwrap_err();
+    assert!(err.contains("MAX_BULK_COUNT"), "got: {err}");
+}
+
+#[test]
+fn bulk_mailboxes_composes_with_bulk_emails_using_a_generated_id() {
+    // Real workflow: generate a tree, then point bulk_emails at one
+    // of its leaves. Validates the id format is stable enough for a
+    // script to interpolate.
+    let script = r#"
+        fixture({ name = "compose" })
+        account({ id = "a", name = "a@b" })
+        bulk_mailboxes({ count = 10 })
+        bulk_emails({ count = 4, mailbox = "mb-01" })
+    "#;
+    let f = lua::load_source(script, "@compose").unwrap();
+    assert_eq!(f.mailboxes.len(), 10);
+    assert_eq!(f.emails.len(), 4);
+    for em in &f.emails {
+        assert_eq!(em.mailbox_ids, vec!["mb-01".to_string()]);
+    }
+}
+
+#[test]
 fn bulk_emails_validates_mailbox_at_normalize_time() {
     // bulk_emails accepts the mailbox id without checking it exists -
     // but normalize() catches the bad reference at the end.

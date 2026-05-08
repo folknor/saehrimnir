@@ -98,9 +98,6 @@ unblocked - we just haven't needed them yet.
   equivalent) that advance state tokens between phases - JMAP
   state, IMAP UIDVALIDITY/HIGHESTMODSEQ bumps, Graph deltatokens,
   Gmail historyId. Out of scope until every happy path lands.
-- `bulk_mailboxes` builder for hierarchical folder generation.
-  Complements `bulk_emails` / `bulk_threads`. Useful for
-  exercising client-side folder-tree logic at scale.
 
 ## Cosmetic and housekeeping
 
