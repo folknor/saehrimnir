@@ -63,8 +63,9 @@ checking whether the fact is already in `notes/`.
   TOML otherwise.
 - `src/lua.rs` - dellingr-backed Lua scenario loader and reactive-
   callback dispatcher. Exposes the `fixture` / `account` / `mailbox`
-  / `email` builder `RustFunc`s plus `bulk_emails` and `bulk_threads`
-  for synthetic-data scale testing, and the control helpers `wait`,
+  / `email` builder `RustFunc`s plus `bulk_emails`, `bulk_threads`,
+  and `bulk_mailboxes` for synthetic-data scale testing, and the
+  control helpers `wait`,
   `mock_done`, `mock_fail`. `on(protocol, command, fn)` is also a
   RustFunc that anchors the callback (via dellingr's `Anchor`, the
   `luaL_ref`-style registry) into a Rust-side `HandlerMap`; the
@@ -184,8 +185,10 @@ for hand-authored scenarios; `bulk_emails({ count, mailbox, seed,
 start_at, interval_seconds, id_prefix })` for synthetic scale-test
 fixtures; `bulk_threads({ count, mailbox, messages_per_thread, seed,
 ... })` for multi-message conversations with proper `In-Reply-To` /
-`References` chaining (deterministic, byte-stable across runs at
-the same seed; templates in `src/templates.rs`).
+`References` chaining; `bulk_mailboxes({ count, branching, seed,
+id_prefix })` for breadth-first folder trees where mailbox `i` has
+parent `(i-1)/branching` (deterministic, byte-stable across runs
+at the same seed; templates in `src/templates.rs`).
 
 Dynamic surface: scripts register callbacks via
 `on(protocol, command, function)`; the protocol layer consults the

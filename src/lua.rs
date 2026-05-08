@@ -173,6 +173,8 @@ fn install_builders(state: &mut State) {
     state.set_global("bulk_emails");
     state.push_rust_fn(builder_bulk_threads);
     state.set_global("bulk_threads");
+    state.push_rust_fn(builder_bulk_mailboxes);
+    state.set_global("bulk_mailboxes");
     state.push_rust_fn(builder_on);
     state.set_global("on");
     state.push_rust_fn(builder_wait);
@@ -572,6 +574,90 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
             prior_message_ids.push(message_id_header);
             builder.emails.push(email);
         }
+    }
+    Ok(0)
+}
+
+/// Bulk-generate a hierarchical mailbox tree directly into the
+/// builder. Useful for exercising client-side folder-tree handling
+/// at scale. Determinism: same `seed` + same opts -> byte-identical
+/// mailboxes out.
+///
+/// Tree shape is breadth-first: mailbox `i` (0-indexed) has parent
+/// `(i-1) / branching` for `i >= 1`; the root (`i = 0`) has no
+/// parent. So `branching = 4, count = 21` gives one root, four
+/// first-level children, then 16 grandchildren. `sort_order` is the
+/// 0-indexed BFS position. Names are picked deterministically from
+/// the `PROJECTS` template pool, suffixed with the index when the
+/// pool wraps so collisions stay visible in test output.
+///
+/// ```lua
+/// bulk_mailboxes({
+///   count = 100,           -- required
+///   branching = 4,         -- default 4 (children per parent)
+///   seed = 42,             -- default 42
+///   id_prefix = "mb",      -- default "mb"
+/// })
+/// ```
+//
+// Same cast story as `builder_bulk_emails`: `count` is bounded above
+// and the seed is intentionally reinterpreted as `u64`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+fn builder_bulk_mailboxes(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "bulk_mailboxes")?;
+    let count = read_int(state, 1, "count")?;
+    if count < 0 {
+        return fail(state, "bulk_mailboxes count must be non-negative");
+    }
+    if count > MAX_BULK_COUNT {
+        return fail(
+            state,
+            format!("bulk_mailboxes count {count} exceeds MAX_BULK_COUNT={MAX_BULK_COUNT}"),
+        );
+    }
+    let branching = read_int_opt(state, 1, "branching")?.unwrap_or(4);
+    if branching < 1 {
+        return fail(state, "bulk_mailboxes branching must be >= 1");
+    }
+    let seed = read_int_opt(state, 1, "seed")?.unwrap_or(42) as u64;
+    let id_prefix = read_string_opt(state, 1, "id_prefix")?
+        .unwrap_or_else(|| "mb".to_string());
+
+    let builder = builder_mut(state)?;
+    builder.mailboxes.reserve(count as usize);
+
+    let pad = pad_width(count);
+    for i in 0..count {
+        let id = format!("{id_prefix}-{i:0pad$}");
+        let parent_id = if i == 0 {
+            None
+        } else {
+            // Integer division: i - 1 >= 0 and branching >= 1.
+            let p = (i - 1) / branching;
+            Some(format!("{id_prefix}-{p:0pad$}"))
+        };
+        // Stable name pick. Suffix with the index once the pool
+        // wraps so a 100-mailbox tree doesn't collapse into 20
+        // duplicate "Atlas" / "Beacon" entries.
+        let base = templates::PROJECTS
+            [(seed.wrapping_add(i as u64) as usize) % templates::PROJECTS.len()];
+        let name = if (count as usize) > templates::PROJECTS.len() {
+            format!("{base} {i:0pad$}")
+        } else {
+            base.to_string()
+        };
+        builder.mailboxes.push(RawMailbox {
+            id,
+            name,
+            role: None,
+            parent_id,
+            sort_order: Some(i),
+            is_subscribed: None,
+        });
     }
     Ok(0)
 }
