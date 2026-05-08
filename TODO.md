@@ -9,10 +9,6 @@ Phase 2 callbacks (`on(protocol, command, fn)`) are wired across all
 five protocols, mapped via `Override::Tagged { status, message }`.
 What's left on the Lua side:
 
-- Pushing structured request data to the `req` table. Currently we
-  push only flat strings/ints; a fixture wanting to react to
-  `Email/get`'s `ids` array needs us to push a Lua table from a
-  `Vec<String>`. Small helper, blocked on no test forcing it yet.
 - Anchor release on handler overwrite. `builder_on` only holds
   `&mut Builder`, not `&mut State`, so re-registering the same
   `(protocol, command)` orphans the previous Anchor. Fixable by

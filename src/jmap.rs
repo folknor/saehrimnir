@@ -63,17 +63,28 @@ fn dispatch(
     args: &Value,
 ) -> (String, Value) {
     // Reactive callback: a registered handler can override the
-    // method response. v0 surfaces `accountId` to the script; future
-    // expansions can populate `ids`, `filter`, etc. once we agree
-    // on a pushing convention for nested values.
+    // method response. Surfaced fields: `account_id` (when present),
+    // and `ids` as a 1-based Lua array when the call carries a
+    // string-typed `ids[]` (Mailbox/get, Email/get).
     if let Some(d) = dispatcher {
         let account_id = args
             .get("accountId")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let ids: Option<Vec<String>> = args
+            .get("ids")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            });
         let result = d.dispatch("jmap", name, move |state| {
             if let Some(a) = &account_id {
                 crate::lua::req_set_str(state, "account_id", a)?;
+            }
+            if let Some(ids) = &ids {
+                crate::lua::req_set_str_array(state, "ids", ids)?;
             }
             Ok(())
         });

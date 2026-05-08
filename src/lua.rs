@@ -1075,6 +1075,32 @@ pub fn req_set_int(state: &mut State, key: &str, value: i64) -> dellingr::Result
     state.set_table_raw(-3)
 }
 
+/// Set `req[key] = { values[0], values[1], ... }` (a 1-based Lua
+/// array of strings) where the parent `req` table is at the top of
+/// the stack on entry. Used to surface request shapes like
+/// `Email/get`'s `ids[]` or IMAP UID lists to callbacks. On exit
+/// the parent table is back on top, balanced.
+//
+// Stack-top capture mirrors the read-side helpers: `state.get_top()`
+// returns `usize` but the table-index API takes `isize`. The Lua
+// stack is bounded by the runtime's stack limit so the cast is safe.
+#[allow(clippy::cast_possible_wrap)]
+pub fn req_set_str_array<I, S>(state: &mut State, key: &str, values: I) -> dellingr::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    state.push_string(key);
+    state.new_table();
+    let arr = state.get_top() as isize;
+    for (i, v) in values.into_iter().enumerate() {
+        state.push_number((i + 1) as f64);
+        state.push_string(v.as_ref());
+        state.set_table_raw(arr)?;
+    }
+    state.set_table_raw(-3)
+}
+
 /// Wrap a [`Dispatcher`] in `Arc` for sharing across protocol
 /// listeners.
 pub fn into_arc(d: Dispatcher) -> Arc<Dispatcher> {

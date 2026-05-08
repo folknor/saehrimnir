@@ -64,14 +64,18 @@ checking whether the fact is already in `notes/`.
 - `src/lua.rs` - dellingr-backed Lua scenario loader and reactive-
   callback dispatcher. Exposes the `fixture` / `account` / `mailbox`
   / `email` builder `RustFunc`s plus `bulk_emails` and `bulk_threads`
-  for synthetic-data scale testing. `on(protocol, command, fn)` is
-  also a RustFunc that anchors the callback (via dellingr's
-  `Anchor`, the `luaL_ref`-style registry) into a Rust-side
-  `HandlerMap`; the script's globals stay clean. `Dispatcher`
-  retains the dellingr `State` behind a `Mutex` so protocol
-  handlers can fire callbacks via `call_anchor`. Accumulates into a
-  `Builder` in user_data, and hands the `RawFixture` to
-  `fixture::normalize` so validation is shared with the TOML path.
+  for synthetic-data scale testing, and the control helpers `wait`,
+  `mock_done`, `mock_fail`. `on(protocol, command, fn)` is also a
+  RustFunc that anchors the callback (via dellingr's `Anchor`, the
+  `luaL_ref`-style registry) into a Rust-side `HandlerMap`; the
+  script's globals stay clean. `Dispatcher` retains the dellingr
+  `State` behind a `Mutex` so protocol handlers can fire callbacks
+  via `call_anchor`. Accumulates into a `Builder` (wrapped in
+  `LuaExtras` alongside the `MockExit` signal slot) in user_data;
+  the LuaExtras stays installed past load so dispatch-time
+  `mock_done()` / `mock_fail()` can record their signal. Hands the
+  `RawFixture` to `fixture::normalize` so validation is shared with
+  the TOML path.
 - `src/scenario.rs` - main loader entry point. `Scenario { fixture,
   dispatcher }` bundles the validated fixture with the optional
   callback dispatcher. `scenario::load(path)` dispatches by
@@ -191,6 +195,17 @@ command)) plus protocol-specific fields. Returning a table with
 `{ status = "...", message = "..." }` overrides the response; `nil`
 or no return = pass through.
 
+Control helpers callable both at script load and inside callbacks:
+`wait(ms)` blocks the current dispatch turn (`std::thread::sleep`,
+safe under the dispatcher mutex - other connections queue briefly
+on the lock but unrelated protocol handling continues on other
+tokio workers); `mock_done()` and `mock_fail("reason")` record a
+`MockExit` signal that `Dispatcher::wait_for_exit` resolves on,
+which `main.rs` races against `wait_for_signal()` to drive a
+clean (`Done` -> exit 0) or fault (`Fail` -> reason on stderr,
+non-zero exit) shutdown. First call wins, so a chatty script
+can't override an earlier `mock_fail` with a later `mock_done`.
+
 Wired across all five protocols. Per-protocol override semantics
 for `Override::Tagged { status, message }`:
 
@@ -214,6 +229,9 @@ for `Override::Tagged { status, message }`:
 Per-(protocol, command) `call_index` is a built-in `req` field;
 protocol-specific extras (`uid_set`, `attrs`, `mailbox`, `folder`,
 `thread_id`, `account_id`, `payload`) are populated where natural.
+JMAP additionally surfaces `ids` as a 1-based Lua array of strings
+when the call carries a string-typed `ids[]` (Mailbox/get,
+Email/get); absent from `req` when the request omits the field.
 
 `Dispatcher` is `Arc<Mutex<State>>`-shaped (dellingr 0.2 made
 `State: Send`); the mutex covers brief synchronous Lua calls and is

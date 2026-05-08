@@ -481,3 +481,69 @@ async fn jmap_callback_nil_return_passes_through() {
     let item = &entry[1]["list"][0];
     assert_eq!(item["id"], "e1");
 }
+
+#[tokio::test]
+async fn jmap_email_get_callback_sees_ids_as_lua_array() {
+    // `req.ids` arrives as a 1-based Lua array of strings, populated
+    // from the request's `ids[]`. Concatenating the entries with
+    // table.concat verifies both the shape (table) and the order.
+    let scenario = r#"
+        fixture({ name = "ids" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        on("jmap", "Email/get", function(req)
+            local joined = table.concat(req.ids, ",")
+            return {
+                status = "serverFail",
+                message = "n=" .. #req.ids .. " ids=" .. joined,
+            }
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let v = post_jmap(
+        router,
+        json!({
+            "using": [],
+            "methodCalls": [[
+                "Email/get",
+                {"accountId": "account-1", "ids": ["e1", "e2", "e3"]},
+                "c0",
+            ]],
+        }),
+    )
+    .await;
+    let entry = &v["methodResponses"][0];
+    assert_eq!(entry[0], "error");
+    assert_eq!(entry[1]["type"], "serverFail");
+    assert_eq!(entry[1]["description"], "n=3 ids=e1,e2,e3");
+}
+
+#[tokio::test]
+async fn jmap_callback_ids_absent_when_request_omits_them() {
+    // Mailbox/get with a missing `ids` (means "all") should not
+    // surface `req.ids` at all - the script can rely on `req.ids
+    // == nil` as the signal that the call requests every entry.
+    let scenario = r#"
+        fixture({ name = "noids" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        on("jmap", "Mailbox/get", function(req)
+            local present = req.ids ~= nil
+            return {
+                status = "serverFail",
+                message = "present=" .. tostring(present),
+            }
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let v = post_jmap(
+        router,
+        json!({
+            "using": [],
+            "methodCalls": [["Mailbox/get", {"accountId": "account-1"}, "c0"]],
+        }),
+    )
+    .await;
+    let entry = &v["methodResponses"][0];
+    assert_eq!(entry[1]["description"], "present=false");
+}
