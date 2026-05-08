@@ -15,8 +15,12 @@ use axum::{
 use chrono::SecondsFormat;
 use serde_json::{Map, Value, json};
 
+use axum::body::Body as AxumBody;
+use axum::http::header;
+use axum::response::IntoResponse;
+
 use super::{AppState, error, odata, ok_json};
-use crate::fixture::{Address, Body, Email, Fixture, Mailbox, Role};
+use crate::fixture::{Address, Attachment, Body, Disposition, Email, Fixture, Mailbox, Role};
 
 /// Default page size for messages, matching ratatoskr's BATCH_SIZE.
 const MESSAGES_DEFAULT_TOP: u32 = 50;
@@ -40,6 +44,18 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1.0/me/mailFolders/{folder}/messages/delta",
             get(delta_messages),
+        )
+        .route(
+            "/v1.0/me/messages/{message_id}/attachments",
+            get(list_message_attachments),
+        )
+        .route(
+            "/v1.0/me/messages/{message_id}/attachments/{attachment_id}",
+            get(get_message_attachment),
+        )
+        .route(
+            "/v1.0/me/messages/{message_id}/attachments/{attachment_id}/$value",
+            get(get_message_attachment_value),
         )
 }
 
@@ -207,6 +223,7 @@ async fn list_messages(
     };
     let q = odata::OdataQuery::parse(raw.as_deref());
     let host = host_or_default(&headers);
+    let expand = expand_attachments(q.expand.as_deref());
 
     let mut messages = sorted_messages_in(&state.fixture, &m.id);
     if let Some(filter) = &q.filter
@@ -230,7 +247,7 @@ async fn list_messages(
         .iter()
         .skip(offset as usize)
         .take(top as usize)
-        .map(|e| message_value(e, &m.id))
+        .map(|e| message_value(e, &m.id, expand))
         .collect();
 
     let path = format!("/v1.0/me/mailFolders/{}/messages", m.id);
@@ -267,6 +284,7 @@ async fn delta_messages(
     };
     let q = odata::OdataQuery::parse(raw.as_deref());
     let host = host_or_default(&headers);
+    let expand = expand_attachments(q.expand.as_deref());
     let path = format!("/v1.0/me/mailFolders/{}/messages/delta", m.id);
 
     // The deltatoken=latest variant: client wants just a fresh delta
@@ -314,7 +332,7 @@ async fn delta_messages(
         .iter()
         .skip(offset as usize)
         .take(top as usize)
-        .map(|e| message_value(e, &m.id))
+        .map(|e| message_value(e, &m.id, expand))
         .collect();
 
     let (next_link, delta_link) = match next_offset(offset, top, total) {
@@ -431,7 +449,7 @@ fn sorted_messages_in<'a>(fixture: &'a Fixture, mailbox_id: &str) -> Vec<&'a Ema
     v
 }
 
-fn message_value(e: &Email, parent_folder_id: &str) -> Value {
+fn message_value(e: &Email, parent_folder_id: &str, expand_attachments: bool) -> Value {
     let mut obj = Map::new();
     obj.insert("id".to_string(), Value::String(e.id.clone()));
     obj.insert(
@@ -507,7 +525,15 @@ fn message_value(e: &Email, parent_folder_id: &str) -> Value {
             None => Value::Null,
         },
     );
-    obj.insert("attachments".to_string(), Value::Array(vec![]));
+    let attachments_array: Vec<Value> = if expand_attachments {
+        e.attachments
+            .iter()
+            .map(|a| graph_attachment_value(&e.id, a, true))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    obj.insert("attachments".to_string(), Value::Array(attachments_array));
     obj.insert(
         "singleValueExtendedProperties".to_string(),
         Value::Array(vec![]),
@@ -593,6 +619,160 @@ fn next_offset(offset: u32, top: u32, total: u64) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// True when the OData `$expand` clause asks for the `attachments`
+/// navigation property. Real Graph supports `$expand=attachments` and
+/// `$expand=attachments($select=...)`; we just look for the prefix.
+fn expand_attachments(expand: Option<&str>) -> bool {
+    expand
+        .map(|s| s.split(',').any(|p| p.trim().starts_with("attachments")))
+        .unwrap_or(false)
+}
+
+fn graph_attachment_value(message_id: &str, a: &Attachment, include_bytes: bool) -> Value {
+    let mut obj = Map::new();
+    obj.insert(
+        "@odata.type".to_string(),
+        Value::String("#microsoft.graph.fileAttachment".to_string()),
+    );
+    obj.insert("@odata.mediaContentType".to_string(), Value::String(a.content_type.clone()));
+    obj.insert("id".to_string(), Value::String(a.blob_id.clone()));
+    obj.insert("name".to_string(), Value::String(a.name.clone()));
+    obj.insert("contentType".to_string(), Value::String(a.content_type.clone()));
+    obj.insert("size".to_string(), Value::Number(a.size.into()));
+    obj.insert(
+        "isInline".to_string(),
+        Value::Bool(matches!(a.disposition, Disposition::Inline)),
+    );
+    if let Some(cid) = &a.cid {
+        obj.insert("contentId".to_string(), Value::String(cid.clone()));
+    }
+    obj.insert(
+        "lastModifiedDateTime".to_string(),
+        Value::String("1970-01-01T00:00:00Z".to_string()),
+    );
+    obj.insert(
+        "@odata.id".to_string(),
+        Value::String(format!(
+            "/v1.0/me/messages/{message_id}/attachments/{}",
+            a.blob_id
+        )),
+    );
+    if include_bytes {
+        obj.insert(
+            "contentBytes".to_string(),
+            Value::String(base64_standard(&a.data)),
+        );
+    }
+    Value::Object(obj)
+}
+
+fn find_email_with_attachment<'a>(
+    fixture: &'a Fixture,
+    message_id: &str,
+    attachment_id: &str,
+) -> Option<(&'a Email, &'a Attachment)> {
+    let email = fixture.emails.iter().find(|e| e.id == message_id)?;
+    let att = email.attachments.iter().find(|a| a.blob_id == attachment_id)?;
+    Some((email, att))
+}
+
+async fn list_message_attachments(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let Some(email) = state.fixture.emails.iter().find(|e| e.id == message_id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("message {message_id:?} not found"),
+            "ResourceNotFound",
+        );
+    };
+    let value: Vec<Value> = email
+        .attachments
+        .iter()
+        .map(|a| graph_attachment_value(&email.id, a, true))
+        .collect();
+    ok_json(odata::collection_envelope(
+        &format!("$metadata#users('me')/messages('{message_id}')/attachments"),
+        value,
+        None,
+        None,
+        None,
+    ))
+}
+
+async fn get_message_attachment(
+    State(state): State<AppState>,
+    Path((message_id, attachment_id)): Path<(String, String)>,
+) -> Response {
+    let Some((email, att)) =
+        find_email_with_attachment(&state.fixture, &message_id, &attachment_id)
+    else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("attachment {attachment_id:?} on message {message_id:?} not found"),
+            "ResourceNotFound",
+        );
+    };
+    ok_json(graph_attachment_value(&email.id, att, true))
+}
+
+async fn get_message_attachment_value(
+    State(state): State<AppState>,
+    Path((message_id, attachment_id)): Path<(String, String)>,
+) -> Response {
+    let Some((_, att)) =
+        find_email_with_attachment(&state.fixture, &message_id, &attachment_id)
+    else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("attachment {attachment_id:?} on message {message_id:?} not found"),
+            "ResourceNotFound",
+        );
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, att.content_type.clone())],
+        AxumBody::from(att.data.clone()),
+    )
+        .into_response()
+}
+
+/// Standard (`+`/`/`) base64 with padding. Avoids pulling in the
+/// `base64` crate for one call site.
+fn base64_standard(input: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut chunks = input.chunks_exact(3);
+    for c in chunks.by_ref() {
+        let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+        out.push(ALPHA[(n & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = u32::from(rem[0]) << 16;
+            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
+            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Parse the only `$filter` shape ratatoskr emits during initial mail

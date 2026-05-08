@@ -21,7 +21,9 @@ use dellingr::{Anchor, ArgCount, LuaType, RetCount, State, error::ErrorKind};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
-use crate::fixture::{self, Fixture, RawAccount, RawAddress, RawEmail, RawFixture, RawMailbox};
+use crate::fixture::{
+    self, Fixture, RawAccount, RawAddress, RawAttachment, RawEmail, RawFixture, RawMailbox,
+};
 use crate::templates;
 
 /// `i64` range bounds expressed as `f64`. These constants encode the
@@ -47,15 +49,29 @@ pub fn load(path: &Path) -> Result<Fixture, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     let chunk_name = format!("@{}", path.display());
-    load_source(&source, &chunk_name)
+    let dir = path.parent().unwrap_or(Path::new("."));
+    load_source_with_dir(&source, &chunk_name, dir)
 }
 
 /// Test-friendly entry point: parse and execute a Lua source string,
 /// returning only the validated `Fixture`. The dispatcher is built
 /// internally and dropped before return; for callback-aware loading
-/// use [`load_source_with_dispatcher`].
+/// use [`load_source_with_dispatcher`]. Resolves any attachment
+/// `data_path` references against the current working directory; for
+/// scripts that declare attachments, use [`load_source_with_dir`].
 pub fn load_source(source: &str, chunk_name: &str) -> Result<Fixture, String> {
-    load_source_with_dispatcher(source, chunk_name).map(|(f, _)| f)
+    load_source_with_dir(source, chunk_name, Path::new("."))
+}
+
+/// Like [`load_source`] but attachment `data_path` references resolve
+/// relative to `fixture_dir`. Used by [`load`] and by tests that
+/// exercise attachment loading from a temp dir.
+pub fn load_source_with_dir(
+    source: &str,
+    chunk_name: &str,
+    fixture_dir: &Path,
+) -> Result<Fixture, String> {
+    load_source_with_dispatcher_and_dir(source, chunk_name, fixture_dir).map(|(f, _)| f)
 }
 
 /// Run a Lua source string and produce both the validated `Fixture`
@@ -63,10 +79,20 @@ pub fn load_source(source: &str, chunk_name: &str) -> Result<Fixture, String> {
 /// The dispatcher is always returned even if no callbacks were
 /// registered - the cost is one idle `Mutex<State>` and the
 /// per-protocol-handler dispatch becomes a fast no-op when no
-/// handlers are anchored.
+/// handlers are anchored. Resolves attachment `data_path` references
+/// against the current working directory; see
+/// [`load_source_with_dispatcher_and_dir`] for the path-aware variant.
 pub fn load_source_with_dispatcher(
     source: &str,
     chunk_name: &str,
+) -> Result<(Fixture, Dispatcher), String> {
+    load_source_with_dispatcher_and_dir(source, chunk_name, Path::new("."))
+}
+
+pub fn load_source_with_dispatcher_and_dir(
+    source: &str,
+    chunk_name: &str,
+    fixture_dir: &Path,
 ) -> Result<(Fixture, Dispatcher), String> {
     let mut state = State::new();
     state.set_user_data(LuaExtras::default());
@@ -90,7 +116,7 @@ pub fn load_source_with_dispatcher(
     };
 
     let (raw, handlers) = builder.into_parts()?;
-    let fixture = fixture::normalize(raw)?;
+    let fixture = fixture::normalize_with_dir(raw, fixture_dir)?;
     let dispatcher = Dispatcher::new(state, handlers);
     Ok((fixture, dispatcher))
 }
@@ -684,9 +710,57 @@ fn builder_email(state: &mut State) -> dellingr::Result<u8> {
         references: read_string_array_opt(state, 1, "references")?,
         has_attachment: read_bool_opt(state, 1, "has_attachment")?,
         body_text: read_string_opt(state, 1, "body_text")?,
+        attachments: read_attachment_array_opt(state, 1, "attachments")?,
     };
     builder_mut(state)?.emails.push(em);
     Ok(0)
+}
+
+fn read_attachment_array_opt(
+    state: &mut State,
+    t: isize,
+    key: &str,
+) -> dellingr::Result<Vec<RawAttachment>> {
+    let typ = lookup(state, t, key)?;
+    let result = match typ {
+        LuaType::Nil => Ok(Vec::new()),
+        LuaType::Table => read_attachment_array_at_top(state, key),
+        _ => fail(state, format!("field {key:?} must be an array")),
+    };
+    state.pop(1);
+    result
+}
+
+// Same stack-top cast story as `read_string_array_at_top`.
+#[allow(clippy::cast_possible_wrap)]
+fn read_attachment_array_at_top(
+    state: &mut State,
+    key: &str,
+) -> dellingr::Result<Vec<RawAttachment>> {
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    let mut out = Vec::with_capacity(len);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(1);
+            return fail(state, format!("field {key:?} entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let raw = RawAttachment {
+            blob_id: read_string(state, entry_idx, "blob_id")?,
+            name: read_string(state, entry_idx, "name")?,
+            content_type: read_string(state, entry_idx, "content_type")?,
+            size: read_int_opt(state, entry_idx, "size")?,
+            disposition: read_string_opt(state, entry_idx, "disposition")?,
+            cid: read_string_opt(state, entry_idx, "cid")?,
+            data_path: read_string(state, entry_idx, "data_path")?,
+        };
+        state.pop(1);
+        out.push(raw);
+    }
+    Ok(out)
 }
 
 // ── Stack helpers ───────────────────────────────────────────────────

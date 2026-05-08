@@ -82,16 +82,30 @@ body_text = "First message body."
 # or
 body_path = "messages/email-002.eml"
 
-# Optional inline attachments (out of scope for v0 happy-path but the
-# shape is reserved):
+# Optional attachments. Each entry references a blob stored under the
+# fixture file's parent directory; the loader reads the bytes at
+# startup. `has_attachment` is auto-derived to true when any entry is
+# present (declaring `has_attachment = false` while listing
+# attachments is rejected).
 [[email.attachment]]
-blob_id = "blob-001"
-name = "report.pdf"
-type = "application/pdf"
-size = 245000
-disposition = "attachment"  # or "inline"
-cid = "<...>"               # optional, used when inline
-data_path = "blobs/report.pdf"  # optional; resolved during /jmap/download (out of v0)
+blob_id = "blob-001"            # opaque, fixture-controlled. Echoed
+                                # as the JMAP attachments[].blobId,
+                                # the Gmail attachmentId, and the
+                                # Graph attachment id.
+name = "report.pdf"             # filename used by all four protocols.
+content_type = "application/pdf"
+size = 245000                   # optional; defaults to the byte
+                                # length of the file at data_path.
+disposition = "attachment"      # optional; "attachment" (default) or
+                                # "inline".
+cid = "report-cid"              # optional; used when disposition =
+                                # "inline" (without angle brackets;
+                                # protocols add them on emit).
+data_path = "blobs/report.pdf"  # required; resolved relative to the
+                                # fixture file's parent dir. The bytes
+                                # are loaded eagerly at startup and
+                                # served verbatim from each protocol's
+                                # download endpoint.
 ```
 
 ### Body sources
@@ -175,8 +189,7 @@ runs:
 - Multiple accounts per fixture (the `[account]` shape is already
   positioned to accept `[[account]]`).
 - Per-mailbox `rights` overrides.
-- Multipart MIME via `body_path`.
-- Attachment download blobs.
+- Multipart MIME via `body_path` (multipart/alternative HTML+text).
 - Failure injection: `[fault]` blocks scoped to method calls (slow
   responses, retryable errors, `cannotCalculateChanges`).
 - Incremental change scripts: `[[change]]` entries that advance state

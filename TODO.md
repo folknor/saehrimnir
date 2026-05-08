@@ -83,13 +83,11 @@ unblocked - we just haven't needed them yet.
 - `body_html` parallel to `body_text`. Reserved in
   `notes/fixture-format.md`; not implemented. Pressing once IMAP
   needs to render an HTML wire body or Graph wants HTML rendering.
-- Multipart MIME via `body_path`. Same constraint - IMAP forces
-  this when a fixture grows attachments because `BODY[]` must emit
-  a real multipart/mixed.
-- Attachments. Need fixture-side `[[email.attachment]]` (or Lua
-  builder), then projection to JMAP `attachments[]`, IMAP
-  `BODYSTRUCTURE` + `BODY[]` parts, Graph `attachments`, Gmail
-  parts under the payload tree.
+- Multipart MIME via `body_path` for fixtures that want to round-trip
+  a real `.eml` rather than authoring per-protocol projections from
+  the canonical fields. Attachments are already wired via
+  `[[email.attachment]]`; this item is specifically about replacing
+  the canonical body+attachments shape with a parsed `.eml`.
 - Multi-account. v0 enforces `is_personal = true` and exactly one
   account. Lifting requires per-protocol tweaks to surface multiple
   accounts (JMAP session resource, Graph `/users/{id}/...` paths,

@@ -86,6 +86,9 @@ checking whether the fact is already in `notes/`.
   `bulk_emails`. Lifted from `<ratatoskr>/crates/dev-seed/src/
   templates.rs` and pruned.
 - `src/sentinel.rs` - atomic readiness-file write (temp + rename).
+- `src/tls.rs` - self-signed cert + `tokio_rustls::TlsAcceptor`
+  generated at startup. Used by SMTP for STARTTLS upgrades; clients
+  must accept invalid certs.
 - `src/shutdown.rs` - SIGTERM/SIGINT handler.
 - `src/lib.rs` - library surface; `main.rs` keeps just the runtime.
 - `src/routes.rs` - axum router, `AppState`, JMAP HTTP route handlers.
@@ -138,8 +141,13 @@ JMAP: complete for v0 (session resource, `Mailbox/get`, `Email/query`,
 
 IMAP: complete for v0's read path (greeting, `CAPABILITY`, `LOGIN`/
 `AUTHENTICATE`, `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT`/`EXAMINE`/
-`CLOSE`, `UID SEARCH`, `UID FETCH` with full RFC 822 body emission,
-CONDSTORE `CHANGEDSINCE`). Plus `UID STORE` as a non-persistent
+`CLOSE`, `UID SEARCH`, `UID FETCH` with full RFC 822 body emission
+including `multipart/mixed` for fixtures with attachments,
+`BODYSTRUCTURE`, `BODY[N]` and `BODY[N.MIME]` sub-part fetch,
+CONDSTORE `CHANGEDSINCE`). Single-part text emails stay byte-
+identical to the pre-attachment wire format; multipart kicks in only
+when `email.attachments` is non-empty (boundary is
+`=_saehrimnir_<email-id>_=`). Plus `UID STORE` as a non-persistent
 no-op: emits the post-op FETCH untagged update and a tagged OK so
 ratatoskr's flag-writeback path completes cleanly without erroring;
 the mutation does not persist (subsequent fetches see the fixture's
@@ -148,9 +156,20 @@ full initial-sync transcript.
 
 SMTP: complete for v0's submission path (greeting, EHLO,
 AUTH PLAIN/LOGIN/XOAUTH2/OAUTHBEARER, MAIL FROM, RCPT TO, DATA with
-dot-stuffing reversal, RSET, NOOP, QUIT). Submissions captured in an
-in-memory `SubmissionLog` that tests read directly. Integration tests
-in `tests/smtp.rs`.
+dot-stuffing reversal, RSET, NOOP, QUIT). MAIL FROM / RCPT TO
+extension parameters (SIZE, BODY, ENVID, NOTIFY, ORCPT, ...) are
+parsed and surfaced as `Submission::from_params` /
+`Submission::rcpt_params` (BTreeMaps keyed upper-case). STARTTLS is
+advertised when the listener is constructed with a `TlsAcceptor`
+(set up by `src/tls.rs`); on upgrade the per-connection state
+machine swaps its boxed stream to a `TlsStream<...>` and discards
+prior session knowledge per RFC 3207. `Submission::parse_mime()`
+exposes a server-side MIME projection of the captured bytes
+(subject, text/html bodies, attachments) so tests can assert on the
+sent message without each pulling in `mail-parser`. Submissions
+captured in an in-memory `SubmissionLog` that tests read directly.
+Integration tests in `tests/smtp.rs`, including a TCP-level
+STARTTLS round-trip.
 
 Graph: complete for v0's mail-sync path. `/v1.0/me/mailFolders`
 (list, by-id, by-well-known-alias, childFolders), `/v1.0/me/

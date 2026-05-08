@@ -24,7 +24,11 @@ fn router() -> axum::Router {
 }
 
 async fn get_json(uri: &str) -> (StatusCode, Value) {
-    let resp = router()
+    get_json_with(router(), uri).await
+}
+
+async fn get_json_with(router: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = router
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -40,6 +44,90 @@ async fn get_json(uri: &str) -> (StatusCode, Value) {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     (status, v)
+}
+
+async fn get_raw(router: axum::Router, uri: &str) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec(), headers)
+}
+
+fn attach_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap();
+    graph::router(graph::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+    })
+}
+
+#[tokio::test]
+async fn graph_list_message_attachments_returns_metadata_with_bytes() {
+    let (status, v) = get_json_with(
+        attach_router(),
+        "/v1.0/me/messages/email-001/attachments",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = v["value"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let a = &arr[0];
+    assert_eq!(a["id"], "blob-att-001");
+    assert_eq!(a["name"], "sample.txt");
+    assert_eq!(a["contentType"], "text/plain");
+    assert_eq!(a["@odata.type"], "#microsoft.graph.fileAttachment");
+    assert!(a["contentBytes"].as_str().unwrap().ends_with("=") || !a["contentBytes"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn graph_get_message_attachment_value_streams_bytes() {
+    let (status, body, headers) = get_raw(
+        attach_router(),
+        "/v1.0/me/messages/email-001/attachments/blob-att-001/$value",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "text/plain");
+    assert!(body.starts_with(b"attachment payload"));
+}
+
+#[tokio::test]
+async fn graph_messages_with_expand_attachments_embeds_them() {
+    let (status, v) = get_json_with(
+        attach_router(),
+        "/v1.0/me/mailFolders/mbx-inbox/messages?$expand=attachments",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let msg = &v["value"][0];
+    let atts = msg["attachments"].as_array().unwrap();
+    assert_eq!(atts.len(), 1);
+    assert_eq!(atts[0]["id"], "blob-att-001");
+}
+
+#[tokio::test]
+async fn graph_messages_without_expand_omits_attachment_data() {
+    let (status, v) = get_json_with(
+        attach_router(),
+        "/v1.0/me/mailFolders/mbx-inbox/messages",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let msg = &v["value"][0];
+    assert_eq!(msg["hasAttachments"], true);
+    assert_eq!(msg["attachments"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

@@ -15,7 +15,7 @@ use axum::{
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
-use crate::fixture::{Address, Body, Email, Fixture, Mailbox, Role};
+use crate::fixture::{Address, Attachment, Body, Email, Fixture, Mailbox, Role};
 
 /// Pinned historyId for the lifetime of a fixture - matches the
 /// determinism contract (read-only fixtures, no real changes).
@@ -413,16 +413,57 @@ fn build_payload(e: &Email) -> Value {
         headers.push(header("References", &e.references.join(" ")));
     }
     headers.push(header("MIME-Version", "1.0"));
-    headers.push(header("Content-Type", "text/plain; charset=utf-8"));
-    headers.push(header("Content-Transfer-Encoding", "8bit"));
 
     let body_str = match &e.body {
         Body::Text(t) => t.clone(),
     };
-    let encoded = base64url_no_pad(body_str.as_bytes());
 
+    if e.attachments.is_empty() {
+        headers.push(header("Content-Type", "text/plain; charset=utf-8"));
+        headers.push(header("Content-Transfer-Encoding", "8bit"));
+        return text_leaf(String::new(), headers, &body_str);
+    }
+
+    // Multipart: root envelope + leaves. Real Gmail emits
+    // attachment leaves with `body.attachmentId` and no `body.data`,
+    // forcing clients to fetch via `/messages/{id}/attachments/{aid}`.
+    let boundary = format!("=_saehrimnir_{}_=", e.id);
+    headers.push(header(
+        "Content-Type",
+        &format!("multipart/mixed; boundary=\"{boundary}\""),
+    ));
+
+    let mut parts = Vec::with_capacity(1 + e.attachments.len());
+    let text_headers = vec![
+        header("Content-Type", "text/plain; charset=utf-8"),
+        header("Content-Transfer-Encoding", "8bit"),
+    ];
+    parts.push(text_leaf("0".to_string(), text_headers, &body_str));
+    for (i, a) in e.attachments.iter().enumerate() {
+        parts.push(attachment_leaf(format!("{}", i + 1), a));
+    }
+
+    let mut root = Map::new();
+    root.insert("partId".to_string(), Value::String(String::new()));
+    root.insert(
+        "mimeType".to_string(),
+        Value::String("multipart/mixed".to_string()),
+    );
+    root.insert("filename".to_string(), Value::String(String::new()));
+    root.insert("headers".to_string(), Value::Array(headers));
+    root.insert(
+        "body".to_string(),
+        json!({
+            "size": 0,
+        }),
+    );
+    root.insert("parts".to_string(), Value::Array(parts));
+    Value::Object(root)
+}
+
+fn text_leaf(part_id: String, headers: Vec<Value>, body_str: &str) -> Value {
     let mut leaf = Map::new();
-    leaf.insert("partId".to_string(), Value::String(String::new()));
+    leaf.insert("partId".to_string(), Value::String(part_id));
     leaf.insert(
         "mimeType".to_string(),
         Value::String("text/plain".to_string()),
@@ -433,7 +474,34 @@ fn build_payload(e: &Email) -> Value {
         "body".to_string(),
         json!({
             "size": body_str.len(),
-            "data": encoded,
+            "data": base64url_no_pad(body_str.as_bytes()),
+        }),
+    );
+    Value::Object(leaf)
+}
+
+fn attachment_leaf(part_id: String, a: &Attachment) -> Value {
+    let mut headers = vec![
+        header("Content-Type", &format!("{}; name=\"{}\"", a.content_type, a.name)),
+        header(
+            "Content-Disposition",
+            &format!("{}; filename=\"{}\"", a.disposition.as_str(), a.name),
+        ),
+        header("Content-Transfer-Encoding", "base64"),
+    ];
+    if let Some(cid) = &a.cid {
+        headers.push(header("Content-ID", &format!("<{cid}>")));
+    }
+    let mut leaf = Map::new();
+    leaf.insert("partId".to_string(), Value::String(part_id));
+    leaf.insert("mimeType".to_string(), Value::String(a.content_type.clone()));
+    leaf.insert("filename".to_string(), Value::String(a.name.clone()));
+    leaf.insert("headers".to_string(), Value::Array(headers));
+    leaf.insert(
+        "body".to_string(),
+        json!({
+            "attachmentId": a.blob_id,
+            "size": a.size,
         }),
     );
     Value::Object(leaf)
@@ -476,15 +544,29 @@ async fn history(State(state): State<AppState>) -> Response {
 // ── Attachments ─────────────────────────────────────────────────────
 
 async fn get_attachment(
+    State(state): State<AppState>,
     Path((message_id, attachment_id)): Path<(String, String)>,
 ) -> Response {
-    error(
-        StatusCode::NOT_FOUND,
-        &format!(
-            "attachment {attachment_id:?} on message {message_id:?} not found"
-        ),
-        "notFound",
-    )
+    let Some(email) = state.fixture.emails.iter().find(|e| e.id == message_id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("message {message_id:?} not found"),
+            "notFound",
+        );
+    };
+    let Some(att) = email.attachments.iter().find(|a| a.blob_id == attachment_id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "attachment {attachment_id:?} on message {message_id:?} not found"
+            ),
+            "notFound",
+        );
+    };
+    ok_json(json!({
+        "size": att.size,
+        "data": base64url_no_pad(&att.data),
+    }))
 }
 
 // ── SendAs ──────────────────────────────────────────────────────────

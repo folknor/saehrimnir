@@ -143,6 +143,58 @@ async fn body_literal_size_is_byte_accurate() {
     assert_eq!(trailer, ")\r\n", "literal length off by some bytes");
 }
 
+async fn run_with_attach_fixture(script: &[u8]) -> String {
+    let fix = Arc::new(
+        fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap(),
+    );
+    let (server, mut client) = tokio::io::duplex(32 * 1024);
+    let (_tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        imap::serve_connection(server, fix, None, &mut rx).await
+    });
+
+    client.write_all(script).await.unwrap();
+    client.shutdown().await.unwrap();
+
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    task.await.unwrap().unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
+#[tokio::test]
+async fn imap_multipart_email_emits_boundary_and_attachment_part() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID FETCH 1 (BODY.PEEK[])\r\n\
+        d UID FETCH 1 (BODYSTRUCTURE)\r\n\
+        e UID FETCH 1 (BODY.PEEK[1] BODY.PEEK[2] BODY.PEEK[2.MIME])\r\n\
+        q LOGOUT\r\n";
+    let out = run_with_attach_fixture(script).await;
+
+    // Multipart wire body: top-level Content-Type and boundary marker.
+    let body_marker = "BODY[] {";
+    let body_start = out.find(body_marker).expect("BODY[] in output");
+    let after = &out[body_start..];
+    assert!(after.contains("Content-Type: multipart/mixed; boundary=\"=_saehrimnir_email-001_=\""));
+    assert!(after.contains("--=_saehrimnir_email-001_=\r\n"));
+    assert!(after.contains("Content-Disposition: attachment; filename=\"sample.txt\""));
+    assert!(after.contains("--=_saehrimnir_email-001_=--\r\n"));
+
+    // BODYSTRUCTURE: nested multipart shape.
+    assert!(out.contains("BODYSTRUCTURE ((\"TEXT\" \"PLAIN\""));
+    assert!(out.contains("\"BASE64\""));
+    assert!(out.contains("\"MIXED\" (\"BOUNDARY\" \"=_saehrimnir_email-001_=\")"));
+
+    // BODY[1] = text body, BODY[2] = base64-encoded attachment, BODY[2.MIME] = part headers.
+    assert!(out.contains("BODY[1] {"));
+    assert!(out.contains("See attached."));
+    assert!(out.contains("BODY[2] {"));
+    assert!(out.contains("BODY[2.MIME] {"));
+}
+
 #[tokio::test]
 async fn deterministic_two_runs_emit_identical_bytes() {
     // The byte-determinism contract: same fixture, same script -> same

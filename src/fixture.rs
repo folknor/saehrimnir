@@ -94,6 +94,49 @@ pub struct Email {
     pub references: Vec<String>,
     pub has_attachment: bool,
     pub body: Body,
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    /// Stable opaque blob identifier referenced from the JMAP
+    /// `attachments[]` `blobId` field, the Gmail `attachmentId`, and
+    /// the Graph `id` of an attachment resource.
+    pub blob_id: String,
+    pub name: String,
+    pub content_type: String,
+    /// Defaults to `data.len()` if the fixture omits it. Wire layers
+    /// emit this value verbatim - the determinism contract requires
+    /// it match what each protocol decodes.
+    pub size: i64,
+    pub disposition: Disposition,
+    /// Content-ID for inline parts (without angle brackets - those
+    /// are added per protocol on emit).
+    pub cid: Option<String>,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    Attachment,
+    Inline,
+}
+
+impl Disposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attachment => "attachment",
+            Self::Inline => "inline",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "attachment" => Ok(Self::Attachment),
+            "inline" => Ok(Self::Inline),
+            other => Err(format!("unknown disposition {other:?}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +226,24 @@ pub(crate) struct RawEmail {
     pub(crate) has_attachment: Option<bool>,
     #[serde(default)]
     pub(crate) body_text: Option<String>,
+    #[serde(default, rename = "attachment")]
+    pub(crate) attachments: Vec<RawAttachment>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawAttachment {
+    pub(crate) blob_id: String,
+    pub(crate) name: String,
+    pub(crate) content_type: String,
+    #[serde(default)]
+    pub(crate) size: Option<i64>,
+    #[serde(default)]
+    pub(crate) disposition: Option<String>,
+    #[serde(default)]
+    pub(crate) cid: Option<String>,
+    /// Path to the blob bytes, resolved relative to the fixture file's
+    /// parent directory.
+    pub(crate) data_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,7 +270,8 @@ impl From<RawAddress> for Address {
 
 /// Public entry point. Dispatches by extension: `.lua` files go through
 /// the dellingr-backed scenario loader; everything else is parsed as
-/// TOML.
+/// TOML. Attachment `data_path` references resolve relative to the
+/// fixture file's parent directory.
 pub fn load(path: &Path) -> Result<Fixture, String> {
     if path.extension().is_some_and(|e| e == "lua") {
         crate::lua::load(path)
@@ -218,11 +280,21 @@ pub fn load(path: &Path) -> Result<Fixture, String> {
             .map_err(|e| format!("read {}: {e}", path.display()))?;
         let raw: RawFixture =
             toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
-        normalize(raw)
+        let dir = path.parent().unwrap_or(Path::new("."));
+        normalize_with_dir(raw, dir)
     }
 }
 
+/// Convenience wrapper for unit tests that build a `RawFixture` from
+/// inline strings without a fixture file on disk. Resolves any
+/// `data_path` references relative to the current working directory;
+/// fixture-file loading goes through [`normalize_with_dir`].
+#[cfg(test)]
 pub(crate) fn normalize(raw: RawFixture) -> Result<Fixture, String> {
+    normalize_with_dir(raw, Path::new("."))
+}
+
+pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<Fixture, String> {
     if !raw.account.is_personal {
         return Err("account.is_personal must be true (v0 supports one personal account)".into());
     }
@@ -298,6 +370,55 @@ pub(crate) fn normalize(raw: RawFixture) -> Result<Fixture, String> {
             Body::Text(s) => i64::try_from(s.len()).unwrap_or(i64::MAX),
         });
 
+        let mut attachments = Vec::with_capacity(em.attachments.len());
+        let mut blob_ids: HashMap<String, ()> = HashMap::new();
+        for raw_att in em.attachments {
+            if blob_ids.insert(raw_att.blob_id.clone(), ()).is_some() {
+                return Err(format!(
+                    "email {:?}: duplicate attachment blob_id {:?}",
+                    em.id, raw_att.blob_id
+                ));
+            }
+            let disposition = match raw_att.disposition.as_deref() {
+                Some(s) => Disposition::parse(s)
+                    .map_err(|e| format!("email {:?} attachment {:?}: {e}", em.id, raw_att.blob_id))?,
+                None => Disposition::Attachment,
+            };
+            let blob_path = fixture_dir.join(&raw_att.data_path);
+            let data = std::fs::read(&blob_path).map_err(|e| {
+                format!(
+                    "email {:?} attachment {:?}: read {}: {e}",
+                    em.id,
+                    raw_att.blob_id,
+                    blob_path.display()
+                )
+            })?;
+            let size = raw_att
+                .size
+                .unwrap_or_else(|| i64::try_from(data.len()).unwrap_or(i64::MAX));
+            attachments.push(Attachment {
+                blob_id: raw_att.blob_id,
+                name: raw_att.name,
+                content_type: raw_att.content_type,
+                size,
+                disposition,
+                cid: raw_att.cid,
+                data,
+            });
+        }
+
+        let has_attachment = match em.has_attachment {
+            Some(false) if !attachments.is_empty() => {
+                return Err(format!(
+                    "email {:?}: has_attachment=false but {} attachment(s) declared",
+                    em.id,
+                    attachments.len()
+                ));
+            }
+            Some(b) => b,
+            None => !attachments.is_empty(),
+        };
+
         emails.push(Email {
             thread_id: em.thread_id.unwrap_or_else(|| em.id.clone()),
             id: em.id,
@@ -316,8 +437,9 @@ pub(crate) fn normalize(raw: RawFixture) -> Result<Fixture, String> {
             message_id: em.message_id,
             in_reply_to: em.in_reply_to,
             references: em.references,
-            has_attachment: em.has_attachment.unwrap_or(false),
+            has_attachment,
             body,
+            attachments,
         });
     }
 

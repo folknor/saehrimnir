@@ -10,24 +10,44 @@
 //! deliberately not advertised. See
 //! `notes/ratatoskr-smtp-surface.md` for the wire surface.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio_rustls::TlsAcceptor;
+
+/// Marker trait that combines the four bounds we need on the per-
+/// connection stream. Lets `Conn` hold a `Box<dyn AsyncStream>` so the
+/// underlying type can swap from a plaintext TCP/duplex stream to a
+/// `TlsStream` after STARTTLS without each handler being generic.
+pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
 
 /// One captured SMTP submission. Tests read these via
 /// [`SubmissionLog::snapshot`].
 #[derive(Debug, Clone)]
 pub struct Submission {
-    /// Raw payload from `MAIL FROM:` - typically `<addr@example.com>`,
-    /// including the angle brackets.
+    /// Address bytes from `MAIL FROM:` - typically `<addr@example.com>`,
+    /// angle brackets included. Extension parameters (SIZE, BODY, etc.)
+    /// are stripped before storage and surfaced separately as
+    /// [`Self::from_params`].
     pub from: String,
-    /// Raw payloads from each `RCPT TO:` in submission order.
+    /// Address bytes from each `RCPT TO:` in submission order. Like
+    /// [`Self::from`] this is the address-only portion; per-recipient
+    /// extension parameters land in [`Self::rcpt_params`].
     pub recipients: Vec<String>,
+    /// Extension parameters that followed the `MAIL FROM:` address.
+    /// Keys are upper-cased for case-insensitive lookup
+    /// (`SIZE`, `BODY`, `ENVID`, ...). Values are the raw RHS bytes;
+    /// a bare flag without `=` is stored with an empty string value.
+    pub from_params: BTreeMap<String, String>,
+    /// Per-recipient extension parameters (`NOTIFY`, `ORCPT`, ...).
+    /// Same length as [`Self::recipients`] - index `i` of one matches
+    /// index `i` of the other.
+    pub rcpt_params: Vec<BTreeMap<String, String>>,
     /// SASL mechanism the client authenticated with, if any.
     pub auth_mechanism: Option<String>,
     /// Full RFC 822 message bytes with dot-stuffing reversed (a body
@@ -38,6 +58,71 @@ pub struct Submission {
     /// submission contents (from / recipients / data), not the
     /// timestamp.
     pub received_at: DateTime<Utc>,
+}
+
+/// Server-side MIME projection of a captured submission. Returned by
+/// [`Submission::parse_mime`] so tests can assert on `Subject`, body
+/// parts, and attachments without each pulling in `mail-parser`.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedSubmission {
+    pub subject: Option<String>,
+    pub text_bodies: Vec<String>,
+    pub html_bodies: Vec<String>,
+    pub attachments: Vec<ParsedAttachment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedAttachment {
+    pub filename: Option<String>,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+impl Submission {
+    /// Parse the captured RFC 822 bytes into a flat structure.
+    /// Returns `None` if `mail-parser` rejects the bytes outright;
+    /// otherwise the parser is lenient enough that anything `lettre`
+    /// might emit will round-trip.
+    pub fn parse_mime(&self) -> Option<ParsedSubmission> {
+        use mail_parser::MimeHeaders;
+        let parser = mail_parser::MessageParser::default();
+        let msg = parser.parse(&self.data)?;
+        let subject = msg.subject().map(str::to_string);
+        let mut text_bodies = Vec::new();
+        for i in 0..msg.text_body_count() {
+            if let Some(t) = msg.body_text(i) {
+                text_bodies.push(t.into_owned());
+            }
+        }
+        let mut html_bodies = Vec::new();
+        for i in 0..msg.html_body_count() {
+            if let Some(h) = msg.body_html(i) {
+                html_bodies.push(h.into_owned());
+            }
+        }
+        let mut attachments = Vec::new();
+        for a in msg.attachments() {
+            let content_type = match a.content_type() {
+                Some(ct) => format!(
+                    "{}/{}",
+                    ct.c_type,
+                    ct.c_subtype.as_deref().unwrap_or("octet-stream")
+                ),
+                None => "application/octet-stream".to_string(),
+            };
+            attachments.push(ParsedAttachment {
+                filename: a.attachment_name().map(str::to_string),
+                content_type,
+                data: a.contents().to_vec(),
+            });
+        }
+        Some(ParsedSubmission {
+            subject,
+            text_bodies,
+            html_bodies,
+            attachments,
+        })
+    }
 }
 
 /// Shared in-memory submission log. Cheap to clone.
@@ -66,11 +151,14 @@ impl SubmissionLog {
 pub const GREETING: &str = "220 saehrimnir ESMTP ready\r\n";
 
 /// Run the accept loop until `shutdown` flips. One task per accepted
-/// connection. Cancels accept on shutdown.
+/// connection. Cancels accept on shutdown. When `tls_acceptor` is
+/// `Some`, EHLO advertises `STARTTLS` and the upgrade path is wired
+/// through the per-connection state machine.
 pub async fn serve(
     listener: TcpListener,
     log: SubmissionLog,
-    dispatcher: Option<std::sync::Arc<crate::lua::Dispatcher>>,
+    dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -86,9 +174,10 @@ pub async fn serve(
                     Ok((stream, peer)) => {
                         let log = log.clone();
                         let disp = dispatcher.clone();
+                        let tls = tls_acceptor.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, log, disp, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, log, disp, tls, &mut sd).await {
                                 eprintln!("saehrimnir: smtp connection {peer}: {e}");
                             }
                         });
@@ -107,23 +196,26 @@ pub async fn serve(
 /// consult it before applying default behaviour. An
 /// `Override::Tagged { status, message }` becomes a wire response
 /// `<status> <message>`, where `status` is interpreted as the SMTP
-/// numeric code (e.g. `"452"`).
+/// numeric code (e.g. `"452"`). When `tls_acceptor` is `Some`, EHLO
+/// advertises `STARTTLS` and the connection accepts a TLS upgrade.
 pub async fn serve_connection<S>(
     stream: S,
     log: SubmissionLog,
-    dispatcher: Option<std::sync::Arc<crate::lua::Dispatcher>>,
+    dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncStream + 'static,
 {
-    let (reader, writer) = tokio::io::split(stream);
+    let boxed: Box<dyn AsyncStream> = Box::new(stream);
     let mut conn = Conn {
-        reader: BufReader::new(reader),
-        writer,
+        stream: Some(BufStream::new(boxed)),
         state: SmtpState::default(),
         log,
         dispatcher,
+        tls_acceptor,
+        tls_active: false,
     };
     conn.write_str(GREETING).await?;
     loop {
@@ -150,15 +242,23 @@ struct SmtpState {
     ehlo: Option<String>,
     auth: Option<String>,
     from: Option<String>,
+    from_params: BTreeMap<String, String>,
     rcpts: Vec<String>,
+    rcpt_params: Vec<BTreeMap<String, String>>,
 }
 
-struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
-    reader: BufReader<ReadHalf<S>>,
-    writer: WriteHalf<S>,
+struct Conn {
+    /// Always `Some` outside the brief STARTTLS upgrade window. Held
+    /// in an `Option` so `cmd_starttls` can `take()` the inner
+    /// `BufStream`, surrender the underlying boxed stream to the
+    /// acceptor, and re-install a fresh `BufStream<TlsStream<...>>`
+    /// before any other handler runs.
+    stream: Option<BufStream<Box<dyn AsyncStream>>>,
     state: SmtpState,
     log: SubmissionLog,
-    dispatcher: Option<std::sync::Arc<crate::lua::Dispatcher>>,
+    dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
+    tls_active: bool,
 }
 
 enum ReadOutcome {
@@ -167,7 +267,13 @@ enum ReadOutcome {
     Shutdown,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
+impl Conn {
+    fn stream_mut(&mut self) -> &mut BufStream<Box<dyn AsyncStream>> {
+        self.stream
+            .as_mut()
+            .expect("smtp stream consumed outside upgrade window")
+    }
+
     /// Consult the Lua dispatcher for `("smtp", command)`. Returns
     /// `Some((code, message))` if the script overrode the response;
     /// the SMTP-side caller should write `<code> <message>\r\n`
@@ -192,15 +298,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     }
 
     async fn write_str(&mut self, s: &str) -> std::io::Result<()> {
-        self.writer.write_all(s.as_bytes()).await?;
-        self.writer.flush().await
+        self.stream_mut().write_all(s.as_bytes()).await?;
+        self.stream_mut().flush().await
     }
 
     async fn write_line(&mut self, code: u16, text: &str) -> std::io::Result<()> {
-        self.writer
+        self.stream_mut()
             .write_all(format!("{code} {text}\r\n").as_bytes())
             .await?;
-        self.writer.flush().await
+        self.stream_mut().flush().await
     }
 
     async fn read_line(
@@ -218,7 +324,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     }
                     continue;
                 }
-                r = self.reader.read_line(&mut buf) => {
+                r = self.stream_mut().read_line(&mut buf) => {
                     let n = r?;
                     return Ok(if n == 0 {
                         ReadOutcome::PeerClosed
@@ -235,6 +341,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         let (verb, rest) = split_verb(line);
         match verb.to_ascii_uppercase().as_str() {
             "EHLO" | "HELO" => self.cmd_ehlo(rest).await.map(|_| false),
+            "STARTTLS" => self.cmd_starttls().await.map(|_| false),
             "AUTH" => self.cmd_auth(rest).await.map(|_| false),
             "MAIL" => self.cmd_mail(rest).await.map(|_| false),
             "RCPT" => self.cmd_rcpt(rest).await.map(|_| false),
@@ -261,16 +368,54 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         self.state.ehlo = Some(host.to_string());
         // Reset envelope state on every (EH)LO.
         self.state.from = None;
+        self.state.from_params.clear();
         self.state.rcpts.clear();
+        self.state.rcpt_params.clear();
+        let advertise_starttls = self.tls_acceptor.is_some() && !self.tls_active;
         // Multi-line 250 reply per RFC 5321: each line except the
         // last uses `250-`; the last uses `250 ` (space).
-        self.writer
+        self.stream_mut()
             .write_all(b"250-saehrimnir greets you\r\n")
             .await?;
-        self.writer.write_all(b"250-SIZE 52428800\r\n").await?;
-        self.writer.write_all(b"250-8BITMIME\r\n").await?;
-        self.writer.write_all(b"250 AUTH PLAIN LOGIN XOAUTH2\r\n").await?;
-        self.writer.flush().await
+        self.stream_mut().write_all(b"250-SIZE 52428800\r\n").await?;
+        self.stream_mut().write_all(b"250-8BITMIME\r\n").await?;
+        if advertise_starttls {
+            self.stream_mut().write_all(b"250-STARTTLS\r\n").await?;
+        }
+        self.stream_mut().write_all(b"250 AUTH PLAIN LOGIN XOAUTH2\r\n").await?;
+        self.stream_mut().flush().await
+    }
+
+    async fn cmd_starttls(&mut self) -> std::io::Result<()> {
+        if self.tls_active {
+            return self.write_line(503, "TLS already active").await;
+        }
+        let Some(acceptor) = self.tls_acceptor.clone() else {
+            return self.write_line(502, "STARTTLS not supported").await;
+        };
+        self.write_line(220, "Ready to start TLS").await?;
+        // Surrender the BufStream and pull out the inner boxed
+        // stream. RFC 3207 says the server MUST discard any data
+        // read after the 220 - the BufStream's internal buffer is
+        // dropped along with it, so we don't need to do anything
+        // explicit.
+        let bufstream = self
+            .stream
+            .take()
+            .expect("smtp stream already taken in cmd_starttls");
+        let inner: Box<dyn AsyncStream> = bufstream.into_inner();
+        let tls = match acceptor.accept(inner).await {
+            Ok(t) => t,
+            Err(e) => return Err(e),
+        };
+        let new_boxed: Box<dyn AsyncStream> = Box::new(tls);
+        self.stream = Some(BufStream::new(new_boxed));
+        self.tls_active = true;
+        // Per RFC 3207 §4.2 the server MUST discard any prior knowledge
+        // it had about the session. We zero the state so the client's
+        // forthcoming EHLO repopulates it.
+        self.state = SmtpState::default();
+        Ok(())
     }
 
     async fn cmd_auth(&mut self, rest: &str) -> std::io::Result<()> {
@@ -282,10 +427,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 if initial_response.is_none() {
                     // Prompt with a 334 challenge and consume one
                     // continuation line.
-                    self.writer.write_all(b"334 \r\n").await?;
-                    self.writer.flush().await?;
+                    self.stream_mut().write_all(b"334 \r\n").await?;
+                    self.stream_mut().flush().await?;
                     let mut buf = String::new();
-                    let n = self.reader.read_line(&mut buf).await?;
+                    let n = self.stream_mut().read_line(&mut buf).await?;
                     if n == 0 {
                         return Ok(());
                     }
@@ -317,8 +462,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         if let Some((code, msg)) = self.maybe_override("MAIL", &payload) {
             return self.write_str(&format!("{code} {msg}\r\n")).await;
         }
-        self.state.from = Some(payload);
+        let (addr, params) = match split_envelope_payload(&payload) {
+            Ok(t) => t,
+            Err(_) => {
+                return self
+                    .write_line(501, "malformed MAIL FROM extension parameter")
+                    .await;
+            }
+        };
+        self.state.from = Some(addr);
+        self.state.from_params = params;
         self.state.rcpts.clear();
+        self.state.rcpt_params.clear();
         self.write_line(250, "OK").await
     }
 
@@ -333,7 +488,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         if let Some((code, msg)) = self.maybe_override("RCPT", &payload) {
             return self.write_str(&format!("{code} {msg}\r\n")).await;
         }
-        self.state.rcpts.push(payload);
+        let (addr, params) = match split_envelope_payload(&payload) {
+            Ok(t) => t,
+            Err(_) => {
+                return self
+                    .write_line(501, "malformed RCPT TO extension parameter")
+                    .await;
+            }
+        };
+        self.state.rcpts.push(addr);
+        self.state.rcpt_params.push(params);
         self.write_line(250, "OK").await
     }
 
@@ -353,6 +517,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         let submission = Submission {
             from: self.state.from.clone().unwrap_or_default(),
             recipients: std::mem::take(&mut self.state.rcpts),
+            from_params: std::mem::take(&mut self.state.from_params),
+            rcpt_params: std::mem::take(&mut self.state.rcpt_params),
             auth_mechanism: self.state.auth.clone(),
             data,
             received_at: Utc::now(),
@@ -363,6 +529,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // values.
         self.state.from = None;
         self.state.rcpts.clear();
+        self.state.rcpt_params.clear();
 
         self.log.push(submission);
         self.write_line(250, "OK queued").await
@@ -373,7 +540,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         let mut line = String::new();
         loop {
             line.clear();
-            let n = self.reader.read_line(&mut line).await?;
+            let n = self.stream_mut().read_line(&mut line).await?;
             if n == 0 {
                 // Peer closed mid-DATA; treat as truncated body and
                 // return what we have. The submission log will reflect
@@ -394,7 +561,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     async fn cmd_rset(&mut self) -> std::io::Result<()> {
         self.state.from = None;
+        self.state.from_params.clear();
         self.state.rcpts.clear();
+        self.state.rcpt_params.clear();
         self.write_line(250, "OK").await
     }
 
@@ -414,6 +583,46 @@ fn split_verb(line: &str) -> (&str, &str) {
         Some((v, r)) => (v, r),
         None => (line, ""),
     }
+}
+
+/// Split a `MAIL FROM:` / `RCPT TO:` payload into its address bytes
+/// and any RFC 5321 / RFC 3461 extension parameters. The payload looks
+/// like `<addr@example.com> SIZE=1234 BODY=8BITMIME NOTIFY=SUCCESS,FAILURE`
+/// where the address is everything up to the first whitespace and the
+/// remaining tokens are `KEY[=VALUE]` pairs (case-insensitive on the
+/// key). A bare token without `=` is stored with an empty value;
+/// truly malformed input (a token that starts with `=` or has no key
+/// before the `=`) is rejected so the client gets a `501`. Unknown
+/// parameter keys are accepted silently - the mock just records them.
+fn split_envelope_payload(
+    payload: &str,
+) -> Result<(String, BTreeMap<String, String>), String> {
+    let trimmed = payload.trim();
+    let (addr, rest) = match trimmed.find(|c: char| c.is_ascii_whitespace()) {
+        Some(i) => (&trimmed[..i], trimmed[i..].trim_start()),
+        None => (trimmed, ""),
+    };
+    let mut params = BTreeMap::new();
+    if !rest.is_empty() {
+        for tok in rest.split_ascii_whitespace() {
+            match tok.split_once('=') {
+                Some((k, v)) => {
+                    let k = k.trim();
+                    if k.is_empty() {
+                        return Err(format!("empty parameter key in {tok:?}"));
+                    }
+                    params.insert(k.to_ascii_uppercase(), v.to_string());
+                }
+                None => {
+                    if tok.starts_with('=') {
+                        return Err(format!("malformed parameter token {tok:?}"));
+                    }
+                    params.insert(tok.to_ascii_uppercase(), String::new());
+                }
+            }
+        }
+    }
+    Ok((addr.to_string(), params))
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -436,7 +645,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, &mut rx).await
+            serve_connection(server, log_clone, None, None, &mut rx).await
         });
         client.write_all(script).await.unwrap();
         client.shutdown().await.unwrap();
@@ -573,6 +782,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mail_and_rcpt_capture_extension_parameters() {
+        let script = b"\
+            EHLO me\r\n\
+            AUTH PLAIN AGFsaWNlAGh1bnRlcg==\r\n\
+            MAIL FROM:<a@b> SIZE=1234 BODY=8BITMIME ENVID=foo\r\n\
+            RCPT TO:<c@d> NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;c@d\r\n\
+            RCPT TO:<e@f>\r\n\
+            DATA\r\n\
+            hi\r\n\
+            .\r\n\
+            QUIT\r\n";
+        let (out, log) = run_script(script).await;
+        assert!(out.contains("250 OK queued"));
+        let snap = log.snapshot();
+        let s = &snap[0];
+        assert_eq!(s.from, "<a@b>");
+        assert_eq!(s.from_params.get("SIZE").map(String::as_str), Some("1234"));
+        assert_eq!(
+            s.from_params.get("BODY").map(String::as_str),
+            Some("8BITMIME")
+        );
+        assert_eq!(s.from_params.get("ENVID").map(String::as_str), Some("foo"));
+
+        assert_eq!(s.recipients, vec!["<c@d>".to_string(), "<e@f>".to_string()]);
+        assert_eq!(s.rcpt_params.len(), 2);
+        assert_eq!(
+            s.rcpt_params[0].get("NOTIFY").map(String::as_str),
+            Some("SUCCESS,FAILURE")
+        );
+        assert_eq!(
+            s.rcpt_params[0].get("ORCPT").map(String::as_str),
+            Some("rfc822;c@d")
+        );
+        assert!(s.rcpt_params[1].is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_envelope_param_is_501() {
+        let script = b"\
+            EHLO me\r\n\
+            MAIL FROM:<a@b> =bogus\r\n\
+            QUIT\r\n";
+        let (out, _) = run_script(script).await;
+        assert!(out.contains("501 malformed MAIL FROM"));
+    }
+
+    #[tokio::test]
     async fn shutdown_signal_drops_connection() {
         let log = SubmissionLog::new();
         let (server, mut client) = tokio::io::duplex(8192);
@@ -580,7 +836,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, &mut rx).await
+            serve_connection(server, log_clone, None, None, &mut rx).await
         });
         let mut greet = vec![0u8; GREETING.len()];
         client.read_exact(&mut greet).await.unwrap();

@@ -1185,6 +1185,16 @@ enum FetchAttr {
     BodyHeader,
     /// `BODY[TEXT]` or `.PEEK[TEXT]`.
     BodyText,
+    /// `BODYSTRUCTURE`. Nested IMAP body structure per RFC 3501 §7.4.2.
+    BodyStructure,
+    /// `BODY[N]` where N is a 1-based part number into the multipart
+    /// tree. For single-part messages, only `BODY[1]` is valid (and
+    /// equivalent to `BODY[TEXT]`).
+    BodyPart(u32),
+    /// `BODY[N.MIME]` - the MIME headers of part N (the part-level
+    /// Content-Type / Content-Transfer-Encoding / Content-Disposition
+    /// block) without the part body itself.
+    BodyPartMime(u32),
 }
 
 fn parse_fetch_attrs(s: &str) -> Option<Vec<FetchAttr>> {
@@ -1196,7 +1206,8 @@ fn parse_fetch_attrs(s: &str) -> Option<Vec<FetchAttr>> {
     };
     let mut out = Vec::new();
     for raw in inner.split_whitespace() {
-        let attr = match raw.to_ascii_uppercase().as_str() {
+        let upper = raw.to_ascii_uppercase();
+        let attr = match upper.as_str() {
             "UID" => FetchAttr::Uid,
             "FLAGS" => FetchAttr::Flags,
             "INTERNALDATE" => FetchAttr::InternalDate,
@@ -1204,7 +1215,8 @@ fn parse_fetch_attrs(s: &str) -> Option<Vec<FetchAttr>> {
             "RFC822" | "BODY[]" | "BODY.PEEK[]" => FetchAttr::BodyFull,
             "BODY[HEADER]" | "BODY.PEEK[HEADER]" | "RFC822.HEADER" => FetchAttr::BodyHeader,
             "BODY[TEXT]" | "BODY.PEEK[TEXT]" | "RFC822.TEXT" => FetchAttr::BodyText,
-            _ => return None,
+            "BODYSTRUCTURE" => FetchAttr::BodyStructure,
+            other => parse_part_section(other)?,
         };
         if !out.contains(&attr) {
             out.push(attr);
@@ -1214,6 +1226,29 @@ fn parse_fetch_attrs(s: &str) -> Option<Vec<FetchAttr>> {
         None
     } else {
         Some(out)
+    }
+}
+
+/// Parse `BODY[N]` / `BODY.PEEK[N]` / `BODY[N.MIME]` /
+/// `BODY.PEEK[N.MIME]` into the matching `FetchAttr`. Caller passes
+/// the upper-cased token. Returns `None` for anything else.
+fn parse_part_section(token: &str) -> Option<FetchAttr> {
+    let after = token
+        .strip_prefix("BODY[")
+        .or_else(|| token.strip_prefix("BODY.PEEK["))?;
+    let inner = after.strip_suffix(']')?;
+    if let Some(num) = inner.strip_suffix(".MIME") {
+        let n: u32 = num.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some(FetchAttr::BodyPartMime(n))
+    } else {
+        let n: u32 = inner.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some(FetchAttr::BodyPart(n))
     }
 }
 
@@ -1288,6 +1323,23 @@ fn fetch_response_line(seq: u32, uid: u32, email: &Email, attrs: &[FetchAttr]) -
                 let text = render_rfc822_text_body(email);
                 out.push_str(&format!("BODY[TEXT] {{{}}}\r\n{}", text.len(), text));
             }
+            FetchAttr::BodyStructure => {
+                out.push_str(&format!("BODYSTRUCTURE {}", render_bodystructure(email)));
+            }
+            FetchAttr::BodyPart(n) => match render_part_n(email, *n) {
+                Some(bytes) => out.push_str(&format!(
+                    "BODY[{n}] {{{}}}\r\n{bytes}",
+                    bytes.len()
+                )),
+                None => out.push_str(&format!("BODY[{n}] NIL")),
+            },
+            FetchAttr::BodyPartMime(n) => match render_part_n_mime(email, *n) {
+                Some(bytes) => out.push_str(&format!(
+                    "BODY[{n}.MIME] {{{}}}\r\n{bytes}",
+                    bytes.len()
+                )),
+                None => out.push_str(&format!("BODY[{n}.MIME] NIL")),
+            },
         }
     }
     out.push_str(")\r\n");
@@ -1362,19 +1414,252 @@ fn render_rfc822_headers(email: &Email) -> String {
         push_header(&mut out, "References", &email.references.join(" "));
     }
     push_header(&mut out, "MIME-Version", "1.0");
-    push_header(
-        &mut out,
-        "Content-Type",
-        "text/plain; charset=utf-8",
-    );
-    push_header(&mut out, "Content-Transfer-Encoding", "8bit");
+    if email.attachments.is_empty() {
+        push_header(
+            &mut out,
+            "Content-Type",
+            "text/plain; charset=utf-8",
+        );
+        push_header(&mut out, "Content-Transfer-Encoding", "8bit");
+    } else {
+        push_header(
+            &mut out,
+            "Content-Type",
+            &format!(
+                "multipart/mixed; boundary=\"{}\"",
+                multipart_boundary(email)
+            ),
+        );
+    }
     out
 }
 
 fn render_rfc822_text_body(email: &Email) -> String {
-    match &email.body {
-        Body::Text(t) => normalize_crlf(t),
+    if email.attachments.is_empty() {
+        return match &email.body {
+            Body::Text(t) => normalize_crlf(t),
+        };
     }
+    render_multipart_body(email)
+}
+
+fn multipart_boundary(email: &Email) -> String {
+    format!("=_saehrimnir_{}_=", email.id)
+}
+
+fn render_multipart_body(email: &Email) -> String {
+    let boundary = multipart_boundary(email);
+    let mut out = String::new();
+    // Part 1: text body.
+    out.push_str(&format!("--{boundary}\r\n"));
+    out.push_str(&part_mime_text());
+    out.push_str(&match &email.body {
+        Body::Text(t) => normalize_crlf(t),
+    });
+    out.push_str("\r\n");
+    // Part 2..N: attachments.
+    for a in &email.attachments {
+        out.push_str(&format!("--{boundary}\r\n"));
+        out.push_str(&part_mime_attachment(a));
+        out.push_str(&base64_wrapped(&a.data));
+        out.push_str("\r\n");
+    }
+    out.push_str(&format!("--{boundary}--\r\n"));
+    out
+}
+
+fn part_mime_text() -> String {
+    let mut out = String::new();
+    push_header(&mut out, "Content-Type", "text/plain; charset=utf-8");
+    push_header(&mut out, "Content-Transfer-Encoding", "8bit");
+    out.push_str("\r\n");
+    out
+}
+
+fn part_mime_attachment(a: &crate::fixture::Attachment) -> String {
+    let mut out = String::new();
+    push_header(
+        &mut out,
+        "Content-Type",
+        &format!("{}; name=\"{}\"", a.content_type, a.name),
+    );
+    push_header(
+        &mut out,
+        "Content-Disposition",
+        &format!("{}; filename=\"{}\"", a.disposition.as_str(), a.name),
+    );
+    push_header(&mut out, "Content-Transfer-Encoding", "base64");
+    if let Some(cid) = &a.cid {
+        push_header(&mut out, "Content-ID", &format!("<{cid}>"));
+    }
+    out.push_str("\r\n");
+    out
+}
+
+/// Standard base64 (with padding), wrapped at 76 chars per line, CRLF
+/// separated. Final line gets a trailing CRLF so the next boundary sits
+/// on its own line.
+fn base64_wrapped(input: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut chunks = input.chunks_exact(3);
+    for c in chunks.by_ref() {
+        let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+        encoded.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+        encoded.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+        encoded.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+        encoded.push(ALPHA[(n & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = u32::from(rem[0]) << 16;
+            encoded.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            encoded.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+            encoded.push_str("==");
+        }
+        2 => {
+            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
+            encoded.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            encoded.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+            encoded.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+            encoded.push('=');
+        }
+        _ => {}
+    }
+    let mut out = String::with_capacity(encoded.len() + encoded.len() / 76 * 2);
+    let mut i = 0;
+    while i < encoded.len() {
+        let end = (i + 76).min(encoded.len());
+        out.push_str(&encoded[i..end]);
+        out.push_str("\r\n");
+        i = end;
+    }
+    out
+}
+
+/// Render IMAP `BODYSTRUCTURE` for an email. Single-part text and
+/// multipart/mixed are the only shapes v0 emits.
+fn render_bodystructure(email: &Email) -> String {
+    if email.attachments.is_empty() {
+        let body = match &email.body {
+            Body::Text(t) => normalize_crlf(t),
+        };
+        return body_structure_text_leaf(&body, "8BIT", &[("CHARSET", "utf-8")]);
+    }
+    let mut parts = String::new();
+    let body = match &email.body {
+        Body::Text(t) => normalize_crlf(t),
+    };
+    parts.push_str(&body_structure_text_leaf(
+        &body,
+        "8BIT",
+        &[("CHARSET", "utf-8")],
+    ));
+    for a in &email.attachments {
+        parts.push_str(&body_structure_attachment_leaf(a));
+    }
+    format!(
+        "({parts} \"MIXED\" (\"BOUNDARY\" \"{}\") NIL NIL NIL)",
+        multipart_boundary(email)
+    )
+}
+
+fn body_structure_text_leaf(body: &str, encoding: &str, params: &[(&str, &str)]) -> String {
+    let octets = body.len();
+    let lines = body.matches("\r\n").count() + usize::from(!body.is_empty() && !body.ends_with("\r\n"));
+    format!(
+        "(\"TEXT\" \"PLAIN\" {} NIL NIL \"{encoding}\" {octets} {lines})",
+        format_params(params)
+    )
+}
+
+fn body_structure_attachment_leaf(a: &crate::fixture::Attachment) -> String {
+    let (typ, sub) = split_media_type(&a.content_type);
+    let encoded = base64_wrapped(&a.data);
+    let octets = encoded.len();
+    let params = [("NAME", a.name.as_str())];
+    if typ.eq_ignore_ascii_case("text") {
+        let lines = encoded.matches("\r\n").count();
+        format!(
+            "(\"{}\" \"{}\" {} NIL NIL \"BASE64\" {octets} {lines})",
+            typ.to_uppercase(),
+            sub.to_uppercase(),
+            format_params(&params)
+        )
+    } else {
+        format!(
+            "(\"{}\" \"{}\" {} NIL NIL \"BASE64\" {octets})",
+            typ.to_uppercase(),
+            sub.to_uppercase(),
+            format_params(&params)
+        )
+    }
+}
+
+fn split_media_type(ct: &str) -> (&str, &str) {
+    let main = ct.split(';').next().unwrap_or(ct).trim();
+    match main.split_once('/') {
+        Some((t, s)) => (t, s),
+        None => (main, "PLAIN"),
+    }
+}
+
+fn format_params(params: &[(&str, &str)]) -> String {
+    if params.is_empty() {
+        return "NIL".to_string();
+    }
+    let mut out = String::from("(");
+    for (i, (k, v)) in params.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("\"{}\" \"{v}\"", k.to_uppercase()));
+    }
+    out.push(')');
+    out
+}
+
+/// Return the wire bytes for `BODY[N]`. Part 1 is the text body, parts
+/// 2..N+1 are the attachments. For single-part messages, only N=1 is
+/// valid (and equals the body text). Returns `None` for out-of-range
+/// part numbers.
+fn render_part_n(email: &Email, n: u32) -> Option<String> {
+    if n == 0 {
+        return None;
+    }
+    if n == 1 {
+        return Some(match &email.body {
+            Body::Text(t) => normalize_crlf(t),
+        });
+    }
+    let idx = (n as usize) - 2;
+    let att = email.attachments.get(idx)?;
+    Some(base64_wrapped(&att.data))
+}
+
+/// Return the MIME header block for `BODY[N.MIME]` (Content-Type +
+/// Content-Transfer-Encoding + optional Content-Disposition / -ID,
+/// terminated by a blank line). For single-part messages only N=1 is
+/// valid; the MIME headers there are the message-level Content-Type
+/// and -Encoding pair.
+fn render_part_n_mime(email: &Email, n: u32) -> Option<String> {
+    if n == 0 {
+        return None;
+    }
+    if email.attachments.is_empty() {
+        if n == 1 {
+            return Some(part_mime_text());
+        }
+        return None;
+    }
+    if n == 1 {
+        return Some(part_mime_text());
+    }
+    let idx = (n as usize) - 2;
+    let att = email.attachments.get(idx)?;
+    Some(part_mime_attachment(att))
 }
 
 fn push_header(out: &mut String, name: &str, value: &str) {
@@ -1513,6 +1798,7 @@ mod tests {
             references: vec![],
             has_attachment: false,
             body: Body::Text("x".into()),
+            attachments: vec![],
         };
         Arc::new(Fixture {
             name: "f".into(),
@@ -2299,6 +2585,7 @@ mod tests {
             references: vec![],
             has_attachment: false,
             body: Body::Text("hi\nthere".into()),
+            attachments: vec![],
         };
         let r = render_rfc822(&e);
         assert!(r.contains("From: Alice <alice@example.com>\r\n"));

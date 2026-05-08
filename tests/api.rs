@@ -215,6 +215,102 @@ async fn email_get_full_email_shape_with_body_values() {
     }
 }
 
+fn attach_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap();
+    routes::router(routes::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+    })
+}
+
+async fn attach_jmap_call(method: &str, args: Value, call_id: &str) -> Value {
+    let req_body = json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [[method, args, call_id]],
+    });
+    let resp = attach_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/api")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn email_get_surfaces_attachments_array() {
+    let v = attach_jmap_call(
+        "Email/get",
+        json!({
+            "accountId": "account-1",
+            "ids": ["email-001"],
+        }),
+        "g0",
+    )
+    .await;
+    let item = &v["methodResponses"][0][1]["list"][0];
+    assert_eq!(item["hasAttachment"], true);
+    let atts = item["attachments"].as_array().unwrap();
+    assert_eq!(atts.len(), 1);
+    let att = &atts[0];
+    assert_eq!(att["blobId"], "blob-att-001");
+    assert_eq!(att["name"], "sample.txt");
+    assert_eq!(att["type"], "text/plain");
+    assert_eq!(att["disposition"], "attachment");
+    assert_eq!(att["isInline"], false);
+    assert_eq!(att["partId"], "email-001:att-1");
+    assert!(att["size"].is_i64());
+}
+
+#[tokio::test]
+async fn jmap_download_returns_blob_bytes() {
+    let resp = attach_router()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/download/account-1/blob-att-001/sample.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/plain"
+    );
+    let cd = resp
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(cd.starts_with("attachment; filename=\"sample.txt\""));
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.starts_with(b"attachment payload"));
+}
+
+#[tokio::test]
+async fn jmap_download_unknown_blob_returns_404_envelope() {
+    let resp = attach_router()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/download/account-1/blob-nonsense/x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v = body_json(resp).await;
+    assert!(v["type"].as_str().unwrap().contains("notFound"));
+}
+
 #[tokio::test]
 async fn email_get_empty_ids_returns_state_only() {
     // get_email_state path: ids=[] purely to read the state token.

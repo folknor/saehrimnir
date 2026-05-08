@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::fixture::{Address, Body, Email, Fixture, Mailbox};
+use crate::fixture::{Address, Attachment, Body, Disposition, Email, Fixture, Mailbox};
 
 /// Wire-level request envelope.
 #[derive(Debug, Deserialize)]
@@ -608,7 +608,10 @@ fn serialize_email(e: &Email, fetch_text: bool, fetch_html: bool, fetch_all: boo
     if let Some(bv) = body_values {
         obj.insert("bodyValues".to_string(), bv);
     }
-    obj.insert("attachments".to_string(), Value::Array(vec![]));
+    obj.insert(
+        "attachments".to_string(),
+        Value::Array(serialize_attachments(e)),
+    );
 
     // Custom-header keys ratatoskr requests; always present, always
     // null until a fixture cares.
@@ -620,6 +623,45 @@ fn serialize_email(e: &Email, fetch_text: bool, fetch_html: bool, fetch_all: boo
         obj.insert(k.to_string(), Value::Null);
     }
 
+    Value::Object(obj)
+}
+
+fn serialize_attachments(e: &Email) -> Vec<Value> {
+    e.attachments
+        .iter()
+        .enumerate()
+        .map(|(i, a)| serialize_attachment(e, i, a))
+        .collect()
+}
+
+fn serialize_attachment(e: &Email, index: usize, a: &Attachment) -> Value {
+    let mut obj = Map::new();
+    obj.insert(
+        "partId".to_string(),
+        Value::String(format!("{}:att-{}", e.id, index + 1)),
+    );
+    obj.insert("blobId".to_string(), Value::String(a.blob_id.clone()));
+    obj.insert("size".to_string(), Value::Number(a.size.into()));
+    obj.insert("name".to_string(), Value::String(a.name.clone()));
+    obj.insert(
+        "type".to_string(),
+        Value::String(a.content_type.clone()),
+    );
+    obj.insert(
+        "disposition".to_string(),
+        Value::String(a.disposition.as_str().to_string()),
+    );
+    obj.insert(
+        "isInline".to_string(),
+        Value::Bool(matches!(a.disposition, Disposition::Inline)),
+    );
+    obj.insert(
+        "cid".to_string(),
+        match &a.cid {
+            Some(c) => Value::String(c.clone()),
+            None => Value::Null,
+        },
+    );
     Value::Object(obj)
 }
 
@@ -763,6 +805,7 @@ mod tests {
                     references: vec![],
                     has_attachment: false,
                     body: Body::Text("x".into()),
+                    attachments: vec![],
                 },
                 Email {
                     id: "e2".into(),
@@ -784,6 +827,7 @@ mod tests {
                     references: vec![],
                     has_attachment: false,
                     body: Body::Text("y".into()),
+                    attachments: vec![],
                 },
             ],
         }
@@ -914,6 +958,7 @@ mod tests {
             references: vec![],
             has_attachment: false,
             body: Body::Text("x".into()),
+            attachments: vec![],
         }
     }
 
@@ -1163,6 +1208,7 @@ mod tests {
                 references: vec![],
                 has_attachment: false,
                 body: Body::Text("hello".into()),
+                attachments: vec![],
             }],
         }
     }

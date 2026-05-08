@@ -92,6 +92,25 @@ fn lua_fixture_matches_equivalent_toml() {
 }
 
 #[test]
+fn lua_attach_fixture_matches_equivalent_toml() {
+    let from_toml = fixture::load(Path::new("fixtures/jmap-attach.toml")).unwrap();
+    let from_lua = fixture::load(Path::new("fixtures/jmap-attach.lua")).unwrap();
+    assert_eq!(from_toml, from_lua);
+
+    let em = &from_toml.emails[0];
+    assert!(em.has_attachment);
+    assert_eq!(em.attachments.len(), 1);
+    let att = &em.attachments[0];
+    assert_eq!(att.blob_id, "blob-att-001");
+    assert_eq!(att.name, "sample.txt");
+    assert_eq!(att.content_type, "text/plain");
+    assert_eq!(att.disposition, fixture::Disposition::Attachment);
+    // size auto-derived from data.len() since the fixture omits it.
+    assert_eq!(usize::try_from(att.size).unwrap(), att.data.len());
+    assert!(att.data.starts_with(b"attachment payload"));
+}
+
+#[test]
 fn lua_loader_rejects_missing_fixture_call() {
     let err = lua::load_source(
         r#"account({ id = "a", name = "a@b" })"#,

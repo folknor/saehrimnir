@@ -30,7 +30,9 @@ pub fn load(path: &Path) -> Result<Scenario, String> {
         let source = std::fs::read_to_string(path)
             .map_err(|e| format!("read {}: {e}", path.display()))?;
         let chunk_name = format!("@{}", path.display());
-        let (fixture, dispatcher) = lua::load_source_with_dispatcher(&source, &chunk_name)?;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let (fixture, dispatcher) =
+            lua::load_source_with_dispatcher_and_dir(&source, &chunk_name, dir)?;
         Ok(Scenario {
             fixture: Arc::new(fixture),
             dispatcher: Some(Arc::new(dispatcher)),

@@ -4,7 +4,7 @@ use std::time::Duration;
 use clap::Parser;
 use saehrimnir::lua::MockExit;
 use saehrimnir::sentinel::ProtocolPort;
-use saehrimnir::{cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp};
+use saehrimnir::{cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp, tls};
 use tokio::sync::watch;
 
 /// Hard budget on graceful drain after SIGTERM. Plan-2 acceptance #6
@@ -125,8 +125,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let smtp_shutdown_rx = shutdown_rx.clone();
     let smtp_log_clone = smtp_log.clone();
     let smtp_dispatcher = dispatcher.clone();
+    let smtp_tls = match tls::make_acceptor() {
+        Ok(a) => Some(Arc::new(a)),
+        Err(e) => {
+            eprintln!("saehrimnir: STARTTLS disabled - cert generation failed: {e}");
+            None
+        }
+    };
     let smtp_task = tokio::spawn(async move {
-        smtp::serve(smtp_listener, smtp_log_clone, smtp_dispatcher, smtp_shutdown_rx).await
+        smtp::serve(
+            smtp_listener,
+            smtp_log_clone,
+            smtp_dispatcher,
+            smtp_tls,
+            smtp_shutdown_rx,
+        )
+        .await
     });
     let _ = smtp_log; // currently no readers in production.
 

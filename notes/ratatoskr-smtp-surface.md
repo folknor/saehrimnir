@@ -17,7 +17,13 @@ outbound message. That makes the surface small.
 - Server greeting line required before any commands. `lettre` parses
   any `220 ...` greeting; mock will emit
   `220 saehrimnir ESMTP ready\r\n`.
-- v0 mock: plaintext only. No STARTTLS, no TLS.
+- v0 mock: plaintext + STARTTLS. The acceptor self-signs an ephemeral
+  cert at startup (subject alt names: `localhost`, `saehrimnir.test`)
+  and offers `STARTTLS` in the EHLO capability list. Clients must
+  accept invalid certs - typical for a test mock. No direct TLS on
+  port 465 (`lettre`'s `tls`/`starttls` modes both work, but the
+  former needs a connected TLS handshake before the greeting which
+  v0 does not support).
 
 ## Authentication
 
@@ -78,10 +84,20 @@ on them.
 
 For tests to verify:
 
-- Sender (the envelope address from MAIL FROM).
-- Recipients (the list from RCPT TO commands).
+- Sender address (from MAIL FROM, with extension parameters stripped).
+- Recipient addresses (from RCPT TO commands, also stripped).
+- Extension parameters: `MAIL FROM` params land in
+  `Submission::from_params` (BTreeMap, keys upper-cased: `SIZE`,
+  `BODY`, `ENVID`, `RET`, ...); `RCPT TO` params land in
+  `Submission::rcpt_params` parallel to `recipients` (one BTreeMap
+  per recipient with `NOTIFY`, `ORCPT`, ...). Bare flags without `=`
+  are stored with empty string values. Unknown keys are accepted
+  silently.
 - Raw message bytes between DATA and the terminator (the full RFC
-  822 message).
+  822 message). `Submission::parse_mime()` projects these into a
+  flat `ParsedSubmission { subject, text_bodies, html_bodies,
+  attachments }` so tests can assert without re-implementing a
+  parser.
 - Per-connection: which AUTH mechanism, which (raw) credential
   string. Useful for tracing OAuth-vs-password regressions even
   though we never validate.
@@ -93,10 +109,13 @@ mock does not have to generate one.
 
 ## Out of scope for v0
 
-- STARTTLS, direct TLS.
+- Direct TLS on port 465 (STARTTLS is wired; the bare-TLS path is
+  not).
 - CHUNKING / BDAT - client uses DATA.
-- DSN (Delivery Status Notification), NOTIFY, ORCPT.
-- SIZE negotiation - client doesn't check before sending.
+- DSN result codes back to the client (NOTIFY/ORCPT are captured but
+  the mock never emits a DSN).
+- SIZE negotiation - we advertise `SIZE 52428800` and capture the
+  `SIZE=` param if sent, but do not enforce.
 - PIPELINING - `lettre` sends sequentially.
 - VRFY / EXPN / HELP / NOOP (we'll accept NOOP for politeness, the
   others stay BAD).

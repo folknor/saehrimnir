@@ -24,7 +24,11 @@ fn router() -> axum::Router {
 }
 
 async fn get_json(uri: &str) -> (StatusCode, Value) {
-    let resp = router()
+    get_json_with(router(), uri).await
+}
+
+async fn get_json_with(router: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = router
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -39,6 +43,62 @@ async fn get_json(uri: &str) -> (StatusCode, Value) {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     (status, v)
+}
+
+fn attach_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap();
+    gmail::router(gmail::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+    })
+}
+
+#[tokio::test]
+async fn gmail_get_thread_emits_multipart_payload_with_attachment_ref() {
+    let (status, v) = get_json_with(
+        attach_router(),
+        "/gmail/v1/users/me/threads/email-001?format=full",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let payload = &v["messages"][0]["payload"];
+    assert_eq!(payload["mimeType"], "multipart/mixed");
+    let parts = payload["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["mimeType"], "text/plain");
+    assert!(parts[0]["body"]["data"].is_string());
+    let att = &parts[1];
+    assert_eq!(att["mimeType"], "text/plain");
+    assert_eq!(att["filename"], "sample.txt");
+    assert_eq!(att["body"]["attachmentId"], "blob-att-001");
+    assert!(att["body"]["data"].is_null() || att["body"].get("data").is_none());
+}
+
+#[tokio::test]
+async fn gmail_get_attachment_returns_base64url_data() {
+    let (status, v) = get_json_with(
+        attach_router(),
+        "/gmail/v1/users/me/messages/email-001/attachments/blob-att-001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v["size"].is_i64());
+    let data = v["data"].as_str().unwrap();
+    // base64url-no-pad of "attachment payload..."
+    assert!(!data.contains('='));
+    assert!(!data.contains('+'));
+    assert!(!data.contains('/'));
+    assert!(!data.is_empty());
+}
+
+#[tokio::test]
+async fn gmail_get_attachment_unknown_blob_404() {
+    let (status, _) = get_json_with(
+        attach_router(),
+        "/gmail/v1/users/me/messages/email-001/attachments/blob-nope",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

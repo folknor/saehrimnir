@@ -16,7 +16,7 @@ async fn run_with_log(script: &[u8]) -> (String, SubmissionLog) {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, None, &mut rx).await
+        smtp::serve_connection(server, log_clone, None, None, &mut rx).await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -135,7 +135,7 @@ async fn run_with_dispatcher(
     let (_tx, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, dispatcher, &mut rx).await
+        smtp::serve_connection(server, log_clone, dispatcher, None, &mut rx).await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -186,4 +186,180 @@ async fn data_callback_can_reject_submission() {
     // Submission was rejected before DATA body was consumed, so
     // nothing in the log.
     assert!(log.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn parse_mime_extracts_subject_and_attachment() {
+    let script = b"\
+        EHLO me\r\n\
+        MAIL FROM:<a@b>\r\n\
+        RCPT TO:<c@d>\r\n\
+        DATA\r\n\
+        From: a@b\r\n\
+        To: c@d\r\n\
+        Subject: with attach\r\n\
+        MIME-Version: 1.0\r\n\
+        Content-Type: multipart/mixed; boundary=\"BND\"\r\n\
+        \r\n\
+        --BND\r\n\
+        Content-Type: text/plain; charset=utf-8\r\n\
+        \r\n\
+        hi there\r\n\
+        --BND\r\n\
+        Content-Type: application/pdf; name=\"r.pdf\"\r\n\
+        Content-Disposition: attachment; filename=\"r.pdf\"\r\n\
+        Content-Transfer-Encoding: base64\r\n\
+        \r\n\
+        SGVsbG8gV29ybGQ=\r\n\
+        --BND--\r\n\
+        .\r\n\
+        QUIT\r\n";
+    let (_, log) = run_with_log(script).await;
+    let snap = log.snapshot();
+    let parsed = snap[0].parse_mime().expect("parse_mime");
+    assert_eq!(parsed.subject.as_deref(), Some("with attach"));
+    assert!(parsed.text_bodies.iter().any(|t| t.contains("hi there")));
+    assert_eq!(parsed.attachments.len(), 1);
+    let att = &parsed.attachments[0];
+    assert_eq!(att.filename.as_deref(), Some("r.pdf"));
+    assert_eq!(att.content_type, "application/pdf");
+    assert_eq!(att.data, b"Hello World");
+}
+
+// STARTTLS test: spin up a real TCP listener with TLS, drive it with a
+// tokio-rustls client that trusts everything (the server cert is
+// self-signed so any cert verifier here is a no-op). Confirms the
+// upgrade path doesn't drop bytes and capture works post-upgrade.
+mod starttls {
+    use super::*;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
+    use rustls::client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    };
+    use std::sync::Arc;
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
+
+    #[derive(Debug)]
+    struct AcceptAny;
+    impl ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    fn insecure_client_config() -> Arc<ClientConfig> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAny))
+            .with_no_client_auth();
+        Arc::new(cfg)
+    }
+
+    #[tokio::test]
+    async fn starttls_upgrade_then_data_round_trip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = SubmissionLog::new();
+        let log_clone = log.clone();
+        let (_tx, rx) = watch::channel(false);
+        let acceptor =
+            Arc::new(saehrimnir::tls::make_acceptor().expect("acceptor"));
+        let server_task = tokio::spawn(async move {
+            smtp::serve(listener, log_clone, None, Some(acceptor), rx).await
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let mut stream = stream;
+        // Read greeting.
+        let mut greeting = String::new();
+        let mut br = tokio::io::BufReader::new(&mut stream);
+        tokio::io::AsyncBufReadExt::read_line(&mut br, &mut greeting)
+            .await
+            .unwrap();
+        assert!(greeting.starts_with("220 "));
+
+        // EHLO and consume capability list.
+        stream.write_all(b"EHLO me\r\n").await.unwrap();
+        let mut saw_starttls = false;
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            let s = std::str::from_utf8(&buf[..n]).unwrap();
+            if s.contains("STARTTLS") {
+                saw_starttls = true;
+            }
+            if s.contains("250 ") {
+                break;
+            }
+        }
+        assert!(saw_starttls, "STARTTLS missing from EHLO reply");
+
+        stream.write_all(b"STARTTLS\r\n").await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("220 "));
+
+        // Upgrade.
+        let connector = TlsConnector::from(insecure_client_config());
+        let domain = ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(domain, stream).await.unwrap();
+
+        // EHLO again, AUTH, MAIL, RCPT, DATA over TLS.
+        let script = b"\
+            EHLO me\r\n\
+            AUTH PLAIN AGFsaWNlAGh1bnRlcg==\r\n\
+            MAIL FROM:<a@b>\r\n\
+            RCPT TO:<c@d>\r\n\
+            DATA\r\n\
+            Subject: secret\r\n\
+            \r\n\
+            shhh\r\n\
+            .\r\n\
+            QUIT\r\n";
+        tls.write_all(script).await.unwrap();
+        // Drain whatever the server replied; we just need the
+        // connection to close cleanly.
+        let mut sink = Vec::new();
+        let _ = tls.read_to_end(&mut sink).await;
+
+        let snap = log.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].from, "<a@b>");
+        assert_eq!(snap[0].recipients, vec!["<c@d>".to_string()]);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
 }
