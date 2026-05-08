@@ -27,19 +27,24 @@ brokkr sync-smoke <script.lua>
     ├─ allocate .brokkr/ratatoskr/sync/<test>/run-N/
     │
     ├─ spawn sæhrimnir
-    │     args: --fixture <fixtures_dir>/<name>.toml
-    │           --port 0
+    │     args: --fixture <fixtures_dir>/<name>.{toml,lua}
     │           --readiness-file <run_dir>/mock-ready
-    │           --log-file <run_dir>/mock-server.stderr   (or stderr piped there)
+    │           [--<proto>-port 0]   (default; ephemeral)
+    │           [--log-file ...]     (omitted - stderr is captured)
     │
     ├─ wait_for_sentinel(<run_dir>/mock-ready, backstop)
     │     ↳ Appeared | BackstopExpired
     │     on BackstopExpired: SIGKILL mock, preserve dir, fail
     │
-    ├─ read sentinel content → extract port
+    ├─ read sentinel content → parse per-protocol ports
+    │     (one line per protocol: JMAP/IMAP/SMTP/GRAPH/GMAIL <port>)
     │
     ├─ spawn harness binary
-    │     env: RATATOSKR_TEST_JMAP_ENDPOINT=http://127.0.0.1:<port>
+    │     env: RATATOSKR_TEST_JMAP_ENDPOINT=http://127.0.0.1:<jmap-port>
+    │          RATATOSKR_TEST_IMAP_ENDPOINT=127.0.0.1:<imap-port>
+    │          RATATOSKR_TEST_SMTP_ENDPOINT=127.0.0.1:<smtp-port>
+    │          RATATOSKR_TEST_GRAPH_ENDPOINT=http://127.0.0.1:<graph-port>
+    │          RATATOSKR_TEST_GMAIL_ENDPOINT=http://127.0.0.1:<gmail-port>
     │          BROKKR_HARNESS_ARTEFACT_DIR=<run_dir>/harness
     │          BROKKR_TEST_BIN_DIR=<bin dir>
     │          BROKKR_MARKER_FIFO=<fifo path>     (sync-bench only)
@@ -50,15 +55,18 @@ brokkr sync-smoke <script.lua>
     ├─ wait for mock exit (~1s budget)
     ├─ SIGKILL if not exited
     │
-    ├─ collect: harness exit, mock exit, mock-server.stderr,
+    ├─ collect: harness exit, mock exit, mock/stderr.log,
     │           summary.json (sync-bench), marker FIFO spans
     │
-    └─ on failure: snapshot_proc both PIDs, preserve run dir
+    └─ on failure: snapshot_proc both PIDs (writes
+                   harness/proc-{status,wchan,syscall,stack}.txt and
+                   mock/proc-{status,wchan,syscall,stack}.txt),
+                   preserve run dir
 ```
 
-The exact env-var name (`RATATOSKR_TEST_JMAP_ENDPOINT`) is configurable
-via `[ratatoskr] test_endpoint_env_jmap` in ratatoskr's brokkr.toml.
-Plan 3 wires whatever name is configured; we don't hardcode it.
+The five env-var names are each configurable via
+`[ratatoskr] test_endpoint_env_<proto>` in ratatoskr's brokkr.toml.
+Plan 3 wires whatever names are configured; we don't hardcode them.
 
 ## Readiness sentinel contract
 
@@ -125,23 +133,31 @@ plus a `[[check]]` sweep so `brokkr check` works inside this repo.
 
 ## Artefacts brokkr collects from us
 
-Per-run, under `.brokkr/ratatoskr/sync/<test>/run-N/`:
+Per-run, under `.brokkr/ratatoskr/sync/<test>/run-N/mock/`. Brokkr
+writes everything in this subdir; we don't see it. Plan 3 mirrors
+plan 1's `harness/` subdir for symmetry, so the four-file `/proc`
+snapshot from brokkr's `snapshot_proc` doesn't collide between the
+two children.
 
-- `mock-server.stderr` - our stderr, captured verbatim. Default log
+- `mock/stderr.log` - our stderr, captured verbatim. Default log
   channel.
-- `proc-at-failure-mock.txt` - `/proc/<our-pid>/{status,wchan,syscall,stack}`,
-  taken at failure-declaration time by brokkr's `snapshot_proc`. We
-  don't write this; brokkr does.
-- `exit-mock.txt` - our exit code, signal, wait time. Brokkr writes.
+- `mock/proc-{status,wchan,syscall,stack}.txt` - `/proc/<our-pid>/`
+  snapshot taken at failure-declaration time by brokkr's
+  `snapshot_proc`. Same four-file shape the harness side uses.
+- `mock/outcome.toml` - our exit code, signal, wait time, fixture
+  name. Brokkr writes.
 
 Our own outputs go to wherever the CLI flags point:
 
 - `--readiness-file` → `<run_dir>/mock-ready`
-- `--log-file` → optional; `<run_dir>/mock-server.log` if set, else
-  stderr (which brokkr captures into `mock-server.stderr`).
+- `--log-file` → optional; if omitted, our stderr is what brokkr
+  captures into `mock/stderr.log`. If set explicitly, we write to
+  the configured path AND brokkr still captures stderr (which will
+  be empty or near-empty in that case).
 
 We do not write into the harness binary's artefact dir
-(`BROKKR_HARNESS_ARTEFACT_DIR`); that's plan 1's surface.
+(`BROKKR_HARNESS_ARTEFACT_DIR`, which lives at
+`<run_dir>/harness/`); that's plan 1's surface.
 
 ## What brokkr does NOT do
 
@@ -195,6 +211,6 @@ We do not write into the harness binary's artefact dir
   `app` crate. We don't depend on or know about them.
 
 (Brokkr does take a one-shot `/proc` snapshot of us at failure time
-via its standalone `snapshot_proc` primitive - written into
-`proc-at-failure-mock.txt` - but it reads from outside; we don't
-participate.)
+via its standalone `snapshot_proc` primitive - written into the
+`mock/proc-{status,wchan,syscall,stack}.txt` set - but it reads
+from outside; we don't participate.)
