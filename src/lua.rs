@@ -23,6 +23,7 @@ use rand::rngs::SmallRng;
 
 use crate::fixture::{
     self, Fixture, RawAccount, RawAddress, RawAttachment, RawEmail, RawFixture, RawMailbox,
+    RawOAuth,
 };
 use crate::templates;
 
@@ -158,6 +159,7 @@ struct Builder {
     account: Option<RawAccount>,
     mailboxes: Vec<RawMailbox>,
     emails: Vec<RawEmail>,
+    oauth: Option<RawOAuth>,
     /// Reactive callbacks registered via the global `on()` RustFunc.
     /// Each entry holds an `Anchor` keeping the Lua closure alive
     /// in the State's registry until the Dispatcher releases it (or
@@ -179,7 +181,7 @@ impl Builder {
             account,
             mailboxes: self.mailboxes,
             emails: self.emails,
-            oauth: None,
+            oauth: self.oauth,
             calendars: vec![],
             events: vec![],
         };
@@ -194,6 +196,8 @@ fn install_builders(state: &mut State) {
     state.set_global("fixture");
     state.push_rust_fn(builder_account);
     state.set_global("account");
+    state.push_rust_fn(builder_oauth);
+    state.set_global("oauth");
     state.push_rust_fn(builder_mailbox);
     state.set_global("mailbox");
     state.push_rust_fn(builder_email);
@@ -318,6 +322,23 @@ fn builder_fixture(state: &mut State) -> dellingr::Result<u8> {
     }
     builder.name = Some(name);
     builder.state_token = state_token;
+    Ok(0)
+}
+
+/// `oauth { enforce = true|false, issuer = "..." }`. Optional; if a
+/// scenario omits it the loader behaves as if no `[oauth]` block were
+/// present (parity with the TOML loader: `enforce = false`, default
+/// issuer). Calling `oauth { ... }` more than once is rejected so a
+/// scenario can't shadow itself silently.
+fn builder_oauth(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "oauth")?;
+    let enforce = read_bool_opt(state, 1, "enforce")?.unwrap_or(false);
+    let issuer = read_string_opt(state, 1, "issuer")?;
+    let builder = builder_mut(state)?;
+    if builder.oauth.is_some() {
+        return fail(state, "oauth { ... } may only be called once");
+    }
+    builder.oauth = Some(RawOAuth { enforce, issuer });
     Ok(0)
 }
 

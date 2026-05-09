@@ -1276,3 +1276,115 @@ async fn jmap_session_enforces_bearer_when_fixture_oauth_enforce_is_true() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// End-to-end revoked-token-recovery walk against
+/// `fixtures/jmap-oauth.toml` (the named bearer-enforced variant of
+/// jmap-small). Proves that the fixture parses with `oauth.enforce
+/// = true` and that the full sync -> revoke -> 401 -> re-mint -> sync
+/// cycle works through the same JMAP endpoint a ratatoskr harness
+/// would drive.
+#[tokio::test]
+async fn jmap_oauth_fixture_drives_revoked_token_recovery_flow() {
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-oauth.toml")).unwrap();
+    assert!(fix.oauth.enforce, "fixture must enable bearer enforcement");
+
+    let store = saehrimnir::oauth::TokenStore::default();
+    let app = routes::router(
+        routes::AppState::for_test(Arc::new(fix)).with_token_store(store.clone()),
+    );
+
+    // Step 1: client mints a token via the OAuth provider.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("grant_type=authorization_code&code=abc"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let token = v["access_token"].as_str().unwrap().to_string();
+
+    // Step 2: bearer-gated sync succeeds.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Step 3: harness revokes the token.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/oauth/invalidate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "token": token }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Step 4: same request now 401s with the JMAP forbidden envelope.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let v = body_json(resp).await;
+    assert_eq!(v["type"], "urn:ietf:params:jmap:error:forbidden");
+
+    // Step 5: re-mint and sync again.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("grant_type=authorization_code&code=xyz"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let fresh = v["access_token"].as_str().unwrap();
+    assert_ne!(fresh, token, "re-mint must produce a distinct token");
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, format!("Bearer {fresh}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

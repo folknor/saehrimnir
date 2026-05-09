@@ -209,6 +209,18 @@ requests whose bearer is not in the active token set (managed by
 surfaces and are unaffected. See `notes/ratatoskr-oauth-surface.md`
 for the full token-issuance / userinfo / invalidation contract.
 
+The Lua loader exposes the same block via the `oauth` builder:
+
+```lua
+oauth({ enforce = true, issuer = "https://example.test/oauth" })
+```
+
+Both fields are optional and the call may appear at most once per
+scenario (a second call returns a load-time error).
+`fixtures/jmap-oauth.toml` is the canonical bearer-enforced fixture
+and demonstrates the revoked-token-recovery flow harness scripts can
+drive against `/oauth/token` + `/test/oauth/invalidate`.
+
 ## Validation rules
 
 The mock refuses to start (non-zero exit, stderr message) if:

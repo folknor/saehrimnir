@@ -679,6 +679,59 @@ fn mock_fail_requires_string_reason() {
     assert!(err.contains("reason"), "got: {err}");
 }
 
+/// `oauth { enforce = true|false, issuer = ... }` writes through to
+/// `Fixture::oauth` so Lua-authored scenarios can opt into bearer
+/// enforcement on the JMAP / Graph / Gmail listeners. Mirrors the
+/// TOML `[oauth]` block.
+#[test]
+fn lua_oauth_builder_sets_enforce_and_issuer() {
+    let fix = lua::load_source(
+        r#"
+        fixture({ name = "x" })
+        oauth({ enforce = true, issuer = "https://example.test/oauth" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "m", name = "Inbox", role = "inbox", sort_order = 0 })
+        "#,
+        "@test",
+    )
+    .unwrap();
+    assert!(fix.oauth.enforce);
+    assert_eq!(fix.oauth.issuer, "https://example.test/oauth");
+}
+
+#[test]
+fn lua_oauth_builder_defaults_match_toml_default() {
+    // Omitting `oauth { ... }` in Lua must produce the same default
+    // (`enforce = false`, project-default issuer) as omitting the
+    // `[oauth]` block in TOML.
+    let fix = lua::load_source(
+        r#"
+        fixture({ name = "x" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "m", name = "Inbox", role = "inbox", sort_order = 0 })
+        "#,
+        "@test",
+    )
+    .unwrap();
+    assert!(!fix.oauth.enforce);
+    assert_eq!(fix.oauth.issuer, "https://saehrimnir.test/oauth");
+}
+
+#[test]
+fn lua_oauth_builder_double_call_errors() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "x" })
+        oauth({ enforce = true })
+        oauth({ enforce = false })
+        account({ id = "a", name = "a@b" })
+        "#,
+        "@test",
+    )
+    .unwrap_err();
+    assert!(err.contains("oauth"), "unexpected error: {err}");
+}
+
 #[test]
 fn lua_loader_double_account_call_errors() {
     let err = lua::load_source(

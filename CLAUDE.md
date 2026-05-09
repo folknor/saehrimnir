@@ -163,6 +163,9 @@ checking whether the fact is already in `notes/`.
   equivalent by `tests/lua_fixture.rs`.
 - `fixtures/jmap-bulk.lua` - 10k-email scale fixture demonstrating
   `bulk_emails`.
+- `fixtures/jmap-oauth.toml` - bearer-enforced
+  (`[oauth] enforce = true`) variant of jmap-small. Drives the
+  revoked-token-recovery flow asserted in `tests/api.rs`.
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status

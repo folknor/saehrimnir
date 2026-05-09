@@ -57,15 +57,16 @@ Both granularity items shipped together:
   from response shape. Filter args / result references are
   deliberately left out: shape-sensitive, would bloat the log.
 
-### OAuth-enforced fixture (M6.9 closeout)
+### OAuth-enforced fixture (M6.9 closeout, landed)
 
-- **Revocation toggle + checked-in fixture variant.** Mechanism is
-  done: `POST /test/oauth/invalidate` (`src/oauth.rs:358`, mounted
-  at `src/routes.rs:121`) revokes an issued token; subsequent
-  provider calls hit `enforce_bearer` and 401. What's missing is a
-  named fixture that wires this into the revoked-token-recovery
-  script (sync fails -> `oauth.exchange_code` re-auths -> follow-up
-  sync succeeds).
+- **Revocation toggle + checked-in fixture variant.**
+  `fixtures/jmap-oauth.toml` is the canonical bearer-enforced
+  scenario (`[oauth] enforce = true`). The full revoked-token-
+  recovery walk (mint -> sync -> revoke -> 401 -> re-mint -> sync)
+  is asserted end-to-end in
+  `tests/api.rs::jmap_oauth_fixture_drives_revoked_token_recovery_flow`.
+  The Lua loader gained a parallel `oauth { enforce, issuer }`
+  builder so dynamic scenarios can opt in too.
 
 ### Fixture breadth (M8 exit + M9 prep)
 
