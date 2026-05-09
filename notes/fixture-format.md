@@ -153,6 +153,46 @@ address as `{name, email}`. Fixtures accept two forms:
 
 Internally normalized to the table form before serialization.
 
+## Calendars and events (optional)
+
+```toml
+[[calendar]]
+id = "cal-work"
+name = "Work"
+color = "lightBlue"        # optional; passed through to Graph
+is_default = true          # optional; defaults to false
+
+[[event]]
+id = "ev-001"
+calendar_id = "cal-work"   # required; must reference a declared calendar
+subject = "Standup"
+body_preview = "Daily ..." # optional
+body_text = "..."          # optional
+start = "2026-01-15T09:00:00Z"   # required, RFC3339
+end   = "2026-01-15T09:15:00Z"   # required, RFC3339
+location = "Conf Room A"   # optional
+organizer = { name = "Alice", email = "alice@example.com" }   # optional, address-shaped
+attendees = [
+    { name = "Bob", email = "bob@example.com" },
+    "carol@example.com",
+]                          # optional; addresses accept bare-string or table form
+is_all_day = false         # optional
+```
+
+Validation rules:
+
+- `calendar.id` is unique within the fixture.
+- `event.id` is unique within the fixture.
+- `event.calendar_id` must reference a declared calendar.
+- `event.start` and `event.end` are RFC3339; sub-second precision is dropped.
+
+Calendars and events project over the Microsoft Graph
+`/v1.0/me/calendars/...` surface today; the same canonical types
+will feed CalDAV when that listener lands. The Graph mock supports
+the GET endpoints, plus echo-mode POST/PATCH/DELETE that record
+the request body in the cross-protocol request log without
+mutating the fixture (which is read-only in v0).
+
 ## OAuth (optional)
 
 ```toml

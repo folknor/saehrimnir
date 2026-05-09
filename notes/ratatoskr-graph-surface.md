@@ -5,10 +5,37 @@ What the v0 Graph mock has to satisfy. Distilled from
 there; this file is a cheat sheet so we don't have to fan out every
 turn.
 
-Mail-sync only for v0. Other resource categories (calendar, contacts,
-OneDrive, groups, labels, public folders via EWS, shared mailboxes,
-webhooks, autodiscover) are listed at the end so the next reader
-knows what scaffolding the module structure has to accommodate.
+Mail-sync and calendar are wired in v0. Other resource categories
+(contacts, OneDrive, groups, labels, public folders via EWS, shared
+mailboxes, webhooks, autodiscover) are listed at the end so the
+next reader knows what scaffolding the module structure has to
+accommodate.
+
+## Calendar (`src/graph/calendar.rs`)
+
+GET endpoints project from `[[calendar]]` and `[[event]]` fixture
+entries; mutating endpoints echo their request body so tests can
+assert on what the client tried to write without mutating the
+fixture.
+
+| Endpoint | Notes |
+|----------|-------|
+| `GET /v1.0/me/calendars` | OData-shaped envelope. Order = fixture declaration order. |
+| `GET /v1.0/me/calendars/{id}` | `id` accepts the literal id or the alias `default` (resolves to the first calendar with `is_default = true`, then the first declared calendar). |
+| `GET /v1.0/me/calendars/{id}/events` | `$top` / `$skiptoken` paginate; default top is 50, max 256. `@odata.nextLink` is emitted while a window remains. |
+| `GET /v1.0/me/calendars/{id}/calendarView/delta` | First call (no `$deltatoken`) returns the full event list; follow-up calls with any `$deltatoken` return an empty `value`. `@odata.deltaLink` is fixed to the fixture state. |
+| `GET /v1.0/me/events/{id}` | Single event. 404 if not declared. |
+| `POST /v1.0/me/calendars/{id}/events` | 201 with `id = "mock-event-create"`, `echoedRequest` carrying the parsed body. Logs `(graph, "POST /v1.0/me/calendars/{id}/events", { body })` to the request log. |
+| `PATCH /v1.0/me/events/{id}` | 200 with `id = <path>`, `echoedRequest` carrying the body. Logs to the request log. |
+| `DELETE /v1.0/me/events/{id}` | 204 with no body. Logs `(graph, "DELETE /v1.0/me/events/{id}", { id })`. |
+
+Event projection populates `subject`, `bodyPreview`, `body`
+(`contentType: "text"`), `start`/`end` (`{ dateTime, timeZone }`,
+always `UTC`), `isAllDay`, `location.displayName`, `organizer.
+emailAddress`, and `attendees[].emailAddress` with `type =
+"required"`. Attendee tone (`required`/`optional`) and
+`responseStatus` are not yet projected; add when a fixture forces
+it.
 
 ## Connection / transport
 

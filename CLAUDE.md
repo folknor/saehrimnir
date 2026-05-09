@@ -125,10 +125,12 @@ checking whether the fact is already in `notes/`.
 - `src/smtp.rs` - SMTP submission listener + in-memory submission
   capture log.
 - `src/graph/` - Microsoft Graph mock. `mod.rs` (router, AppState,
-  catchall 404), `odata.rs` (query parsing, pagination cursors,
-  envelope), `mail.rs` (mail-sync handlers). Sibling files for
-  calendar / contacts / drive / groups / EWS land here when those
-  surfaces are scouted.
+  catchall 404, bearer middleware), `odata.rs` (query parsing,
+  pagination cursors, envelope), `mail.rs` (mail-sync handlers),
+  `calendar.rs` (calendar + event handlers, including echo-mode
+  POST/PATCH/DELETE that record bodies in the request log).
+  Sibling files for contacts / drive / groups / EWS land here when
+  those surfaces are scouted.
 - `src/gmail/` - Gmail REST mock. `mod.rs` (router, AppState,
   catchall 404), `mail.rs` (profile, labels, threads, history,
   attachments stub, MIME payload builder, hand-rolled base64url).
@@ -205,14 +207,20 @@ restarting the binary. Integration tests in `tests/smtp.rs`,
 including a TCP-level STARTTLS round-trip; the route shape is
 covered in `tests/api.rs`.
 
-Graph: complete for v0's mail-sync path. `/v1.0/me/mailFolders`
-(list, by-id, by-well-known-alias, childFolders), `/v1.0/me/
-mailFolders/{id}/messages` (with `$top`/`$skip`/`$skiptoken`/
-`$filter`), `/v1.0/me/mailFolders/{id}/messages/delta` (initial
-dump, follow-up no-op, `$deltatoken=latest` shortcut). Catchall
-returns the Graph error envelope so unimplemented resources are
-visibly out-of-scope. Module is laid out as a directory so calendar/
-contacts/drive/groups/EWS drop in as siblings later.
+Graph: mail-sync and calendar are complete for v0. Mail:
+`/v1.0/me/mailFolders` (list, by-id, by-well-known-alias,
+childFolders), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
+`$skip` / `$skiptoken` / `$filter`), `/v1.0/me/mailFolders/{id}/
+messages/delta` (initial dump, follow-up no-op, `$deltatoken=latest`
+shortcut). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
+alias + events list with `$top`/`$skiptoken` pagination + delta
+view), `/v1.0/me/events/{id}` GET / PATCH / DELETE, plus
+`POST /v1.0/me/calendars/{id}/events`. Mutating endpoints echo
+their parsed body into the response and append the body to the
+request log; the fixture itself stays read-only. Catchall returns
+the Graph error envelope so unimplemented resources are visibly
+out-of-scope. Sibling files for contacts / drive / groups / EWS
+drop in later.
 
 Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`
 + `/labels` + `/threads` (list paginated by `nextPageToken`, with

@@ -18,6 +18,14 @@ pub struct Fixture {
     pub mailboxes: Vec<Mailbox>,
     pub emails: Vec<Email>,
     pub oauth: OAuthConfig,
+    /// Calendars projected over the Microsoft Graph
+    /// `/v1.0/me/calendars/...` surface (and, eventually, the
+    /// CalDAV listener). Empty by default; fixtures that don't need
+    /// calendar coverage can omit the `[[calendar]]` table.
+    pub calendars: Vec<Calendar>,
+    /// Events scoped to one of the declared calendars by
+    /// `calendar_id`. Empty by default.
+    pub events: Vec<Event>,
 }
 
 /// Fixture-side OAuth configuration. Optional in TOML/Lua; defaults
@@ -43,6 +51,34 @@ impl Default for OAuthConfig {
             issuer: "https://saehrimnir.test/oauth".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Calendar {
+    pub id: String,
+    pub name: String,
+    /// Echoed as `color` in Graph responses. Real Graph uses the
+    /// enum names `lightBlue` / `lightGreen` / etc.; we accept any
+    /// string and pass it through.
+    pub color: Option<String>,
+    /// Exactly one calendar should typically have `is_default = true`
+    /// per fixture; the loader does not enforce uniqueness today.
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    pub id: String,
+    pub calendar_id: String,
+    pub subject: String,
+    pub body_preview: Option<String>,
+    pub body_text: Option<String>,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub location: Option<String>,
+    pub organizer: Option<Address>,
+    pub attendees: Vec<Address>,
+    pub is_all_day: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +230,41 @@ pub(crate) struct RawFixture {
     pub(crate) emails: Vec<RawEmail>,
     #[serde(default)]
     pub(crate) oauth: Option<RawOAuth>,
+    #[serde(default, rename = "calendar")]
+    pub(crate) calendars: Vec<RawCalendar>,
+    #[serde(default, rename = "event")]
+    pub(crate) events: Vec<RawEvent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawCalendar {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) color: Option<String>,
+    #[serde(default)]
+    pub(crate) is_default: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawEvent {
+    pub(crate) id: String,
+    pub(crate) calendar_id: String,
+    pub(crate) subject: String,
+    #[serde(default)]
+    pub(crate) body_preview: Option<String>,
+    #[serde(default)]
+    pub(crate) body_text: Option<String>,
+    pub(crate) start: String,
+    pub(crate) end: String,
+    #[serde(default)]
+    pub(crate) location: Option<String>,
+    #[serde(default)]
+    pub(crate) organizer: Option<RawAddress>,
+    #[serde(default)]
+    pub(crate) attendees: Vec<RawAddress>,
+    #[serde(default)]
+    pub(crate) is_all_day: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -490,6 +561,48 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         None => OAuthConfig::default(),
     };
 
+    // Calendars and events. Validate that every event references a
+    // declared calendar - same shape as the email -> mailbox check.
+    let mut calendar_ids: HashMap<String, ()> = HashMap::new();
+    let mut calendars = Vec::with_capacity(raw.calendars.len());
+    for cal in raw.calendars {
+        if calendar_ids.insert(cal.id.clone(), ()).is_some() {
+            return Err(format!("duplicate calendar id {:?}", cal.id));
+        }
+        calendars.push(Calendar {
+            id: cal.id,
+            name: cal.name,
+            color: cal.color,
+            is_default: cal.is_default,
+        });
+    }
+    let mut event_ids: HashMap<String, ()> = HashMap::new();
+    let mut events = Vec::with_capacity(raw.events.len());
+    for ev in raw.events {
+        if event_ids.insert(ev.id.clone(), ()).is_some() {
+            return Err(format!("duplicate event id {:?}", ev.id));
+        }
+        if !calendar_ids.contains_key(&ev.calendar_id) {
+            return Err(format!(
+                "event {:?} references unknown calendar {:?}",
+                ev.id, ev.calendar_id
+            ));
+        }
+        events.push(Event {
+            id: ev.id,
+            calendar_id: ev.calendar_id,
+            subject: ev.subject,
+            body_preview: ev.body_preview,
+            body_text: ev.body_text,
+            start: parse_ts(&ev.start)?,
+            end: parse_ts(&ev.end)?,
+            location: ev.location,
+            organizer: ev.organizer.map(Address::from),
+            attendees: ev.attendees.into_iter().map(Address::from).collect(),
+            is_all_day: ev.is_all_day,
+        });
+    }
+
     Ok(Fixture {
         name: raw.name,
         state: raw.state.unwrap_or_else(|| "fixture-state".to_string()),
@@ -500,6 +613,8 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         mailboxes,
         emails,
         oauth,
+        calendars,
+        events,
     })
 }
 

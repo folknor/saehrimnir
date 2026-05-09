@@ -43,30 +43,14 @@ remain unblocked-but-unneeded.
   accounts (JMAP session resource, Graph `/users/{id}/...` paths,
   IMAP per-connection account context).
 
-## Calendar (matrix item 10)
+## CalDAV (matrix item 10, alternative path)
 
-Pick Graph calendar *or* CalDAV first based on which client surface
-ratatoskr exercises in its calendar smoke; landing both is fine
-later.
-
-### Microsoft Graph calendar
-
-Promoted from the Graph "future work" list because it's actively
-wanted for matrix item 10. Will need `[[calendar]]` and `[[event]]`
-fixture entries; reference `<ratatoskr>/crates/graph/src/
-calendar_sync.rs`. Endpoints:
-
-- `GET /v1.0/me/calendars`
-- `GET /v1.0/me/calendars/{id}/calendarView/delta`
-- `POST /v1.0/me/calendars/{id}/events`
-- `PATCH /v1.0/me/events/{id}`
-- `GET /v1.0/me/events/{id}`
-- `DELETE /v1.0/me/events/{id}`
-
-### CalDAV
-
-Net-new protocol surface. New `src/caldav.rs` module +
-`notes/ratatoskr-caldav-surface.md` scout doc. Endpoints:
+Net-new protocol surface for ratatoskr's calendar smoke; the Graph
+calendar surface (above the line) is already wired, so this is
+only needed if ratatoskr's calendar client ends up speaking CalDAV
+to a non-Graph backend. New `src/caldav.rs` module + new listener
+binding (separate `--caldav-port`) + `notes/ratatoskr-caldav-
+surface.md` scout doc. Endpoints:
 
 - Principal discovery (`PROPFIND /.well-known/caldav`).
 - Calendar home set (`PROPFIND` on principal).

@@ -980,6 +980,8 @@ mod tests {
                 },
             ],
             oauth: crate::fixture::OAuthConfig::default(),
+            calendars: vec![],
+            events: vec![],
         }
     }
 
@@ -1150,6 +1152,8 @@ mod tests {
                 email("d", "mb-archive", mk(2026, 1, 15, 9)),
             ],
             oauth: crate::fixture::OAuthConfig::default(),
+            calendars: vec![],
+            events: vec![],
         }
     }
 
@@ -1422,6 +1426,8 @@ mod tests {
                 attachments: vec![],
             }],
             oauth: crate::fixture::OAuthConfig::default(),
+            calendars: vec![],
+            events: vec![],
         }
     }
 

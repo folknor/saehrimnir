@@ -453,3 +453,255 @@ async fn graph_middleware_records_request_log_entries() {
     assert_eq!(snap[1].command, "GET /v1.0/me/mailFolders/inbox/messages");
     assert_eq!(snap[1].detail["query"], "$top=10");
 }
+
+// ── Calendar surface (Microsoft Graph) ──────────────────────────────
+
+fn calendar_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/graph-calendar-small.toml",
+    ))
+    .unwrap();
+    graph::router(graph::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
+    })
+}
+
+async fn json_request(
+    router: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut req_builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, "127.0.0.1:9999");
+    let body = match body {
+        Some(v) => {
+            req_builder = req_builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = router
+        .oneshot(req_builder.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn graph_list_calendars_projects_fixture_in_declaration_order() {
+    let (status, v) = get_json_with(calendar_router(), "/v1.0/me/calendars").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = v["value"].as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["id"], "cal-work");
+    assert_eq!(arr[0]["isDefaultCalendar"], true);
+    assert_eq!(arr[0]["name"], "Work");
+    assert_eq!(arr[0]["color"], "lightBlue");
+    assert_eq!(arr[1]["id"], "cal-personal");
+    assert_eq!(arr[1]["isDefaultCalendar"], false);
+}
+
+#[tokio::test]
+async fn graph_get_calendar_resolves_default_alias_to_first_default() {
+    let (status, v) = get_json_with(calendar_router(), "/v1.0/me/calendars/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "cal-work");
+}
+
+#[tokio::test]
+async fn graph_get_calendar_404s_unknown_id() {
+    let (status, v) = get_json_with(calendar_router(), "/v1.0/me/calendars/ghost").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn graph_list_events_filters_by_calendar_and_paginates() {
+    let (status, v) =
+        get_json_with(calendar_router(), "/v1.0/me/calendars/cal-work/events").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = v["value"].as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["id"], "ev-001");
+    assert_eq!(arr[0]["subject"], "Standup");
+    assert_eq!(arr[0]["start"]["dateTime"], "2026-01-15T09:00:00Z");
+    assert_eq!(arr[0]["start"]["timeZone"], "UTC");
+    assert_eq!(
+        arr[0]["organizer"]["emailAddress"]["address"],
+        "alice@example.com"
+    );
+    let attendees = arr[0]["attendees"].as_array().unwrap();
+    assert_eq!(attendees.len(), 2);
+    assert_eq!(attendees[1]["emailAddress"]["address"], "carol@example.com");
+
+    // Paginate one at a time.
+    let (status, v) = get_json_with(
+        calendar_router(),
+        "/v1.0/me/calendars/cal-work/events?$top=1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = v["value"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let next = v["@odata.nextLink"].as_str().unwrap();
+    assert!(next.contains("$skiptoken=s.1"));
+
+    let (_, v2) = get_json_with(
+        calendar_router(),
+        "/v1.0/me/calendars/cal-work/events?$top=1&$skiptoken=s.1",
+    )
+    .await;
+    let arr2 = v2["value"].as_array().unwrap();
+    assert_eq!(arr2.len(), 1);
+    assert_eq!(arr2[0]["id"], "ev-002");
+    assert!(v2.get("@odata.nextLink").is_none());
+}
+
+#[tokio::test]
+async fn graph_list_events_for_empty_calendar_returns_empty_array() {
+    let (status, v) =
+        get_json_with(calendar_router(), "/v1.0/me/calendars/cal-personal/events").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["value"].as_array().unwrap().len(), 0);
+    assert!(v.get("@odata.nextLink").is_none());
+}
+
+#[tokio::test]
+async fn graph_calendar_view_delta_returns_full_then_empty() {
+    let (status, v) = get_json_with(
+        calendar_router(),
+        "/v1.0/me/calendars/cal-work/calendarView/delta",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["value"].as_array().unwrap().len(), 2);
+    assert!(v["@odata.deltaLink"].as_str().unwrap().contains("$deltatoken="));
+
+    let (_, v2) = get_json_with(
+        calendar_router(),
+        "/v1.0/me/calendars/cal-work/calendarView/delta?$deltatoken=d.fixture-state",
+    )
+    .await;
+    assert_eq!(v2["value"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn graph_get_event_projects_fixture() {
+    let (status, v) = get_json_with(calendar_router(), "/v1.0/me/events/ev-001").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "ev-001");
+    assert_eq!(v["subject"], "Standup");
+}
+
+#[tokio::test]
+async fn graph_create_event_echoes_body_and_logs_request() {
+    let log = saehrimnir::request_log::RequestLog::default();
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/graph-calendar-small.toml",
+    ))
+    .unwrap();
+    let app = graph::router(graph::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        request_log: log.clone(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
+    });
+
+    let body = serde_json::json!({
+        "subject": "New meeting",
+        "start": { "dateTime": "2026-03-01T10:00:00Z", "timeZone": "UTC" },
+        "end":   { "dateTime": "2026-03-01T11:00:00Z", "timeZone": "UTC" },
+    });
+    let (status, v) = json_request(
+        app,
+        "POST",
+        "/v1.0/me/calendars/cal-work/events",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(v["id"], "mock-event-create");
+    assert_eq!(v["calendarId"], "cal-work");
+    assert_eq!(v["echoedRequest"]["subject"], "New meeting");
+
+    // The detail-bearing entry is the handler-emitted one (the
+    // middleware also records a path-level entry without the body).
+    let snap = log.snapshot();
+    let mutation = snap
+        .iter()
+        .find(|e| e.command == "POST /v1.0/me/calendars/cal-work/events" && !e.detail["body"].is_null())
+        .expect("mutation entry recorded");
+    assert_eq!(mutation.detail["body"]["subject"], "New meeting");
+}
+
+#[tokio::test]
+async fn graph_patch_event_echoes_body_and_logs_request() {
+    let log = saehrimnir::request_log::RequestLog::default();
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/graph-calendar-small.toml",
+    ))
+    .unwrap();
+    let app = graph::router(graph::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        request_log: log.clone(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
+    });
+    let body = serde_json::json!({ "subject": "Renamed" });
+    let (status, v) = json_request(app, "PATCH", "/v1.0/me/events/ev-001", Some(body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "ev-001");
+    assert_eq!(v["calendarId"], "cal-work");
+    assert_eq!(v["echoedRequest"]["subject"], "Renamed");
+
+    let snap = log.snapshot();
+    let entry = snap
+        .iter()
+        .find(|e| e.command == "PATCH /v1.0/me/events/ev-001" && !e.detail["body"].is_null())
+        .expect("patch entry recorded");
+    assert_eq!(entry.detail["body"]["subject"], "Renamed");
+}
+
+#[tokio::test]
+async fn graph_delete_event_returns_204_and_logs_request() {
+    let log = saehrimnir::request_log::RequestLog::default();
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/graph-calendar-small.toml",
+    ))
+    .unwrap();
+    let app = graph::router(graph::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        request_log: log.clone(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1.0/me/events/ev-001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let snap = log.snapshot();
+    assert!(snap.iter().any(|e| e.command == "DELETE /v1.0/me/events/ev-001"
+        && e.detail["id"] == "ev-001"));
+}

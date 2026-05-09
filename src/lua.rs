@@ -180,6 +180,8 @@ impl Builder {
             mailboxes: self.mailboxes,
             emails: self.emails,
             oauth: None,
+            calendars: vec![],
+            events: vec![],
         };
         Ok((raw, self.handlers))
     }
