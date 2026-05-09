@@ -197,7 +197,11 @@ async fn email_get_full_email_shape_with_body_values() {
     assert_eq!(item["blobId"], "blob-email-001");
     // mailboxIds + keywords are bool maps, not arrays.
     assert_eq!(item["mailboxIds"], json!({"mbx-inbox": true}));
-    assert!(item["receivedAt"].is_i64());
+    let received = item["receivedAt"].as_str().expect("receivedAt is a UTCDate string");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(received).is_ok(),
+        "receivedAt {received:?} is RFC3339",
+    );
     let from = item["from"].as_array().unwrap();
     assert_eq!(from[0]["email"], "alice@example.com");
 

@@ -582,13 +582,22 @@ fn serialize_email(e: &Email, fetch_text: bool, fetch_html: bool, fetch_all: boo
     );
     obj.insert("threadId".to_string(), Value::String(e.thread_id.clone()));
     obj.insert("size".to_string(), Value::Number(e.size.into()));
+    // Per RFC 8621 §4.1.1: `receivedAt` is `UTCDate` and `sentAt` is
+    // `Date`; both serialise as RFC3339 strings, not unix seconds.
+    // Fixture timestamps are already in UTC, so the "Z"-suffixed
+    // `UTCDate` form is also a valid `Date`. Second precision keeps
+    // bytes byte-stable across runs.
     obj.insert(
         "receivedAt".to_string(),
-        Value::Number(e.received_at.timestamp().into()),
+        Value::String(
+            e.received_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
     );
     obj.insert(
         "sentAt".to_string(),
-        Value::Number(e.sent_at.timestamp().into()),
+        Value::String(
+            e.sent_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
     );
 
     obj.insert("mailboxIds".to_string(), bool_map(&e.mailbox_ids));
@@ -1334,13 +1343,14 @@ mod tests {
         assert_eq!(item.get("subject").unwrap(), "hi");
         assert_eq!(item.get("hasAttachment").unwrap(), false);
 
-        // Timestamps as unix seconds (not RFC3339 strings).
-        assert_eq!(
-            item.get("receivedAt").unwrap().as_i64().unwrap(),
-            chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap().timestamp()
-        );
-        assert!(item.get("sentAt").unwrap().as_i64().unwrap()
-            < item.get("receivedAt").unwrap().as_i64().unwrap());
+        // Timestamps as RFC3339 UTCDate / Date strings per RFC 8621
+        // §4.1.1.
+        assert_eq!(item.get("receivedAt").unwrap(), "2026-01-15T10:00:00Z");
+        let sent = item.get("sentAt").unwrap().as_str().unwrap();
+        let received = item.get("receivedAt").unwrap().as_str().unwrap();
+        let sent_ts = chrono::DateTime::parse_from_rfc3339(sent).unwrap();
+        let received_ts = chrono::DateTime::parse_from_rfc3339(received).unwrap();
+        assert!(sent_ts < received_ts);
 
         // mailboxIds + keywords are maps to true.
         let mb = item.get("mailboxIds").unwrap().as_object().unwrap();

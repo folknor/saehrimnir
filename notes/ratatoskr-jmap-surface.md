@@ -118,7 +118,10 @@ Per email (`crates/jmap/src/parse.rs:72-197`):
 - `from` - array of `{name, email}`; ratatoskr uses only the first.
 - `to`, `cc`, `bcc`, `replyTo` - arrays of `{name, email}`.
 - `subject`, `preview` - strings, both optional.
-- `sentAt`, `receivedAt` - Unix seconds. `date` defaults to `sentAt`,
+- `sentAt`, `receivedAt` - RFC3339 strings per RFC 8621 §4.1.1
+  (`receivedAt` is `UTCDate`, "Z"-suffixed; `sentAt` is `Date`, which
+  may carry an offset but the mock emits the "Z"-suffixed UTC form
+  since fixture timestamps are UTC). `date` defaults to `sentAt`,
   falls back to `receivedAt`. `internalDate` is `receivedAt`.
 - `keywords` - map; `$seen` -> read, `$flagged` -> starred. Non-`$`
   keys become user category labels.
