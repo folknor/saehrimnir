@@ -19,14 +19,7 @@ use saehrimnir::{fixture, lua, routes};
 
 fn router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    routes::router(routes::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        submission_log: saehrimnir::smtp::SubmissionLog::default(),
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-        base_url: "http://localhost".into(),
-    })
+    routes::router(routes::AppState::for_test(Arc::new(fix)))
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -309,14 +302,7 @@ async fn email_get_full_email_shape_with_body_values() {
 
 fn attach_router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap();
-    routes::router(routes::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        submission_log: saehrimnir::smtp::SubmissionLog::default(),
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-        base_url: "http://localhost".into(),
-    })
+    routes::router(routes::AppState::for_test(Arc::new(fix)))
 }
 
 async fn attach_jmap_call(method: &str, args: Value, call_id: &str) -> Value {
@@ -549,14 +535,9 @@ async fn responses_are_byte_identical_across_runs() {
 fn router_with_lua_scenario(scenario: &str) -> axum::Router {
     let (fixture, dispatcher) =
         lua::load_source_with_dispatcher(scenario, "@cb-test").unwrap();
-    routes::router(routes::AppState {
-        fixture: Arc::new(fixture),
-        dispatcher: Some(Arc::new(dispatcher)),
-        submission_log: saehrimnir::smtp::SubmissionLog::default(),
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-        base_url: "http://localhost".into(),
-    })
+    routes::router(
+        routes::AppState::for_test(Arc::new(fixture)).with_dispatcher(Arc::new(dispatcher)),
+    )
 }
 
 async fn post_jmap(router: axum::Router, body: Value) -> Value {
@@ -748,14 +729,7 @@ async fn jmap_callback_ids_absent_when_request_omits_them() {
 
 fn router_with_smtp_log(log: saehrimnir::smtp::SubmissionLog) -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    routes::router(routes::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        submission_log: log,
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-        base_url: "http://localhost".into(),
-    })
+    routes::router(routes::AppState::for_test(Arc::new(fix)).with_submission_log(log))
 }
 
 fn sample_submission(from: &str, attachment_size: usize) -> saehrimnir::smtp::Submission {
@@ -872,14 +846,11 @@ fn router_with_logs(
     request_log: saehrimnir::request_log::RequestLog,
 ) -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    routes::router(routes::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        submission_log: smtp_log,
-        request_log,
-        token_store: saehrimnir::oauth::TokenStore::default(),
-        base_url: "http://localhost".into(),
-    })
+    routes::router(
+        routes::AppState::for_test(Arc::new(fix))
+            .with_submission_log(smtp_log)
+            .with_request_log(request_log),
+    )
 }
 
 #[tokio::test]
@@ -1011,14 +982,7 @@ async fn test_fixture_step_returns_501_until_change_scripts_land() {
 
 fn router_with_token_store(store: saehrimnir::oauth::TokenStore) -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    routes::router(routes::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        submission_log: saehrimnir::smtp::SubmissionLog::default(),
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: store,
-        base_url: "http://localhost".into(),
-    })
+    routes::router(routes::AppState::for_test(Arc::new(fix)).with_token_store(store))
 }
 
 #[tokio::test]
@@ -1218,14 +1182,7 @@ fn router_with_enforce(store: saehrimnir::oauth::TokenStore) -> axum::Router {
         enforce: true,
         issuer: "https://saehrimnir.test/oauth".to_string(),
     };
-    routes::router(routes::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        submission_log: saehrimnir::smtp::SubmissionLog::default(),
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: store,
-        base_url: "http://localhost".into(),
-    })
+    routes::router(routes::AppState::for_test(Arc::new(fix)).with_token_store(store))
 }
 
 #[tokio::test]

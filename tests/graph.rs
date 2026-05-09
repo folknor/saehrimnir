@@ -17,12 +17,7 @@ use saehrimnir::{fixture, graph, lua};
 
 fn router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    graph::router(graph::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    })
+    graph::router(graph::AppState::for_test(Arc::new(fix)))
 }
 
 async fn get_json(uri: &str) -> (StatusCode, Value) {
@@ -69,12 +64,7 @@ async fn get_raw(router: axum::Router, uri: &str) -> (StatusCode, Vec<u8>, axum:
 
 fn attach_router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap();
-    graph::router(graph::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    })
+    graph::router(graph::AppState::for_test(Arc::new(fix)))
 }
 
 #[tokio::test]
@@ -352,12 +342,9 @@ async fn child_folders_for_top_level_folder() {
 fn router_with_lua_scenario(scenario: &str) -> axum::Router {
     let (fixture, dispatcher) =
         lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
-    graph::router(graph::AppState {
-        fixture: Arc::new(fixture),
-        dispatcher: Some(Arc::new(dispatcher)),
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    })
+    graph::router(
+        graph::AppState::for_test(Arc::new(fixture)).with_dispatcher(Arc::new(dispatcher)),
+    )
 }
 
 async fn get_json_via(router: axum::Router, uri: &str) -> (StatusCode, Value) {
@@ -435,12 +422,9 @@ async fn graph_middleware_records_request_log_entries() {
 
     let request_log = RequestLog::default();
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    let app = graph::router(graph::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        request_log: request_log.clone(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    });
+    let app = graph::router(
+        graph::AppState::for_test(Arc::new(fix)).with_request_log(request_log.clone()),
+    );
 
     let _ = get_json_with(app.clone(), "/v1.0/me/mailFolders").await;
     let _ = get_json_with(app, "/v1.0/me/mailFolders/inbox/messages?$top=10").await;
@@ -461,12 +445,7 @@ fn calendar_router() -> axum::Router {
         "fixtures/graph-calendar-small.toml",
     ))
     .unwrap();
-    graph::router(graph::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    })
+    graph::router(graph::AppState::for_test(Arc::new(fix)))
 }
 
 async fn json_request(
@@ -613,12 +592,9 @@ async fn graph_create_event_echoes_body_and_logs_request() {
         "fixtures/graph-calendar-small.toml",
     ))
     .unwrap();
-    let app = graph::router(graph::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        request_log: log.clone(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    });
+    let app = graph::router(
+        graph::AppState::for_test(Arc::new(fix)).with_request_log(log.clone()),
+    );
 
     let body = serde_json::json!({
         "subject": "New meeting",
@@ -654,12 +630,9 @@ async fn graph_patch_event_echoes_body_and_logs_request() {
         "fixtures/graph-calendar-small.toml",
     ))
     .unwrap();
-    let app = graph::router(graph::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        request_log: log.clone(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    });
+    let app = graph::router(
+        graph::AppState::for_test(Arc::new(fix)).with_request_log(log.clone()),
+    );
     let body = serde_json::json!({ "subject": "Renamed" });
     let (status, v) = json_request(app, "PATCH", "/v1.0/me/events/ev-001", Some(body)).await;
     assert_eq!(status, StatusCode::OK);
@@ -682,12 +655,9 @@ async fn graph_delete_event_returns_204_and_logs_request() {
         "fixtures/graph-calendar-small.toml",
     ))
     .unwrap();
-    let app = graph::router(graph::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        request_log: log.clone(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    });
+    let app = graph::router(
+        graph::AppState::for_test(Arc::new(fix)).with_request_log(log.clone()),
+    );
 
     let resp = app
         .oneshot(
@@ -713,12 +683,9 @@ async fn graph_patch_event_404s_unknown_id() {
         "fixtures/graph-calendar-small.toml",
     ))
     .unwrap();
-    let app = graph::router(graph::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        request_log: log.clone(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    });
+    let app = graph::router(
+        graph::AppState::for_test(Arc::new(fix)).with_request_log(log.clone()),
+    );
     let body = serde_json::json!({ "subject": "Renamed" });
     let (status, v) = json_request(app, "PATCH", "/v1.0/me/events/ev-missing", Some(body)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -737,12 +704,9 @@ async fn graph_delete_event_404s_unknown_id() {
         "fixtures/graph-calendar-small.toml",
     ))
     .unwrap();
-    let app = graph::router(graph::AppState {
-        fixture: Arc::new(fix),
-        dispatcher: None,
-        request_log: log.clone(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    });
+    let app = graph::router(
+        graph::AppState::for_test(Arc::new(fix)).with_request_log(log.clone()),
+    );
     let resp = app
         .oneshot(
             Request::builder()

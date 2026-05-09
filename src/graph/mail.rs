@@ -74,6 +74,7 @@ async fn list_folders(
 
     // Top-level folders only (no parent).
     let folders: Vec<&Mailbox> = state
+        .shared
         .fixture
         .mailboxes
         .iter()
@@ -96,7 +97,7 @@ async fn list_folders(
         .iter()
         .skip(offset as usize)
         .take(top as usize)
-        .map(|m| folder_value(&state.fixture, m))
+        .map(|m| folder_value(&state.shared.fixture, m))
         .collect();
 
     let next_link = next_offset(offset, top, total).map(|next| {
@@ -123,14 +124,14 @@ async fn get_folder(
     }) {
         return r;
     }
-    let Some(m) = resolve_folder(&state.fixture, &folder) else {
+    let Some(m) = resolve_folder(&state.shared.fixture, &folder) else {
         return error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
             &format!("mailFolder {folder:?} not found"),
         );
     };
-    let mut v = folder_value(&state.fixture, m);
+    let mut v = folder_value(&state.shared.fixture, m);
     if let Some(obj) = v.as_object_mut() {
         obj.insert(
             "@odata.context".to_string(),
@@ -154,7 +155,7 @@ async fn list_child_folders(
     }) {
         return r;
     }
-    let Some(parent) = resolve_folder(&state.fixture, &folder) else {
+    let Some(parent) = resolve_folder(&state.shared.fixture, &folder) else {
         return error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
@@ -165,6 +166,7 @@ async fn list_child_folders(
     let host = host_or_default(&headers);
 
     let children: Vec<&Mailbox> = state
+        .shared
         .fixture
         .mailboxes
         .iter()
@@ -186,7 +188,7 @@ async fn list_child_folders(
         .iter()
         .skip(offset as usize)
         .take(top as usize)
-        .map(|m| folder_value(&state.fixture, m))
+        .map(|m| folder_value(&state.shared.fixture, m))
         .collect();
 
     let path = format!("/v1.0/me/mailFolders/{}/childFolders", parent.id);
@@ -214,7 +216,7 @@ async fn list_messages(
     }) {
         return r;
     }
-    let Some(m) = resolve_folder(&state.fixture, &folder) else {
+    let Some(m) = resolve_folder(&state.shared.fixture, &folder) else {
         return error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
@@ -225,7 +227,7 @@ async fn list_messages(
     let host = host_or_default(&headers);
     let expand = expand_attachments(q.expand.as_deref());
 
-    let mut messages = sorted_messages_in(&state.fixture, &m.id);
+    let mut messages = sorted_messages_in(&state.shared.fixture, &m.id);
     if let Some(filter) = &q.filter
         && let Some(after) = parse_received_ge_filter(filter)
     {
@@ -275,7 +277,7 @@ async fn delta_messages(
     }) {
         return r;
     }
-    let Some(m) = resolve_folder(&state.fixture, &folder) else {
+    let Some(m) = resolve_folder(&state.shared.fixture, &folder) else {
         return error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
@@ -315,7 +317,7 @@ async fn delta_messages(
 
     // Initial bootstrap: page through the full folder, ending with a
     // deltaLink instead of a nextLink.
-    let messages = sorted_messages_in(&state.fixture, &m.id);
+    let messages = sorted_messages_in(&state.shared.fixture, &m.id);
     let total = messages.len() as u64;
     let top = q.page_size(MESSAGES_DEFAULT_TOP, MESSAGES_MAX_TOP);
     let offset = match q.offset() {
@@ -682,7 +684,7 @@ async fn list_message_attachments(
     State(state): State<AppState>,
     Path(message_id): Path<String>,
 ) -> Response {
-    let Some(email) = state.fixture.emails.iter().find(|e| e.id == message_id) else {
+    let Some(email) = state.shared.fixture.emails.iter().find(|e| e.id == message_id) else {
         return error(
             StatusCode::NOT_FOUND,
             &format!("message {message_id:?} not found"),
@@ -708,7 +710,7 @@ async fn get_message_attachment(
     Path((message_id, attachment_id)): Path<(String, String)>,
 ) -> Response {
     let Some((email, att)) =
-        find_email_with_attachment(&state.fixture, &message_id, &attachment_id)
+        find_email_with_attachment(&state.shared.fixture, &message_id, &attachment_id)
     else {
         return error(
             StatusCode::NOT_FOUND,
@@ -724,7 +726,7 @@ async fn get_message_attachment_value(
     Path((message_id, attachment_id)): Path<(String, String)>,
 ) -> Response {
     let Some((_, att)) =
-        find_email_with_attachment(&state.fixture, &message_id, &attachment_id)
+        find_email_with_attachment(&state.shared.fixture, &message_id, &attachment_id)
     else {
         return error(
             StatusCode::NOT_FOUND,

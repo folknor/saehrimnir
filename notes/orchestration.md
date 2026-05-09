@@ -215,22 +215,49 @@ feature gate guards these. All routes are scoped under `/test/`.
     (JMAP `call_id`, IMAP `tag` + `args`, SMTP `args`, HTTP
     `query`).
 - `DELETE /test/requests` -> 204; clears the request log.
-- `POST /test/fixture/reset` -> 204; clears the SMTP submission
-  log, the request log, AND the OAuth token store. The fixture
-  itself is read-only in v0 (IMAP `UID STORE` is a non-persistent
-  no-op), so reset is currently equivalent to "clear all three
-  in-memory logs". When mutation lands (`[[change]]` scripts,
-  persistent UID STORE), the implementation grows here without
-  changing the route shape - harness scripts can rely on the
-  contract.
+- `POST /test/fixture/reset` -> 204; reset in-process mutable
+  state to the post-load baseline. The route is the source of
+  truth on what "reset" means; the handler in
+  `src/routes.rs::reset_fixture` defers to this section. v0
+  reset clears:
+  - the SMTP submission log,
+  - the cross-protocol request log (everything `GET /test/requests`
+    would otherwise return - including the OAuth-mint envelopes
+    for tokens about to be dropped),
+  - the OAuth token store (every active access + refresh token
+    becomes invalid; subsequent calls 401),
+  - the Lua dispatcher's per-(protocol, command) `call_index`
+    counters when a dispatcher is attached (so a scenario
+    asserting `req.call_index == 1` after reset gets a clean
+    window).
+
+  The fixture itself stays read-only in v0; IMAP `UID STORE` is
+  a non-persistent no-op. When `[[change]]` scripts land
+  (fixture-format growth in `TODO.md`), reset gains a "rewind to
+  the initial state" bullet here without changing the route
+  shape: 204 stays, the contract stays, the implementation
+  grows.
 - `POST /test/fixture/step` -> 501 with body
   `{"error": "fixture step not implemented", "detail": "..."}`.
-  Reserved for `[[change]]` script entries (fixture-format growth,
-  see `TODO.md`); returns 501 today so harness scripts can detect
-  the gap rather than silently no-op.
+  Reserved for `[[change]]` script entries; returns 501 today
+  so harness scripts can detect the gap rather than silently
+  no-op. Once change scripts land, the contract becomes:
+
+  - 200 + `{"step": "<id>", "applied": true}` when a step ran
+    (state-token bumps and any synthetic add/move/delete on the
+    fixture image take effect before the response returns; the
+    next `GET /test/requests` shows the resulting dispatches in
+    the standard shape).
+  - 200 + `{"step": null, "applied": false}` when no further
+    steps exist (the harness has reached the end of the script).
+  - 400 with the standard error envelope for malformed bodies.
+
+  Until `[[change]]` is wired, the route returns 501 to stay
+  visibly out of scope.
 
 The request log is process-scoped: a fresh saehrimnir start is
-always an empty log.
+always an empty log. The log is a 100k-entry drop-oldest ring
+(see `notes/request-log.md`).
 
 OAuth provider routes (also mounted on the JMAP listener):
 

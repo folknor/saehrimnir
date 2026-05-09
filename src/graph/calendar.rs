@@ -81,10 +81,11 @@ async fn list_calendars(
     }
     let _ = headers;
     let value: Vec<Value> = state
+        .shared
         .fixture
         .calendars
         .iter()
-        .map(|c| serialize_calendar(&state.fixture, c))
+        .map(|c| serialize_calendar(&state.shared.fixture, c))
         .collect();
     ok_json(json!({
         "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#me/calendars",
@@ -101,8 +102,8 @@ async fn get_calendar(
     }) {
         return o;
     }
-    match resolve_calendar(&state.fixture, &calendar) {
-        Some(c) => ok_json(serialize_calendar(&state.fixture, c)),
+    match resolve_calendar(&state.shared.fixture, &calendar) {
+        Some(c) => ok_json(serialize_calendar(&state.shared.fixture, c)),
         None => error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -121,7 +122,7 @@ async fn list_events(
     }) {
         return o;
     }
-    if resolve_calendar(&state.fixture, &calendar).is_none() {
+    if resolve_calendar(&state.shared.fixture, &calendar).is_none() {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -148,16 +149,18 @@ async fn list_events(
     // `nextLink` decision needs the total count, which is one
     // additional pass and still avoids the O(N) clone.
     let page: Vec<Value> = state
+        .shared
         .fixture
         .events
         .iter()
         .filter(|e| e.calendar_id == calendar)
         .skip(skip as usize)
         .take(top as usize)
-        .map(|e| serialize_event(&state.fixture, e))
+        .map(|e| serialize_event(&state.shared.fixture, e))
         .collect();
     let next_skip = (skip as usize) + page.len();
     let has_more = state
+        .shared
         .fixture
         .events
         .iter()
@@ -197,7 +200,7 @@ async fn delta_events(
     }) {
         return o;
     }
-    if resolve_calendar(&state.fixture, &calendar).is_none() {
+    if resolve_calendar(&state.shared.fixture, &calendar).is_none() {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -260,16 +263,18 @@ async fn delta_events(
         }
     };
     let page: Vec<Value> = state
+        .shared
         .fixture
         .events
         .iter()
         .filter(|e| e.calendar_id == calendar)
         .skip(offset as usize)
         .take(top as usize)
-        .map(|e| serialize_event(&state.fixture, e))
+        .map(|e| serialize_event(&state.shared.fixture, e))
         .collect();
     let next_offset_val = (offset as usize) + page.len();
     let has_more = state
+        .shared
         .fixture
         .events
         .iter()
@@ -312,8 +317,8 @@ async fn get_event(
     }) {
         return o;
     }
-    match state.fixture.events.iter().find(|e| e.id == event) {
-        Some(e) => ok_json(serialize_event(&state.fixture, e)),
+    match state.shared.fixture.events.iter().find(|e| e.id == event) {
+        Some(e) => ok_json(serialize_event(&state.shared.fixture, e)),
         None => error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -341,7 +346,7 @@ async fn create_event(
     Path(calendar): Path<String>,
     body: AxumBody,
 ) -> Response {
-    if resolve_calendar(&state.fixture, &calendar).is_none() {
+    if resolve_calendar(&state.shared.fixture, &calendar).is_none() {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -352,7 +357,7 @@ async fn create_event(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    state.request_log.record(
+    state.shared.request_log.record(
         "graph",
         format!("POST /v1.0/me/calendars/{calendar}/events"),
         json!({ "body": parsed }),
@@ -366,7 +371,7 @@ async fn patch_event(
     Path(event): Path<String>,
     body: AxumBody,
 ) -> Response {
-    let calendar_id = match state.fixture.events.iter().find(|e| e.id == event) {
+    let calendar_id = match state.shared.fixture.events.iter().find(|e| e.id == event) {
         Some(e) => e.calendar_id.clone(),
         None => {
             return error(
@@ -380,7 +385,7 @@ async fn patch_event(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    state.request_log.record(
+    state.shared.request_log.record(
         "graph",
         format!("PATCH /v1.0/me/events/{event}"),
         json!({ "body": parsed }),
@@ -393,14 +398,14 @@ async fn delete_event(
     State(state): State<AppState>,
     Path(event): Path<String>,
 ) -> Response {
-    if !state.fixture.events.iter().any(|e| e.id == event) {
+    if !state.shared.fixture.events.iter().any(|e| e.id == event) {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
             &format!("event {event:?} not declared in fixture"),
         );
     }
-    state.request_log.record(
+    state.shared.request_log.record(
         "graph",
         format!("DELETE /v1.0/me/events/{event}"),
         json!({ "id": event }),

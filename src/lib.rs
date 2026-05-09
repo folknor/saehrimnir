@@ -22,6 +22,7 @@ pub mod request_log;
 pub mod routes;
 pub mod scenario;
 pub mod sentinel;
+pub mod shared;
 pub mod shutdown;
 pub mod smtp;
 pub mod templates;

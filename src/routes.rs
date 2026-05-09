@@ -21,28 +21,21 @@ use serde_json::{Value, json};
 
 use crate::fixture::Fixture;
 use crate::jmap::{self, JmapRequest, JmapResponse};
-use crate::oauth::{self, BearerDecision, TokenStore};
-use crate::request_log::{RequestEntry, RequestLog};
+use crate::oauth::{self, BearerDecision};
+use crate::request_log::RequestEntry;
+use crate::shared::SharedHandles;
 use crate::smtp::{self, Submission};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub fixture: Arc<Fixture>,
-    pub dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    /// Shared handle bag: fixture, dispatcher, request log,
+    /// token store. See `crate::shared::SharedHandles`.
+    pub shared: SharedHandles,
     /// Shared handle to the SMTP submission log. The test-only
     /// `/test/smtp/submissions` route reads (and `DELETE` clears)
     /// this. Tests that don't drive SMTP can construct it via
     /// `SubmissionLog::default()`.
     pub submission_log: smtp::SubmissionLog,
-    /// Cross-protocol request log. Threaded into all five
-    /// protocol layers so a single `GET /test/requests` snapshot
-    /// covers everything the harness has driven. Cheap to clone.
-    pub request_log: RequestLog,
-    /// OAuth token store. `/oauth/token` mints into it,
-    /// `/oauth/userinfo` and the bearer-enforcement middleware
-    /// consult it, `/test/oauth/invalidate` and
-    /// `/test/fixture/reset` clear/remove from it.
-    pub token_store: TokenStore,
     /// Externally-visible base URL (`scheme://host[:port]`)
     /// advertised in the JMAP session resource for `apiUrl` /
     /// `downloadUrl` / `uploadUrl` / `eventSourceUrl`. Sourced
@@ -52,6 +45,44 @@ pub struct AppState {
     /// sending `Host: evil.com` would otherwise rewrite every
     /// advertised endpoint to point at an attacker-chosen host.
     pub base_url: String,
+}
+
+impl AppState {
+    /// Build an `AppState` around `fixture` with fresh, default
+    /// shared handles, an empty SMTP submission log, and a
+    /// `"http://localhost"` base URL. Tests that need to drive a
+    /// specific log clone the field after construction.
+    pub fn for_test(fixture: Arc<Fixture>) -> Self {
+        Self {
+            shared: SharedHandles::for_test(fixture),
+            submission_log: smtp::SubmissionLog::default(),
+            base_url: "http://localhost".into(),
+        }
+    }
+
+    /// Replace the request log on the shared handle bag.
+    pub fn with_request_log(mut self, log: crate::request_log::RequestLog) -> Self {
+        self.shared.request_log = log;
+        self
+    }
+
+    /// Attach a Lua dispatcher.
+    pub fn with_dispatcher(mut self, dispatcher: Arc<crate::lua::Dispatcher>) -> Self {
+        self.shared.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Replace the OAuth token store.
+    pub fn with_token_store(mut self, store: crate::oauth::TokenStore) -> Self {
+        self.shared.token_store = store;
+        self
+    }
+
+    /// Replace the SMTP submission log.
+    pub fn with_submission_log(mut self, log: smtp::SubmissionLog) -> Self {
+        self.submission_log = log;
+        self
+    }
 }
 
 /// Bearer-enforcement coverage on this router (verified
@@ -85,15 +116,15 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let oauth_token_router: Router = Router::new()
         .route("/oauth/token", post(oauth::token_endpoint))
-        .with_state(state.token_store.clone());
+        .with_state(state.shared.token_store.clone());
     let oauth_invalidate_router: Router = Router::new()
         .route("/test/oauth/invalidate", post(oauth::invalidate_endpoint))
-        .with_state(state.token_store.clone());
+        .with_state(state.shared.token_store.clone());
     let oauth_userinfo_router: Router = Router::new()
         .route("/oauth/userinfo", get(oauth::userinfo_endpoint))
         .with_state(oauth::UserInfoState {
-            fixture: Arc::clone(&state.fixture),
-            store: state.token_store.clone(),
+            fixture: Arc::clone(&state.shared.fixture),
+            store: state.shared.token_store.clone(),
         });
 
     Router::new()
@@ -136,7 +167,7 @@ async fn session(
     headers: HeaderMap,
 ) -> Result<Json<Value>, Response> {
     enforce_bearer(&state, &headers).map_err(|b| *b)?;
-    let fixture = &state.fixture;
+    let fixture = &state.shared.fixture;
     let acct_id = &fixture.account.id;
     let acct_name = &fixture.account.name;
     let base = state.base_url.as_str();
@@ -206,6 +237,7 @@ async fn api(
     // round-trips.
     let now = Utc::now();
     state
+        .shared
         .request_log
         .extend(req.method_calls.iter().map(|(method, _args, call_id)| {
             RequestEntry {
@@ -216,8 +248,8 @@ async fn api(
             }
         }));
     Ok(Json(jmap::handle(
-        &state.fixture,
-        state.dispatcher.as_ref(),
+        &state.shared.fixture,
+        state.shared.dispatcher.as_ref(),
         req,
     )))
 }
@@ -239,7 +271,7 @@ async fn api(
 /// unbootstrappable. Calling this from each protected handler is
 /// the simplest way to keep the bootstrap routes open.
 fn enforce_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
-    match crate::oauth::check_bearer(&state.fixture, &state.token_store, headers) {
+    match crate::oauth::check_bearer(&state.shared.fixture, &state.shared.token_store, headers) {
         BearerDecision::Allow => Ok(()),
         BearerDecision::Deny(reason) => Err(Box::new(
             (
@@ -271,7 +303,7 @@ async fn download(
     if let Err(deny) = enforce_bearer(&state, &headers) {
         return *deny;
     }
-    for email in &state.fixture.emails {
+    for email in &state.shared.fixture.emails {
         for att in &email.attachments {
             if att.blob_id == blob_id {
                 // RFC 5987 `filename*=UTF-8''<percent-encoded>`
@@ -400,46 +432,35 @@ async fn clear_smtp_submissions(State(state): State<AppState>) -> StatusCode {
 // goal.
 
 async fn list_requests(State(state): State<AppState>) -> Json<Vec<RequestEntry>> {
-    Json(state.request_log.snapshot())
+    Json(state.shared.request_log.snapshot())
 }
 
 async fn clear_requests(State(state): State<AppState>) -> StatusCode {
-    state.request_log.clear();
+    state.shared.request_log.clear();
     StatusCode::NO_CONTENT
 }
 
 // ── Test-only fixture admin ─────────────────────────────────────────
 
-/// Reset in-process mutable state to the post-load baseline. The
-/// fixture itself is read-only in v0 (IMAP `UID STORE` is a
-/// non-persistent no-op), so reset is currently a multi-handle
-/// log-clearing operation. When mutation lands (`[[change]]`
-/// scripts, persistent UID STORE, etc.), the implementation grows
-/// here without changing the route shape. Returns 204
-/// unconditionally so harness scripts get a stable contract.
-///
-/// What is reset:
-///   - SMTP submission log
-///   - cross-protocol request log
-///   - OAuth token store (tokens dropped, counter back to 0)
-///   - Lua dispatcher's per-(protocol, command) `call_index`
-///     counters, when a dispatcher is attached
+/// `POST /test/fixture/reset` -> 204. Contract is documented in
+/// `notes/orchestration.md` (the "Test / admin control plane"
+/// section) and tracked there as the source of truth: this
+/// handler is the implementation, not the spec.
 async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     state.submission_log.clear();
-    state.request_log.clear();
-    state.token_store.clear();
-    if let Some(d) = &state.dispatcher {
+    state.shared.request_log.clear();
+    state.shared.token_store.clear();
+    if let Some(d) = &state.shared.dispatcher {
         d.reset_counts();
     }
     StatusCode::NO_CONTENT
 }
 
-/// Advance one scenario step. Paired with `[[change]]` script
-/// entries (see TODO.md "Fixture format growth"), which don't yet
-/// exist; today there are no steps to advance, so the route
-/// returns 501 with a JSON body so harness scripts can detect the
-/// gap rather than silently no-op. When change scripts land, this
-/// becomes the dispatch point.
+/// `POST /test/fixture/step` -> 501 today; full contract (200
+/// shapes for applied / no-more, 400 for malformed body) lives
+/// in `notes/orchestration.md`. Returns 501 until `[[change]]`
+/// scripts land so harness scripts can detect the gap rather
+/// than silently no-op.
 async fn step_fixture() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,

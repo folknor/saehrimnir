@@ -31,32 +31,15 @@ fn bulk_fixture() -> Arc<fixture::Fixture> {
 }
 
 fn jmap_router() -> axum::Router {
-    routes::router(routes::AppState {
-        fixture: bulk_fixture(),
-        dispatcher: None,
-        submission_log: saehrimnir::smtp::SubmissionLog::default(),
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-        base_url: "http://localhost".into(),
-    })
+    routes::router(routes::AppState::for_test(bulk_fixture()))
 }
 
 fn graph_router() -> axum::Router {
-    graph::router(graph::AppState {
-        fixture: bulk_fixture(),
-        dispatcher: None,
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    })
+    graph::router(graph::AppState::for_test(bulk_fixture()))
 }
 
 fn gmail_router() -> axum::Router {
-    gmail::router(gmail::AppState {
-        fixture: bulk_fixture(),
-        dispatcher: None,
-        request_log: saehrimnir::request_log::RequestLog::default(),
-        token_store: saehrimnir::oauth::TokenStore::default(),
-    })
+    gmail::router(gmail::AppState::for_test(bulk_fixture()))
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {

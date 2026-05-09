@@ -22,26 +22,6 @@ the "Fix soon" backlog below.
 
 ### Fix soon (cleanup, ergonomics, smaller bugs)
 
-- **[arch] AppState duplication across `routes`/`graph`/`gmail`.**
-  Five fields × three places. Fix: extract a `SharedHandles {
-  fixture, dispatcher, request_log, token_store }` that each
-  AppState embeds via `pub shared`; protocol-specific extras
-  (e.g. `submission_log` on `routes::AppState`) live alongside.
-  Don't unify the AppStates themselves - axum's `State<T>`
-  typing makes them path-distinct.
-- **[arch] Test ergonomics.** Every test spells out four-to-five
-  AppState fields. Fix: `impl AppState { pub fn for_test(fixture:
-  Arc<Fixture>) -> Self }` per module, returning fresh handles by
-  default. Tests that need to drive a specific log clone the
-  field after construction.
-- **[arch] `/test/fixture/{reset,step}` policy buried in
-  doc-comments.** `reset_fixture` documents what it does and
-  doesn't reset; `step_fixture` 501s with a `TODO.md` pointer. A
-  year from now nobody will grep doc-comments. Fix: expand the
-  "Test / admin control plane" section in `notes/orchestration.md`
-  with what each route must do once `[[change]]` lands and the
-  expected response shapes; have the route-handler comments point
-  at that section instead of being the source of truth.
 - **[bugs] `received_at` makes `RequestEntry` JSON output
   non-byte-stable.** Documented in `src/request_log.rs`. Fix
   (when a test forces it): `#[serde(skip_serializing)]` behind

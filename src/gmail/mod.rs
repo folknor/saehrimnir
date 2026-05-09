@@ -21,15 +21,36 @@ use axum::{
 use serde_json::{Value, json};
 
 use crate::fixture::Fixture;
-use crate::oauth::{BearerDecision, TokenStore};
-use crate::request_log::RequestLog;
+use crate::oauth::BearerDecision;
+use crate::shared::SharedHandles;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub fixture: Arc<Fixture>,
-    pub dispatcher: Option<Arc<crate::lua::Dispatcher>>,
-    pub request_log: RequestLog,
-    pub token_store: TokenStore,
+    /// Shared handle bag: fixture, dispatcher, request log,
+    /// token store. See `crate::shared::SharedHandles`.
+    pub shared: SharedHandles,
+}
+
+impl AppState {
+    /// Build an `AppState` around `fixture` with fresh, default
+    /// shared handles.
+    pub fn for_test(fixture: Arc<Fixture>) -> Self {
+        Self {
+            shared: SharedHandles::for_test(fixture),
+        }
+    }
+
+    /// Replace the request log on the shared handle bag.
+    pub fn with_request_log(mut self, log: crate::request_log::RequestLog) -> Self {
+        self.shared.request_log = log;
+        self
+    }
+
+    /// Attach a Lua dispatcher.
+    pub fn with_dispatcher(mut self, dispatcher: Arc<crate::lua::Dispatcher>) -> Self {
+        self.shared.dispatcher = Some(dispatcher);
+        self
+    }
 }
 
 /// Consult the Lua dispatcher for `("gmail", command)` and convert
@@ -40,7 +61,7 @@ pub fn maybe_override(
     command: &str,
     build_req: impl FnOnce(&mut dellingr::State) -> dellingr::Result<()>,
 ) -> Option<Response> {
-    let d = state.dispatcher.as_ref()?;
+    let d = state.shared.dispatcher.as_ref()?;
     match d.dispatch("gmail", command, build_req) {
         crate::lua::Override::Tagged { status, message } => {
             Some(error(StatusCode::BAD_REQUEST, &message, &status))
@@ -78,8 +99,8 @@ async fn enforce_bearer_middleware(
     next: Next,
 ) -> Response {
     match crate::oauth::check_bearer(
-        &state.fixture,
-        &state.token_store,
+        &state.shared.fixture,
+        &state.shared.token_store,
         req.headers(),
     ) {
         BearerDecision::Allow => next.run(req).await,
@@ -97,7 +118,7 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_string);
-    state.request_log.record(
+    state.shared.request_log.record(
         "gmail",
         format!("{method} {path}"),
         json!({ "query": query }),

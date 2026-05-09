@@ -110,12 +110,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the inbound Host header. main.rs binds 127.0.0.1, so the
     // string ends up shaped like "http://127.0.0.1:NNNN".
     let base_url = format!("http://{jmap_addr}");
-    let app = routes::router(routes::AppState {
+    let shared = saehrimnir::shared::SharedHandles {
         fixture: Arc::clone(&fixture),
         dispatcher: dispatcher.clone(),
-        submission_log: smtp_log.clone(),
         request_log: request_log.clone(),
         token_store: token_store.clone(),
+    };
+    let app = routes::router(routes::AppState {
+        shared: shared.clone(),
+        submission_log: smtp_log.clone(),
         base_url,
     });
 
@@ -173,10 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     // Microsoft Graph server.
     let graph_app = graph::router(graph::AppState {
-        fixture: Arc::clone(&fixture),
-        dispatcher: dispatcher.clone(),
-        request_log: request_log.clone(),
-        token_store: token_store.clone(),
+        shared: shared.clone(),
     });
     let graph_shutdown_rx = shutdown_rx.clone();
     let graph_task = tokio::spawn(
@@ -194,10 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Gmail server.
     let gmail_app = gmail::router(gmail::AppState {
-        fixture: Arc::clone(&fixture),
-        dispatcher: dispatcher.clone(),
-        request_log: request_log.clone(),
-        token_store: token_store.clone(),
+        shared,
     });
     let gmail_shutdown_rx = shutdown_rx.clone();
     let gmail_task = tokio::spawn(

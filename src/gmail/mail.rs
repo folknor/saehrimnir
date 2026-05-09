@@ -46,7 +46,7 @@ async fn profile(State(state): State<AppState>) -> Response {
     if let Some(r) = super::maybe_override(&state, "profile", |_s| Ok(())) {
         return r;
     }
-    let f = &state.fixture;
+    let f = &state.shared.fixture;
     ok_json(json!({
         "emailAddress": f.account.name,
         "messagesTotal": f.emails.len(),
@@ -71,22 +71,23 @@ async fn list_labels(State(state): State<AppState>) -> Response {
     // System labels are always present, even if no fixture mailbox
     // carries the corresponding role - matches Gmail's behaviour.
     for sys in SYSTEM_LABELS {
-        labels.push(label_value(sys, sys, "system", &state.fixture));
+        labels.push(label_value(sys, sys, "system", &state.shared.fixture));
     }
 
     // User labels: fixture mailboxes without a role become user
     // labels.
-    for m in &state.fixture.mailboxes {
+    for m in &state.shared.fixture.mailboxes {
         if m.role.is_some() {
             continue;
         }
         let id = format!("Label_{}", m.id);
-        labels.push(label_value(&id, &m.name, "user", &state.fixture));
+        labels.push(label_value(&id, &m.name, "user", &state.shared.fixture));
     }
 
     // Custom keywords (non-`$` prefixed) on any email become user
     // labels too. Collect distinct ones.
     let mut custom: Vec<String> = state
+        .shared
         .fixture
         .emails
         .iter()
@@ -96,7 +97,7 @@ async fn list_labels(State(state): State<AppState>) -> Response {
     custom.dedup();
     for keyword in custom {
         let id = format!("Label_{keyword}");
-        labels.push(label_value(&id, &keyword, "user", &state.fixture));
+        labels.push(label_value(&id, &keyword, "user", &state.shared.fixture));
     }
 
     ok_json(json!({"labels": labels}))
@@ -217,7 +218,7 @@ async fn list_threads(
         .clamp(1, THREADS_HARD_MAX);
     let offset = q.offset();
 
-    let mut threads = thread_summaries(&state.fixture);
+    let mut threads = thread_summaries(&state.shared.fixture);
     if let Some(after_q) = &q.q {
         // v0 only knows the `after:YYYY/M/D` shape ratatoskr's
         // initial-sync code emits. Anything else - typo, drift, or
@@ -328,6 +329,7 @@ async fn get_thread(
         return r;
     }
     let mut messages: Vec<&Email> = state
+        .shared
         .fixture
         .emails
         .iter()
@@ -351,7 +353,7 @@ async fn get_thread(
 
     let messages_json: Vec<Value> = messages
         .iter()
-        .map(|e| message_value(e, &state.fixture))
+        .map(|e| message_value(e, &state.shared.fixture))
         .collect();
 
     ok_json(json!({
@@ -547,7 +549,7 @@ async fn get_attachment(
     State(state): State<AppState>,
     Path((message_id, attachment_id)): Path<(String, String)>,
 ) -> Response {
-    let Some(email) = state.fixture.emails.iter().find(|e| e.id == message_id) else {
+    let Some(email) = state.shared.fixture.emails.iter().find(|e| e.id == message_id) else {
         return error(
             StatusCode::NOT_FOUND,
             &format!("message {message_id:?} not found"),
