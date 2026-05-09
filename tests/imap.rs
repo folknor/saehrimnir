@@ -454,3 +454,75 @@ async fn imap_dispatch_records_request_log_entries() {
         ["CAPABILITY", "LOGIN", "SELECT", "UID FETCH", "LOGOUT"]
     );
 }
+
+/// `UID FETCH` log rows expose `detail.attrs` (parsed FETCH item
+/// list) and `detail.body` (true when any item asks for message
+/// bytes). Lets a steady-state delta test soften to "no body
+/// refetch" while still permitting flag-only reconciliation.
+#[tokio::test]
+async fn imap_uid_fetch_log_distinguishes_body_from_metadata() {
+    use saehrimnir::request_log::RequestLog;
+
+    let log = RequestLog::default();
+    let log_clone = log.clone();
+    let fix = Arc::new(
+        fixture::load(std::path::Path::new("fixtures/imap-small.toml")).unwrap(),
+    );
+
+    let (server, mut client) = tokio::io::duplex(64 * 1024);
+    let (_tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        imap::serve_connection(server, fix, None, log_clone, &mut rx).await
+    });
+
+    let script = b"\
+        a1 LOGIN \"u\" \"p\"\r\n\
+        a2 SELECT \"INBOX\"\r\n\
+        a3 UID FETCH 1:* (UID FLAGS INTERNALDATE)\r\n\
+        a4 UID FETCH 1 (UID BODY.PEEK[])\r\n\
+        a5 UID FETCH 1 (UID FLAGS) (CHANGEDSINCE 0)\r\n\
+        a6 LOGOUT\r\n";
+    client.write_all(script).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    let fetches: Vec<_> = log
+        .snapshot()
+        .into_iter()
+        .filter(|e| e.command == "UID FETCH")
+        .collect();
+    assert_eq!(fetches.len(), 3);
+
+    // Metadata-only fetch.
+    let attrs0: Vec<&str> = fetches[0].detail["attrs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(attrs0, ["UID", "FLAGS", "INTERNALDATE"]);
+    assert_eq!(fetches[0].detail["body"], serde_json::json!(false));
+
+    // Body fetch.
+    let attrs1: Vec<&str> = fetches[1].detail["attrs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(attrs1, ["UID", "BODY[]"]);
+    assert_eq!(fetches[1].detail["body"], serde_json::json!(true));
+
+    // Modifier list (CHANGEDSINCE) doesn't perturb attrs/body.
+    let attrs2: Vec<&str> = fetches[2].detail["attrs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(attrs2, ["UID", "FLAGS"]);
+    assert_eq!(fetches[2].detail["body"], serde_json::json!(false));
+}

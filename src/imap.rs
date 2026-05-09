@@ -255,11 +255,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         } else {
             parsed.args
         };
-        self.request_log.record(
-            "imap",
-            recorded,
-            serde_json::json!({ "tag": parsed.tag, "args": logged_args }),
-        );
+        // For `UID FETCH`, surface the parsed FETCH item list and a
+        // `body` flag: `true` when any item asks for message bytes
+        // (`BODY[...]`, `BODY.PEEK[...]`, `RFC822*`, part fetches),
+        // `false` for metadata-only fetches (FLAGS, UID, MODSEQ,
+        // INTERNALDATE, BODYSTRUCTURE, RFC822.SIZE). Lets a script
+        // assert "no body refetch" while still permitting a flag-only
+        // reconciliation pass. See `notes/request-log.md`.
+        let mut detail = serde_json::json!({ "tag": parsed.tag, "args": logged_args });
+        if recorded == "UID FETCH" {
+            // At this layer `parsed.command == "UID"` and `parsed.args
+            // == "FETCH <set> <attrs> [<modifiers>]"`. Drop the FETCH
+            // sub-verb and the sequence-set, then strip any trailing
+            // modifier list before parsing the attribute set.
+            let attr_tail = parsed
+                .args
+                .split_whitespace()
+                .skip(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (attrs_str, _modifiers) = split_attrs_and_modifiers(&attr_tail);
+            let attrs = parse_fetch_attrs(attrs_str).unwrap_or_default();
+            let body = attrs.iter().any(|a| {
+                matches!(
+                    a,
+                    FetchAttr::BodyFull
+                        | FetchAttr::BodyHeader
+                        | FetchAttr::BodyText
+                        | FetchAttr::BodyPart(_)
+                        | FetchAttr::BodyPartMime(_)
+                )
+            });
+            let attr_names: Vec<String> = attrs.iter().map(fetch_attr_name).collect();
+            detail["attrs"] = serde_json::json!(attr_names);
+            detail["body"] = serde_json::json!(body);
+        }
+        self.request_log.record("imap", recorded, detail);
         match cmd_upper.as_str() {
             "CAPABILITY" => self.cmd_capability(parsed.tag).await,
             "NOOP" => self.cmd_noop(parsed.tag).await,
@@ -1283,6 +1314,24 @@ fn parse_fetch_attrs(s: &str) -> Option<Vec<FetchAttr>> {
         None
     } else {
         Some(out)
+    }
+}
+
+/// Stable string label for a `FetchAttr`. Used by the request-log
+/// detail (`detail.attrs`) so harness scripts can match on attribute
+/// names without re-parsing the raw command line.
+fn fetch_attr_name(attr: &FetchAttr) -> String {
+    match attr {
+        FetchAttr::Uid => "UID".into(),
+        FetchAttr::Flags => "FLAGS".into(),
+        FetchAttr::InternalDate => "INTERNALDATE".into(),
+        FetchAttr::Rfc822Size => "RFC822.SIZE".into(),
+        FetchAttr::BodyFull => "BODY[]".into(),
+        FetchAttr::BodyHeader => "BODY[HEADER]".into(),
+        FetchAttr::BodyText => "BODY[TEXT]".into(),
+        FetchAttr::BodyStructure => "BODYSTRUCTURE".into(),
+        FetchAttr::BodyPart(n) => format!("BODY[{n}]"),
+        FetchAttr::BodyPartMime(n) => format!("BODY[{n}.MIME]"),
     }
 }
 

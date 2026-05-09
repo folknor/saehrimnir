@@ -55,6 +55,17 @@ contract harness scripts can rely on.
   mutex is taken once).
 - `detail.call_id`: the per-method `callId` from the envelope so
   tests can correlate multiple calls.
+- `detail.account_id` (optional): the `accountId` argument when
+  present.
+- `detail.ids` (optional): the `ids[]` argument as a JSON array of
+  strings, when the call carries a string-typed list (`Mailbox/get`,
+  `Email/get`, future `*/set`). Absent when the field is missing
+  or contains non-string entries.
+- `detail.properties` (optional): the `properties[]` argument as a
+  JSON array of strings. Lets a script distinguish a metadata-only
+  `Email/get` (e.g. `properties=["id","keywords"]`) from a body
+  fetch (`properties=[..., "bodyValues"]`) without re-deriving it
+  from response shape.
 
 ### IMAP (`src/imap.rs::dispatch`)
 
@@ -68,6 +79,18 @@ contract harness scripts can rely on.
   mechanism token, never the credential payload. The `+`
   continuation line for SASL is read inside the AUTH handler
   and never reaches the recorder.
+- `detail.attrs` (UID FETCH only): the parsed FETCH item list as a
+  JSON array of stable string labels (`"UID"`, `"FLAGS"`,
+  `"INTERNALDATE"`, `"RFC822.SIZE"`, `"BODY[]"`, `"BODY[HEADER]"`,
+  `"BODY[TEXT]"`, `"BODYSTRUCTURE"`, `"BODY[N]"`, `"BODY[N.MIME]"`).
+  Empty array when the attribute list fails to parse; the raw line
+  is still in `detail.args` for debugging.
+- `detail.body` (UID FETCH only): `true` when any item in `attrs`
+  asks for message bytes (`BODY[...]`, `RFC822*`, part / part-MIME
+  fetches), `false` for metadata-only fetches (FLAGS / UID / MODSEQ
+  / INTERNALDATE / BODYSTRUCTURE / RFC822.SIZE). Lets a steady-state
+  script assert "no body refetch" while still permitting a flag-only
+  reconciliation pass.
 
 ### SMTP (`src/smtp.rs::dispatch`)
 

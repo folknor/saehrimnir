@@ -4,6 +4,98 @@ Running task list, ordered by what ratatoskr is actively waiting on.
 Per-protocol design notes live alongside in `notes/`; this file just
 tracks what's next.
 
+## Ratatoskr-driven gaps (2026-05-09 audit)
+
+Ten items ratatoskr's sync code is actively waiting on, ordered
+roughly by leverage. Items 1, 2, 3, and 9 are tightly coupled -
+they all need the fixture to become writable / steppable, which
+`POST /test/fixture/step` is the natural seam for. Lifting the
+read-only fixture invariant is the prerequisite for the mutation
+trio.
+
+### Mutation surfaces (highest leverage)
+
+- **[jmap] `Email/set` + `Mailbox/set`.** `src/jmap.rs:120` falls
+  through to `unknownMethod` for any method outside the v0 reads.
+  Needs to accept the changes and reflect them in the next
+  `Email/changes` / `Mailbox/changes` so a delta-after-mutation
+  script can prove the round-trip. Closes the IMAP/JMAP "mutation
+  fixtures remain" gap on the JMAP side.
+- **[imap] `UID STORE` (persistent), `UID COPY`, `UID EXPUNGE`.**
+  `UID STORE` is wired today as a non-persistent no-op
+  (`src/imap.rs:683` - tagged OK plus post-op FETCH untagged, but
+  the fixture is unchanged). `UID COPY` and `UID EXPUNGE` are not
+  matched at all. All three should mutate fixture state and
+  surface in subsequent `UID FETCH` / CONDSTORE replies. Same
+  gap as the JMAP item above, on the IMAP side.
+- **[graph] Calendar mutations surface in delta.** `POST` /
+  `PATCH` / `DELETE /v1.0/me/events` exist
+  (`src/graph/calendar.rs:60,68,344,390,397`) and echo bodies into
+  the request log, but the fixture stays read-only - the next
+  `events/delta` doesn't reflect the mutation. Lift the read-only
+  invariant for calendar so M6.10's create/update/delete coverage
+  can land.
+
+### Request-log granularity (landed)
+
+Both granularity items shipped together:
+
+- **[imap]** `UID FETCH` log rows now expose `detail.attrs` (parsed
+  FETCH item list as stable string labels: `"UID"`, `"FLAGS"`,
+  `"BODY[]"`, `"BODY[N]"`, `"BODY[N.MIME]"`, ...) and
+  `detail.body` (true when any item asks for message bytes,
+  false for metadata-only fetches). Lets a steady-state delta
+  test soften to "no body refetch" while still permitting a
+  flag-only reconciliation pass. Contract documented in
+  `notes/request-log.md`.
+- **[jmap]** Method-call log rows now surface `detail.account_id`
+  (when present), `detail.ids` (when the call carries a string-
+  typed `ids[]`), and `detail.properties` (when the call carries a
+  string-typed `properties[]`). Distinguishes a metadata-only
+  `Email/get` (e.g. `properties=["id","keywords"]`) from a body
+  fetch (`properties=[..., "bodyValues"]`) without re-deriving it
+  from response shape. Filter args / result references are
+  deliberately left out: shape-sensitive, would bloat the log.
+
+### OAuth-enforced fixture (M6.9 closeout)
+
+- **Revocation toggle + checked-in fixture variant.** Mechanism is
+  done: `POST /test/oauth/invalidate` (`src/oauth.rs:358`, mounted
+  at `src/routes.rs:121`) revokes an issued token; subsequent
+  provider calls hit `enforce_bearer` and 401. What's missing is a
+  named fixture that wires this into the revoked-token-recovery
+  script (sync fails -> `oauth.exchange_code` re-auths -> follow-up
+  sync succeeds).
+
+### Fixture breadth (M8 exit + M9 prep)
+
+- **Larger named fixtures.** `fixtures/jmap-bulk.lua` is the 10k
+  case; the `bulk_emails` / `bulk_threads` / `bulk_mailboxes`
+  builders make medium (~1k), huge-thread, and many-folders
+  fixtures one-liners. Author them as M9 sync benchmarks need them.
+- **Edge-case fixtures.** Duplicate `Message-Id`, malformed MIME,
+  configurable per-page latency. The first two need the validator
+  carve-out + `body_raw_bytes` escape hatch tracked under
+  "Authoring hooks for adversarial-shape fixtures" below; slow
+  paging is already achievable via `wait(ms)` inside an `on()`
+  callback (a documented recipe in `notes/fixture-format.md`
+  closes the third).
+- **Incremental sequence fixture.** A scripted timeline of
+  new + change + delete + move events so a single steady-state
+  script can assert the delta path handles all four. Drives
+  `POST /test/fixture/step` (currently 501) and the change-script
+  item under "Fixture format growth" below.
+
+### M9 prerequisite (lower priority)
+
+- **Deterministic timing knobs.** `POST /test/set-latency` per
+  route and `GET /test/snapshot-state` to dump current server-side
+  mailbox state. Neither route exists today
+  (`src/routes.rs` only has `smtp/submissions`, `requests`,
+  `fixture/reset`, `fixture/step`, `oauth/invalidate`). Per-route
+  latency can be hacked via `on()` + `wait(ms)`; the global knob
+  is what unblocks reproducible sync-bench numbers.
+
 ## From the 2026-05-09 multi-agent review
 
 Findings from a four-agent (security / bugs / perf / arch) review

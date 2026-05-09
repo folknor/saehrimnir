@@ -889,6 +889,61 @@ async fn jmap_method_calls_land_in_request_log() {
     assert_eq!(snap[1].detail["call_id"], "c1");
 }
 
+/// `Email/get` request-log rows surface `accountId`, `ids[]`, and
+/// `properties[]` in `detail`. Lets a delta-after-mutation script
+/// distinguish a metadata-only get from a body-bearing one without
+/// having to inspect the response shape.
+#[tokio::test]
+async fn jmap_request_log_surfaces_ids_and_properties() {
+    let request_log = saehrimnir::request_log::RequestLog::default();
+    let app = router_with_logs(
+        saehrimnir::smtp::SubmissionLog::default(),
+        request_log.clone(),
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/jmap/api")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [
+                    ["Email/get", {
+                        "accountId": "account-1",
+                        "ids": ["email-1", "email-2"],
+                        "properties": ["id", "keywords"]
+                    }, "c0"],
+                    ["Email/query", { "accountId": "account-1" }, "c1"]
+                ]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let snap = request_log.snapshot();
+    assert_eq!(snap[0].command, "Email/get");
+    assert_eq!(snap[0].detail["account_id"], "account-1");
+    assert_eq!(
+        snap[0].detail["ids"],
+        json!(["email-1", "email-2"])
+    );
+    assert_eq!(snap[0].detail["properties"], json!(["id", "keywords"]));
+
+    // Email/query call doesn't carry ids/properties so those fields
+    // stay absent (only call_id + account_id surface).
+    assert_eq!(snap[1].command, "Email/query");
+    assert_eq!(snap[1].detail["account_id"], "account-1");
+    assert!(snap[1].detail.get("ids").is_none(), "{:?}", snap[1].detail);
+    assert!(
+        snap[1].detail.get("properties").is_none(),
+        "{:?}",
+        snap[1].detail
+    );
+}
+
 #[tokio::test]
 async fn test_requests_get_returns_snapshot_and_delete_clears() {
     let request_log = saehrimnir::request_log::RequestLog::default();

@@ -239,12 +239,37 @@ async fn api(
     state
         .shared
         .request_log
-        .extend(req.method_calls.iter().map(|(method, _args, call_id)| {
+        .extend(req.method_calls.iter().map(|(method, args, call_id)| {
+            // Surface the high-signal arg fields ratatoskr's delta
+            // scripts care about: `accountId`, the `ids[]` list when
+            // the call carries a string-typed one (Mailbox/get,
+            // Email/get, future */set), and the `properties[]` list
+            // (lets a script distinguish `Email/get properties=
+            // [bodyValues, ...]` from a metadata-only get). Filter
+            // arguments and result references are deliberately left
+            // out: they're shape-sensitive and would bloat the log
+            // without giving asserts a stable matcher.
+            let mut detail = json!({ "call_id": call_id });
+            if let Some(account_id) = args.get("accountId").and_then(|v| v.as_str()) {
+                detail["account_id"] = json!(account_id);
+            }
+            if let Some(ids) = args.get("ids").and_then(|v| v.as_array()) {
+                let strs: Vec<&str> = ids.iter().filter_map(|v| v.as_str()).collect();
+                if !strs.is_empty() {
+                    detail["ids"] = json!(strs);
+                }
+            }
+            if let Some(props) = args.get("properties").and_then(|v| v.as_array()) {
+                let strs: Vec<&str> = props.iter().filter_map(|v| v.as_str()).collect();
+                if !strs.is_empty() {
+                    detail["properties"] = json!(strs);
+                }
+            }
             RequestEntry {
                 protocol: "jmap",
                 command: method.clone(),
                 received_at: now,
-                detail: json!({ "call_id": call_id }),
+                detail,
             }
         }));
     Ok(Json(jmap::handle(
