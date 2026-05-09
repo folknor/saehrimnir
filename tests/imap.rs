@@ -526,3 +526,121 @@ async fn imap_uid_fetch_log_distinguishes_body_from_metadata() {
     assert_eq!(attrs2, ["UID", "FLAGS"]);
     assert_eq!(fetches[2].detail["body"], serde_json::json!(false));
 }
+
+// ── UID STORE / COPY / EXPUNGE persistence ─────────────────────────
+
+/// `UID STORE +FLAGS (\Seen)` now persists. A subsequent
+/// `UID FETCH (FLAGS)` against the same connection sees the flag,
+/// closing the v0 "no-op writeback" gap. `imap-small.toml` starts
+/// with email-002 carrying only `$flagged`; after the store both
+/// `\Seen` and `\Flagged` are present.
+#[tokio::test]
+async fn uid_store_persists_across_fetches() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID STORE 2 +FLAGS (\\Seen)\r\n\
+        d UID FETCH 2 (UID FLAGS)\r\n\
+        e LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+    assert!(out.contains("c OK UID STORE completed"));
+    // Post-store FETCH on the same connection sees both flags.
+    let post = out
+        .split("c OK UID STORE completed")
+        .nth(1)
+        .expect("post-store transcript present");
+    assert!(
+        post.contains("* 2 FETCH (UID 2 FLAGS (\\Flagged \\Seen))"),
+        "post-store FETCH missing combined flags: {post:?}"
+    );
+}
+
+/// `UID COPY <set> "Archive"` adds the target mailbox to the
+/// matched email's `mailbox_ids`. After SELECT-ing Archive the
+/// copied email is visible there too. `imap-small.toml` already
+/// declares an `Archive` mailbox.
+#[tokio::test]
+async fn uid_copy_makes_email_visible_in_target_mailbox() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID COPY 1 \"Archive\"\r\n\
+        d SELECT \"Archive\"\r\n\
+        e UID FETCH 1:* (UID)\r\n\
+        f LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+    assert!(out.contains("c OK UID COPY completed"));
+    // Archive's first SELECT now reports EXISTS 1 (was 0); FETCH
+    // returns the copied email.
+    assert!(out.contains("d OK [READ-WRITE] SELECT completed"));
+    let post_select = out.split("d OK").nth(1).expect("post-Archive SELECT transcript");
+    assert!(
+        post_select.contains("* 1 FETCH (UID 1)"),
+        "Archive missing copied email after UID COPY: {post_select:?}"
+    );
+}
+
+/// Copying to an unknown mailbox returns `NO [TRYCREATE]`, mirroring
+/// real IMAP. The fixture is left unchanged.
+#[tokio::test]
+async fn uid_copy_unknown_mailbox_returns_no_trycreate() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID COPY 1 \"Nope\"\r\n\
+        d LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+    assert!(out.contains("c NO [TRYCREATE]"), "got: {out:?}");
+}
+
+/// `UID EXPUNGE` removes only `\Deleted`-flagged emails. The
+/// canonical writeback flow is `STORE +FLAGS (\Deleted)` then
+/// `UID EXPUNGE`. The expunged messages emit `* <seq> EXPUNGE` and
+/// disappear from subsequent fetches.
+#[tokio::test]
+async fn uid_expunge_drops_only_deleted_flagged_messages() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID STORE 1 +FLAGS (\\Deleted)\r\n\
+        d UID EXPUNGE 1:*\r\n\
+        e UID FETCH 1:* (UID)\r\n\
+        f LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+    // Only the \Deleted-flagged UID 1 expunges; UID 2 (only
+    // \Flagged in imap-small.toml) survives.
+    assert!(out.contains("* 1 EXPUNGE"), "got: {out:?}");
+    assert!(!out.contains("* 2 EXPUNGE"));
+    assert!(out.contains("d OK UID EXPUNGE completed"));
+    // Post-expunge: UID 1 is gone. UID 2 is the surviving message,
+    // and (since the fixture's enumeration re-numbers from 1 in
+    // each mailbox view) it now fetches as UID 1.
+    let post = out.split("d OK UID EXPUNGE completed").nth(1).expect("post-expunge");
+    assert!(
+        post.contains("* 1 FETCH (UID 1)"),
+        "surviving message missing post-expunge: {post:?}"
+    );
+    assert!(!post.contains("* 2 FETCH"));
+}
+
+/// `UID EXPUNGE` is a no-op when no message in range carries
+/// `\Deleted`: the tagged OK fires but no `* <seq> EXPUNGE` lines
+/// are emitted and the mailbox view is unchanged.
+#[tokio::test]
+async fn uid_expunge_without_deleted_flag_is_noop() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID EXPUNGE 1:*\r\n\
+        d UID FETCH 1:* (UID)\r\n\
+        e LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+    let pre_post_split: Vec<&str> = out.split("c OK UID EXPUNGE completed").collect();
+    assert_eq!(pre_post_split.len(), 2, "tagged OK missing: {out:?}");
+    let pre = pre_post_split[0];
+    assert!(!pre.contains("EXPUNGE\r\n"), "stray EXPUNGE: {pre:?}");
+    let post = pre_post_split[1];
+    assert!(post.contains("* 1 FETCH (UID 1)"));
+    assert!(post.contains("* 2 FETCH (UID 2)"));
+}
+

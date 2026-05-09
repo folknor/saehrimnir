@@ -194,12 +194,21 @@ including `multipart/mixed` for fixtures with attachments,
 CONDSTORE `CHANGEDSINCE`). Single-part text emails stay byte-
 identical to the pre-attachment wire format; multipart kicks in only
 when `email.attachments` is non-empty (boundary is
-`=_saehrimnir_<email-id>_=`). Plus `UID STORE` as a non-persistent
-no-op: emits the post-op FETCH untagged update and a tagged OK so
-ratatoskr's flag-writeback path completes cleanly without erroring;
-the mutation does not persist (subsequent fetches see the fixture's
-keywords unchanged). Integration test in `tests/imap.rs` drives the
-full initial-sync transcript.
+`=_saehrimnir_<email-id>_=`). Plus a persistent mutation surface:
+`UID STORE`, `UID COPY`, and `UID EXPUNGE`. Each takes a brief
+write guard, mutates the shared `Fixture`, bumps `state`, and
+records a transition so the change surfaces in the next JMAP
+`Email/changes`. `UID STORE` translates IMAP wire flags
+(`\Seen`, `\Flagged`, `\Draft`, `\Answered`, `\Deleted`) into
+fixture keywords (`$seen`, ...) and back, supporting `+FLAGS` /
+`-FLAGS` / `FLAGS` plus `.SILENT`. `UID COPY` adds the target
+mailbox id to the matched email's `mailbox_ids[]`; unknown
+target returns `NO [TRYCREATE]`. `UID EXPUNGE` drops every
+matched message that carries `\Deleted` from the current
+mailbox, destroying the email entirely when its last mailbox
+membership goes away. Integration tests in `tests/imap.rs`
+drive both the full initial-sync transcript and the persistent
+writeback / copy / expunge round-trips.
 
 SMTP: complete for v0's submission path (greeting, EHLO,
 AUTH PLAIN/LOGIN/XOAUTH2/OAUTHBEARER, MAIL FROM, RCPT TO, DATA with

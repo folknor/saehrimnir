@@ -168,10 +168,37 @@ same values.
   line and walks it manually (`connection.rs:514-643`). Not relevant
   in v0 because we do not advertise NAMESPACE.
 
+## Mutation surface (v0)
+
+`UID STORE`, `UID COPY`, `UID EXPUNGE` are persistent and bump
+`Fixture::state` so the change shows up in the JMAP `Email/changes`
+delta on the same fixture.
+
+- `UID STORE <set> <flag-op> <flags>` mutates `Email::keywords`
+  for every matched message. IMAP wire flags map to fixture
+  keywords (`\Seen` -> `$seen`, `\Flagged` -> `$flagged`,
+  `\Draft` -> `$draft`, `\Answered` -> `$answered`, `\Deleted`
+  -> `$deleted`; custom tokens pass through). `+FLAGS` /
+  `-FLAGS` / `FLAGS` (replace) all supported, plus `.SILENT`.
+  Each touched email is recorded as `email_updated` in the
+  resulting transition.
+- `UID COPY <set> <mailbox>` adds the target mailbox id to each
+  matched email's `mailbox_ids[]`. The source mailbox keeps the
+  email and its UID; the copy appears in the target with that
+  mailbox's local sequence numbering. Unknown target -> `NO
+  [TRYCREATE]`. COPYUID is omitted in v0.
+- `UID EXPUNGE <set>` removes every matched email that carries
+  `\Deleted` *from the current mailbox*. If the email no longer
+  belongs to any mailbox after the operation, the email is
+  destroyed entirely (`email_destroyed`); otherwise it survives
+  and contributes `email_updated`. EXPUNGE responses fire in
+  descending sequence-number order so no per-line renumbering is
+  required.
+
 ## Out of scope for v0
 
-- APPEND, COPY, MOVE, DELETE, EXPUNGE - write paths not exercised by
-  initial sync.
+- APPEND, MOVE, DELETE - destructive write paths not driven by
+  ratatoskr's writeback flow.
 - IDLE, NOTIFY, COMPRESS - push and bandwidth optimisations.
 - ACL / MYRIGHTS - attempted but failures are soft
   (`connection.rs:712-755`).

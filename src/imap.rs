@@ -621,6 +621,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "SEARCH" => self.cmd_uid_search(tag, rest).await,
             "FETCH" => self.cmd_uid_fetch(tag, rest).await,
             "STORE" => self.cmd_uid_store(tag, rest).await,
+            "COPY" => self.cmd_uid_copy(tag, rest).await,
+            "EXPUNGE" => self.cmd_uid_expunge(tag, rest).await,
             other => {
                 self.write_line(&format!(
                     "{tag} BAD UID {other} not implemented in v0"
@@ -733,14 +735,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         self.writer.flush().await
     }
 
-    /// `UID STORE <set> <flag-op> <flags>` - flag writeback. v0
-    /// fixtures are read-only, so this is a no-op that *acts* as if
-    /// the flags were applied: emits a `* <seq> FETCH (UID x FLAGS
-    /// (...))` for each matched message with the post-op flag set,
-    /// then a tagged OK. The mutation does not persist - subsequent
-    /// fetches still see the fixture's keywords. Good enough for
-    /// ratatoskr's writeback path to complete cleanly without
-    /// erroring.
+    /// `UID STORE <set> <flag-op> <flags>` - persistent flag
+    /// writeback. Mutates the fixture's `keywords` for every matched
+    /// email and bumps `Fixture::state`, so the change surfaces in
+    /// the next `Email/changes` (under `updated`) and in any
+    /// subsequent `UID FETCH (FLAGS)` against the same connection.
+    /// Emits a `* <seq> FETCH (UID x FLAGS (...))` per matched
+    /// message unless `.SILENT` was requested, then a tagged OK.
     async fn cmd_uid_store(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
         let (uid_set_str, after) = match split_after_set(args) {
             Some(p) => p,
@@ -771,29 +772,240 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .selected
             .clone()
             .expect("Selected state requires selected mailbox");
+        // Mutate under a write guard, collect the per-message FETCH
+        // lines for emission *after* the guard drops. Every matched
+        // message contributes one transition entry under
+        // `email_updated` so a JMAP `Email/changes` against the
+        // pre-mutation state reflects the writeback.
         let lines: Vec<String> = {
-            let fix = self.fix_read();
-            mailbox_messages(&fix, &selected_id)
-                .into_iter()
-                .filter(|(uid, _)| set.matches(*uid))
-                .map(|(uid, email)| {
-                    let flags = store_op.apply(email);
-                    if store_op.silent {
-                        String::new()
-                    } else {
-                        format!("* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n")
+            let mut fix = self.fixture.write().expect("fixture lock poisoned");
+            let mut emitted: Vec<String> = Vec::new();
+            let _ = fix.mutate(|f| {
+                let mut diff = crate::fixture::MutationDiff::default();
+                let mailbox_indices: Vec<usize> = f
+                    .emails
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.mailbox_ids.iter().any(|id| id == &selected_id))
+                    .map(|(i, _)| i)
+                    .collect();
+                for (slot, idx) in mailbox_indices.iter().copied().enumerate() {
+                    let uid = u32::try_from(slot + 1).expect("mailbox seq fits in u32");
+                    if !set.matches(uid) {
+                        continue;
                     }
-                })
-                .collect()
+                    let email = &mut f.emails[idx];
+                    let changed = store_op.apply_in_place(email);
+                    if changed {
+                        diff.email_updated.push(email.id.clone());
+                    }
+                    if !store_op.silent {
+                        let flags = flags_for(email);
+                        emitted.push(format!(
+                            "* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n"
+                        ));
+                    }
+                }
+                diff
+            });
+            emitted
         };
 
         for line in lines {
-            if line.is_empty() {
-                continue;
-            }
             self.write_response(&line).await?;
         }
         self.write_line(&format!("{tag} OK UID STORE completed"))
+            .await
+    }
+
+    /// `UID COPY <set> <mailbox>` - per RFC 3501 §6.4.8. Adds the
+    /// target mailbox to each matched email's `mailbox_ids` (since
+    /// the fixture model expresses an email's presence in a folder
+    /// via `mailbox_ids[]`, "copy" is a set-insert; the source
+    /// mailbox keeps the email and its UID). Returns `NO TRYCREATE`
+    /// when the target name does not resolve to a fixture mailbox.
+    /// COPYUID is omitted in v0 - ratatoskr's copy code accepts a
+    /// bare OK.
+    async fn cmd_uid_copy(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !matches!(self.state, State::Selected) {
+            return self
+                .write_line(&format!("{tag} BAD UID COPY requires SELECT first"))
+                .await;
+        }
+        let (uid_set_str, target_raw) = match split_after_set(args) {
+            Some(p) => p,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID COPY expects <set> <mailbox>"))
+                    .await;
+            }
+        };
+        let set = match parse_uid_set(uid_set_str) {
+            Some(s) => s,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID COPY bad sequence-set"))
+                    .await;
+            }
+        };
+        let target_name = match parse_one_astring(target_raw) {
+            Some(n) => n,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID COPY expects \"mailbox\""))
+                    .await;
+            }
+        };
+        let selected_id = self
+            .selected
+            .clone()
+            .expect("Selected state requires selected mailbox");
+        let outcome: Result<(), String> = {
+            let mut fix = self.fixture.write().expect("fixture lock poisoned");
+            // Resolve target mailbox name against the fixture-side
+            // path projection (matches LIST output, case-insensitive
+            // for INBOX as elsewhere).
+            let target_id = list_mailboxes(&fix)
+                .iter()
+                .find(|e| e.path.eq_ignore_ascii_case(&target_name))
+                .map(|e| e.fixture_id.clone());
+            match target_id {
+                None => Err(format!("unknown mailbox {target_name:?}")),
+                Some(target_id) => {
+                    let _ = fix.mutate(|f| {
+                        let mut diff = crate::fixture::MutationDiff::default();
+                        let mailbox_indices: Vec<usize> = f
+                            .emails
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, e)| {
+                                e.mailbox_ids.iter().any(|id| id == &selected_id)
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        for (slot, idx) in mailbox_indices.iter().copied().enumerate() {
+                            let uid = u32::try_from(slot + 1)
+                                .expect("mailbox seq fits in u32");
+                            if !set.matches(uid) {
+                                continue;
+                            }
+                            let email = &mut f.emails[idx];
+                            if !email.mailbox_ids.iter().any(|id| id == &target_id) {
+                                email.mailbox_ids.push(target_id.clone());
+                                diff.email_updated.push(email.id.clone());
+                            }
+                        }
+                        diff
+                    });
+                    Ok(())
+                }
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                self.write_line(&format!("{tag} OK UID COPY completed"))
+                    .await
+            }
+            Err(reason) => {
+                self.write_line(&format!("{tag} NO [TRYCREATE] {reason}"))
+                    .await
+            }
+        }
+    }
+
+    /// `UID EXPUNGE <set>` - per RFC 4315. Removes every matched
+    /// email that carries the `\Deleted` flag from the *current*
+    /// mailbox. Emits one `* <seq> EXPUNGE` per removed message,
+    /// in descending sequence-number order so the wire is correct
+    /// without per-line renumbering (each emission targets the
+    /// then-highest-known sequence, so already-emitted entries do
+    /// not shift). When the email no longer belongs to any mailbox
+    /// after the operation, it is destroyed entirely; otherwise
+    /// it survives in its other mailboxes.
+    async fn cmd_uid_expunge(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !matches!(self.state, State::Selected) {
+            return self
+                .write_line(&format!("{tag} BAD UID EXPUNGE requires SELECT first"))
+                .await;
+        }
+        let set = match parse_uid_set(args.trim()) {
+            Some(s) => s,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID EXPUNGE bad sequence-set"))
+                    .await;
+            }
+        };
+        let selected_id = self
+            .selected
+            .clone()
+            .expect("Selected state requires selected mailbox");
+        let expunged_seqs: Vec<u32> = {
+            let mut fix = self.fixture.write().expect("fixture lock poisoned");
+            let mut seqs: Vec<u32> = Vec::new();
+            let _ = fix.mutate(|f| {
+                let mut diff = crate::fixture::MutationDiff::default();
+                // Snapshot (seq, fixture_index) for the messages in
+                // this mailbox so we can mutate by `f.emails` index
+                // without losing the original sequence numbers.
+                let mailbox_view: Vec<(u32, usize)> = f
+                    .emails
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.mailbox_ids.iter().any(|id| id == &selected_id))
+                    .enumerate()
+                    .map(|(slot, (idx, _))| {
+                        let uid =
+                            u32::try_from(slot + 1).expect("mailbox seq fits in u32");
+                        (uid, idx)
+                    })
+                    .collect();
+                // Collect the indices we will delete (in fixture
+                // order, ascending) but emit EXPUNGE responses in
+                // descending sequence-number order. Two separate
+                // walks let us remove from `f.emails` in reverse
+                // index order without invalidating earlier indices.
+                let mut victims: Vec<(u32, usize)> = mailbox_view
+                    .iter()
+                    .copied()
+                    .filter(|(uid, idx)| {
+                        if !set.matches(*uid) {
+                            return false;
+                        }
+                        f.emails[*idx]
+                            .keywords
+                            .iter()
+                            .any(|k| k == "$deleted")
+                    })
+                    .collect();
+                // Highest sequence first so the wire-side renumbering
+                // contract holds without us tracking shifts.
+                victims.sort_by_key(|(uid, _)| std::cmp::Reverse(*uid));
+                seqs = victims.iter().map(|(uid, _)| *uid).collect();
+                // Mutate in descending fixture-index order so earlier
+                // indices stay valid through the loop.
+                let mut fixture_indices: Vec<usize> =
+                    victims.iter().map(|(_, idx)| *idx).collect();
+                fixture_indices.sort_unstable_by_key(|i| std::cmp::Reverse(*i));
+                for idx in fixture_indices {
+                    let id = f.emails[idx].id.clone();
+                    f.emails[idx].mailbox_ids.retain(|m| m != &selected_id);
+                    if f.emails[idx].mailbox_ids.is_empty() {
+                        f.emails.remove(idx);
+                        diff.email_destroyed.push(id);
+                    } else {
+                        diff.email_updated.push(id);
+                    }
+                }
+                diff
+            });
+            seqs
+        };
+
+        for seq in expunged_seqs {
+            self.write_line(&format!("* {seq} EXPUNGE")).await?;
+        }
+        self.write_line(&format!("{tag} OK UID EXPUNGE completed"))
             .await
     }
 
@@ -1201,26 +1413,59 @@ enum StoreKind {
 }
 
 impl StoreOp {
-    /// Compute the post-op flag-token list as it would appear on the
-    /// wire if the mutation had taken effect. Existing fixture
-    /// keywords project through `flags_for`; the requested flags are
-    /// taken verbatim (already in IMAP wire form like `\Seen` or a
-    /// custom keyword like `important`).
-    fn apply(&self, email: &Email) -> String {
-        let existing = flags_for(email);
-        let existing_set: std::collections::BTreeSet<String> = if existing.is_empty() {
-            std::collections::BTreeSet::new()
-        } else {
-            existing.split_whitespace().map(str::to_string).collect()
-        };
-        let requested: std::collections::BTreeSet<String> =
-            self.flags.iter().cloned().collect();
-        let merged: std::collections::BTreeSet<String> = match self.kind {
-            StoreKind::Add => existing_set.union(&requested).cloned().collect(),
-            StoreKind::Remove => existing_set.difference(&requested).cloned().collect(),
-            StoreKind::Replace => requested,
-        };
-        merged.into_iter().collect::<Vec<_>>().join(" ")
+    /// Apply the flag operation in-place to the email's `keywords`.
+    /// Translates each requested IMAP flag token into its canonical
+    /// fixture keyword (`\Seen` -> `$seen`, etc.) before merging so
+    /// the persisted state matches what the JMAP / Graph / Gmail
+    /// projections expect to see. Returns true when the mutation
+    /// changed at least one keyword (caller uses the bit to decide
+    /// whether to bump fixture state).
+    fn apply_in_place(&self, email: &mut Email) -> bool {
+        let requested: Vec<String> = self
+            .flags
+            .iter()
+            .map(|f| imap_flag_to_keyword(f))
+            .collect();
+        let before = email.keywords.clone();
+        match self.kind {
+            StoreKind::Add => {
+                for k in &requested {
+                    if !email.keywords.iter().any(|x| x == k) {
+                        email.keywords.push(k.clone());
+                    }
+                }
+            }
+            StoreKind::Remove => {
+                email.keywords.retain(|k| !requested.iter().any(|r| r == k));
+            }
+            StoreKind::Replace => {
+                email.keywords = requested;
+            }
+        }
+        // Stable order in the fixture so successive STOREs that
+        // converge on the same set produce a byte-identical
+        // projection downstream.
+        email.keywords.sort();
+        email.keywords.dedup();
+        let mut sorted_before = before;
+        sorted_before.sort();
+        sorted_before.dedup();
+        email.keywords != sorted_before
+    }
+}
+
+/// Reverse of `flags_for`: translate an IMAP wire flag token into
+/// the fixture's canonical keyword. The standard system flags
+/// project to their `$`-prefixed JMAP keywords; custom tokens pass
+/// through verbatim.
+fn imap_flag_to_keyword(token: &str) -> String {
+    match token {
+        "\\Seen" => "$seen".to_string(),
+        "\\Flagged" => "$flagged".to_string(),
+        "\\Draft" => "$draft".to_string(),
+        "\\Answered" => "$answered".to_string(),
+        "\\Deleted" => "$deleted".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -1494,6 +1739,7 @@ fn flags_for(email: &Email) -> String {
             "$flagged" => "\\Flagged".to_string(),
             "$draft" => "\\Draft".to_string(),
             "$answered" => "\\Answered".to_string(),
+            "$deleted" => "\\Deleted".to_string(),
             other => other.to_string(),
         })
         .collect();

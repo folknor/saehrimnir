@@ -35,12 +35,22 @@ trio.
   `email_set_if_in_state_mismatch_rejects_envelope`). Surface
   documented in `notes/ratatoskr-jmap-surface.md`.
 - **[imap] `UID STORE` (persistent), `UID COPY`, `UID EXPUNGE`.**
-  `UID STORE` is wired today as a non-persistent no-op
-  (`src/imap.rs:683` - tagged OK plus post-op FETCH untagged, but
-  the fixture is unchanged). `UID COPY` and `UID EXPUNGE` are not
-  matched at all. All three should mutate fixture state and
-  surface in subsequent `UID FETCH` / CONDSTORE replies. Same
-  gap as the JMAP item above, on the IMAP side.
+  Landed. All three now take a write guard on the shared fixture,
+  mutate in place, and bump `Fixture::state` so the change rolls
+  forward into the JMAP `Email/changes` delta. `UID STORE`
+  translates IMAP wire flags (`\Seen`, `\Flagged`, `\Draft`,
+  `\Answered`, `\Deleted`) to / from fixture keywords; `UID COPY`
+  adds the target mailbox to the email's `mailbox_ids[]` (unknown
+  target -> `NO [TRYCREATE]`); `UID EXPUNGE` removes
+  `\Deleted`-flagged messages from the current mailbox, destroying
+  the email entirely when its last membership drops. Five new
+  integration tests in `tests/imap.rs`
+  (`uid_store_persists_across_fetches`,
+  `uid_copy_makes_email_visible_in_target_mailbox`,
+  `uid_copy_unknown_mailbox_returns_no_trycreate`,
+  `uid_expunge_drops_only_deleted_flagged_messages`,
+  `uid_expunge_without_deleted_flag_is_noop`). Surface documented
+  in `notes/ratatoskr-imap-surface.md`.
 - **[graph] Calendar mutations surface in delta.** `POST` /
   `PATCH` / `DELETE /v1.0/me/events` exist
   (`src/graph/calendar.rs:60,68,344,390,397`) and echo bodies into
