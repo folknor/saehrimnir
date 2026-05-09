@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::fixture::Fixture;
 use crate::jmap::{self, JmapRequest, JmapResponse};
+use crate::request_log::{RequestEntry, RequestLog};
 use crate::smtp::{self, Submission};
 
 #[derive(Clone)]
@@ -32,6 +33,10 @@ pub struct AppState {
     /// this. Tests that don't drive SMTP can construct it via
     /// `SubmissionLog::default()`.
     pub submission_log: smtp::SubmissionLog,
+    /// Cross-protocol request log. Threaded into all five
+    /// protocol layers so a single `GET /test/requests` snapshot
+    /// covers everything the harness has driven. Cheap to clone.
+    pub request_log: RequestLog,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -48,6 +53,12 @@ pub fn router(state: AppState) -> Router {
             "/test/smtp/submissions",
             get(list_smtp_submissions).delete(clear_smtp_submissions),
         )
+        .route(
+            "/test/requests",
+            get(list_requests).delete(clear_requests),
+        )
+        .route("/test/fixture/reset", post(reset_fixture))
+        .route("/test/fixture/step", post(step_fixture))
         .with_state(state)
 }
 
@@ -134,6 +145,16 @@ async fn session(State(state): State<AppState>, headers: HeaderMap) -> Json<Valu
 /// via axum's `Json` extractor, which is the right behaviour per RFC
 /// 8620 §3.6.1.
 async fn api(State(state): State<AppState>, Json(req): Json<JmapRequest>) -> Json<JmapResponse> {
+    // Record one request-log entry per method-call in the envelope so
+    // `GET /test/requests` reflects the granularity ratatoskr cares
+    // about (per-method asserts, not per-batch).
+    for (method, _args, call_id) in &req.method_calls {
+        state.request_log.record(
+            "jmap",
+            method.clone(),
+            json!({ "call_id": call_id }),
+        );
+    }
     Json(jmap::handle(&state.fixture, state.dispatcher.as_ref(), req))
 }
 
@@ -260,4 +281,57 @@ async fn list_smtp_submissions(State(state): State<AppState>) -> Json<Vec<Submis
 async fn clear_smtp_submissions(State(state): State<AppState>) -> StatusCode {
     state.submission_log.clear();
     StatusCode::NO_CONTENT
+}
+
+// ── Test-only cross-protocol request log ───────────────────────────
+//
+// One entry per protocol-level dispatch event, wired into every
+// protocol layer (JMAP method calls in `api`, IMAP commands in
+// `imap.rs`, SMTP commands in `smtp.rs`, Graph + Gmail HTTP via
+// the request-logging axum middleware in their respective
+// modules). Tests assert on `(protocol, command, detail)`;
+// `received_at` is wall-clock so byte-stable rendering is not a
+// goal.
+
+async fn list_requests(State(state): State<AppState>) -> Json<Vec<RequestEntry>> {
+    Json(state.request_log.snapshot())
+}
+
+async fn clear_requests(State(state): State<AppState>) -> StatusCode {
+    state.request_log.clear();
+    StatusCode::NO_CONTENT
+}
+
+// ── Test-only fixture admin ─────────────────────────────────────────
+
+/// Reset all in-process mutable state to the post-load baseline.
+/// Today that is exactly two pieces: the SMTP submission log and
+/// the cross-protocol request log. The fixture itself is read-only
+/// in v0 (IMAP `UID STORE` is a non-persistent no-op), so resetting
+/// is purely a log-clearing operation. When mutation lands
+/// (`[[change]]` scripts, persistent UID STORE, etc.), the
+/// implementation grows here without changing the route shape.
+/// Returns 204 unconditionally so harness scripts get a stable
+/// contract.
+async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
+    state.submission_log.clear();
+    state.request_log.clear();
+    StatusCode::NO_CONTENT
+}
+
+/// Advance one scenario step. Paired with `[[change]]` script
+/// entries (see TODO.md "Fixture format growth"), which don't yet
+/// exist; today there are no steps to advance, so the route
+/// returns 501 with a JSON body so harness scripts can detect the
+/// gap rather than silently no-op. When change scripts land, this
+/// becomes the dispatch point.
+async fn step_fixture() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "fixture step not implemented",
+            "detail": "no [[change]] scripts in v0; see TODO.md \"Fixture format growth\""
+        })),
+    )
+        .into_response()
 }

@@ -91,7 +91,15 @@ checking whether the fact is already in `notes/`.
   must accept invalid certs.
 - `src/shutdown.rs` - SIGTERM/SIGINT handler.
 - `src/lib.rs` - library surface; `main.rs` keeps just the runtime.
+- `src/request_log.rs` - cross-protocol request log. `RequestLog`
+  is a cheap-to-clone `Arc<Mutex<Vec<RequestEntry>>>` threaded into
+  every protocol layer; each command/dispatch event appends one
+  entry. Read out via `GET /test/requests`, cleared via
+  `DELETE /test/requests` or `POST /test/fixture/reset`. See
+  `notes/orchestration.md` "Test / admin control plane".
 - `src/routes.rs` - axum router, `AppState`, JMAP HTTP route handlers.
+  Also serves the test/admin control plane: `/test/smtp/submissions`,
+  `/test/requests`, `/test/fixture/reset`, `/test/fixture/step`.
 - `src/jmap.rs` - JMAP request envelope, dispatcher, per-method
   handlers.
 - `src/imap.rs` - IMAP listener, connection state machine, command

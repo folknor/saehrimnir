@@ -169,6 +169,7 @@ pub async fn serve(
     log: SubmissionLog,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
+    request_log: Option<crate::request_log::RequestLog>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -185,9 +186,10 @@ pub async fn serve(
                         let log = log.clone();
                         let disp = dispatcher.clone();
                         let tls = tls_acceptor.clone();
+                        let req_log = request_log.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, log, disp, tls, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, log, disp, tls, req_log, &mut sd).await {
                                 eprintln!("saehrimnir: smtp connection {peer}: {e}");
                             }
                         });
@@ -213,6 +215,7 @@ pub async fn serve_connection<S>(
     log: SubmissionLog,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
+    request_log: Option<crate::request_log::RequestLog>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -226,6 +229,7 @@ where
         dispatcher,
         tls_acceptor,
         tls_active: false,
+        request_log,
     };
     conn.write_str(GREETING).await?;
     loop {
@@ -269,6 +273,7 @@ struct Conn {
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     tls_active: bool,
+    request_log: Option<crate::request_log::RequestLog>,
 }
 
 enum ReadOutcome {
@@ -349,7 +354,19 @@ impl Conn {
     /// Returns `true` if the connection should close (QUIT).
     async fn dispatch(&mut self, line: &str) -> std::io::Result<bool> {
         let (verb, rest) = split_verb(line);
-        match verb.to_ascii_uppercase().as_str() {
+        let upper = verb.to_ascii_uppercase();
+        if let Some(log) = &self.request_log {
+            // Empty input still produces a "" verb that maps to a
+            // 500 below; record it as well so the log captures
+            // ratatoskr's literal command stream including stray
+            // empty lines.
+            log.record(
+                "smtp",
+                upper.clone(),
+                serde_json::json!({ "args": rest }),
+            );
+        }
+        match upper.as_str() {
             "EHLO" | "HELO" => self.cmd_ehlo(rest).await.map(|_| false),
             "STARTTLS" => self.cmd_starttls().await.map(|_| false),
             "AUTH" => self.cmd_auth(rest).await.map(|_| false),
@@ -655,7 +672,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, None, &mut rx).await
+            serve_connection(server, log_clone, None, None, None, &mut rx).await
         });
         client.write_all(script).await.unwrap();
         client.shutdown().await.unwrap();
@@ -846,7 +863,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, None, &mut rx).await
+            serve_connection(server, log_clone, None, None, None, &mut rx).await
         });
         let mut greet = vec![0u8; GREETING.len()];
         client.read_exact(&mut greet).await.unwrap();

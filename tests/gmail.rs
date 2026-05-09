@@ -20,6 +20,7 @@ fn router() -> axum::Router {
     gmail::router(gmail::AppState {
         fixture: Arc::new(fix),
         dispatcher: None,
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -50,6 +51,7 @@ fn attach_router() -> axum::Router {
     gmail::router(gmail::AppState {
         fixture: Arc::new(fix),
         dispatcher: None,
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -300,6 +302,7 @@ fn router_with_lua_scenario(scenario: &str) -> axum::Router {
     gmail::router(gmail::AppState {
         fixture: Arc::new(fixture),
         dispatcher: Some(Arc::new(dispatcher)),
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -355,4 +358,29 @@ async fn get_thread_callback_passes_thread_id_to_script() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
     assert_eq!(v["error"]["message"], "asked for abc-123");
+}
+
+/// HTTP middleware records `(protocol="gmail", command="GET <path>",
+/// detail.query)` per request. Mirrors the Graph version.
+#[tokio::test]
+async fn gmail_middleware_records_request_log_entries() {
+    use saehrimnir::request_log::RequestLog;
+
+    let request_log = RequestLog::default();
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
+    let app = gmail::router(gmail::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        request_log: request_log.clone(),
+    });
+
+    let _ = get_json_via(app.clone(), "/gmail/v1/users/me/profile").await;
+    let _ = get_json_via(app, "/gmail/v1/users/me/threads?q=after:2026/1/1").await;
+
+    let snap = request_log.snapshot();
+    assert_eq!(snap.len(), 2);
+    assert_eq!(snap[0].protocol, "gmail");
+    assert_eq!(snap[0].command, "GET /gmail/v1/users/me/profile");
+    assert_eq!(snap[1].command, "GET /gmail/v1/users/me/threads");
+    assert_eq!(snap[1].detail["query"], "q=after:2026/1/1");
 }

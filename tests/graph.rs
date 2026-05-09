@@ -20,6 +20,7 @@ fn router() -> axum::Router {
     graph::router(graph::AppState {
         fixture: Arc::new(fix),
         dispatcher: None,
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -70,6 +71,7 @@ fn attach_router() -> axum::Router {
     graph::router(graph::AppState {
         fixture: Arc::new(fix),
         dispatcher: None,
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -351,6 +353,7 @@ fn router_with_lua_scenario(scenario: &str) -> axum::Router {
     graph::router(graph::AppState {
         fixture: Arc::new(fixture),
         dispatcher: Some(Arc::new(dispatcher)),
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -418,4 +421,31 @@ async fn delta_messages_callback_call_index_increments() {
     .await;
     assert_eq!(s2, StatusCode::BAD_REQUEST);
     assert_eq!(v2["error"]["code"], "Throttled");
+}
+
+/// HTTP middleware records `(protocol="graph", command="GET <path>",
+/// detail.query)` per request. Verifies path is captured without
+/// the query string and that the query lands in `detail`.
+#[tokio::test]
+async fn graph_middleware_records_request_log_entries() {
+    use saehrimnir::request_log::RequestLog;
+
+    let request_log = RequestLog::default();
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
+    let app = graph::router(graph::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        request_log: request_log.clone(),
+    });
+
+    let _ = get_json_with(app.clone(), "/v1.0/me/mailFolders").await;
+    let _ = get_json_with(app, "/v1.0/me/mailFolders/inbox/messages?$top=10").await;
+
+    let snap = request_log.snapshot();
+    assert_eq!(snap.len(), 2);
+    assert_eq!(snap[0].protocol, "graph");
+    assert_eq!(snap[0].command, "GET /v1.0/me/mailFolders");
+    assert!(snap[0].detail["query"].is_null());
+    assert_eq!(snap[1].command, "GET /v1.0/me/mailFolders/inbox/messages");
+    assert_eq!(snap[1].detail["query"], "$top=10");
 }

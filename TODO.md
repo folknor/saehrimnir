@@ -4,27 +4,6 @@ Running task list, ordered by what ratatoskr is actively waiting on.
 Per-protocol design notes live alongside in `notes/`; this file just
 tracks what's next.
 
-## Test / admin control plane
-
-Tests-only routes on the JMAP HTTP listener, following the shape
-already set by `GET`/`DELETE /test/smtp/submissions`. Brokkr reuses
-a single mock across cohort cycles, so mutable fixtures need
-deterministic reset and inspection hooks.
-
-- `POST /test/fixture/reset` - reset all mutable state to the
-  fixture's initial snapshot (relevant once `[[change]]` scripts
-  or any persistent mutation lands; today the fixture is read-only
-  and IMAP `UID STORE` is a non-persistent no-op, so this is a
-  no-op stub until mutation exists).
-- `POST /test/fixture/step` - advance one scenario step (paired
-  with `[[change]]` script entries below).
-- `GET /test/requests` + `DELETE /test/requests` - inspect and
-  clear a per-process request log spanning all five protocols.
-  Useful for asserting "client did/did not call X" without each
-  test plumbing its own capture. Distinct from the SMTP
-  submissions log (which captures *parsed messages*, not request
-  envelopes).
-
 ## JMAP depth (incremental sync)
 
 - `Email/changes` and `Mailbox/changes`. Currently return

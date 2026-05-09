@@ -53,6 +53,7 @@ pub async fn serve(
     listener: TcpListener,
     fixture: Arc<Fixture>,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    request_log: Option<crate::request_log::RequestLog>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -68,9 +69,10 @@ pub async fn serve(
                     Ok((stream, peer)) => {
                         let fix = Arc::clone(&fixture);
                         let disp = dispatcher.clone();
+                        let log = request_log.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, fix, disp, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, fix, disp, log, &mut sd).await {
                                 eprintln!("saehrimnir: imap connection {peer}: {e}");
                             }
                         });
@@ -92,6 +94,7 @@ pub async fn serve_connection<S>(
     stream: S,
     fixture: Arc<Fixture>,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    request_log: Option<crate::request_log::RequestLog>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -104,6 +107,7 @@ where
         state: State::NotAuthenticated,
         fixture,
         dispatcher,
+        request_log,
         selected: None,
     };
 
@@ -133,6 +137,10 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     state: State,
     fixture: Arc<Fixture>,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    /// Optional cross-protocol request log. `None` for the unit
+    /// tests that don't care; `Some` for the production server and
+    /// any tests asserting on `/test/requests`.
+    request_log: Option<crate::request_log::RequestLog>,
     /// Fixture id of the currently selected mailbox, if any. Set by
     /// SELECT/EXAMINE, cleared on CLOSE/UNSELECT (which we don't yet
     /// handle).
@@ -203,6 +211,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         };
 
         let cmd_upper = parsed.command.to_ascii_uppercase();
+        if let Some(log) = &self.request_log {
+            // For UID FETCH / UID SEARCH / etc. we record the
+            // sub-command so test assertions can target the verb
+            // ratatoskr actually issued, not just "UID".
+            let recorded = if cmd_upper == "UID" {
+                let sub = parsed
+                    .args
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+                if sub.is_empty() {
+                    "UID".to_string()
+                } else {
+                    format!("UID {sub}")
+                }
+            } else {
+                cmd_upper.clone()
+            };
+            log.record(
+                "imap",
+                recorded,
+                serde_json::json!({ "tag": parsed.tag, "args": parsed.args }),
+            );
+        }
         match cmd_upper.as_str() {
             "CAPABILITY" => self.cmd_capability(parsed.tag).await,
             "NOOP" => self.cmd_noop(parsed.tag).await,
@@ -1884,7 +1917,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, &mut rx).await
+            serve_connection(server, fix, None, None, &mut rx).await
         });
 
         client.write_all(script).await.unwrap();
@@ -2605,7 +2638,7 @@ mod tests {
         let fix = fixture();
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, &mut rx).await
+            serve_connection(server, fix, None, None, &mut rx).await
         });
 
         // Read greeting first so the server is parked on the read.

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use saehrimnir::lua::MockExit;
+use saehrimnir::request_log::RequestLog;
 use saehrimnir::sentinel::ProtocolPort;
 use saehrimnir::{cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp, tls};
 use tokio::sync::watch;
@@ -93,10 +94,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // restart, otherwise grows for the life of the binary.
     let smtp_log = smtp::SubmissionLog::new();
 
+    // Cross-protocol request log. Cloned into every protocol layer
+    // so a single `GET /test/requests` snapshot covers everything.
+    let request_log = RequestLog::new();
+
     let app = routes::router(routes::AppState {
         fixture: Arc::clone(&fixture),
         dispatcher: dispatcher.clone(),
         submission_log: smtp_log.clone(),
+        request_log: request_log.clone(),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -121,8 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let imap_shutdown_rx = shutdown_rx.clone();
     let imap_fixture = Arc::clone(&fixture);
     let imap_dispatcher = dispatcher.clone();
+    let imap_request_log = Some(request_log.clone());
     let imap_task = tokio::spawn(async move {
-        imap::serve(imap_listener, imap_fixture, imap_dispatcher, imap_shutdown_rx).await
+        imap::serve(imap_listener, imap_fixture, imap_dispatcher, imap_request_log, imap_shutdown_rx).await
     });
 
     // SMTP server. The submission log is the same handle exposed to
@@ -138,12 +145,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    let smtp_request_log = Some(request_log.clone());
     let smtp_task = tokio::spawn(async move {
         smtp::serve(
             smtp_listener,
             smtp_log_clone,
             smtp_dispatcher,
             smtp_tls,
+            smtp_request_log,
             smtp_shutdown_rx,
         )
         .await
@@ -152,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph_app = graph::router(graph::AppState {
         fixture: Arc::clone(&fixture),
         dispatcher: dispatcher.clone(),
+        request_log: request_log.clone(),
     });
     let graph_shutdown_rx = shutdown_rx.clone();
     let graph_task = tokio::spawn(
@@ -171,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gmail_app = gmail::router(gmail::AppState {
         fixture: Arc::clone(&fixture),
         dispatcher: dispatcher.clone(),
+        request_log: request_log.clone(),
     });
     let gmail_shutdown_rx = shutdown_rx.clone();
     let gmail_task = tokio::spawn(

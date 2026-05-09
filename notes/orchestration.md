@@ -187,6 +187,50 @@ We do not write into the harness binary's artefact dir
 - **Byte-stable responses.** Same fixture in → same bytes out. A
   failure-triage tool should be able to diff two runs byte-for-byte.
 
+## Test / admin control plane
+
+Tests-only routes mounted on the JMAP HTTP listener (the JMAP port
+from the sentinel). Sæhrimnir is a test-only binary, so no auth or
+feature gate guards these. All routes are scoped under `/test/`.
+
+- `GET /test/smtp/submissions` - JSON array of captured SMTP
+  submissions (parsed projection, see
+  `notes/ratatoskr-smtp-surface.md`).
+- `DELETE /test/smtp/submissions` -> 204; clears the SMTP log.
+- `GET /test/requests` - JSON array of every protocol-level
+  dispatch event the binary has handled across all five protocols,
+  in arrival order. Each entry is `{ protocol, command,
+  received_at, detail }`:
+  - `protocol`: lowercase tag - `"jmap"` / `"imap"` / `"smtp"` /
+    `"graph"` / `"gmail"`.
+  - `command`: the protocol-native verb. JMAP method name (e.g.
+    `"Mailbox/get"`), IMAP keyword (`"CAPABILITY"`, `"UID FETCH"`
+    - `UID` sub-commands are recorded as `"UID <SUB>"`), SMTP verb
+    (`"EHLO"`, `"MAIL"`, ...), or for HTTP-based protocols the
+    request `METHOD path` with the query string stripped.
+  - `received_at`: wall-clock RFC3339 timestamp. The only
+    non-deterministic field saehrimnir emits anywhere; tests
+    asserting on byte-stable JSON should ignore it.
+  - `detail`: free-form JSON object with protocol-specific extras
+    (JMAP `call_id`, IMAP `tag` + `args`, SMTP `args`, HTTP
+    `query`).
+- `DELETE /test/requests` -> 204; clears the request log.
+- `POST /test/fixture/reset` -> 204; clears the SMTP submission
+  log AND the request log. The fixture itself is read-only in v0
+  (IMAP `UID STORE` is a non-persistent no-op), so reset is
+  currently equivalent to "clear both logs". When mutation lands
+  (`[[change]]` scripts, persistent UID STORE), the implementation
+  grows here without changing the route shape - harness scripts
+  can rely on the contract.
+- `POST /test/fixture/step` -> 501 with body
+  `{"error": "fixture step not implemented", "detail": "..."}`.
+  Reserved for `[[change]]` script entries (fixture-format growth,
+  see `TODO.md`); returns 501 today so harness scripts can detect
+  the gap rather than silently no-op.
+
+The request log is process-scoped: a fresh saehrimnir start is
+always an empty log.
+
 ## Things plan 3 hasn't decided yet
 
 - **Mock build orchestration in brokkr.** Plan 3 says "same model as

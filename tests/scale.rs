@@ -35,6 +35,7 @@ fn jmap_router() -> axum::Router {
         fixture: bulk_fixture(),
         dispatcher: None,
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -42,6 +43,7 @@ fn graph_router() -> axum::Router {
     graph::router(graph::AppState {
         fixture: bulk_fixture(),
         dispatcher: None,
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -49,6 +51,7 @@ fn gmail_router() -> axum::Router {
     gmail::router(gmail::AppState {
         fixture: bulk_fixture(),
         dispatcher: None,
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 

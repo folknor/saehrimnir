@@ -12,19 +12,22 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::Request,
+    extract::{Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
 };
 use serde_json::{Value, json};
 
 use crate::fixture::Fixture;
+use crate::request_log::RequestLog;
 
 #[derive(Clone)]
 pub struct AppState {
     pub fixture: Arc<Fixture>,
     pub dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    pub request_log: RequestLog,
 }
 
 /// Consult the Lua dispatcher for `("gmail", command)` and convert
@@ -51,7 +54,27 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(mail::router())
         .fallback(any(not_implemented))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            log_request,
+        ))
         .with_state(state)
+}
+
+/// Per-request middleware mirroring `graph::log_request`. Records
+/// `(method, path)` into the shared request log; the query string
+/// (Gmail's `?q=after:...&pageToken=...`) lands in `detail.query`
+/// so tests can assert on it without the path noise.
+async fn log_request(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
+    state.request_log.record(
+        "gmail",
+        format!("{method} {path}"),
+        json!({ "query": query }),
+    );
+    next.run(req).await
 }
 
 /// Gmail error envelope as documented at

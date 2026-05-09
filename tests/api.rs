@@ -23,6 +23,7 @@ fn router() -> axum::Router {
         fixture: Arc::new(fix),
         dispatcher: None,
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -226,6 +227,7 @@ fn attach_router() -> axum::Router {
         fixture: Arc::new(fix),
         dispatcher: None,
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -463,6 +465,7 @@ fn router_with_lua_scenario(scenario: &str) -> axum::Router {
         fixture: Arc::new(fixture),
         dispatcher: Some(Arc::new(dispatcher)),
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -659,6 +662,7 @@ fn router_with_smtp_log(log: saehrimnir::smtp::SubmissionLog) -> axum::Router {
         fixture: Arc::new(fix),
         dispatcher: None,
         submission_log: log,
+        request_log: saehrimnir::request_log::RequestLog::default(),
     })
 }
 
@@ -767,4 +771,144 @@ async fn test_smtp_submissions_delete_clears_log() {
     )
     .await;
     assert_eq!(v.as_array().unwrap().len(), 0);
+}
+
+// ── /test/requests + /test/fixture/{reset,step} ─────────────────────
+
+fn router_with_logs(
+    smtp_log: saehrimnir::smtp::SubmissionLog,
+    request_log: saehrimnir::request_log::RequestLog,
+) -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
+    routes::router(routes::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        submission_log: smtp_log,
+        request_log,
+    })
+}
+
+#[tokio::test]
+async fn jmap_method_calls_land_in_request_log() {
+    let request_log = saehrimnir::request_log::RequestLog::default();
+    let app = router_with_logs(
+        saehrimnir::smtp::SubmissionLog::default(),
+        request_log.clone(),
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/jmap/api")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [
+                    ["Mailbox/get", { "accountId": "account-1" }, "c0"],
+                    ["Email/query", { "accountId": "account-1" }, "c1"]
+                ]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // One entry per method call, in submission order.
+    let snap = request_log.snapshot();
+    assert_eq!(snap.len(), 2, "{snap:?}");
+    assert_eq!(snap[0].protocol, "jmap");
+    assert_eq!(snap[0].command, "Mailbox/get");
+    assert_eq!(snap[0].detail["call_id"], "c0");
+    assert_eq!(snap[1].command, "Email/query");
+    assert_eq!(snap[1].detail["call_id"], "c1");
+}
+
+#[tokio::test]
+async fn test_requests_get_returns_snapshot_and_delete_clears() {
+    let request_log = saehrimnir::request_log::RequestLog::default();
+    request_log.record("imap", "CAPABILITY", json!({"tag": "a1"}));
+    request_log.record("smtp", "EHLO", json!({"args": "client"}));
+
+    let app =
+        router_with_logs(saehrimnir::smtp::SubmissionLog::default(), request_log.clone());
+
+    // GET returns the array.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/test/requests")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["protocol"], "imap");
+    assert_eq!(arr[0]["command"], "CAPABILITY");
+    assert_eq!(arr[1]["protocol"], "smtp");
+
+    // DELETE clears.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/test/requests")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(request_log.is_empty());
+}
+
+#[tokio::test]
+async fn test_fixture_reset_clears_both_logs() {
+    let smtp_log = saehrimnir::smtp::SubmissionLog::default();
+    smtp_log.push(sample_submission("alice@example.com", 16));
+    let request_log = saehrimnir::request_log::RequestLog::default();
+    request_log.record("imap", "CAPABILITY", json!({}));
+
+    let app = router_with_logs(smtp_log.clone(), request_log.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/fixture/reset")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(smtp_log.snapshot().len(), 0);
+    assert!(request_log.is_empty());
+}
+
+#[tokio::test]
+async fn test_fixture_step_returns_501_until_change_scripts_land() {
+    let app = router_with_logs(
+        saehrimnir::smtp::SubmissionLog::default(),
+        saehrimnir::request_log::RequestLog::default(),
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/fixture/step")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let v = body_json(resp).await;
+    assert_eq!(v["error"], "fixture step not implemented");
+    assert!(v["detail"].as_str().unwrap().contains("[[change]]"));
 }

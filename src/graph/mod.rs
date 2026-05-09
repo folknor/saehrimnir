@@ -16,19 +16,22 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::Request,
+    extract::{Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
 };
 use serde_json::{Value, json};
 
 use crate::fixture::Fixture;
+use crate::request_log::RequestLog;
 
 #[derive(Clone)]
 pub struct AppState {
     pub fixture: Arc<Fixture>,
     pub dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    pub request_log: RequestLog,
 }
 
 /// Consult the Lua dispatcher for `("graph", command)` and convert
@@ -58,7 +61,28 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(mail::router())
         .fallback(any(not_implemented))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            log_request,
+        ))
         .with_state(state)
+}
+
+/// Per-request middleware that records `(method, path)` into the
+/// shared request log before the handler runs. Query strings are
+/// dropped so `?$top=10` and `?$top=20` collapse to the same entry
+/// for assertion purposes; tests that need the query string can
+/// look in `detail.query`.
+async fn log_request(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
+    state.request_log.record(
+        "graph",
+        format!("{method} {path}"),
+        json!({ "query": query }),
+    );
+    next.run(req).await
 }
 
 /// Graph error envelope, RFC 7807 / Microsoft Graph error format.

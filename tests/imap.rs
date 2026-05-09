@@ -18,7 +18,7 @@ async fn run_with_fixture(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, &mut rx).await
+        imap::serve_connection(server, fix, None, None, &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -151,7 +151,7 @@ async fn run_with_attach_fixture(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, &mut rx).await
+        imap::serve_connection(server, fix, None, None, &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -222,7 +222,7 @@ async fn run_with_lua_scenario(scenario: &str, imap_script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, dispatcher, &mut rx).await
+        imap::serve_connection(server, fix, dispatcher, None, &mut rx).await
     });
     client.write_all(imap_script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -372,7 +372,7 @@ async fn run_with_imap_small(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, &mut rx).await
+        imap::serve_connection(server, fix, None, None, &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -406,4 +406,51 @@ async fn imap_small_fixture_projects_seen_and_flagged() {
     assert!(out.contains("* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n"));
     assert!(out.contains("* 2 FETCH (UID 2 FLAGS (\\Flagged))\r\n"));
     assert!(out.contains("a4 OK UID FETCH completed\r\n"));
+}
+
+/// Each IMAP command appends a `(protocol="imap", command, detail)`
+/// entry to the shared request log. Verifies UID FETCH lands as
+/// `"UID FETCH"` rather than the raw `"UID"` verb so test assertions
+/// can target the sub-command ratatoskr actually issued.
+#[tokio::test]
+async fn imap_dispatch_records_request_log_entries() {
+    use saehrimnir::request_log::RequestLog;
+
+    let log = RequestLog::default();
+    let log_clone = log.clone();
+    let fix = Arc::new(
+        fixture::load(std::path::Path::new("fixtures/imap-small.toml")).unwrap(),
+    );
+
+    let (server, mut client) = tokio::io::duplex(32 * 1024);
+    let (_tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        imap::serve_connection(server, fix, None, Some(log_clone), &mut rx).await
+    });
+
+    let script = b"\
+        a1 CAPABILITY\r\n\
+        a2 LOGIN \"u\" \"p\"\r\n\
+        a3 SELECT \"INBOX\"\r\n\
+        a4 UID FETCH 1:* (UID)\r\n\
+        a5 LOGOUT\r\n";
+    client.write_all(script).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    let snapshot = log.snapshot();
+    let commands: Vec<&str> = snapshot
+        .iter()
+        .map(|e| {
+            assert_eq!(e.protocol, "imap");
+            e.command.as_str()
+        })
+        .collect();
+    assert_eq!(
+        commands,
+        ["CAPABILITY", "LOGIN", "SELECT", "UID FETCH", "LOGOUT"]
+    );
 }

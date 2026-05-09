@@ -17,6 +17,7 @@ pub mod graph;
 pub mod imap;
 pub mod jmap;
 pub mod lua;
+pub mod request_log;
 pub mod routes;
 pub mod scenario;
 pub mod sentinel;

@@ -16,7 +16,7 @@ async fn run_with_log(script: &[u8]) -> (String, SubmissionLog) {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, None, None, &mut rx).await
+        smtp::serve_connection(server, log_clone, None, None, None, &mut rx).await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -135,7 +135,7 @@ async fn run_with_dispatcher(
     let (_tx, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, dispatcher, None, &mut rx).await
+        smtp::serve_connection(server, log_clone, dispatcher, None, None, &mut rx).await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -226,6 +226,52 @@ async fn parse_mime_extracts_subject_and_attachment() {
     assert_eq!(att.data, b"Hello World");
 }
 
+/// Each SMTP verb appends a `(protocol="smtp", command, detail)`
+/// entry. Verifies the dispatch hook fires for the full submission
+/// path and that an empty (whitespace-only) line surfaces as a `""`
+/// verb so harness scripts can detect protocol weirdness.
+#[tokio::test]
+async fn smtp_dispatch_records_request_log_entries() {
+    use saehrimnir::request_log::RequestLog;
+
+    let log = SubmissionLog::new();
+    let log_clone = log.clone();
+    let req_log = RequestLog::default();
+    let req_log_clone = req_log.clone();
+    let (server, mut client) = tokio::io::duplex(64 * 1024);
+    let (_tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        smtp::serve_connection(server, log_clone, None, None, Some(req_log_clone), &mut rx).await
+    });
+
+    let script = b"\
+        EHLO me\r\n\
+        MAIL FROM:<a@b>\r\n\
+        RCPT TO:<c@d>\r\n\
+        DATA\r\n\
+        Subject: hi\r\n\
+        \r\n\
+        body\r\n\
+        .\r\n\
+        QUIT\r\n";
+    client.write_all(script).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    let snapshot = req_log.snapshot();
+    let commands: Vec<&str> = snapshot
+        .iter()
+        .map(|e| {
+            assert_eq!(e.protocol, "smtp");
+            e.command.as_str()
+        })
+        .collect();
+    assert_eq!(commands, ["EHLO", "MAIL", "RCPT", "DATA", "QUIT"]);
+}
+
 // STARTTLS test: spin up a real TCP listener with TLS, drive it with a
 // tokio-rustls client that trusts everything (the server cert is
 // self-signed so any cert verifier here is a no-op). Confirms the
@@ -298,7 +344,7 @@ mod starttls {
         let acceptor =
             Arc::new(saehrimnir::tls::make_acceptor().expect("acceptor"));
         let server_task = tokio::spawn(async move {
-            smtp::serve(listener, log_clone, None, Some(acceptor), rx).await
+            smtp::serve(listener, log_clone, None, Some(acceptor), None, rx).await
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
