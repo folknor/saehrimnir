@@ -34,12 +34,6 @@ the "Fix soon" backlog below.
   Arc<Fixture>) -> Self }` per module, returning fresh handles by
   default. Tests that need to drive a specific log clone the
   field after construction.
-- **[security] `base_url()` echoes the `Host` header into the
-  JMAP session resource.** `src/routes.rs::base_url`. A client
-  sending `Host: evil.com` causes the session to advertise
-  `apiUrl: http://evil.com/jmap/api`. Fix: derive the base from
-  the bound listen address (thread it through `AppState`) or
-  whitelist to loopback.
 - **[arch] `/test/fixture/{reset,step}` policy buried in
   doc-comments.** `reset_fixture` documents what it does and
   doesn't reset; `step_fixture` 501s with a `TODO.md` pointer. A
@@ -48,20 +42,6 @@ the "Fix soon" backlog below.
   with what each route must do once `[[change]]` lands and the
   expected response shapes; have the route-handler comments point
   at that section instead of being the source of truth.
-- **[arch] `RequestEntry.detail` key conventions undocumented.**
-  Each protocol's middleware/dispatch picks ad-hoc keys
-  (`call_id`, `query`, `tag`, `args`, `body`). Fix: add a
-  `notes/request-log.md` (or per-protocol surface-doc section)
-  listing the per-protocol detail-key contract.
-- **[bugs] `delta_events` first-call deviates from real Graph.**
-  Documented in `src/graph/calendar.rs::delta_events`. Fix:
-  paginate the initial dump with `@odata.nextLink` until
-  exhausted, then emit `@odata.deltaLink`.
-- **[security] `email` claim sources from `acct.name`, not an
-  `email` field.** Documented in
-  `src/oauth.rs::userinfo_endpoint`. Fix: validate that
-  `account.name` is email-shaped at load time, or add a separate
-  `account.email` field to the fixture format.
 - **[bugs] `received_at` makes `RequestEntry` JSON output
   non-byte-stable.** Documented in `src/request_log.rs`. Fix
   (when a test forces it): `#[serde(skip_serializing)]` behind

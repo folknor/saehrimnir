@@ -406,6 +406,21 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     if !raw.account.is_personal {
         return Err("account.is_personal must be true (v0 supports one personal account)".into());
     }
+    // OAuth's userinfo endpoint serves `account.name` verbatim as
+    // both the `email` and `name` claims. Reject non-email-shaped
+    // names at load time so a fixture can't ship a misleading
+    // `email` claim - cheaper to fail loud here than to chase
+    // down a downstream client confused by `email: "Display
+    // Name"`. The check is intentionally minimal (one `@`, non-
+    // empty local, dotted domain, no whitespace); fixtures that
+    // need richer mailbox-name semantics can grow a separate
+    // `account.email` field later.
+    if !is_email_shaped(&raw.account.name) {
+        return Err(format!(
+            "account.name must be email-shaped (got {:?}); the OAuth userinfo endpoint exposes it as the `email` claim",
+            raw.account.name
+        ));
+    }
 
     let mut mb_ids: HashMap<String, ()> = HashMap::new();
     for mb in &raw.mailboxes {
@@ -638,6 +653,24 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {
         .map_err(|e| format!("invalid RFC3339 timestamp {s:?}: {e}"))
 }
 
+/// Cheap email-shape check for `account.name`. Not RFC 5322
+/// compliant - we just want to catch the obvious "Display Name"
+/// mistake before a downstream OAuth client trips on it.
+/// Requires exactly one `@`, non-empty local and domain parts,
+/// and no whitespace anywhere. Domains without a dot are allowed
+/// (e.g. `user@localhost`) since fixtures sometimes use short
+/// hosts in tests.
+fn is_email_shaped(s: &str) -> bool {
+    if s.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = s.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !local.is_empty() && !domain.is_empty()
+}
+
 /// Walk parent_id chains starting from each mailbox; report any cycle.
 ///
 /// Each parent_id is already validated to exist by the caller, so the
@@ -726,6 +759,13 @@ mod tests {
         let s = MINIMAL.replace("is_personal = true", "is_personal = false");
         let err = parse(&s).unwrap_err();
         assert!(err.contains("is_personal"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_account_name_without_email_shape() {
+        let s = MINIMAL.replace(r#"name = "alice@example.com""#, r#"name = "Alice""#);
+        let err = parse(&s).unwrap_err();
+        assert!(err.contains("email-shaped"), "got: {err}");
     }
 
     #[test]

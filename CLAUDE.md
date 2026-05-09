@@ -30,6 +30,9 @@ resource modules), and `notes/` for the per-protocol surface docs.
   `/oauth/userinfo`, `/test/oauth/invalidate`) plus the
   fixture-side `[oauth]` block that gates bearer enforcement on
   the mail listeners.
+- `notes/request-log.md` - cross-protocol request log
+  (`/test/requests`): per-protocol command / detail-key
+  contract harness scripts can rely on.
 - `TODO.md` - what's left, per protocol.
 
 The notes are the source of truth. Do not refer to siblings

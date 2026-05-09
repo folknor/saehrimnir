@@ -189,6 +189,7 @@ async fn list_events(
 async fn delta_events(
     State(state): State<AppState>,
     Path(calendar): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     if let Some(o) = super::maybe_override(&state, "delta_events", |s| {
@@ -209,40 +210,97 @@ async fn delta_events(
     // that sends an empty token still hits the follow-up branch
     // (correct: any acknowledged token means "I've seen the
     // initial dump").
-    //
-    // Spec deviation (acknowledged 2026-05-09): real Graph
-    // paginates the initial dump with `@odata.nextLink` and only
-    // emits `@odata.deltaLink` on the final page. v0 doesn't
-    // paginate the initial dump at all and emits `deltaLink`
-    // immediately. Acceptable for current ratatoskr smokes; if a
-    // calendar grows past EVENTS_DEFAULT_TOP, add nextLink-style
-    // pagination to the initial branch (TODO.md "Fix soon").
     let q = odata::OdataQuery::parse(raw_query.as_deref());
-    let value: Vec<Value> = if q.deltatoken.is_some() {
-        // Follow-up call with a delta cursor; nothing has changed.
-        vec![]
-    } else {
-        state
-            .fixture
-            .events
-            .iter()
-            .filter(|e| e.calendar_id == calendar)
-            .map(|e| serialize_event(&state.fixture, e))
-            .collect()
-    };
-    // Byte-stable delta link: derives from `fixture.state` which
-    // is constant within a process lifetime.
-    let delta_link = format!(
-        "https://graph.microsoft.com/v1.0/me/calendars/{calendar}/calendarView/delta?$deltatoken=d.{}",
-        state.fixture.state
+    let host = host_or_default(&headers);
+    let path = format!("/v1.0/me/calendars/{calendar}/calendarView/delta");
+    let context = format!(
+        "https://graph.microsoft.com/v1.0/$metadata#me/calendars(\"{calendar}\")/calendarView"
     );
-    ok_json(json!({
-        "@odata.context": format!(
-            "https://graph.microsoft.com/v1.0/$metadata#me/calendars(\"{calendar}\")/calendarView"
-        ),
-        "value": value,
-        "@odata.deltaLink": delta_link,
-    }))
+
+    // The `$deltatoken=latest` shortcut: client wants a fresh
+    // delta link with no event dump (mirrors the messages/delta
+    // shape).
+    if q.deltatoken.as_deref() == Some("latest") {
+        let delta_link = odata::build_delta_link(&host, &path, raw_query.as_deref(), 1);
+        return ok_json(json!({
+            "@odata.context": context,
+            "value": [],
+            "@odata.deltaLink": delta_link,
+        }));
+    }
+
+    // Subsequent delta cycles. v0 fixtures are read-only, so
+    // nothing has changed - return empty + a re-issued delta
+    // link.
+    if q.deltatoken.is_some() {
+        let delta_link = odata::build_delta_link(&host, &path, raw_query.as_deref(), 1);
+        return ok_json(json!({
+            "@odata.context": context,
+            "value": [],
+            "@odata.deltaLink": delta_link,
+        }));
+    }
+
+    // Initial bootstrap: paginate the full event dump with
+    // `@odata.nextLink`; only on the final page emit
+    // `@odata.deltaLink`. Real Graph behaves the same way; v0
+    // previously short-circuited and emitted deltaLink on the
+    // first call regardless of size, which silently dropped
+    // pages off the wire for any calendar bigger than the
+    // default top.
+    let top = q.page_size(EVENTS_DEFAULT_TOP, EVENTS_MAX_TOP);
+    let offset = match q.offset() {
+        Some(o) => o,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidQueryParameter",
+                "$skiptoken did not decode - reset pagination by retrying without it",
+            );
+        }
+    };
+    let page: Vec<Value> = state
+        .fixture
+        .events
+        .iter()
+        .filter(|e| e.calendar_id == calendar)
+        .skip(offset as usize)
+        .take(top as usize)
+        .map(|e| serialize_event(&state.fixture, e))
+        .collect();
+    let next_offset_val = (offset as usize) + page.len();
+    let has_more = state
+        .fixture
+        .events
+        .iter()
+        .filter(|e| e.calendar_id == calendar)
+        .nth(next_offset_val)
+        .is_some();
+
+    let mut envelope = Map::new();
+    envelope.insert("@odata.context".to_string(), Value::String(context));
+    envelope.insert("value".to_string(), Value::Array(page));
+    if has_more {
+        let next_off = u32::try_from(next_offset_val).unwrap_or(u32::MAX);
+        envelope.insert(
+            "@odata.nextLink".to_string(),
+            Value::String(odata::build_next_link(&host, &path, raw_query.as_deref(), next_off)),
+        );
+    } else {
+        envelope.insert(
+            "@odata.deltaLink".to_string(),
+            Value::String(odata::build_delta_link(&host, &path, raw_query.as_deref(), 1)),
+        );
+    }
+    ok_json(Value::Object(envelope))
+}
+
+fn host_or_default(headers: &HeaderMap) -> String {
+    headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("graph.microsoft.com")
+        .to_string()
 }
 
 async fn get_event(

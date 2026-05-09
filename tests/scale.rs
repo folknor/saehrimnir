@@ -37,6 +37,7 @@ fn jmap_router() -> axum::Router {
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
         token_store: saehrimnir::oauth::TokenStore::default(),
+        base_url: "http://localhost".into(),
     })
 }
 

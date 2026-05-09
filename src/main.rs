@@ -104,12 +104,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same active set as `/oauth/token` minted into.
     let token_store = TokenStore::new();
 
+    // Base URL advertised in the JMAP session resource. Derived
+    // from the actually-bound JMAP socket so the apiUrl /
+    // downloadUrl / etc. point at this process; we do not trust
+    // the inbound Host header. main.rs binds 127.0.0.1, so the
+    // string ends up shaped like "http://127.0.0.1:NNNN".
+    let base_url = format!("http://{jmap_addr}");
     let app = routes::router(routes::AppState {
         fixture: Arc::clone(&fixture),
         dispatcher: dispatcher.clone(),
         submission_log: smtp_log.clone(),
         request_log: request_log.clone(),
         token_store: token_store.clone(),
+        base_url,
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

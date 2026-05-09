@@ -323,11 +323,10 @@ pub async fn userinfo_endpoint(
         return unauthorized("token is unknown or has been invalidated");
     }
 
-    // `email` and `name` both source from `account.name` because v0
-    // has no separate `account.email` field. Account `name` is
-    // documented as email-shaped in `notes/fixture-format.md`. If a
-    // fixture sets `name = "Display Name"` (non-email) the userinfo
-    // claim follows along; that's a fixture bug, not a wire bug.
+    // `email` and `name` both source from `account.name`. The
+    // fixture loader rejects non-email-shaped names at load time
+    // (`fixture::is_email_shaped`), so any fixture that survives
+    // to here is safe to expose as the `email` claim.
     let acct = &state.fixture.account;
     Json(json!({
         "sub": acct.id,

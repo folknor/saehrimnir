@@ -25,6 +25,7 @@ fn router() -> axum::Router {
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
         token_store: saehrimnir::oauth::TokenStore::default(),
+        base_url: "http://localhost".into(),
     })
 }
 
@@ -314,6 +315,7 @@ fn attach_router() -> axum::Router {
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
         token_store: saehrimnir::oauth::TokenStore::default(),
+        base_url: "http://localhost".into(),
     })
 }
 
@@ -553,6 +555,7 @@ fn router_with_lua_scenario(scenario: &str) -> axum::Router {
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
         token_store: saehrimnir::oauth::TokenStore::default(),
+        base_url: "http://localhost".into(),
     })
 }
 
@@ -751,6 +754,7 @@ fn router_with_smtp_log(log: saehrimnir::smtp::SubmissionLog) -> axum::Router {
         submission_log: log,
         request_log: saehrimnir::request_log::RequestLog::default(),
         token_store: saehrimnir::oauth::TokenStore::default(),
+        base_url: "http://localhost".into(),
     })
 }
 
@@ -874,6 +878,7 @@ fn router_with_logs(
         submission_log: smtp_log,
         request_log,
         token_store: saehrimnir::oauth::TokenStore::default(),
+        base_url: "http://localhost".into(),
     })
 }
 
@@ -1012,6 +1017,7 @@ fn router_with_token_store(store: saehrimnir::oauth::TokenStore) -> axum::Router
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
         token_store: store,
+        base_url: "http://localhost".into(),
     })
 }
 
@@ -1218,6 +1224,7 @@ fn router_with_enforce(store: saehrimnir::oauth::TokenStore) -> axum::Router {
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
         token_store: store,
+        base_url: "http://localhost".into(),
     })
 }
 

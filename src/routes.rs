@@ -43,6 +43,15 @@ pub struct AppState {
     /// consult it, `/test/oauth/invalidate` and
     /// `/test/fixture/reset` clear/remove from it.
     pub token_store: TokenStore,
+    /// Externally-visible base URL (`scheme://host[:port]`)
+    /// advertised in the JMAP session resource for `apiUrl` /
+    /// `downloadUrl` / `uploadUrl` / `eventSourceUrl`. Sourced
+    /// from the bound listener in `main.rs`; tests can pass
+    /// `"http://localhost".into()`. We deliberately do NOT
+    /// derive this from the inbound `Host` header - a client
+    /// sending `Host: evil.com` would otherwise rewrite every
+    /// advertised endpoint to point at an attacker-chosen host.
+    pub base_url: String,
 }
 
 /// Bearer-enforcement coverage on this router (verified
@@ -116,20 +125,6 @@ async fn root() -> &'static str {
     "saehrimnir\n"
 }
 
-/// Derive the externally-visible base URL (`scheme://host[:port]`) from
-/// the request `Host` header so the session resource can advertise
-/// absolute `apiUrl` / `downloadUrl` / `uploadUrl` / `eventSourceUrl`
-/// values, per RFC 8620 §2 (URL templates resolve against the session
-/// URL, but ratatoskr's client treats them as absolute). The JMAP
-/// listener is plain HTTP; no TLS termination in v0.
-fn base_url(headers: &HeaderMap) -> String {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-    format!("http://{host}")
-}
-
 /// Session resource per RFC 8620 §2.
 ///
 /// Capabilities are deliberately limited to `core` + `mail` (see
@@ -144,7 +139,7 @@ async fn session(
     let fixture = &state.fixture;
     let acct_id = &fixture.account.id;
     let acct_name = &fixture.account.name;
-    let base = base_url(&headers);
+    let base = state.base_url.as_str();
 
     let mut accounts = serde_json::Map::new();
     accounts.insert(
