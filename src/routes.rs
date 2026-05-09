@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -43,16 +43,31 @@ async fn root() -> &'static str {
     "saehrimnir\n"
 }
 
+/// Derive the externally-visible base URL (`scheme://host[:port]`) from
+/// the request `Host` header so the session resource can advertise
+/// absolute `apiUrl` / `downloadUrl` / `uploadUrl` / `eventSourceUrl`
+/// values, per RFC 8620 §2 (URL templates resolve against the session
+/// URL, but ratatoskr's client treats them as absolute). The JMAP
+/// listener is plain HTTP; no TLS termination in v0.
+fn base_url(headers: &HeaderMap) -> String {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    format!("http://{host}")
+}
+
 /// Session resource per RFC 8620 §2.
 ///
 /// Capabilities are deliberately limited to `core` + `mail` (see
 /// `notes/ratatoskr-jmap-surface.md` - advertising `principals`
 /// pulls the client into `Principal/get` and `ShareNotification`
 /// paths the mock can't satisfy in v0).
-async fn session(State(state): State<AppState>) -> Json<Value> {
+async fn session(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
     let fixture = &state.fixture;
     let acct_id = &fixture.account.id;
     let acct_name = &fixture.account.name;
+    let base = base_url(&headers);
 
     let mut accounts = serde_json::Map::new();
     accounts.insert(
@@ -94,10 +109,10 @@ async fn session(State(state): State<AppState>) -> Json<Value> {
         "accounts": accounts,
         "primaryAccounts": primary,
         "username": acct_name,
-        "apiUrl": "/jmap/api",
-        "downloadUrl": "/jmap/download/{accountId}/{blobId}/{name}?accept={type}",
-        "uploadUrl": "/jmap/upload/{accountId}",
-        "eventSourceUrl": "/jmap/eventsource/?types={types}&closeafter={closeafter}&ping={ping}",
+        "apiUrl": format!("{base}/jmap/api"),
+        "downloadUrl": format!("{base}/jmap/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}"),
+        "uploadUrl": format!("{base}/jmap/upload/{{accountId}}"),
+        "eventSourceUrl": format!("{base}/jmap/eventsource/?types={{types}}&closeafter={{closeafter}}&ping={{ping}}"),
         "state": fixture.state
     }))
 }
