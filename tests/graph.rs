@@ -609,9 +609,15 @@ async fn graph_create_event_echoes_body_and_logs_request() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(v["id"], "mock-event-create");
+    // POST now mutates the fixture: response is the freshly created
+    // event projected via `serialize_event`. Server id is
+    // `mock-event-N` where N counts existing events at create time
+    // (the small calendar fixture has two events, so the new event
+    // is mock-event-3).
+    assert_eq!(v["id"], "mock-event-3");
     assert_eq!(v["calendarId"], "cal-work");
-    assert_eq!(v["echoedRequest"]["subject"], "New meeting");
+    assert_eq!(v["subject"], "New meeting");
+    assert_eq!(v["start"]["dateTime"], "2026-03-01T10:00:00Z");
 
     // The detail-bearing entry is the handler-emitted one (the
     // middleware also records a path-level entry without the body).
@@ -636,9 +642,11 @@ async fn graph_patch_event_echoes_body_and_logs_request() {
     let body = serde_json::json!({ "subject": "Renamed" });
     let (status, v) = json_request(app, "PATCH", "/v1.0/me/events/ev-001", Some(body)).await;
     assert_eq!(status, StatusCode::OK);
+    // PATCH now mutates the fixture: response is the post-patch
+    // event projected via `serialize_event`.
     assert_eq!(v["id"], "ev-001");
     assert_eq!(v["calendarId"], "cal-work");
-    assert_eq!(v["echoedRequest"]["subject"], "Renamed");
+    assert_eq!(v["subject"], "Renamed");
 
     let snap = log.snapshot();
     let entry = snap
@@ -727,3 +735,120 @@ async fn graph_delete_event_404s_unknown_id() {
     assert!(!snap.iter().any(|e| e.command.starts_with("DELETE /v1.0/me/events/")
         && !e.detail["id"].is_null()));
 }
+
+// ── Calendar mutation round-trip through events/delta ──────────────
+
+/// Create + patch + delete events, then verify each shows up in the
+/// next `calendarView/delta` cycle. Proves the mutation surface
+/// actually persists into the change log and round-trips through
+/// the Graph delta endpoint - closes the M6.10 audit gap on item 3.
+#[tokio::test]
+async fn graph_calendar_mutations_round_trip_through_delta() {
+    // Pin one router so every request hits the same fixture handle.
+    let app = calendar_router();
+
+    // Initial bootstrap: capture the `@odata.deltaLink` so the
+    // follow-up call can prove "since this state, here's what
+    // changed".
+    let (_, v) = get_json_with(
+        app.clone(),
+        "/v1.0/me/calendars/cal-work/calendarView/delta",
+    )
+    .await;
+    let initial_delta_link = v["@odata.deltaLink"].as_str().unwrap().to_string();
+    let initial_events = v["value"].as_array().unwrap().len();
+
+    // 1. Create a new event.
+    let create_body = serde_json::json!({
+        "subject": "Round-trip event",
+        "start": { "dateTime": "2026-04-01T09:00:00Z", "timeZone": "UTC" },
+        "end":   { "dateTime": "2026-04-01T10:00:00Z", "timeZone": "UTC" },
+    });
+    let (status, v) = json_request(
+        app.clone(),
+        "POST",
+        "/v1.0/me/calendars/cal-work/events",
+        Some(create_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created_id = v["id"].as_str().unwrap().to_string();
+
+    // 2. Patch one of the seeded events.
+    let (status, _) = json_request(
+        app.clone(),
+        "PATCH",
+        "/v1.0/me/events/ev-001",
+        Some(serde_json::json!({ "subject": "Renamed in round-trip" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 3. Delete another seeded event.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1.0/me/events/ev-002")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // 4. Follow-up delta against the original deltaLink. Should
+    // contain: the new event (full body), the patched event (full
+    // body with new subject), and a tombstone for the deleted event.
+    let path_with_token = initial_delta_link
+        .split_once("/v1.0/")
+        .map(|(_, s)| format!("/v1.0/{s}"))
+        .expect("deltaLink starts with /v1.0/");
+    let (status, v) = get_json_with(app.clone(), &path_with_token).await;
+    assert_eq!(status, StatusCode::OK);
+    let value = v["value"].as_array().unwrap();
+    assert_eq!(value.len(), 3, "expected created+updated+destroyed: {value:?}");
+
+    // The created event projects with its full body.
+    let created_in_delta = value
+        .iter()
+        .find(|e| e["id"] == serde_json::Value::String(created_id.clone()))
+        .expect("created event missing from delta");
+    assert_eq!(created_in_delta["subject"], "Round-trip event");
+
+    // The patched event projects with its updated subject.
+    let patched_in_delta = value
+        .iter()
+        .find(|e| e["id"] == "ev-001")
+        .expect("patched event missing from delta");
+    assert_eq!(patched_in_delta["subject"], "Renamed in round-trip");
+
+    // The deleted event appears as a Graph-style tombstone.
+    let deleted_in_delta = value
+        .iter()
+        .find(|e| e["id"] == "ev-002")
+        .expect("deleted event missing from delta");
+    assert_eq!(deleted_in_delta["@removed"]["reason"], "deleted");
+
+    // The fresh deltaLink in this response carries the post-mutation
+    // state, so a second follow-up returns empty.
+    let new_delta_link = v["@odata.deltaLink"].as_str().unwrap().to_string();
+    let path_with_new_token = new_delta_link
+        .split_once("/v1.0/")
+        .map(|(_, s)| format!("/v1.0/{s}"))
+        .expect("deltaLink starts with /v1.0/");
+    let (_, v2) = get_json_with(app.clone(), &path_with_new_token).await;
+    assert_eq!(v2["value"].as_array().unwrap().len(), 0);
+
+    // Sanity: the initial bootstrap had two events; current cal-work
+    // event count is 2 (one created + one survivor after delete).
+    let (_, v3) = get_json_with(
+        app,
+        "/v1.0/me/calendars/cal-work/events",
+    )
+    .await;
+    assert_eq!(v3["value"].as_array().unwrap().len(), 2);
+    let _ = initial_events; // documenting the pre-state was 2 too.
+}
+

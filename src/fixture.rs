@@ -72,6 +72,9 @@ pub struct Transition {
     pub mailbox_created: Vec<String>,
     pub mailbox_updated: Vec<String>,
     pub mailbox_destroyed: Vec<String>,
+    pub event_created: Vec<String>,
+    pub event_updated: Vec<String>,
+    pub event_destroyed: Vec<String>,
 }
 
 /// Resource-id deltas a single mutator pass produced. Returned by the
@@ -86,6 +89,9 @@ pub struct MutationDiff {
     pub mailbox_created: Vec<String>,
     pub mailbox_updated: Vec<String>,
     pub mailbox_destroyed: Vec<String>,
+    pub event_created: Vec<String>,
+    pub event_updated: Vec<String>,
+    pub event_destroyed: Vec<String>,
 }
 
 impl MutationDiff {
@@ -96,6 +102,9 @@ impl MutationDiff {
             && self.mailbox_created.is_empty()
             && self.mailbox_updated.is_empty()
             && self.mailbox_destroyed.is_empty()
+            && self.event_created.is_empty()
+            && self.event_updated.is_empty()
+            && self.event_destroyed.is_empty()
     }
 }
 
@@ -158,6 +167,9 @@ impl Fixture {
                 mailbox_created: vec![],
                 mailbox_updated: vec![],
                 mailbox_destroyed: vec![],
+                event_created: vec![],
+                event_updated: vec![],
+                event_destroyed: vec![],
             };
         }
         self.change_log.counter += 1;
@@ -172,6 +184,9 @@ impl Fixture {
             mailbox_created: diff.mailbox_created,
             mailbox_updated: diff.mailbox_updated,
             mailbox_destroyed: diff.mailbox_destroyed,
+            event_created: diff.event_created,
+            event_updated: diff.event_updated,
+            event_destroyed: diff.event_destroyed,
         };
         if self.change_log.transitions.len() >= ChangeLog::MAX_TRANSITIONS {
             self.change_log.transitions.pop_front();
@@ -208,6 +223,19 @@ impl Fixture {
                 &t.mailbox_updated,
                 &t.mailbox_destroyed,
             )
+        })
+    }
+
+    /// Event-side analogue of [`email_delta_since`]. Drives the
+    /// Microsoft Graph `calendarView/delta` and `events/delta`
+    /// surfaces: a follow-up call with a known `$deltatoken` returns
+    /// only the events that changed since that token, plus a fresh
+    /// deltaLink. Tokens older than the seed (or evicted from the
+    /// bounded ring) return `None`; the Graph layer converts that to
+    /// a full re-bootstrap.
+    pub fn event_delta_since(&self, since: &str) -> Option<DeltaSet> {
+        self.delta_since(since, |t| {
+            (&t.event_created, &t.event_updated, &t.event_destroyed)
         })
     }
 
@@ -902,7 +930,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     })
 }
 
-fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {
+pub fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| format!("invalid RFC3339 timestamp {s:?}: {e}"))

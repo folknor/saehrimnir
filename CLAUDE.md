@@ -242,11 +242,16 @@ messages/delta` (initial dump, follow-up no-op, `$deltatoken=latest`
 shortcut). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
 alias + events list with `$top`/`$skiptoken` pagination + delta
 view), `/v1.0/me/events/{id}` GET / PATCH / DELETE, plus
-`POST /v1.0/me/calendars/{id}/events`. Mutating endpoints echo
-their parsed body into the response and append the body to the
-request log; the fixture itself stays read-only. Catchall returns
-the Graph error envelope so unimplemented resources are visibly
-out-of-scope. Sibling files for contacts / drive / groups / EWS
+`POST /v1.0/me/calendars/{id}/events`. Calendar mutations are
+persistent: POST/PATCH/DELETE on `/v1.0/me/events` mutate the
+shared fixture, bump `Fixture::state`, and record `event_created`
+/ `event_updated` / `event_destroyed` in the change log. The next
+`calendarView/delta` (or `events/delta`) walks the log between
+the client-supplied `$deltatoken` and the current state, returning
+created/updated events as full bodies and destroyed events as
+Graph tombstones (`{ id, "@removed": { reason: "deleted" } }`).
+Catchall returns the Graph error envelope so unimplemented
+resources are visibly out-of-scope. Sibling files for contacts / drive / groups / EWS
 drop in later.
 
 Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`

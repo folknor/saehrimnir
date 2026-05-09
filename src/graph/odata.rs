@@ -131,10 +131,22 @@ fn decode_skiptoken(token: &str) -> Option<u32> {
     token.strip_prefix("s.")?.parse().ok()
 }
 
-/// Encode a delta-state cursor. With a read-only fixture v0 always
-/// uses state `1`; the value just needs to round-trip stably.
-pub fn encode_deltatoken(state: u64) -> String {
+/// Encode a delta-state cursor. The cursor wraps the fixture's
+/// current state token (`Fixture::state`) so a follow-up call can
+/// reconstruct the from-state for a delta walk. The fixture state
+/// strings we emit are alphanumeric + `.` only (`<seed>` or
+/// `<seed>.<n>`), so no URL-escaping is required for the values
+/// we actually mint.
+pub fn encode_deltatoken(state: &str) -> String {
     format!("d.{state}")
+}
+
+/// Inverse of [`encode_deltatoken`]. Returns the raw fixture-state
+/// string the caller previously serialised. Returns `None` when the
+/// token does not carry the `d.` prefix (treat as unknown -> full
+/// re-bootstrap on Graph, `cannotCalculateChanges` on JMAP).
+pub fn decode_deltatoken(token: &str) -> Option<&str> {
+    token.strip_prefix("d.")
 }
 
 /// Build an `@odata.nextLink` absolute URL by re-using the request's
@@ -158,7 +170,7 @@ pub fn build_next_link(host: &str, path: &str, raw_query: Option<&str>, offset: 
 /// resource path with `$deltatoken` set; `$skiptoken` and `$skip`
 /// are stripped because the deltaLink stands on its own for the
 /// next cycle.
-pub fn build_delta_link(host: &str, path: &str, raw_query: Option<&str>, state: u64) -> String {
+pub fn build_delta_link(host: &str, path: &str, raw_query: Option<&str>, state: &str) -> String {
     let mut pairs = match raw_query {
         Some(s) => parse_query_pairs(s),
         None => Vec::new(),
@@ -303,7 +315,7 @@ mod tests {
             "h",
             "/v1.0/me/mailFolders/x/messages/delta",
             Some("$skip=10&$skiptoken=abc&$top=50"),
-            1,
+            "fixture-state",
         );
         assert!(dl.contains("$top=50"));
         assert!(dl.contains("$deltatoken="));

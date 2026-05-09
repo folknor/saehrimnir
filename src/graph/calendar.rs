@@ -46,7 +46,7 @@ use chrono::SecondsFormat;
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, odata, ok_json};
-use crate::fixture::{Calendar, Event, Fixture};
+use crate::fixture::{Address, Calendar, Event, Fixture, MutationDiff};
 
 const EVENTS_DEFAULT_TOP: u32 = 50;
 const EVENTS_MAX_TOP: u32 = 256;
@@ -220,9 +220,12 @@ async fn delta_events(
 
     // The `$deltatoken=latest` shortcut: client wants a fresh
     // delta link with no event dump (mirrors the messages/delta
-    // shape).
+    // shape). The token returned is the *current* fixture state
+    // so the next follow-up walks no transitions if nothing
+    // changes.
     if q.deltatoken.as_deref() == Some("latest") {
-        let delta_link = odata::build_delta_link(&host, &path, raw_query.as_deref(), 1);
+        let delta_link =
+            odata::build_delta_link(&host, &path, raw_query.as_deref(), &fixture.state);
         return ok_json(json!({
             "@odata.context": context,
             "value": [],
@@ -230,16 +233,39 @@ async fn delta_events(
         }));
     }
 
-    // Subsequent delta cycles. v0 fixtures are read-only, so
-    // nothing has changed - return empty + a re-issued delta
-    // link.
-    if q.deltatoken.is_some() {
-        let delta_link = odata::build_delta_link(&host, &path, raw_query.as_deref(), 1);
-        return ok_json(json!({
-            "@odata.context": context,
-            "value": [],
-            "@odata.deltaLink": delta_link,
-        }));
+    // Subsequent delta cycles: walk the fixture change log between
+    // the client-supplied token and the current state. Created /
+    // updated events project as `serialize_event`; destroyed events
+    // are emitted as Graph deletion stubs (id + `@removed.reason =
+    // "deleted"`). An unknown / evicted token falls back to a fresh
+    // bootstrap (returns the full event list); real Graph signals
+    // 410 Gone for this case but a re-bootstrap is the closest
+    // single-shot equivalent v0 can provide.
+    if let Some(token) = q.deltatoken.as_deref() {
+        let raw = odata::decode_deltatoken(token).unwrap_or("");
+        if let Some(delta) = fixture.event_delta_since(raw) {
+            let mut value: Vec<Value> = Vec::new();
+            for id in delta.created.iter().chain(delta.updated.iter()) {
+                if let Some(e) = fixture
+                    .events
+                    .iter()
+                    .find(|e| &e.id == id && e.calendar_id == calendar)
+                {
+                    value.push(serialize_event(&fixture, e));
+                }
+            }
+            for id in &delta.destroyed {
+                value.push(graph_event_tombstone(id));
+            }
+            let delta_link =
+                odata::build_delta_link(&host, &path, raw_query.as_deref(), &fixture.state);
+            return ok_json(json!({
+                "@odata.context": context,
+                "value": value,
+                "@odata.deltaLink": delta_link,
+            }));
+        }
+        // Token unknown / evicted: fall through to full bootstrap.
     }
 
     // Initial bootstrap: paginate the full event dump with
@@ -288,10 +314,26 @@ async fn delta_events(
     } else {
         envelope.insert(
             "@odata.deltaLink".to_string(),
-            Value::String(odata::build_delta_link(&host, &path, raw_query.as_deref(), 1)),
+            Value::String(odata::build_delta_link(
+                &host,
+                &path,
+                raw_query.as_deref(),
+                &fixture.state,
+            )),
         );
     }
     ok_json(Value::Object(envelope))
+}
+
+/// Graph-style deletion stub for `events/delta`. Real Graph emits
+/// `{"id": "...", "@removed": { "reason": "deleted" }}` for events
+/// that disappeared between two delta cycles. v0 follows the same
+/// shape so client deletion handlers light up the same code path.
+fn graph_event_tombstone(id: &str) -> Value {
+    json!({
+        "id": id,
+        "@removed": { "reason": "deleted" },
+    })
 }
 
 fn host_or_default(headers: &HeaderMap) -> String {
@@ -363,8 +405,43 @@ async fn create_event(
         format!("POST /v1.0/me/calendars/{calendar}/events"),
         json!({ "body": parsed }),
     );
-    let echoed = mutation_echo(&calendar, "mock-event-create", &parsed);
-    (StatusCode::CREATED, axum::Json(echoed)).into_response()
+
+    // Mutate the fixture under a write guard. The closure resolves
+    // `calendar` against the *current* event count to assign a
+    // deterministic `mock-event-N` id, then appends the new event.
+    let result: Result<Value, Response> = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        let calendar_id = match resolve_calendar(&fix, &calendar) {
+            Some(c) => c.id.clone(),
+            None => {
+                // Calendar disappeared between the read-guard probe
+                // and the write-guard acquisition. Treat as 404.
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "ResourceNotFound",
+                    &format!("calendar {calendar:?} not declared in fixture"),
+                );
+            }
+        };
+        let event = match build_event_from_create(&fix, &calendar_id, &parsed) {
+            Ok(e) => e,
+            Err(resp) => return *resp,
+        };
+        let server_id = event.id.clone();
+        let event_for_serialize = event.clone();
+        let _ = fix.mutate(|f| {
+            f.events.push(event);
+            MutationDiff {
+                event_created: vec![server_id.clone()],
+                ..Default::default()
+            }
+        });
+        Ok(serialize_event(&fix, &event_for_serialize))
+    };
+    match result {
+        Ok(v) => (StatusCode::CREATED, axum::Json(v)).into_response(),
+        Err(resp) => resp,
+    }
 }
 
 async fn patch_event(
@@ -372,20 +449,17 @@ async fn patch_event(
     Path(event): Path<String>,
     body: AxumBody,
 ) -> Response {
-    let calendar_id = {
+    let event_known = {
         let fixture = state.fixture();
-        match fixture.events.iter().find(|e| e.id == event) {
-            Some(e) => e.calendar_id.clone(),
-            None => {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    "ResourceNotFound",
-                    &format!("event {event:?} not declared in fixture"),
-                );
-            }
-        }
+        fixture.events.iter().any(|e| e.id == event)
     };
-    // Read guard dropped before the await on the request body.
+    if !event_known {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("event {event:?} not declared in fixture"),
+        );
+    }
     let parsed = match parse_json_body(body).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -395,8 +469,38 @@ async fn patch_event(
         format!("PATCH /v1.0/me/events/{event}"),
         json!({ "body": parsed }),
     );
-    let echoed = mutation_echo(&calendar_id, &event, &parsed);
-    ok_json(echoed)
+
+    let result: Result<Value, Response> = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        let idx = match fix.events.iter().position(|e| e.id == event) {
+            Some(i) => i,
+            None => {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "ResourceNotFound",
+                    &format!("event {event:?} not declared in fixture"),
+                );
+            }
+        };
+        let mut clone = fix.events[idx].clone();
+        if let Err(resp) = apply_event_patch(&mut clone, &parsed) {
+            return *resp;
+        }
+        let updated_id = clone.id.clone();
+        let view = clone.clone();
+        let _ = fix.mutate(|f| {
+            f.events[idx] = clone;
+            MutationDiff {
+                event_updated: vec![updated_id.clone()],
+                ..Default::default()
+            }
+        });
+        Ok(serialize_event(&fix, &view))
+    };
+    match result {
+        Ok(v) => ok_json(v),
+        Err(resp) => resp,
+    }
 }
 
 async fn delete_event(
@@ -419,7 +523,186 @@ async fn delete_event(
         format!("DELETE /v1.0/me/events/{event}"),
         json!({ "id": event }),
     );
+
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        let event_id = event.clone();
+        let _ = fix.mutate(|f| {
+            let len_before = f.events.len();
+            f.events.retain(|e| e.id != event_id);
+            if f.events.len() < len_before {
+                MutationDiff {
+                    event_destroyed: vec![event_id.clone()],
+                    ..Default::default()
+                }
+            } else {
+                MutationDiff::default()
+            }
+        });
+    }
     StatusCode::NO_CONTENT.into_response()
+}
+
+// ── Mutation helpers ────────────────────────────────────────────────
+
+fn build_event_from_create(
+    fix: &Fixture,
+    calendar_id: &str,
+    body: &Value,
+) -> Result<Event, Box<Response>> {
+    let obj = body.as_object().ok_or_else(|| {
+        Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "create body must be a JSON object",
+        ))
+    })?;
+    let subject = obj
+        .get("subject")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let start = parse_graph_datetime(obj.get("start")).ok_or_else(|| {
+        Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "missing or malformed start.dateTime",
+        ))
+    })?;
+    let end = parse_graph_datetime(obj.get("end")).ok_or_else(|| {
+        Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "missing or malformed end.dateTime",
+        ))
+    })?;
+    let body_text = obj
+        .get("body")
+        .and_then(|v| v.get("content"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let location = obj
+        .get("location")
+        .and_then(|v| v.get("displayName"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let is_all_day = obj
+        .get("isAllDay")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let attendees = obj
+        .get("attendees")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(parse_graph_attendee).collect())
+        .unwrap_or_default();
+    let id = format!("mock-event-{}", fix.events.len() + 1);
+    Ok(Event {
+        id,
+        calendar_id: calendar_id.to_string(),
+        subject,
+        body_preview: None,
+        body_text,
+        start,
+        end,
+        location,
+        organizer: None,
+        attendees,
+        is_all_day,
+    })
+}
+
+fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response>> {
+    let obj = body.as_object().ok_or_else(|| {
+        Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "patch body must be a JSON object",
+        ))
+    })?;
+    for (k, v) in obj {
+        match k.as_str() {
+            "subject" => {
+                event.subject = v.as_str().unwrap_or("").to_string();
+            }
+            "start" => {
+                event.start = parse_graph_datetime(Some(v)).ok_or_else(|| {
+                    Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "BadRequest",
+                        "malformed start.dateTime in patch",
+                    ))
+                })?;
+            }
+            "end" => {
+                event.end = parse_graph_datetime(Some(v)).ok_or_else(|| {
+                    Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "BadRequest",
+                        "malformed end.dateTime in patch",
+                    ))
+                })?;
+            }
+            "body" => {
+                event.body_text = v
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            "location" => {
+                event.location = v
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            "isAllDay" => {
+                event.is_all_day = v.as_bool().unwrap_or(false);
+            }
+            "attendees" => {
+                event.attendees = v
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(parse_graph_attendee).collect())
+                    .unwrap_or_default();
+            }
+            _ => {
+                // Quietly ignore properties v0 doesn't model. Real
+                // Graph clients send a lot of fields we don't echo
+                // back (importance, sensitivity, ...); rejecting any
+                // unknown key would break harmless pass-throughs.
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_graph_datetime(v: Option<&Value>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = v?.get("dateTime")?.as_str()?;
+    // Graph timestamps drop the timezone offset (`2026-01-15T10:00:00.0000000`)
+    // and stash the zone in a sibling `timeZone` field. RFC 3339 needs a
+    // suffix; append `Z` if missing so `parse_ts` accepts it. v0 only
+    // honours UTC since the fixture has no tz database.
+    let normalised = if s.ends_with('Z') || s.contains('+') || s.contains('-') {
+        s.to_string()
+    } else {
+        format!("{s}Z")
+    };
+    crate::fixture::parse_ts(&normalised).ok()
+}
+
+fn parse_graph_attendee(v: &Value) -> Option<Address> {
+    let email = v
+        .get("emailAddress")
+        .and_then(|e| e.get("address"))
+        .and_then(Value::as_str)?;
+    let name = v
+        .get("emailAddress")
+        .and_then(|e| e.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|n| !n.is_empty());
+    Some(Address {
+        email: email.to_string(),
+        name,
+    })
 }
 
 async fn parse_json_body(body: AxumBody) -> Result<Value, Response> {
@@ -442,21 +725,6 @@ async fn parse_json_body(body: AxumBody) -> Result<Value, Response> {
             "InvalidRequest",
             &format!("body is not JSON: {e}"),
         )
-    })
-}
-
-/// Build a Graph-shaped event body around the request payload. The
-/// id is fixed (`mock-event-create` for POST, the path id for
-/// PATCH) so tests can match without parsing nondeterministic
-/// values.
-fn mutation_echo(calendar_id: &str, id: &str, body: &Value) -> Value {
-    json!({
-        "@odata.context": format!(
-            "https://graph.microsoft.com/v1.0/$metadata#me/calendars(\"{calendar_id}\")/events/$entity"
-        ),
-        "id": id,
-        "calendarId": calendar_id,
-        "echoedRequest": body,
     })
 }
 

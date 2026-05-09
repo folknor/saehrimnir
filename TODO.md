@@ -51,13 +51,21 @@ trio.
   `uid_expunge_drops_only_deleted_flagged_messages`,
   `uid_expunge_without_deleted_flag_is_noop`). Surface documented
   in `notes/ratatoskr-imap-surface.md`.
-- **[graph] Calendar mutations surface in delta.** `POST` /
-  `PATCH` / `DELETE /v1.0/me/events` exist
-  (`src/graph/calendar.rs:60,68,344,390,397`) and echo bodies into
-  the request log, but the fixture stays read-only - the next
-  `events/delta` doesn't reflect the mutation. Lift the read-only
-  invariant for calendar so M6.10's create/update/delete coverage
-  can land.
+- **[graph] Calendar mutations surface in delta.** Landed.
+  `POST /v1.0/me/calendars/{id}/events`, `PATCH /v1.0/me/events/
+  {id}`, and `DELETE /v1.0/me/events/{id}` now mutate the shared
+  fixture under a write guard. The change log gained
+  `event_created` / `event_updated` / `event_destroyed` id sets;
+  `calendarView/delta` walks them between the client-supplied
+  `$deltatoken` and the current state. Created and updated events
+  project as full bodies; destroyed events emit Graph-shaped
+  tombstones (`{ id, "@removed": { reason: "deleted" } }`).
+  Unknown / evicted token falls back to a fresh bootstrap.
+  Asserted end-to-end in `tests/graph.rs::
+  graph_calendar_mutations_round_trip_through_delta` (create +
+  patch + delete in one envelope, then a follow-up delta returns
+  all three changes plus a deltaLink that shows empty on the next
+  call).
 
 ### Request-log granularity (landed)
 

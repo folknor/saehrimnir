@@ -298,7 +298,7 @@ async fn delta_messages(
             "https://graph.microsoft.com/v1.0/$metadata#message",
             vec![],
             None,
-            Some(odata::build_delta_link(&host, &path, raw.as_deref(), 1)),
+            Some(odata::build_delta_link(&host, &path, raw.as_deref(), &fixture.state)),
             None,
         ));
     }
@@ -311,7 +311,7 @@ async fn delta_messages(
             "https://graph.microsoft.com/v1.0/$metadata#message",
             vec![],
             None,
-            Some(odata::build_delta_link(&host, &path, raw.as_deref(), 1)),
+            Some(odata::build_delta_link(&host, &path, raw.as_deref(), &fixture.state)),
             None,
         ));
     }
@@ -345,7 +345,7 @@ async fn delta_messages(
         ),
         None => (
             None,
-            Some(odata::build_delta_link(&host, &path, raw.as_deref(), 1)),
+            Some(odata::build_delta_link(&host, &path, raw.as_deref(), &fixture.state)),
         ),
     };
 
