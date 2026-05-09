@@ -394,13 +394,20 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
 #[derive(Default)]
 struct Filter {
     after: Option<i64>,
+    before: Option<i64>,
     in_mailbox: Option<String>,
 }
 
 impl Filter {
     fn matches(&self, e: &crate::fixture::Email) -> bool {
-        if let Some(ts) = self.after
-            && e.received_at.timestamp() < ts
+        let ts = e.received_at.timestamp();
+        if let Some(a) = self.after
+            && ts < a
+        {
+            return false;
+        }
+        if let Some(b) = self.before
+            && ts >= b
         {
             return false;
         }
@@ -411,6 +418,33 @@ impl Filter {
         }
         true
     }
+}
+
+/// Accept either an integer (unix seconds, legacy) or a JMAP `UTCDate`
+/// string (RFC3339, e.g. `"2026-01-15T11:00:00Z"`). Per RFC 8621
+/// §4.4.1 `after`/`before` are `UTCDate`; ratatoskr's notes still
+/// describe an integer, so both shapes are accepted.
+fn parse_utc_date(field: &str, val: &Value) -> Result<i64, Value> {
+    if let Some(i) = val.as_i64() {
+        return Ok(i);
+    }
+    if let Some(s) = val.as_str() {
+        let parsed = chrono::DateTime::parse_from_rfc3339(s).map_err(|_| {
+            json!({
+                "type": "invalidArguments",
+                "description": format!(
+                    "filter.{field} must be an RFC3339 UTCDate string or unix-seconds integer",
+                ),
+            })
+        })?;
+        return Ok(parsed.timestamp());
+    }
+    Err(json!({
+        "type": "invalidArguments",
+        "description": format!(
+            "filter.{field} must be an RFC3339 UTCDate string or unix-seconds integer",
+        ),
+    }))
 }
 
 fn parse_filter(raw: Option<&Value>) -> Result<Filter, Value> {
@@ -428,13 +462,10 @@ fn parse_filter(raw: Option<&Value>) -> Result<Filter, Value> {
     for (key, val) in obj {
         match key.as_str() {
             "after" => {
-                let ts = val.as_i64().ok_or_else(|| {
-                    json!({
-                        "type": "invalidArguments",
-                        "description": "filter.after must be a unix-seconds integer",
-                    })
-                })?;
-                f.after = Some(ts);
+                f.after = Some(parse_utc_date("after", val)?);
+            }
+            "before" => {
+                f.before = Some(parse_utc_date("before", val)?);
             }
             "inMailbox" => {
                 let s = val.as_str().ok_or_else(|| {
@@ -1053,6 +1084,66 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["a", "a2", "b"]);
+    }
+
+    #[test]
+    fn email_query_after_filter_accepts_rfc3339_utc_date() {
+        let f = fix_for_query();
+        // Same cutoff as the unix-seconds test, expressed as a JMAP
+        // UTCDate string per RFC 8621 §4.4.1.
+        let resp = email_query(
+            &f,
+            &json!({
+                "accountId": "acct",
+                "filter": {"after": "2026-01-15T11:00:00Z"},
+            }),
+        )
+        .unwrap();
+        let ids: Vec<&str> = resp
+            .get("ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["a", "a2", "b"]);
+    }
+
+    #[test]
+    fn email_query_before_filter_accepts_rfc3339_utc_date() {
+        let f = fix_for_query();
+        // Strict-less-than-cutoff: 11:00:00Z excludes the 11:00 emails
+        // ("a", "a2", "b") and keeps the earlier "c" (10:00) and "d"
+        // (09:00).
+        let resp = email_query(
+            &f,
+            &json!({
+                "accountId": "acct",
+                "filter": {"before": "2026-01-15T11:00:00Z"},
+            }),
+        )
+        .unwrap();
+        let ids: Vec<&str> = resp
+            .get("ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["c", "d"]);
+    }
+
+    #[test]
+    fn email_query_after_filter_rejects_garbage_string() {
+        let f = fix_for_query();
+        let err = email_query(
+            &f,
+            &json!({"accountId": "acct", "filter": {"after": "not-a-date"}}),
+        )
+        .unwrap_err();
+        assert_eq!(err.get("type").unwrap(), "invalidArguments");
     }
 
     #[test]

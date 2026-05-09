@@ -62,7 +62,8 @@ In order, every method `jmap_initial_sync` reaches:
    only - called by `get_mailbox_state` after the list is persisted.
    Same call, just discards the list. Source: `:217`.
 3. `Email/query` in a loop until a page returns fewer than 50 ids.
-   Per call: filter `{ "after": <unix_ts> }`, sort
+   Per call: filter `{ "after": <UTCDate> }` (RFC3339 string per RFC
+   8621, integer unix seconds also accepted by the mock), sort
    `[{"property": "receivedAt"}]`, `position`, `limit: 50`,
    `calculateTotal: true` on first page only.
    Source: `crates/jmap/src/sync/mod.rs:241-269`.
@@ -164,10 +165,14 @@ What the client sends (`crates/jmap/src/sync/mod.rs:248-258`,
 `helpers.rs:11-21`):
 
 - `accountId` - defaulted to the session's primary mail account.
-- `filter` - for initial sync: `{ "after": <unix_ts> }`.
+- `filter` - for initial sync: `{ "after": <UTCDate> }`. Per RFC 8621
+  §4.4.1, `after`/`before` are `UTCDate` strings (RFC3339, "Z"-suffixed,
+  e.g. `"2026-01-15T11:00:00Z"`). The mock parser also accepts a
+  unix-seconds integer for legacy callers. `after` is inclusive
+  (`receivedAt >= after`); `before` is exclusive (`receivedAt < before`).
   For thread-scoped lookups (used outside initial sync):
   `{ "inThread": "<thread_id>" }`.
-  v0 needs `after` only; `inThread` can be a v1 concern.
+  v0 needs `after`/`before` only; `inThread` can be a v1 concern.
 - `sort` - `[{ "property": "receivedAt" }]`. Direction defaults to
   ascending in jmap-client; ratatoskr does not pass `isAscending`,
   but reads results in the order returned. **For determinism, sort
