@@ -22,12 +22,6 @@ the "Fix soon" backlog below.
 
 ### Fix soon (cleanup, ergonomics, smaller bugs)
 
-- **[arch] `Option<RequestLog>` asymmetry in `imap::serve` /
-  `smtp::serve`.** The `Option` exists only because the log was
-  added later; `RequestLog` is a cheap-clone `Arc<Mutex<...>>`
-  with a `Default` impl. Fix: drop the `Option`, drop the
-  `if let Some(log)` guards, have unit tests pass
-  `RequestLog::new()`.
 - **[arch] AppState duplication across `routes`/`graph`/`gmail`.**
   Five fields × three places. Fix: extract a `SharedHandles {
   fixture, dispatcher, request_log, token_store }` that each
@@ -40,27 +34,12 @@ the "Fix soon" backlog below.
   Arc<Fixture>) -> Self }` per module, returning fresh handles by
   default. Tests that need to drive a specific log clone the
   field after construction.
-- **[security] `Content-Disposition` filename interpolated
-  unquoted.** `src/routes.rs::download` builds `format!("{};
-  filename=\"{}\"", ...)`. A fixture-supplied name containing
-  `"` or CRLF splices headers. Fix: use
-  `filename*=UTF-8''<percent-encoded>` or reject names containing
-  CTL / `"`.
 - **[security] `base_url()` echoes the `Host` header into the
   JMAP session resource.** `src/routes.rs::base_url`. A client
   sending `Host: evil.com` causes the session to advertise
   `apiUrl: http://evil.com/jmap/api`. Fix: derive the base from
   the bound listen address (thread it through `AppState`) or
   whitelist to loopback.
-- **[bugs] `/test/fixture/reset` does not reset `Dispatcher`
-  `call_index` counters.** Documented in
-  `src/routes.rs::reset_fixture`. Fix: add a
-  `Dispatcher::reset_counts()` and call it; or amend the
-  docstring to say the call_index never resets and is a feature.
-- **[perf] JMAP `api()` records per method-call with one mutex
-  acquire each.** `src/routes.rs::api`. N `push`es under N lock
-  acquisitions for batches up to 16 calls. Fix: collect entries
-  locally, then `extend` once.
 - **[arch] `/test/fixture/{reset,step}` policy buried in
   doc-comments.** `reset_fixture` documents what it does and
   doesn't reset; `step_fixture` 501s with a `TODO.md` pointer. A
@@ -74,19 +53,10 @@ the "Fix soon" backlog below.
   (`call_id`, `query`, `tag`, `args`, `body`). Fix: add a
   `notes/request-log.md` (or per-protocol surface-doc section)
   listing the per-protocol detail-key contract.
-- **[bugs] `parse_ts` for events lacks event-id context.**
-  `src/fixture.rs::normalize_with_dir` event branch. Mailbox /
-  email parse errors include the id; event timestamps don't.
-  Fix: `.map_err(|e| format!("event {:?} start: {e}", ev.id))?`
-  for both `start` and `end`.
 - **[bugs] `delta_events` first-call deviates from real Graph.**
   Documented in `src/graph/calendar.rs::delta_events`. Fix:
   paginate the initial dump with `@odata.nextLink` until
   exhausted, then emit `@odata.deltaLink`.
-- **[bugs] No uniqueness check on calendar `is_default = true`.**
-  Documented as intentional in `Calendar`'s doc-comment in
-  `src/fixture.rs`, but cheap to tighten. Fix: at load time,
-  reject fixtures with more than one default calendar.
 - **[security] `email` claim sources from `acct.name`, not an
   `email` field.** Documented in
   `src/oauth.rs::userinfo_endpoint`. Fix: validate that

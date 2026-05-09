@@ -169,7 +169,7 @@ pub async fn serve(
     log: SubmissionLog,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
-    request_log: Option<crate::request_log::RequestLog>,
+    request_log: crate::request_log::RequestLog,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -215,7 +215,7 @@ pub async fn serve_connection<S>(
     log: SubmissionLog,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
-    request_log: Option<crate::request_log::RequestLog>,
+    request_log: crate::request_log::RequestLog,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -273,7 +273,7 @@ struct Conn {
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     tls_active: bool,
-    request_log: Option<crate::request_log::RequestLog>,
+    request_log: crate::request_log::RequestLog,
 }
 
 enum ReadOutcome {
@@ -355,31 +355,28 @@ impl Conn {
     async fn dispatch(&mut self, line: &str) -> std::io::Result<bool> {
         let (verb, rest) = split_verb(line);
         let upper = verb.to_ascii_uppercase();
-        if let Some(log) = &self.request_log {
-            // Empty input still produces a "" verb that maps to a
-            // 500 below; record it as well so the log captures
-            // ratatoskr's literal command stream including stray
-            // empty lines.
-            //
-            // For `AUTH <mech> [initial-response]` we record only
-            // the mechanism token, never the credential payload -
-            // /test/requests is exposed unauthenticated and the
-            // SASL initial-response carries decoded user/pass for
-            // PLAIN / LOGIN / XOAUTH2 / OAUTHBEARER. The 334
-            // continuation line is read directly inside
-            // `cmd_auth` and never reaches `dispatch`, so we don't
-            // need to redact it here.
-            let logged_args = if upper == "AUTH" {
-                rest.split_whitespace().next().unwrap_or("")
-            } else {
-                rest
-            };
-            log.record(
-                "smtp",
-                upper.clone(),
-                serde_json::json!({ "args": logged_args }),
-            );
-        }
+        // Empty input still produces a "" verb that maps to a
+        // 500 below; record it as well so the log captures
+        // ratatoskr's literal command stream including stray
+        // empty lines.
+        //
+        // For `AUTH <mech> [initial-response]` we record only the
+        // mechanism token, never the credential payload -
+        // /test/requests is exposed unauthenticated and the SASL
+        // initial-response carries decoded user/pass for PLAIN /
+        // LOGIN / XOAUTH2 / OAUTHBEARER. The 334 continuation
+        // line is read directly inside `cmd_auth` and never
+        // reaches `dispatch`, so we don't need to redact it here.
+        let logged_args = if upper == "AUTH" {
+            rest.split_whitespace().next().unwrap_or("")
+        } else {
+            rest
+        };
+        self.request_log.record(
+            "smtp",
+            upper.clone(),
+            serde_json::json!({ "args": logged_args }),
+        );
         match upper.as_str() {
             "EHLO" | "HELO" => self.cmd_ehlo(rest).await.map(|_| false),
             "STARTTLS" => self.cmd_starttls().await.map(|_| false),
@@ -686,7 +683,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, None, None, &mut rx).await
+            serve_connection(server, log_clone, None, None, crate::request_log::RequestLog::default(), &mut rx).await
         });
         client.write_all(script).await.unwrap();
         client.shutdown().await.unwrap();
@@ -877,7 +874,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, None, None, &mut rx).await
+            serve_connection(server, log_clone, None, None, crate::request_log::RequestLog::default(), &mut rx).await
         });
         let mut greet = vec![0u8; GREETING.len()];
         client.read_exact(&mut greet).await.unwrap();

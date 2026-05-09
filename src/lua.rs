@@ -1097,6 +1097,20 @@ impl Dispatcher {
         result
     }
 
+    /// Reset per-(protocol, command) call counts so the next
+    /// dispatch sees `call_index == 1`. Used by
+    /// `POST /test/fixture/reset` to give scripted scenarios a
+    /// clean window without restarting the binary. Anchors and
+    /// the dellingr `State` are preserved - only the counter map
+    /// is cleared.
+    pub fn reset_counts(&self) {
+        self.inner
+            .lock()
+            .expect("dispatcher mutex poisoned")
+            .call_counts
+            .clear();
+    }
+
     /// Snapshot of any pending mock-exit signal. Non-destructive.
     /// Returns the same value across calls until the runtime acts
     /// on it.

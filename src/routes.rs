@@ -206,14 +206,20 @@ async fn api(
     enforce_bearer(&state, &headers).map_err(|b| *b)?;
     // Record one request-log entry per method-call in the envelope so
     // `GET /test/requests` reflects the granularity ratatoskr cares
-    // about (per-method asserts, not per-batch).
-    for (method, _args, call_id) in &req.method_calls {
-        state.request_log.record(
-            "jmap",
-            method.clone(),
-            json!({ "call_id": call_id }),
-        );
-    }
+    // about (per-method asserts, not per-batch). Batched into a
+    // single `extend` so a 16-call envelope doesn't take 16 lock
+    // round-trips.
+    let now = Utc::now();
+    state
+        .request_log
+        .extend(req.method_calls.iter().map(|(method, _args, call_id)| {
+            RequestEntry {
+                protocol: "jmap",
+                command: method.clone(),
+                received_at: now,
+                detail: json!({ "call_id": call_id }),
+            }
+        }));
     Ok(Json(jmap::handle(
         &state.fixture,
         state.dispatcher.as_ref(),
@@ -273,18 +279,22 @@ async fn download(
     for email in &state.fixture.emails {
         for att in &email.attachments {
             if att.blob_id == blob_id {
+                // RFC 5987 `filename*=UTF-8''<percent-encoded>`
+                // form. Avoids splicing a fixture-supplied name
+                // unquoted into the header, which would let `"`
+                // or CRLF in the name break header framing or
+                // inject another field. All modern user agents
+                // honour the `filename*` form.
+                let disposition = format!(
+                    "{}; filename*=UTF-8''{}",
+                    att.disposition.as_str(),
+                    rfc5987_encode(&att.name),
+                );
                 return (
                     StatusCode::OK,
                     [
                         (header::CONTENT_TYPE, att.content_type.clone()),
-                        (
-                            header::CONTENT_DISPOSITION,
-                            format!(
-                                "{}; filename=\"{}\"",
-                                att.disposition.as_str(),
-                                att.name
-                            ),
-                        ),
+                        (header::CONTENT_DISPOSITION, disposition),
                     ],
                     Body::from(att.data.clone()),
                 )
@@ -417,17 +427,15 @@ async fn clear_requests(State(state): State<AppState>) -> StatusCode {
 ///   - SMTP submission log
 ///   - cross-protocol request log
 ///   - OAuth token store (tokens dropped, counter back to 0)
-///
-/// What is NOT reset (gap acknowledged 2026-05-09 review):
-///   - the Lua dispatcher's per-(protocol, command) `call_index`
-///     counters. A scenario asserting `req.call_index == 1`
-///     after reset will see the counter continue advancing.
-///     Either add `Dispatcher::reset_counts()` here, or amend
-///     this comment - tracked in TODO.md "Fix soon".
+///   - Lua dispatcher's per-(protocol, command) `call_index`
+///     counters, when a dispatcher is attached
 async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     state.submission_log.clear();
     state.request_log.clear();
     state.token_store.clear();
+    if let Some(d) = &state.dispatcher {
+        d.reset_counts();
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -446,4 +454,38 @@ async fn step_fixture() -> Response {
         })),
     )
         .into_response()
+}
+
+/// Percent-encode `s` for use as the value of an RFC 5987
+/// `filename*=UTF-8''...` parameter. Per the spec, only `attr-char`
+/// (ALPHA / DIGIT / `! # $ & + - . ^ _ \` | ~`) passes through
+/// unescaped; everything else (including space, `"`, `'`, `*`, `,`,
+/// `;`, `=`, CTLs, and any non-ASCII byte) is `%HH` encoded against
+/// the UTF-8 byte stream.
+fn rfc5987_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        let pass_through = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'&'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            );
+        if pass_through {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
 }

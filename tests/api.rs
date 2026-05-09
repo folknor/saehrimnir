@@ -384,7 +384,7 @@ async fn jmap_download_returns_blob_bytes() {
         .unwrap()
         .to_str()
         .unwrap();
-    assert!(cd.starts_with("attachment; filename=\"sample.txt\""));
+    assert!(cd.starts_with("attachment; filename*=UTF-8''sample.txt"));
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert!(bytes.starts_with(b"attachment payload"));
 }

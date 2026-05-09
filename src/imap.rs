@@ -53,7 +53,7 @@ pub async fn serve(
     listener: TcpListener,
     fixture: Arc<Fixture>,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
-    request_log: Option<crate::request_log::RequestLog>,
+    request_log: crate::request_log::RequestLog,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -94,7 +94,7 @@ pub async fn serve_connection<S>(
     stream: S,
     fixture: Arc<Fixture>,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
-    request_log: Option<crate::request_log::RequestLog>,
+    request_log: crate::request_log::RequestLog,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -137,10 +137,10 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     state: State,
     fixture: Arc<Fixture>,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
-    /// Optional cross-protocol request log. `None` for the unit
-    /// tests that don't care; `Some` for the production server and
-    /// any tests asserting on `/test/requests`.
-    request_log: Option<crate::request_log::RequestLog>,
+    /// Cross-protocol request log handle. Cheap to clone (it's an
+    /// `Arc<Mutex<...>>`); tests that don't care just pass
+    /// `RequestLog::default()`.
+    request_log: crate::request_log::RequestLog,
     /// Fixture id of the currently selected mailbox, if any. Set by
     /// SELECT/EXAMINE, cleared on CLOSE/UNSELECT (which we don't yet
     /// handle).
@@ -211,58 +211,55 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         };
 
         let cmd_upper = parsed.command.to_ascii_uppercase();
-        if let Some(log) = &self.request_log {
-            // For UID FETCH / UID SEARCH / etc. we record the
-            // sub-command so test assertions can target the verb
-            // ratatoskr actually issued, not just "UID".
-            // Per-command record. Note that this fires *once* per
-            // dispatched line, never per matched message - so a
-            // `UID FETCH 1:*` against a 1M-row fixture records a
-            // single entry, not a million. See the FETCH handler
-            // for the per-message work.
-            //
-            // The bare-`UID` branch (no sub-command) records as
-            // `"UID"`, which conflates a malformed line with a
-            // legitimate-but-empty UID command. The dispatcher
-            // BADs the response in either case so the conflation
-            // is invisible to the wire client; tests that need to
-            // distinguish should inspect `detail.args`.
-            let recorded = if cmd_upper == "UID" {
-                let sub = parsed
-                    .args
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_uppercase();
-                if sub.is_empty() {
-                    "UID".to_string()
-                } else {
-                    format!("UID {sub}")
-                }
+        // For UID FETCH / UID SEARCH / etc. we record the
+        // sub-command so test assertions can target the verb
+        // ratatoskr actually issued, not just "UID". Per-command
+        // record fires *once* per dispatched line, never per
+        // matched message - so a `UID FETCH 1:*` against a 1M-row
+        // fixture records a single entry, not a million. See the
+        // FETCH handler for the per-message work.
+        //
+        // The bare-`UID` branch (no sub-command) records as
+        // `"UID"`, which conflates a malformed line with a
+        // legitimate-but-empty UID command. The dispatcher BADs
+        // the response in either case so the conflation is
+        // invisible to the wire client; tests that need to
+        // distinguish should inspect `detail.args`.
+        let recorded = if cmd_upper == "UID" {
+            let sub = parsed
+                .args
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            if sub.is_empty() {
+                "UID".to_string()
             } else {
-                cmd_upper.clone()
-            };
-            // /test/requests is exposed unauthenticated, so for
-            // the auth verbs we only record the mechanism (or an
-            // empty string for LOGIN, which has no mechanism
-            // token). `LOGIN <user> <pass>` and `AUTHENTICATE
-            // PLAIN <base64>` would otherwise leak credentials
-            // verbatim. The `+` continuation line for AUTHENTICATE
-            // is read inside `cmd_authenticate` and never reaches
-            // `dispatch`, so no redaction needed there.
-            let logged_args: &str = if cmd_upper == "LOGIN" {
-                ""
-            } else if cmd_upper == "AUTHENTICATE" {
-                parsed.args.split_whitespace().next().unwrap_or("")
-            } else {
-                parsed.args
-            };
-            log.record(
-                "imap",
-                recorded,
-                serde_json::json!({ "tag": parsed.tag, "args": logged_args }),
-            );
-        }
+                format!("UID {sub}")
+            }
+        } else {
+            cmd_upper.clone()
+        };
+        // /test/requests is exposed unauthenticated, so for the
+        // auth verbs we only record the mechanism (or an empty
+        // string for LOGIN, which has no mechanism token).
+        // `LOGIN <user> <pass>` and `AUTHENTICATE PLAIN <base64>`
+        // would otherwise leak credentials verbatim. The `+`
+        // continuation line for AUTHENTICATE is read inside
+        // `cmd_authenticate` and never reaches `dispatch`, so no
+        // redaction needed there.
+        let logged_args: &str = if cmd_upper == "LOGIN" {
+            ""
+        } else if cmd_upper == "AUTHENTICATE" {
+            parsed.args.split_whitespace().next().unwrap_or("")
+        } else {
+            parsed.args
+        };
+        self.request_log.record(
+            "imap",
+            recorded,
+            serde_json::json!({ "tag": parsed.tag, "args": logged_args }),
+        );
         match cmd_upper.as_str() {
             "CAPABILITY" => self.cmd_capability(parsed.tag).await,
             "NOOP" => self.cmd_noop(parsed.tag).await,
@@ -1950,7 +1947,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, None, &mut rx).await
+            serve_connection(server, fix, None, crate::request_log::RequestLog::default(), &mut rx).await
         });
 
         client.write_all(script).await.unwrap();
@@ -2671,7 +2668,7 @@ mod tests {
         let fix = fixture();
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, None, &mut rx).await
+            serve_connection(server, fix, None, crate::request_log::RequestLog::default(), &mut rx).await
         });
 
         // Read greeting first so the server is parked on the read.

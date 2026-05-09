@@ -90,6 +90,21 @@ impl RequestLog {
         });
     }
 
+    /// Append many entries under one lock acquisition. Used by
+    /// JMAP's `api()` so a 16-call batch costs one mutex round-
+    /// trip rather than 16. The ring cap is applied incrementally
+    /// inside the loop so a batch larger than `REQUEST_LOG_CAP`
+    /// still leaves a coherent (capped) tail.
+    pub fn extend(&self, entries: impl IntoIterator<Item = RequestEntry>) {
+        let mut g = self.0.lock().expect("request log mutex poisoned");
+        for entry in entries {
+            if g.len() >= REQUEST_LOG_CAP {
+                g.pop_front();
+            }
+            g.push_back(entry);
+        }
+    }
+
     /// Steal the current contents for read-out. The mutex is
     /// released before the (potentially large) materialisation
     /// into `Vec`, so a `GET /test/requests` against a long-lived

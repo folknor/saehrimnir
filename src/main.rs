@@ -134,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let imap_shutdown_rx = shutdown_rx.clone();
     let imap_fixture = Arc::clone(&fixture);
     let imap_dispatcher = dispatcher.clone();
-    let imap_request_log = Some(request_log.clone());
+    let imap_request_log = request_log.clone();
     let imap_task = tokio::spawn(async move {
         imap::serve(imap_listener, imap_fixture, imap_dispatcher, imap_request_log, imap_shutdown_rx).await
     });
@@ -152,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let smtp_request_log = Some(request_log.clone());
+    let smtp_request_log = request_log.clone();
     let smtp_task = tokio::spawn(async move {
         smtp::serve(
             smtp_listener,

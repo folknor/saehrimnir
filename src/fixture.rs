@@ -61,8 +61,9 @@ pub struct Calendar {
     /// enum names `lightBlue` / `lightGreen` / etc.; we accept any
     /// string and pass it through.
     pub color: Option<String>,
-    /// Exactly one calendar should typically have `is_default = true`
-    /// per fixture; the loader does not enforce uniqueness today.
+    /// At most one calendar per fixture may have
+    /// `is_default = true`; the loader rejects fixtures with
+    /// multiple defaults.
     pub is_default: bool,
 }
 
@@ -565,9 +566,19 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     // declared calendar - same shape as the email -> mailbox check.
     let mut calendar_ids: HashMap<String, ()> = HashMap::new();
     let mut calendars = Vec::with_capacity(raw.calendars.len());
+    let mut default_seen: Option<String> = None;
     for cal in raw.calendars {
         if calendar_ids.insert(cal.id.clone(), ()).is_some() {
             return Err(format!("duplicate calendar id {:?}", cal.id));
+        }
+        if cal.is_default {
+            if let Some(prev) = &default_seen {
+                return Err(format!(
+                    "fixture has two default calendars: {prev:?} and {:?} - is_default = true must be unique",
+                    cal.id
+                ));
+            }
+            default_seen = Some(cal.id.clone());
         }
         calendars.push(Calendar {
             id: cal.id,
@@ -588,14 +599,17 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
                 ev.id, ev.calendar_id
             ));
         }
+        let start =
+            parse_ts(&ev.start).map_err(|e| format!("event {:?} start: {e}", ev.id))?;
+        let end = parse_ts(&ev.end).map_err(|e| format!("event {:?} end: {e}", ev.id))?;
         events.push(Event {
             id: ev.id,
             calendar_id: ev.calendar_id,
             subject: ev.subject,
             body_preview: ev.body_preview,
             body_text: ev.body_text,
-            start: parse_ts(&ev.start)?,
-            end: parse_ts(&ev.end)?,
+            start,
+            end,
             location: ev.location,
             organizer: ev.organizer.map(Address::from),
             attendees: ev.attendees.into_iter().map(Address::from).collect(),
