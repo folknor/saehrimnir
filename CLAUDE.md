@@ -42,8 +42,10 @@ checking whether the fact is already in `notes/`.
   validating.
 - One shared fixture per process. Each protocol projects its own wire
   shape from the same canonical types in `src/fixture.rs`.
-- Out-of-scope JMAP methods (`Email/changes`, `Mailbox/changes`,
-  `Email/set`, `EmailSubmission/set`, push, etc.) return
+- `Email/changes` / `Mailbox/changes` return the RFC-shaped
+  envelope: empty-delta when `sinceState == fixture.state`,
+  `cannotCalculateChanges` otherwise. Other out-of-scope JMAP
+  methods (`Email/set`, `EmailSubmission/set`, push, etc.) return
   `unknownMethod`. Out-of-scope IMAP commands (write paths, IDLE,
   NOTIFY, etc.) return `BAD`.
 - The session must NOT advertise `urn:ietf:params:jmap:principals`.
@@ -145,7 +147,8 @@ checking whether the fact is already in `notes/`.
 ## Status
 
 JMAP: complete for v0 (session resource, `Mailbox/get`, `Email/query`,
-`Email/get`, full integration test coverage).
+`Email/get`, `Mailbox/changes` + `Email/changes` with steady-state
+semantics, full integration test coverage).
 
 IMAP: complete for v0's read path (greeting, `CAPABILITY`, `LOGIN`/
 `AUTHENTICATE`, `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT`/`EXAMINE`/

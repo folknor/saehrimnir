@@ -109,6 +109,14 @@ fn dispatch(
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
+        "Mailbox/changes" => match mailbox_changes(fixture, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
+        "Email/changes" => match email_changes(fixture, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
         _ => (
             "error".to_string(),
             json!({
@@ -274,6 +282,107 @@ fn my_rights_all_true() -> Value {
 
 /// Server-side cap on `limit`. Above this we silently truncate.
 const QUERY_LIMIT_CAP: u64 = 256;
+// ── Mailbox/changes + Email/changes ─────────────────────────────────
+//
+// RFC 8621 §2.2 (`Mailbox/changes`) and §4.2 (`Email/changes`).
+//
+// v0 fixture state is constant across a process lifetime: there are
+// no `[[change]]` scripts yet (see `TODO.md`, fixture-format growth).
+// That gives us exactly two server-side cases:
+//
+//   1. `sinceState == fixture.state` -> no changes happened in this
+//      window. Echo it as `newState`, return empty arrays,
+//      `hasMoreChanges = false`. This is the steady-state response a
+//      polling client sees.
+//
+//   2. `sinceState != fixture.state` -> the mock has no recorded
+//      history to project, so per the RFC we return
+//      `cannotCalculateChanges`. The client falls back to a fresh
+//      `Email/query` + `Email/get` round.
+//
+// When `[[change]]` scripts ship, this dispatch grows a state machine
+// that walks an ordered list of `(state, created, updated,
+// destroyed)` deltas. The RFC-shaped envelope below stays the same.
+
+fn mailbox_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = require_account(fixture, args)?;
+    let since_state = require_since_state(args)?;
+    if since_state != fixture.state {
+        return Err(json!({
+            "type": "cannotCalculateChanges",
+            "description": format!(
+                "sinceState {since_state:?} does not match the fixture state \
+                 (no recorded change history in v0)"
+            ),
+        }));
+    }
+    Ok(no_changes_response(account_id, &fixture.state, false))
+}
+
+fn email_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = require_account(fixture, args)?;
+    let since_state = require_since_state(args)?;
+    if since_state != fixture.state {
+        return Err(json!({
+            "type": "cannotCalculateChanges",
+            "description": format!(
+                "sinceState {since_state:?} does not match the fixture state \
+                 (no recorded change history in v0)"
+            ),
+        }));
+    }
+    Ok(no_changes_response(account_id, &fixture.state, true))
+}
+
+fn require_account<'a>(fixture: &'a Fixture, args: &'a Value) -> Result<&'a str, Value> {
+    let account_id = args
+        .get("accountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            json!({
+                "type": "invalidArguments",
+                "description": "missing accountId",
+            })
+        })?;
+    if account_id != fixture.account.id {
+        return Err(json!({
+            "type": "accountNotFound",
+            "description": format!("account {account_id:?} not found"),
+        }));
+    }
+    Ok(account_id)
+}
+
+fn require_since_state(args: &Value) -> Result<&str, Value> {
+    args.get("sinceState")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            json!({
+                "type": "invalidArguments",
+                "description": "missing sinceState",
+            })
+        })
+}
+
+/// Build the empty-changes response envelope shared by `Mailbox/
+/// changes` and `Email/changes`. `is_email` toggles the
+/// `updatedProperties: null` field, which is `Email/changes`-only
+/// per RFC 8621 §4.2.
+fn no_changes_response(account_id: &str, state: &str, is_email: bool) -> Value {
+    let mut out = Map::new();
+    out.insert("accountId".to_string(), Value::String(account_id.to_string()));
+    out.insert("oldState".to_string(), Value::String(state.to_string()));
+    out.insert("newState".to_string(), Value::String(state.to_string()));
+    out.insert("hasMoreChanges".to_string(), Value::Bool(false));
+    out.insert("created".to_string(), Value::Array(vec![]));
+    out.insert("updated".to_string(), Value::Array(vec![]));
+    out.insert("destroyed".to_string(), Value::Array(vec![]));
+    if is_email {
+        out.insert("updatedProperties".to_string(), Value::Null);
+    }
+    Value::Object(out)
+}
+
 /// Default page size when the client omits `limit`.
 const QUERY_LIMIT_DEFAULT: u64 = 50;
 

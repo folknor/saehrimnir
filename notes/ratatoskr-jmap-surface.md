@@ -200,10 +200,9 @@ So the mock must:
   the first one.
 - Return fewer than 50 ids on the final page so the loop exits.
 
-## State tokens (out of scope for changes, IN scope for getters)
+## State tokens
 
-Even though `Email/changes` and `Mailbox/changes` are out of scope
-for v0, the initial-sync code persists state tokens at the end:
+The initial-sync code persists state tokens at the end:
 
 - `get_mailbox_state` reads `state` off a bare `Mailbox/get` response.
 - `get_email_state` reads `state` off an empty `Email/get` response
@@ -213,6 +212,23 @@ Both must be present and non-empty strings. Any stable value is
 fine - `"v0"`, `"fixture-state"`, the SHA of the fixture file -
 the mock just has to return the same string consistently within a
 process lifetime.
+
+## `Mailbox/changes` and `Email/changes`
+
+Wired in v0 with steady-state semantics: the fixture state is
+constant across a process lifetime (no `[[change]]` scripts yet -
+see `TODO.md` "Fixture format growth"), so:
+
+- `sinceState == fixture.state` -> empty delta. `newState` echoes
+  back, `hasMoreChanges = false`, `created/updated/destroyed = []`.
+  `Email/changes` additionally returns `updatedProperties: null`
+  per RFC 8621 §4.2.
+- `sinceState != fixture.state` -> `cannotCalculateChanges`. The
+  client falls back to a fresh `Email/query` + `Email/get` round.
+
+When `[[change]]` scripts ship, this dispatch grows a state machine
+that walks an ordered list of `(state, created, updated,
+destroyed)` deltas. The RFC-shaped envelope stays the same.
 
 ## Constants worth knowing
 

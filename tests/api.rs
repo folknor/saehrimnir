@@ -106,6 +106,90 @@ async fn well_known_jmap_matches_session() {
 }
 
 #[tokio::test]
+async fn mailbox_changes_with_matching_state_returns_empty_delta() {
+    let v = jmap_call(
+        "Mailbox/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c0",
+    )
+    .await;
+    let mr = v.get("methodResponses").unwrap().as_array().unwrap();
+    assert_eq!(mr[0][0], "Mailbox/changes");
+    let body = &mr[0][1];
+    assert_eq!(body["accountId"], "account-1");
+    assert_eq!(body["oldState"], "fixture-state");
+    assert_eq!(body["newState"], "fixture-state");
+    assert_eq!(body["hasMoreChanges"], false);
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["updated"], json!([]));
+    assert_eq!(body["destroyed"], json!([]));
+    // Mailbox/changes does NOT carry updatedProperties.
+    assert!(body.get("updatedProperties").is_none());
+}
+
+#[tokio::test]
+async fn mailbox_changes_with_unknown_state_returns_cannot_calculate() {
+    let v = jmap_call(
+        "Mailbox/changes",
+        json!({"accountId": "account-1", "sinceState": "stale"}),
+        "c0",
+    )
+    .await;
+    let mr = v.get("methodResponses").unwrap().as_array().unwrap();
+    assert_eq!(mr[0][0], "error");
+    assert_eq!(mr[0][1]["type"], "cannotCalculateChanges");
+}
+
+#[tokio::test]
+async fn email_changes_with_matching_state_returns_empty_delta_with_updated_properties_null() {
+    let v = jmap_call(
+        "Email/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c0",
+    )
+    .await;
+    let mr = v.get("methodResponses").unwrap().as_array().unwrap();
+    assert_eq!(mr[0][0], "Email/changes");
+    let body = &mr[0][1];
+    assert_eq!(body["newState"], "fixture-state");
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["updated"], json!([]));
+    assert_eq!(body["destroyed"], json!([]));
+    assert!(body["updatedProperties"].is_null());
+}
+
+#[tokio::test]
+async fn email_changes_with_unknown_state_returns_cannot_calculate() {
+    let v = jmap_call(
+        "Email/changes",
+        json!({"accountId": "account-1", "sinceState": "old"}),
+        "c0",
+    )
+    .await;
+    let mr = v.get("methodResponses").unwrap().as_array().unwrap();
+    assert_eq!(mr[0][0], "error");
+    assert_eq!(mr[0][1]["type"], "cannotCalculateChanges");
+}
+
+#[tokio::test]
+async fn changes_methods_validate_account_and_since_state() {
+    // Missing sinceState.
+    let v = jmap_call("Email/changes", json!({"accountId": "account-1"}), "c0").await;
+    assert_eq!(v["methodResponses"][0][0], "error");
+    assert_eq!(v["methodResponses"][0][1]["type"], "invalidArguments");
+
+    // Wrong account.
+    let v = jmap_call(
+        "Email/changes",
+        json!({"accountId": "ghost", "sinceState": "fixture-state"}),
+        "c0",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][0], "error");
+    assert_eq!(v["methodResponses"][0][1]["type"], "accountNotFound");
+}
+
+#[tokio::test]
 async fn mailbox_get_returns_fixture_mailboxes_in_order() {
     let v = jmap_call("Mailbox/get", json!({"accountId": "account-1"}), "c0").await;
     let mr = v.get("methodResponses").unwrap().as_array().unwrap();

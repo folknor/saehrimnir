@@ -4,17 +4,6 @@ Running task list, ordered by what ratatoskr is actively waiting on.
 Per-protocol design notes live alongside in `notes/`; this file just
 tracks what's next.
 
-## JMAP depth (incremental sync)
-
-- `Email/changes` and `Mailbox/changes`. Currently return
-  `unknownMethod` by deliberate v0 policy
-  (`notes/ratatoskr-jmap-surface.md:205`, CLAUDE.md). Ratatoskr's
-  incremental-sync coverage needs them, so this is a policy
-  reversal, not just an implementation: pick a state-string scheme
-  (probably monotonic counters projected from `[[change]]` script
-  entries, see fixture-format growth below), update the surface
-  note, then implement.
-
 ## Fixture format growth
 
 The incremental-sync item is now actively wanted for M8; the
@@ -26,8 +15,11 @@ remain unblocked-but-unneeded.
   state, IMAP UIDVALIDITY/HIGHESTMODSEQ bumps, Graph deltatokens,
   Gmail historyId. **No longer parked** - ratatoskr needs
   new/change/delete/move scenarios to exercise incremental sync
-  paths. Pairs with `Email/changes` (JMAP section above) and the
-  test control plane's `/test/fixture/step`.
+  paths. JMAP `Email/changes` / `Mailbox/changes` are already wired
+  with steady-state semantics (empty delta on matching state,
+  `cannotCalculateChanges` otherwise); change scripts grow this
+  into a real state machine. Also drives the test control plane's
+  `POST /test/fixture/step`, which currently returns 501.
 - Authoring hooks for adversarial-shape fixtures: duplicate
   `Message-Id` across emails (today's `normalize` rejects it as a
   cross-reference error, so this is a validator carve-out plus
