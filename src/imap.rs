@@ -242,15 +242,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             } else {
                 cmd_upper.clone()
             };
-            // SECURITY TODO (2026-05-09 review): `parsed.args` for
-            // LOGIN / AUTHENTICATE PLAIN carries user credentials
-            // verbatim. Either redact at this site or strip the
-            // entry before exposing it via /test/requests. Tracked
-            // in TODO.md "Fix now".
+            // /test/requests is exposed unauthenticated, so for
+            // the auth verbs we only record the mechanism (or an
+            // empty string for LOGIN, which has no mechanism
+            // token). `LOGIN <user> <pass>` and `AUTHENTICATE
+            // PLAIN <base64>` would otherwise leak credentials
+            // verbatim. The `+` continuation line for AUTHENTICATE
+            // is read inside `cmd_authenticate` and never reaches
+            // `dispatch`, so no redaction needed there.
+            let logged_args: &str = if cmd_upper == "LOGIN" {
+                ""
+            } else if cmd_upper == "AUTHENTICATE" {
+                parsed.args.split_whitespace().next().unwrap_or("")
+            } else {
+                parsed.args
+            };
             log.record(
                 "imap",
                 recorded,
-                serde_json::json!({ "tag": parsed.tag, "args": parsed.args }),
+                serde_json::json!({ "tag": parsed.tag, "args": logged_args }),
             );
         }
         match cmd_upper.as_str() {

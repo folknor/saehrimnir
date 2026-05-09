@@ -705,3 +705,61 @@ async fn graph_delete_event_returns_204_and_logs_request() {
     assert!(snap.iter().any(|e| e.command == "DELETE /v1.0/me/events/ev-001"
         && e.detail["id"] == "ev-001"));
 }
+
+#[tokio::test]
+async fn graph_patch_event_404s_unknown_id() {
+    let log = saehrimnir::request_log::RequestLog::default();
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/graph-calendar-small.toml",
+    ))
+    .unwrap();
+    let app = graph::router(graph::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        request_log: log.clone(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
+    });
+    let body = serde_json::json!({ "subject": "Renamed" });
+    let (status, v) = json_request(app, "PATCH", "/v1.0/me/events/ev-missing", Some(body)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ResourceNotFound");
+    // The middleware still records the (method, path) envelope,
+    // but the 404 short-circuits before the body is parsed and
+    // attached, so no `body` detail leaks into the log.
+    let snap = log.snapshot();
+    assert!(!snap.iter().any(|e| !e.detail["body"].is_null()));
+}
+
+#[tokio::test]
+async fn graph_delete_event_404s_unknown_id() {
+    let log = saehrimnir::request_log::RequestLog::default();
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/graph-calendar-small.toml",
+    ))
+    .unwrap();
+    let app = graph::router(graph::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        request_log: log.clone(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1.0/me/events/ev-missing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["code"], "ResourceNotFound");
+    let snap = log.snapshot();
+    assert!(!snap.iter().any(|e| e.command.starts_with("DELETE /v1.0/me/events/")
+        && !e.detail["id"].is_null()));
+}

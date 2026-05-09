@@ -143,27 +143,28 @@ async fn list_events(
     //   skip=4/top=1         -> page=1, next_skip=5, no link.
     //   skip=10/total=5      -> page=0, next_skip=10, no link.
     //
-    // PERF TODO (2026-05-09 review): the `Vec<&Event>` allocation
-    // walks every event in the fixture per request, which is
-    // O(N) work amortising to O(N²) over many pages. Replace
-    // with a chained iterator (filter().skip().take().map()) and
-    // a separate filter().count() if `total` is needed. Tracked
-    // in TODO.md "Fix now".
-    let all: Vec<&Event> = state
+    // The page is built straight off a streaming iterator chain
+    // so we never materialise the full filtered list. The
+    // `nextLink` decision needs the total count, which is one
+    // additional pass and still avoids the O(N) clone.
+    let page: Vec<Value> = state
         .fixture
         .events
         .iter()
         .filter(|e| e.calendar_id == calendar)
-        .collect();
-    let total = all.len();
-    let page: Vec<Value> = all
-        .iter()
         .skip(skip as usize)
         .take(top as usize)
         .map(|e| serialize_event(&state.fixture, e))
         .collect();
     let next_skip = (skip as usize) + page.len();
-    let next_link = if next_skip < total {
+    let has_more = state
+        .fixture
+        .events
+        .iter()
+        .filter(|e| e.calendar_id == calendar)
+        .nth(next_skip)
+        .is_some();
+    let next_link = if has_more {
         Some(format!(
             "https://graph.microsoft.com/v1.0/me/calendars/{calendar}/events?$skiptoken=s.{next_skip}"
         ))
@@ -271,17 +272,11 @@ async fn get_event(
 // body to the cross-protocol request log under `detail.body`, so
 // tests can assert on what the client tried to write.
 //
-// Two known deviations from real Graph, accepted for v0:
-//   - PATCH on an unknown event id silently 200s with
-//     `calendarId: "unknown"`. Real Graph 404s. TODO.md "Fix now".
-//   - DELETE on an unknown event id always 204s. Real Graph 404s.
-//     TODO.md "Fix now".
-//
-// PERF TODO (2026-05-09 review): the parsed body (capped at 1MB
-// by `parse_json_body`) is cloned into the request log entry.
-// Long-running scenarios accumulate it. Capping the request log
-// itself addresses the symptom; storing only body size/hash here
-// is a smaller alternative.
+// PATCH and DELETE return `ResourceNotFound` when the event id
+// is not declared in the fixture, mirroring real Graph and the
+// GET-side behaviour. The check happens before the body is
+// parsed / recorded so a 404 won't pollute the request log
+// either.
 
 async fn create_event(
     State(state): State<AppState>,
@@ -313,12 +308,16 @@ async fn patch_event(
     Path(event): Path<String>,
     body: AxumBody,
 ) -> Response {
-    let calendar_id = state
-        .fixture
-        .events
-        .iter()
-        .find(|e| e.id == event)
-        .map(|e| e.calendar_id.clone());
+    let calendar_id = match state.fixture.events.iter().find(|e| e.id == event) {
+        Some(e) => e.calendar_id.clone(),
+        None => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "ResourceNotFound",
+                &format!("event {event:?} not declared in fixture"),
+            );
+        }
+    };
     let parsed = match parse_json_body(body).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -328,8 +327,7 @@ async fn patch_event(
         format!("PATCH /v1.0/me/events/{event}"),
         json!({ "body": parsed }),
     );
-    let cal = calendar_id.unwrap_or_else(|| "unknown".to_string());
-    let echoed = mutation_echo(&cal, &event, &parsed);
+    let echoed = mutation_echo(&calendar_id, &event, &parsed);
     ok_json(echoed)
 }
 
@@ -337,6 +335,13 @@ async fn delete_event(
     State(state): State<AppState>,
     Path(event): Path<String>,
 ) -> Response {
+    if !state.fixture.events.iter().any(|e| e.id == event) {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("event {event:?} not declared in fixture"),
+        );
+    }
     state.request_log.record(
         "graph",
         format!("DELETE /v1.0/me/events/{event}"),

@@ -17,11 +17,19 @@
 //! impurity here because timestamps are useful for diagnosing
 //! ordering issues in CI logs.
 
+use std::collections::VecDeque;
+use std::mem;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+
+/// Maximum number of entries retained in the cross-protocol log.
+/// Past this, oldest entries drop off the front. Sized for a long
+/// scale-test run (10k-email fixtures with deltas + sweeps); a
+/// pathological client still can't grow the log without bound.
+pub const REQUEST_LOG_CAP: usize = 100_000;
 
 /// One dispatch event. `protocol` is the lowercase protocol tag
 /// (`"jmap"`, `"imap"`, `"smtp"`, `"graph"`, `"gmail"`). `command`
@@ -39,33 +47,34 @@ pub struct RequestEntry {
     pub detail: Value,
 }
 
-/// Shared, cheap-to-clone handle. Backed by a `Mutex<Vec<_>>`; the
-/// log is process-scoped and grows for the life of the binary
-/// unless a test clears it via `DELETE /test/requests` or
-/// `POST /test/fixture/reset`.
+/// Shared, cheap-to-clone handle. Backed by a
+/// `Mutex<VecDeque<_>>`; the log is process-scoped and capped at
+/// `REQUEST_LOG_CAP` entries (drop-oldest). Tests clear it via
+/// `DELETE /test/requests` or `POST /test/fixture/reset`.
 ///
 /// Every method `expect("request log mutex poisoned")`. Critical
-/// sections are tiny (push, clone, clear) and panic-free, so
+/// sections are tiny (push, take, clear) and panic-free, so
 /// poisoning is unreachable today. If a future panic *under* the
 /// lock surfaces here, the binary dies; that's intentional - a
 /// process-wide restart is preferable to silently degraded
 /// recording in a test mock.
 #[derive(Debug, Clone, Default)]
-pub struct RequestLog(Arc<Mutex<Vec<RequestEntry>>>);
+pub struct RequestLog(Arc<Mutex<VecDeque<RequestEntry>>>);
 
 impl RequestLog {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Append one entry. Lock is held only for the push; the
-    /// per-protocol callers build the `RequestEntry` first and
-    /// hand it over.
+    /// Append one entry, evicting the oldest if the ring is full.
+    /// Lock is held only for the push; the per-protocol callers
+    /// build the `RequestEntry` first and hand it over.
     pub fn push(&self, entry: RequestEntry) {
-        self.0
-            .lock()
-            .expect("request log mutex poisoned")
-            .push(entry);
+        let mut g = self.0.lock().expect("request log mutex poisoned");
+        if g.len() >= REQUEST_LOG_CAP {
+            g.pop_front();
+        }
+        g.push_back(entry);
     }
 
     /// Convenience: build an entry from `protocol` + `command` +
@@ -81,8 +90,29 @@ impl RequestLog {
         });
     }
 
+    /// Steal the current contents for read-out. The mutex is
+    /// released before the (potentially large) materialisation
+    /// into `Vec`, so a `GET /test/requests` against a long-lived
+    /// process doesn't stall every listener for the duration of
+    /// the copy.
     pub fn snapshot(&self) -> Vec<RequestEntry> {
-        self.0.lock().expect("request log mutex poisoned").clone()
+        let mut taken = {
+            let mut g = self.0.lock().expect("request log mutex poisoned");
+            mem::take(&mut *g)
+        };
+        let out: Vec<RequestEntry> = taken.iter().cloned().collect();
+        let mut g = self.0.lock().expect("request log mutex poisoned");
+        if !g.is_empty() {
+            // Concurrent pushes landed while we were cloning;
+            // splice them after the taken history (preserving
+            // chronological order) and re-apply the ring cap.
+            taken.append(&mut g);
+            while taken.len() > REQUEST_LOG_CAP {
+                taken.pop_front();
+            }
+        }
+        *g = taken;
+        out
     }
 
     pub fn clear(&self) {

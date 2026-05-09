@@ -12,43 +12,13 @@ verified-correct invariants, and accepted trade-offs are recorded
 as inline comments at the relevant code sites; only items that
 need work end up here.
 
-### Fix now (security, correctness, perf hot spots)
+### Fix now
 
-- **[security] Credential leakage in the request log.** SMTP
-  `AUTH PLAIN <base64>` / `LOGIN` / `XOAUTH2` flows through
-  `dispatch()` at `src/smtp.rs:362-368` and the full `rest` of the
-  line lands in `detail.args` of the request log, which is exposed
-  unauthenticated via `GET /test/requests` on the JMAP listener.
-  IMAP has the same shape: `LOGIN <user> <pass>` and
-  `AUTHENTICATE PLAIN <base64>` continuation lines flow through
-  `src/imap.rs:233-237`. Fix: in both recorders, special-case the
-  auth verbs and store only the mechanism name (first whitespace
-  token of `rest`), not the secret payload.
-- **[perf+security] Unbounded RequestLog growth + clone-under-
-  lock.** `src/request_log.rs` has no row cap; `snapshot()` clones
-  the whole `Vec` while holding the cross-protocol mutex, so a
-  `GET /test/requests` against a long-lived process stalls every
-  listener. The Graph mutation echo at
-  `src/graph/calendar.rs::create_event`/`patch_event` writes
-  up-to-1MB parsed JSON bodies into `detail.body` per request,
-  accelerating the growth. Fix: cap as a drop-oldest ring (~100k
-  entries), and have `snapshot()` `mem::take` into a local `Vec`
-  so the clone happens after the lock drops; consider capping
-  per-entry detail size too, or storing the body's size/hash
-  instead of the parsed `Value`.
-- **[perf] `list_events` / `delta_events` materialise the full
-  filtered Vec before pagination.** `src/graph/calendar.rs::
-  list_events` and `delta_events`. `O(N²)` over many pages on a
-  large fixture. Fix: chain
-  `.iter().filter().skip().take().map().collect()` directly; use
-  a separate `.filter().count()` if `total` is needed for
-  `nextLink` decisions.
-- **[bugs] PATCH/DELETE on unknown event ids silently succeed.**
-  `src/graph/calendar.rs::patch_event` echoes with
-  `calendarId: "unknown"` and 200; `delete_event` always 204s.
-  Real Graph 404s. Fix: return the standard `ResourceNotFound`
-  error envelope when the event id isn't declared, mirroring the
-  GET-side behaviour.
+All four "Fix now" items from the 2026-05-09 review are landed
+(SMTP / IMAP auth-payload redaction, RequestLog ring cap +
+take-then-clone snapshot, list_events streaming pagination,
+PATCH/DELETE 404 on unknown event ids). Remaining work is
+the "Fix soon" backlog below.
 
 ### Fix soon (cleanup, ergonomics, smaller bugs)
 
