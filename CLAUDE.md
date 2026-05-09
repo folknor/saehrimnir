@@ -168,8 +168,15 @@ exposes a server-side MIME projection of the captured bytes
 (subject, text/html bodies, attachments) so tests can assert on the
 sent message without each pulling in `mail-parser`. Submissions
 captured in an in-memory `SubmissionLog` that tests read directly.
-Integration tests in `tests/smtp.rs`, including a TCP-level
-STARTTLS round-trip.
+The same `SubmissionLog` handle is also exposed to harness scripts
+over the JMAP HTTP listener: `GET /test/smtp/submissions` returns a
+parsed-projection JSON array (connection envelope plus subject /
+body counts / attachment metadata; raw bytes deliberately not
+serialized), and `DELETE /test/smtp/submissions` returns 204 and
+clears the log so tests can assert on a clean window without
+restarting the binary. Integration tests in `tests/smtp.rs`,
+including a TCP-level STARTTLS round-trip; the route shape is
+covered in `tests/api.rs`.
 
 Graph: complete for v0's mail-sync path. `/v1.0/me/mailFolders`
 (list, by-id, by-well-known-alias, childFolders), `/v1.0/me/

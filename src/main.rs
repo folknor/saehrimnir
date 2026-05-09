@@ -87,9 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.readiness_file.display()
     );
 
+    // SMTP submission log. Shared between the SMTP listener (writer)
+    // and the JMAP HTTP router (reader, via the test-only
+    // `/test/smtp/submissions` route). Process-scoped: cleared on
+    // restart, otherwise grows for the life of the binary.
+    let smtp_log = smtp::SubmissionLog::new();
+
     let app = routes::router(routes::AppState {
         fixture: Arc::clone(&fixture),
         dispatcher: dispatcher.clone(),
+        submission_log: smtp_log.clone(),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -118,10 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         imap::serve(imap_listener, imap_fixture, imap_dispatcher, imap_shutdown_rx).await
     });
 
-    // SMTP server. The submission log is process-scoped (cleared at
-    // exit). When plan-3 wants test-side introspection we will hand
-    // out an Arc clone or expose it via a debug HTTP route.
-    let smtp_log = smtp::SubmissionLog::new();
+    // SMTP server. The submission log is the same handle exposed to
+    // the JMAP HTTP router above, so harness scripts can read
+    // captured submissions via `GET /test/smtp/submissions`.
     let smtp_shutdown_rx = shutdown_rx.clone();
     let smtp_log_clone = smtp_log.clone();
     let smtp_dispatcher = dispatcher.clone();
@@ -142,8 +148,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
     });
-    let _ = smtp_log; // currently no readers in production.
-
     // Microsoft Graph server.
     let graph_app = graph::router(graph::AppState {
         fixture: Arc::clone(&fixture),

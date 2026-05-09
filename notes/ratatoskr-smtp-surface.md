@@ -104,6 +104,26 @@ For tests to verify:
 - Connection time / submission count - cheap, lets tests assert
   timing and ordering across multiple submissions.
 
+Captured submissions are exposed to harness scripts over the JMAP
+HTTP listener as a test-only route:
+
+- `GET /test/smtp/submissions` -> JSON array of submissions in the
+  order they were received. Each entry carries the connection-level
+  fields (`from`, `recipients`, `from_params`, `rcpt_params`,
+  `auth_mechanism`, `received_at`, `raw_size`) plus an optional
+  `parsed` object derived from `Submission::parse_mime()`
+  (`subject`, `text_body_count`, `html_body_count`, and an
+  `attachments` array of `{filename, content_type, size}`). Raw
+  message bytes are deliberately not serialized; tests assert on
+  `raw_size` and per-attachment `size` instead.
+- `DELETE /test/smtp/submissions` -> `204 No Content`; clears the
+  log so tests can assert "no other submission landed in this
+  window" without restarting the binary.
+
+Process-scoped: a fresh sæhrimnir start is always an empty log.
+No auth or feature gate guards the route - sæhrimnir is a test-only
+binary.
+
 The client never reads back a Message-ID or any DSN handle, so the
 mock does not have to generate one.
 

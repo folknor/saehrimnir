@@ -15,15 +15,23 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::fixture::Fixture;
 use crate::jmap::{self, JmapRequest, JmapResponse};
+use crate::smtp::{self, Submission};
 
 #[derive(Clone)]
 pub struct AppState {
     pub fixture: Arc<Fixture>,
     pub dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    /// Shared handle to the SMTP submission log. The test-only
+    /// `/test/smtp/submissions` route reads (and `DELETE` clears)
+    /// this. Tests that don't drive SMTP can construct it via
+    /// `SubmissionLog::default()`.
+    pub submission_log: smtp::SubmissionLog,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -35,6 +43,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/jmap/download/{account_id}/{blob_id}/{name}",
             get(download),
+        )
+        .route(
+            "/test/smtp/submissions",
+            get(list_smtp_submissions).delete(clear_smtp_submissions),
         )
         .with_state(state)
 }
@@ -167,4 +179,85 @@ async fn download(
         })),
     )
         .into_response()
+}
+
+// ── Test-only SMTP submission introspection ────────────────────────
+//
+// Sæhrimnir is a test-only binary; no auth or feature gate guards
+// these routes. The submission log is process-scoped, so tests can
+// either restart the binary for a clean window or hit the `DELETE`.
+
+/// JSON view of a captured SMTP submission. Mirrors `Submission`'s
+/// connection-level fields plus a parsed projection of the RFC 822
+/// body. Raw bytes are deliberately not serialized; tests assert on
+/// `parsed.attachments[].size` and `raw_size` instead.
+#[derive(Debug, Serialize)]
+pub struct SubmissionJson {
+    pub from: String,
+    pub recipients: Vec<String>,
+    pub from_params: std::collections::BTreeMap<String, String>,
+    pub rcpt_params: Vec<std::collections::BTreeMap<String, String>>,
+    pub auth_mechanism: Option<String>,
+    pub received_at: DateTime<Utc>,
+    pub raw_size: usize,
+    pub parsed: Option<ParsedJson>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ParsedJson {
+    pub subject: Option<String>,
+    pub text_body_count: usize,
+    pub html_body_count: usize,
+    pub attachments: Vec<AttachmentJson>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttachmentJson {
+    pub filename: Option<String>,
+    pub content_type: String,
+    pub size: usize,
+}
+
+impl SubmissionJson {
+    fn from_submission(s: &Submission) -> Self {
+        let parsed = s.parse_mime().map(|p| ParsedJson {
+            subject: p.subject,
+            text_body_count: p.text_bodies.len(),
+            html_body_count: p.html_bodies.len(),
+            attachments: p
+                .attachments
+                .into_iter()
+                .map(|a| AttachmentJson {
+                    filename: a.filename,
+                    content_type: a.content_type,
+                    size: a.data.len(),
+                })
+                .collect(),
+        });
+        SubmissionJson {
+            from: s.from.clone(),
+            recipients: s.recipients.clone(),
+            from_params: s.from_params.clone(),
+            rcpt_params: s.rcpt_params.clone(),
+            auth_mechanism: s.auth_mechanism.clone(),
+            received_at: s.received_at,
+            raw_size: s.data.len(),
+            parsed,
+        }
+    }
+}
+
+async fn list_smtp_submissions(State(state): State<AppState>) -> Json<Vec<SubmissionJson>> {
+    let snapshot = state.submission_log.snapshot();
+    Json(
+        snapshot
+            .iter()
+            .map(SubmissionJson::from_submission)
+            .collect(),
+    )
+}
+
+async fn clear_smtp_submissions(State(state): State<AppState>) -> StatusCode {
+    state.submission_log.clear();
+    StatusCode::NO_CONTENT
 }

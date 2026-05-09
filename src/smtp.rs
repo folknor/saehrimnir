@@ -145,6 +145,16 @@ impl SubmissionLog {
             .expect("submission log mutex poisoned")
             .clone()
     }
+
+    /// Drop every captured submission. Used by the test-only HTTP
+    /// route so harness scripts can assert on a clean window without
+    /// restarting the binary.
+    pub fn clear(&self) {
+        self.0
+            .lock()
+            .expect("submission log mutex poisoned")
+            .clear();
+    }
 }
 
 /// Greeting emitted on connect.

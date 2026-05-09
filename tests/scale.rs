@@ -34,6 +34,7 @@ fn jmap_router() -> axum::Router {
     routes::router(routes::AppState {
         fixture: bulk_fixture(),
         dispatcher: None,
+        submission_log: saehrimnir::smtp::SubmissionLog::default(),
     })
 }
 

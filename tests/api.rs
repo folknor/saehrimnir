@@ -22,6 +22,7 @@ fn router() -> axum::Router {
     routes::router(routes::AppState {
         fixture: Arc::new(fix),
         dispatcher: None,
+        submission_log: saehrimnir::smtp::SubmissionLog::default(),
     })
 }
 
@@ -224,6 +225,7 @@ fn attach_router() -> axum::Router {
     routes::router(routes::AppState {
         fixture: Arc::new(fix),
         dispatcher: None,
+        submission_log: saehrimnir::smtp::SubmissionLog::default(),
     })
 }
 
@@ -460,6 +462,7 @@ fn router_with_lua_scenario(scenario: &str) -> axum::Router {
     routes::router(routes::AppState {
         fixture: Arc::new(fixture),
         dispatcher: Some(Arc::new(dispatcher)),
+        submission_log: saehrimnir::smtp::SubmissionLog::default(),
     })
 }
 
@@ -646,4 +649,122 @@ async fn jmap_callback_ids_absent_when_request_omits_them() {
     .await;
     let entry = &v["methodResponses"][0];
     assert_eq!(entry[1]["description"], "present=false");
+}
+
+// ── /test/smtp/submissions ─────────────────────────────────────────
+
+fn router_with_smtp_log(log: saehrimnir::smtp::SubmissionLog) -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
+    routes::router(routes::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        submission_log: log,
+    })
+}
+
+fn sample_submission(from: &str, attachment_size: usize) -> saehrimnir::smtp::Submission {
+    let body = format!(
+        "From: <{from}>\r\n\
+         To: <to@example.com>\r\n\
+         Subject: hello\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\
+         \r\n\
+         --BOUND\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         \r\n\
+         body text\r\n\
+         --BOUND\r\n\
+         Content-Type: application/pdf\r\n\
+         Content-Disposition: attachment; filename=\"big.pdf\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         \r\n\
+         {payload}\r\n\
+         --BOUND--\r\n",
+        payload = "A".repeat(attachment_size),
+    );
+    saehrimnir::smtp::Submission {
+        from: from.to_string(),
+        recipients: vec!["to@example.com".to_string()],
+        from_params: Default::default(),
+        rcpt_params: vec![Default::default()],
+        auth_mechanism: Some("PLAIN".to_string()),
+        data: body.into_bytes(),
+        received_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_smtp_submissions_returns_parsed_view() {
+    let log = saehrimnir::smtp::SubmissionLog::default();
+    log.push(sample_submission("alice@example.com", 64));
+    let v = body_json(
+        router_with_smtp_log(log)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/test/smtp/submissions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let s = &arr[0];
+    assert_eq!(s["from"], "alice@example.com");
+    assert_eq!(s["recipients"][0], "to@example.com");
+    assert_eq!(s["auth_mechanism"], "PLAIN");
+    assert!(s["raw_size"].as_u64().unwrap() > 64);
+    let parsed = &s["parsed"];
+    assert_eq!(parsed["subject"], "hello");
+    // mail-parser projects a text/plain body into both text and html
+    // counts; assert both fields exist as numbers but don't pin the
+    // exact values - the harness scripts care about attachments.
+    assert!(parsed["text_body_count"].is_number());
+    assert!(parsed["html_body_count"].is_number());
+    let attachments = parsed["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["filename"], "big.pdf");
+    assert_eq!(attachments[0]["content_type"], "application/pdf");
+    assert!(attachments[0]["size"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_smtp_submissions_delete_clears_log() {
+    let log = saehrimnir::smtp::SubmissionLog::default();
+    log.push(sample_submission("alice@example.com", 16));
+    log.push(sample_submission("bob@example.com", 16));
+    assert_eq!(log.snapshot().len(), 2);
+
+    let resp = router_with_smtp_log(log.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/test/smtp/submissions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(log.snapshot().len(), 0);
+
+    let v = body_json(
+        router_with_smtp_log(log)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/test/smtp/submissions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v.as_array().unwrap().len(), 0);
 }
