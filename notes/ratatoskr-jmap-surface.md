@@ -215,20 +215,61 @@ process lifetime.
 
 ## `Mailbox/changes` and `Email/changes`
 
-Wired in v0 with steady-state semantics: the fixture state is
-constant across a process lifetime (no `[[change]]` scripts yet -
-see `TODO.md` "Fixture format growth"), so:
+Wired against the real per-state change log
+(`Fixture::change_log`). The seed state is set at fixture-load
+time; each successful `Email/set` / `Mailbox/set` envelope appends
+a transition and bumps `Fixture::state` to `<seed>.<n>` (counter
+monotonic). Semantics:
 
 - `sinceState == fixture.state` -> empty delta. `newState` echoes
   back, `hasMoreChanges = false`, `created/updated/destroyed = []`.
   `Email/changes` additionally returns `updatedProperties: null`
   per RFC 8621 §4.2.
-- `sinceState != fixture.state` -> `cannotCalculateChanges`. The
-  client falls back to a fresh `Email/query` + `Email/get` round.
+- `sinceState` matches the seed or any retained transition's
+  `from_state` -> walk forward, union the per-resource ids with
+  RFC 8620 §5.2 dominance: created+destroyed cancels, created+
+  updated collapses to created, destroyed+updated collapses to
+  destroyed. Per-list dedup preserves first-seen order so the
+  byte-stable invariant holds.
+- `sinceState` is unknown (older than seed, or evicted from the
+  bounded ring at `ChangeLog::MAX_TRANSITIONS = 256`) ->
+  `cannotCalculateChanges`. The client falls back to a fresh
+  `Email/query` + `Email/get` round.
 
-When `[[change]]` scripts ship, this dispatch grows a state machine
-that walks an ordered list of `(state, created, updated,
-destroyed)` deltas. The RFC-shaped envelope stays the same.
+A fixture with no recorded mutations (the post-load steady state)
+hits the first branch: any `sinceState == seed` returns empty.
+That preserves the v0 "no change history" behaviour for read-only
+fixtures while letting tests that mutate prove the round-trip
+through delta.
+
+## `Email/set` and `Mailbox/set`
+
+RFC 8621 §4.6 (`Email/set`) and §2.5 (`Mailbox/set`). v0 accepts
+the canonical create / update / destroy maps; mutations apply
+in-place to the fixture, bump `state`, and record a transition
+visible to the next `Email/changes` / `Mailbox/changes`.
+
+`ifInState`, when present, is checked against the current state
+before any mutation; mismatch returns `stateMismatch`.
+
+`Email/set` patch shapes ratatoskr drives:
+
+- `keywords` (full replace, `String[Boolean]`) and
+  `keywords/<flag>` (`true` to add, `null` to remove).
+- `mailboxIds` (full replace, `String[true]`) and
+  `mailboxIds/<id>` (`true` to add, `null` to remove).
+- Other patch paths return `notUpdated[<id>] = invalidProperties`.
+
+`Mailbox/set` honours `name`, `parentId`, `sortOrder`, `role`,
+`isSubscribed` on both create and update. Destroy fails with
+`mailboxHasEmail` while any email still references the mailbox
+in its `mailboxIds`, mirroring real JMAP servers.
+
+Server-assigned ids are deterministic for byte-stable transcripts:
+created emails come back as `mock-email-<n>` (1-based, counted
+against `fixture.emails.len()` at create time) and created
+mailboxes as `mock-mailbox-<n>`. Counter values reset across
+fixture loads but advance monotonically within one process.
 
 ## Constants worth knowing
 

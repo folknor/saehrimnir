@@ -1911,6 +1911,7 @@ mod tests {
             oauth: crate::fixture::OAuthConfig::default(),
             calendars: vec![],
             events: vec![],
+            change_log: crate::fixture::ChangeLog::default(),
         })
     }
 
@@ -1988,6 +1989,7 @@ mod tests {
             oauth: crate::fixture::OAuthConfig::default(),
             calendars: vec![],
             events: vec![],
+            change_log: crate::fixture::ChangeLog::default(),
         })
     }
 

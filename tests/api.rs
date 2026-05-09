@@ -1388,3 +1388,262 @@ async fn jmap_oauth_fixture_drives_revoked_token_recovery_flow() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ── Email/set + Mailbox/set round-trip ──────────────────────────────
+
+/// Helper for multi-call round-trip tests: pin a single router so
+/// every method-call hits the same fixture handle.
+async fn jmap_call_on(router: &axum::Router, method: &str, args: Value, call_id: &str) -> Value {
+    let req_body = json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [[method, args, call_id]],
+    });
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/api")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+/// `Email/set update` flips a keyword on an existing fixture email,
+/// then `Email/changes(sinceState=fixture-state)` lists the same id
+/// in `updated`. Proves the per-state change log walks correctly
+/// across at least one mutation.
+#[tokio::test]
+async fn email_set_update_round_trips_through_email_changes() {
+    let app = router();
+
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "update": {
+                "email-001": { "keywords/$seen": true }
+            }
+        }),
+        "c0",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["accountId"], "account-1");
+    assert_eq!(body["oldState"], "fixture-state");
+    let new_state = body["newState"].as_str().unwrap().to_string();
+    assert_ne!(new_state, "fixture-state", "state must bump on mutation");
+    assert_eq!(body["updated"], json!({ "email-001": null }));
+    assert!(body["notUpdated"].is_null());
+
+    // Email/changes from the original seed surfaces email-001 in
+    // `updated` and reports the new state.
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c1",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["oldState"], "fixture-state");
+    assert_eq!(body["newState"], new_state);
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["updated"], json!(["email-001"]));
+    assert_eq!(body["destroyed"], json!([]));
+}
+
+/// `Email/set destroy` removes an email; `Email/changes` lists it
+/// under `destroyed`; `Email/get` reports the id under `notFound`.
+#[tokio::test]
+async fn email_set_destroy_round_trips() {
+    let app = router();
+
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({"accountId": "account-1", "destroy": ["email-001"]}),
+        "c0",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["destroyed"], json!(["email-001"]));
+    assert!(body["notDestroyed"].is_null());
+
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c1",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["destroyed"], json!(["email-001"]));
+
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({"accountId": "account-1", "ids": ["email-001"]}),
+        "c2",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["list"], json!([]));
+    assert_eq!(body["notFound"], json!(["email-001"]));
+}
+
+/// `Email/set create` assigns a deterministic `mock-email-N` id;
+/// the new email surfaces in the next `Email/changes` (`created`)
+/// and in `Email/get` (`list`).
+#[tokio::test]
+async fn email_set_create_round_trips_through_email_get() {
+    let app = router();
+
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "create": {
+                "draft": {
+                    "mailboxIds": { "mbx-inbox": true },
+                    "keywords": { "$draft": true }
+                }
+            }
+        }),
+        "c0",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    let server_id = body["created"]["draft"]["id"].as_str().unwrap().to_string();
+    assert_eq!(server_id, "mock-email-3");
+    assert!(body["notCreated"].is_null());
+
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c1",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["created"],
+        json!([server_id.clone()])
+    );
+
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({"accountId": "account-1", "ids": [server_id.clone()]}),
+        "c2",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["list"][0]["id"], server_id);
+    assert_eq!(body["list"][0]["mailboxIds"], json!({ "mbx-inbox": true }));
+    assert_eq!(body["list"][0]["keywords"], json!({ "$draft": true }));
+}
+
+/// Created-then-destroyed in the same change window cancels per
+/// RFC 8620 §5.2: the surviving delta lists neither id.
+#[tokio::test]
+async fn mailbox_set_create_then_destroy_cancels_in_changes() {
+    let app = router();
+
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({
+            "accountId": "account-1",
+            "create": { "scratch": { "name": "Scratch" } }
+        }),
+        "c0",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    let server_id = body["created"]["scratch"]["id"].as_str().unwrap().to_string();
+    assert_eq!(server_id, "mock-mailbox-3");
+
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({"accountId": "account-1", "destroy": [server_id.clone()]}),
+        "c1",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["destroyed"],
+        json!([server_id.clone()])
+    );
+
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c2",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["destroyed"], json!([]));
+}
+
+/// Destroying a non-empty mailbox fails with `mailboxHasEmail`.
+#[tokio::test]
+async fn mailbox_set_destroy_rejects_non_empty_mailbox() {
+    let app = router();
+
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({"accountId": "account-1", "destroy": ["mbx-inbox"]}),
+        "c0",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert!(body["destroyed"].is_null());
+    assert_eq!(
+        body["notDestroyed"]["mbx-inbox"]["type"],
+        "mailboxHasEmail"
+    );
+    assert_eq!(body["oldState"], "fixture-state");
+    assert_eq!(body["newState"], "fixture-state");
+}
+
+/// `ifInState` mismatch short-circuits the envelope and leaves the
+/// fixture untouched.
+#[tokio::test]
+async fn email_set_if_in_state_mismatch_rejects_envelope() {
+    let app = router();
+
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "ifInState": "wrong-state",
+            "update": { "email-001": { "keywords/$seen": true } }
+        }),
+        "c0",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][0], "error");
+    assert_eq!(v["methodResponses"][0][1]["type"], "stateMismatch");
+
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c1",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["oldState"], "fixture-state");
+    assert_eq!(body["newState"], "fixture-state");
+    assert_eq!(body["updated"], json!([]));
+}

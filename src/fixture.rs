@@ -26,6 +26,258 @@ pub struct Fixture {
     /// Events scoped to one of the declared calendars by
     /// `calendar_id`. Empty by default.
     pub events: Vec<Event>,
+    /// Per-mutation transition log. Empty at load time (the seed
+    /// state is the only known state); each successful `Email/set`
+    /// or `Mailbox/set` envelope appends a transition and bumps
+    /// `state`. JMAP `Email/changes` / `Mailbox/changes` walk this
+    /// log to compute deltas between two known states.
+    pub change_log: ChangeLog,
+}
+
+/// Bounded ring of recent state transitions.
+///
+/// Each transition records the (oldState -> newState) pair and the
+/// per-resource id sets the mutation touched. `Email/changes` walks
+/// from the entry whose `from_state == sinceState` to the head and
+/// unions the email-side ids; `Mailbox/changes` does the same for
+/// the mailbox-side ids.
+///
+/// The ring is bounded at [`ChangeLog::MAX_TRANSITIONS`]. Once full,
+/// the oldest transition is dropped on every push, which means a
+/// `sinceState` that fell off the end now resolves to "unknown" and
+/// the caller returns `cannotCalculateChanges`. Bounded retention
+/// matches RFC 8620 §5.2: the server is free to forget how to compute
+/// changes from arbitrarily-old states.
+///
+/// The seed state (the value of `Fixture::state` at load time) is
+/// recorded separately and is *never* evicted: it always sits one
+/// step before the first retained transition. A fresh
+/// `sinceState == seed` therefore always resolves to the full delta
+/// across every retained transition, regardless of how many later
+/// mutations have rolled in.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangeLog {
+    transitions: std::collections::VecDeque<Transition>,
+    counter: u64,
+    seed: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    pub from_state: String,
+    pub to_state: String,
+    pub email_created: Vec<String>,
+    pub email_updated: Vec<String>,
+    pub email_destroyed: Vec<String>,
+    pub mailbox_created: Vec<String>,
+    pub mailbox_updated: Vec<String>,
+    pub mailbox_destroyed: Vec<String>,
+}
+
+/// Resource-id deltas a single mutator pass produced. Returned by the
+/// closure passed to [`Fixture::mutate`]; the caller never constructs
+/// transitions directly. An all-empty `MutationDiff` is treated as a
+/// no-op: the state token does not bump and no transition is recorded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MutationDiff {
+    pub email_created: Vec<String>,
+    pub email_updated: Vec<String>,
+    pub email_destroyed: Vec<String>,
+    pub mailbox_created: Vec<String>,
+    pub mailbox_updated: Vec<String>,
+    pub mailbox_destroyed: Vec<String>,
+}
+
+impl MutationDiff {
+    pub fn is_empty(&self) -> bool {
+        self.email_created.is_empty()
+            && self.email_updated.is_empty()
+            && self.email_destroyed.is_empty()
+            && self.mailbox_created.is_empty()
+            && self.mailbox_updated.is_empty()
+            && self.mailbox_destroyed.is_empty()
+    }
+}
+
+impl ChangeLog {
+    /// Bounded retention. Set to comfortably exceed the longest test
+    /// scripts we run (the `lifecycle` and `scale` tests stay below
+    /// 100 mutations); pick something high enough that an unrelated
+    /// long-running fixture won't trip the eviction path mid-test
+    /// but low enough that the per-mutation snapshot stays cheap.
+    pub const MAX_TRANSITIONS: usize = 256;
+
+    fn seed(seed_state: &str) -> Self {
+        Self {
+            transitions: std::collections::VecDeque::new(),
+            counter: 0,
+            seed: seed_state.to_string(),
+        }
+    }
+}
+
+/// Fold the per-transition diffs over the half-open range
+/// `(from, to]` (i.e. every transition whose `from_state == from` or
+/// later, up to `to`). Applies RFC 8620 §5.2 dominance: an id that
+/// was both created and destroyed in the window is omitted entirely
+/// (the caller never knew it existed); created+updated collapses to
+/// created; destroyed+updated collapses to destroyed.
+#[derive(Debug, Default)]
+pub struct DeltaSet {
+    pub created: Vec<String>,
+    pub updated: Vec<String>,
+    pub destroyed: Vec<String>,
+}
+
+impl Fixture {
+    /// Apply a mutation, record its transition, and bump `state`.
+    /// The closure is the only thing allowed to touch the fixture
+    /// fields; it returns the resource-id diff so we can capture it
+    /// without re-walking the (potentially large) email/mailbox
+    /// vectors. An all-empty diff is a no-op (no state bump, no
+    /// transition recorded) so that idempotent set-calls (e.g. an
+    /// `update` block that only patches keywords already present)
+    /// stay observable as "nothing changed".
+    pub fn mutate<F>(&mut self, f: F) -> Transition
+    where
+        F: FnOnce(&mut Fixture) -> MutationDiff,
+    {
+        let from_state = self.state.clone();
+        let diff = f(self);
+        if diff.is_empty() {
+            // No-op: don't bump state, don't record a transition.
+            // Return a marker transition with `from == to` so the
+            // caller's `oldState == newState` response stays correct
+            // without us polluting the log.
+            return Transition {
+                from_state: from_state.clone(),
+                to_state: from_state,
+                email_created: vec![],
+                email_updated: vec![],
+                email_destroyed: vec![],
+                mailbox_created: vec![],
+                mailbox_updated: vec![],
+                mailbox_destroyed: vec![],
+            };
+        }
+        self.change_log.counter += 1;
+        let to_state = format!("{}.{}", self.change_log.seed, self.change_log.counter);
+        self.state = to_state.clone();
+        let trans = Transition {
+            from_state,
+            to_state,
+            email_created: diff.email_created,
+            email_updated: diff.email_updated,
+            email_destroyed: diff.email_destroyed,
+            mailbox_created: diff.mailbox_created,
+            mailbox_updated: diff.mailbox_updated,
+            mailbox_destroyed: diff.mailbox_destroyed,
+        };
+        if self.change_log.transitions.len() >= ChangeLog::MAX_TRANSITIONS {
+            self.change_log.transitions.pop_front();
+        }
+        self.change_log.transitions.push_back(trans.clone());
+        trans
+    }
+
+    /// Compute the email-side delta between two known states.
+    ///
+    /// - `sinceState == self.state`: empty delta.
+    /// - `sinceState` matches the seed or any retained transition's
+    ///   `from_state`: walk forward from there, unioning with RFC
+    ///   §5.2 dominance.
+    /// - `sinceState` is unknown (older than seed, or evicted from
+    ///   the bounded ring, or simply not a state we ever issued):
+    ///   returns `None`, which the caller maps to
+    ///   `cannotCalculateChanges`.
+    pub fn email_delta_since(&self, since: &str) -> Option<DeltaSet> {
+        self.delta_since(since, |t| {
+            (
+                &t.email_created,
+                &t.email_updated,
+                &t.email_destroyed,
+            )
+        })
+    }
+
+    /// Mailbox-side analogue of [`email_delta_since`].
+    pub fn mailbox_delta_since(&self, since: &str) -> Option<DeltaSet> {
+        self.delta_since(since, |t| {
+            (
+                &t.mailbox_created,
+                &t.mailbox_updated,
+                &t.mailbox_destroyed,
+            )
+        })
+    }
+
+    fn delta_since<'a, F>(&'a self, since: &str, project: F) -> Option<DeltaSet>
+    where
+        F: Fn(&'a Transition) -> (&'a Vec<String>, &'a Vec<String>, &'a Vec<String>),
+    {
+        if since == self.state {
+            return Some(DeltaSet::default());
+        }
+        // The seed and every retained `from_state` count as "known".
+        // If `since` matches none of them, we can no longer reconstruct
+        // the delta and the caller returns `cannotCalculateChanges`.
+        let seed_known = since == self.change_log.seed;
+        let head_known = self
+            .change_log
+            .transitions
+            .iter()
+            .any(|t| t.from_state == since);
+        if !seed_known && !head_known {
+            return None;
+        }
+        let mut started = seed_known;
+        let mut created: Vec<String> = Vec::new();
+        let mut updated: Vec<String> = Vec::new();
+        let mut destroyed: Vec<String> = Vec::new();
+        for t in &self.change_log.transitions {
+            if !started {
+                if t.from_state == since {
+                    started = true;
+                } else {
+                    continue;
+                }
+            }
+            let (c, u, d) = project(t);
+            created.extend(c.iter().cloned());
+            updated.extend(u.iter().cloned());
+            destroyed.extend(d.iter().cloned());
+        }
+        // Apply RFC 8620 §5.2 dominance: created∩destroyed cancels;
+        // created+updated collapses to created; destroyed+updated
+        // collapses to destroyed. The order of these checks matters
+        // (cancel first, then collapse).
+        let cancel: std::collections::HashSet<String> = created
+            .iter()
+            .filter(|id| destroyed.contains(id))
+            .cloned()
+            .collect();
+        created.retain(|id| !cancel.contains(id));
+        destroyed.retain(|id| !cancel.contains(id));
+        let in_created: std::collections::HashSet<String> = created.iter().cloned().collect();
+        let in_destroyed: std::collections::HashSet<String> = destroyed.iter().cloned().collect();
+        updated.retain(|id| !in_created.contains(id) && !in_destroyed.contains(id));
+        // Dedup each list while preserving first-seen order (stable
+        // for byte-determinism).
+        dedup_preserving_order(&mut created);
+        dedup_preserving_order(&mut updated);
+        dedup_preserving_order(&mut destroyed);
+        Some(DeltaSet {
+            created,
+            updated,
+            destroyed,
+        })
+    }
+}
+
+fn dedup_preserving_order(v: &mut Vec<String>) {
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(v.len());
+    v.retain(|id| seen.insert(id.clone()));
 }
 
 /// Fixture-side OAuth configuration. Optional in TOML/Lua; defaults
@@ -122,7 +374,7 @@ impl Role {
         }
     }
 
-    fn parse(s: &str) -> Result<Self, String> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "inbox" => Ok(Self::Inbox),
             "archive" => Ok(Self::Archive),
@@ -632,9 +884,11 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    let state = raw.state.unwrap_or_else(|| "fixture-state".to_string());
+    let change_log = ChangeLog::seed(&state);
     Ok(Fixture {
         name: raw.name,
-        state: raw.state.unwrap_or_else(|| "fixture-state".to_string()),
+        state,
         account: Account {
             id: raw.account.id,
             name: raw.account.name,
@@ -644,6 +898,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         oauth,
         calendars,
         events,
+        change_log,
     })
 }
 

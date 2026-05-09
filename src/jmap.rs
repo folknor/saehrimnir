@@ -102,11 +102,25 @@ fn dispatch(
         }
     }
 
-    // Acquire the read guard *after* the dispatcher callback returns
-    // (callbacks must never run with a fixture lock held - a future
-    // hook that mutates would deadlock) and drop it as soon as the
-    // method handler returns. Each method-call in a batched envelope
-    // gets its own brief acquisition.
+    // Acquire the appropriate guard *after* the dispatcher callback
+    // returns (callbacks must never run with a fixture lock held - a
+    // future hook that mutates would deadlock). Mutating methods
+    // take a write guard for the duration of the handler; everything
+    // else takes a brief read guard. Each method-call in a batched
+    // envelope gets its own acquisition; readers and a writer
+    // mutually exclude per-call only.
+    if matches!(name, "Email/set" | "Mailbox/set") {
+        let mut fix = fixture.write().expect("fixture lock poisoned");
+        let res = match name {
+            "Email/set" => email_set(&mut fix, args),
+            "Mailbox/set" => mailbox_set(&mut fix, args),
+            _ => unreachable!(),
+        };
+        return match res {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        };
+    }
     let fix = fixture.read().expect("fixture lock poisoned");
     match name {
         "Mailbox/get" => match mailbox_get(&fix, args) {
@@ -335,31 +349,43 @@ const QUERY_LIMIT_CAP: u64 = 256;
 fn mailbox_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?;
     let since_state = require_since_state(args)?;
-    if since_state != fixture.state {
-        return Err(json!({
+    let delta = fixture.mailbox_delta_since(since_state).ok_or_else(|| {
+        json!({
             "type": "cannotCalculateChanges",
             "description": format!(
-                "sinceState {since_state:?} does not match the fixture state \
-                 (no recorded change history in v0)"
+                "sinceState {since_state:?} is not a known fixture state \
+                 (older than the seed or evicted from the bounded change log)"
             ),
-        }));
-    }
-    Ok(no_changes_response(account_id, &fixture.state, false))
+        })
+    })?;
+    Ok(changes_response(
+        account_id,
+        since_state,
+        &fixture.state,
+        delta,
+        false,
+    ))
 }
 
 fn email_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?;
     let since_state = require_since_state(args)?;
-    if since_state != fixture.state {
-        return Err(json!({
+    let delta = fixture.email_delta_since(since_state).ok_or_else(|| {
+        json!({
             "type": "cannotCalculateChanges",
             "description": format!(
-                "sinceState {since_state:?} does not match the fixture state \
-                 (no recorded change history in v0)"
+                "sinceState {since_state:?} is not a known fixture state \
+                 (older than the seed or evicted from the bounded change log)"
             ),
-        }));
-    }
-    Ok(no_changes_response(account_id, &fixture.state, true))
+        })
+    })?;
+    Ok(changes_response(
+        account_id,
+        since_state,
+        &fixture.state,
+        delta,
+        true,
+    ))
 }
 
 fn require_account<'a>(fixture: &'a Fixture, args: &'a Value) -> Result<&'a str, Value> {
@@ -392,19 +418,33 @@ fn require_since_state(args: &Value) -> Result<&str, Value> {
         })
 }
 
-/// Build the empty-changes response envelope shared by `Mailbox/
-/// changes` and `Email/changes`. `is_email` toggles the
-/// `updatedProperties: null` field, which is `Email/changes`-only
-/// per RFC 8621 §4.2.
-fn no_changes_response(account_id: &str, state: &str, is_email: bool) -> Value {
+/// Build the changes response envelope shared by `Mailbox/changes`
+/// and `Email/changes`. `is_email` toggles the `updatedProperties:
+/// null` field, which is `Email/changes`-only per RFC 8621 §4.2.
+fn changes_response(
+    account_id: &str,
+    old_state: &str,
+    new_state: &str,
+    delta: crate::fixture::DeltaSet,
+    is_email: bool,
+) -> Value {
     let mut out = Map::new();
     out.insert("accountId".to_string(), Value::String(account_id.to_string()));
-    out.insert("oldState".to_string(), Value::String(state.to_string()));
-    out.insert("newState".to_string(), Value::String(state.to_string()));
+    out.insert("oldState".to_string(), Value::String(old_state.to_string()));
+    out.insert("newState".to_string(), Value::String(new_state.to_string()));
     out.insert("hasMoreChanges".to_string(), Value::Bool(false));
-    out.insert("created".to_string(), Value::Array(vec![]));
-    out.insert("updated".to_string(), Value::Array(vec![]));
-    out.insert("destroyed".to_string(), Value::Array(vec![]));
+    out.insert(
+        "created".to_string(),
+        Value::Array(delta.created.into_iter().map(Value::String).collect()),
+    );
+    out.insert(
+        "updated".to_string(),
+        Value::Array(delta.updated.into_iter().map(Value::String).collect()),
+    );
+    out.insert(
+        "destroyed".to_string(),
+        Value::Array(delta.destroyed.into_iter().map(Value::String).collect()),
+    );
     if is_email {
         out.insert("updatedProperties".to_string(), Value::Null);
     }
@@ -926,6 +966,594 @@ fn serialize_address_list(xs: &[Address]) -> Value {
     }
 }
 
+// ── Email/set ───────────────────────────────────────────────────────
+//
+// RFC 8621 §4.6. The v0 surface is deliberately narrow: it accepts
+// the create / update / destroy maps ratatoskr's writeback path
+// emits, applies them to the fixture, and bumps the state token so
+// `Email/changes` can return a real delta on the next call.
+//
+// Update patches honour the two property paths ratatoskr touches:
+//   - `keywords` (full replace) and `keywords/<name>` (true=add,
+//     null=remove). RFC 8621 §4.1.1: keywords are a `String[Boolean]`
+//     map. The `unread` synthetic property is *not* exposed - the
+//     client toggles `$seen` directly via `keywords`.
+//   - `mailboxIds` (full replace) and `mailboxIds/<id>` (true=add,
+//     null=remove). RFC 8621 §4.1.1: a Set<Id> represented as
+//     `String[true]`.
+// Anything else is rejected as `notUpdated[<id>] = invalidProperties`.
+//
+// Create / destroy are full-replace and ID-removal respectively;
+// they round-trip through `Email/changes` with no extra trickery.
+
+fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = require_account(fixture, args)?.to_string();
+    if let Some(if_in_state) = args.get("ifInState").and_then(Value::as_str)
+        && if_in_state != fixture.state
+    {
+        return Err(json!({
+            "type": "stateMismatch",
+            "description": format!(
+                "ifInState {if_in_state:?} does not match current state {:?}",
+                fixture.state,
+            ),
+        }));
+    }
+    let creates = args
+        .get("create")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let updates = args
+        .get("update")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let destroys: Vec<String> = args
+        .get("destroy")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let mut created_out = Map::new();
+    let mut not_created = Map::new();
+    let mut updated_out = Map::new();
+    let mut not_updated = Map::new();
+    let mut destroyed_out: Vec<String> = Vec::new();
+    let mut not_destroyed = Map::new();
+
+    let trans = fixture.mutate(|fix| {
+        let mut diff = crate::fixture::MutationDiff::default();
+
+        // Creates: assign a server id and append. Default field
+        // values are filled from the fixture's existing rendering
+        // (zero-length subject, empty body, no attachments) so
+        // tests that round-trip a brand-new email can rely on a
+        // stable shape.
+        for (client_id, body) in &creates {
+            match build_email_from_create(fix, body) {
+                Ok((server_id, email)) => {
+                    fix.emails.push(email);
+                    diff.email_created.push(server_id.clone());
+                    created_out.insert(
+                        client_id.clone(),
+                        json!({
+                            "id": server_id,
+                            "blobId": format!("blob-{server_id}"),
+                            "threadId": server_id,
+                            "size": 0,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    not_created.insert(client_id.clone(), err);
+                }
+            }
+        }
+
+        // Updates: locate by id, apply the patch, record. We mutate
+        // a clone first so a partial failure on one property leaves
+        // the original untouched; on success we swap the clone back
+        // in. The clone is cheap relative to the number of update
+        // calls we expect (single-digit per envelope).
+        for (id, patch) in &updates {
+            let Some(idx) = fix.emails.iter().position(|e| &e.id == id) else {
+                not_updated.insert(id.clone(), set_error("notFound", "no such email"));
+                continue;
+            };
+            let mut clone = fix.emails[idx].clone();
+            match apply_email_patch(&mut clone, patch) {
+                Ok(()) => {
+                    fix.emails[idx] = clone;
+                    diff.email_updated.push(id.clone());
+                    updated_out.insert(id.clone(), Value::Null);
+                }
+                Err(err) => {
+                    not_updated.insert(id.clone(), err);
+                }
+            }
+        }
+
+        // Destroys: drop in place, record id.
+        for id in &destroys {
+            let len_before = fix.emails.len();
+            fix.emails.retain(|e| &e.id != id);
+            if fix.emails.len() < len_before {
+                diff.email_destroyed.push(id.clone());
+                destroyed_out.push(id.clone());
+            } else {
+                not_destroyed.insert(id.clone(), set_error("notFound", "no such email"));
+            }
+        }
+
+        diff
+    });
+
+    Ok(set_response(
+        &account_id,
+        &trans.from_state,
+        &trans.to_state,
+        created_out,
+        not_created,
+        updated_out,
+        not_updated,
+        destroyed_out,
+        not_destroyed,
+    ))
+}
+
+fn build_email_from_create(
+    fix: &Fixture,
+    body: &Value,
+) -> Result<(String, Email), Value> {
+    let body = body.as_object().ok_or_else(|| {
+        set_error("invalidProperties", "create body must be an object")
+    })?;
+    let mailbox_ids: Vec<String> = body
+        .get("mailboxIds")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .ok_or_else(|| set_error("invalidProperties", "missing mailboxIds"))?;
+    for id in &mailbox_ids {
+        if !fix.mailboxes.iter().any(|m| &m.id == id) {
+            return Err(set_error(
+                "invalidProperties",
+                &format!("unknown mailboxId {id:?}"),
+            ));
+        }
+    }
+    let keywords: Vec<String> = body
+        .get("keywords")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let server_id = format!("mock-email-{}", fix.emails.len() + 1);
+    // Determinism: a create-into-empty-fixture must produce the
+    // same timestamp every run. The fixture has no clock; we anchor
+    // to a fixed epoch so byte-stable transcripts hold even when
+    // the create path fires from a fresh fixture.
+    let received_at = fix
+        .emails
+        .iter()
+        .map(|e| e.received_at)
+        .max()
+        .unwrap_or_else(|| {
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .expect("hardcoded RFC3339")
+                .with_timezone(&chrono::Utc)
+        });
+    let email = Email {
+        id: server_id.clone(),
+        thread_id: server_id.clone(),
+        mailbox_ids,
+        keywords,
+        size: 0,
+        received_at,
+        sent_at: received_at,
+        from: None,
+        to: vec![],
+        cc: vec![],
+        bcc: vec![],
+        reply_to: vec![],
+        subject: None,
+        preview: None,
+        message_id: vec![],
+        in_reply_to: vec![],
+        references: vec![],
+        has_attachment: false,
+        body: crate::fixture::Body::Text(String::new()),
+        attachments: vec![],
+    };
+    Ok((server_id, email))
+}
+
+fn apply_email_patch(email: &mut Email, patch: &Value) -> Result<(), Value> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| set_error("invalidProperties", "patch must be an object"))?;
+    for (path, value) in obj {
+        match path.as_str() {
+            "keywords" => {
+                let map = value
+                    .as_object()
+                    .ok_or_else(|| set_error("invalidProperties", "keywords must be an object"))?;
+                email.keywords = map.keys().cloned().collect();
+            }
+            "mailboxIds" => {
+                let map = value.as_object().ok_or_else(|| {
+                    set_error("invalidProperties", "mailboxIds must be an object")
+                })?;
+                email.mailbox_ids = map.keys().cloned().collect();
+            }
+            other if other.starts_with("keywords/") => {
+                let name = other.strip_prefix("keywords/").expect("checked");
+                if value.is_null() {
+                    email.keywords.retain(|k| k != name);
+                } else if value.as_bool() == Some(true) {
+                    if !email.keywords.iter().any(|k| k == name) {
+                        email.keywords.push(name.to_string());
+                    }
+                } else {
+                    return Err(set_error(
+                        "invalidProperties",
+                        &format!("{path} expects true or null"),
+                    ));
+                }
+            }
+            other if other.starts_with("mailboxIds/") => {
+                let id = other.strip_prefix("mailboxIds/").expect("checked");
+                if value.is_null() {
+                    email.mailbox_ids.retain(|m| m != id);
+                } else if value.as_bool() == Some(true) {
+                    if !email.mailbox_ids.iter().any(|m| m == id) {
+                        email.mailbox_ids.push(id.to_string());
+                    }
+                } else {
+                    return Err(set_error(
+                        "invalidProperties",
+                        &format!("{path} expects true or null"),
+                    ));
+                }
+            }
+            other => {
+                return Err(set_error(
+                    "invalidProperties",
+                    &format!("v0 mock does not implement patch path {other:?}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Mailbox/set ─────────────────────────────────────────────────────
+//
+// RFC 8621 §2.5. v0 supports the `name`, `parentId`, `sortOrder`,
+// `role`, and `isSubscribed` properties on create + update. The
+// counter / sub-resource fields (`totalEmails`, `unreadEmails`, ...)
+// are derived at read time and cannot be patched.
+
+fn mailbox_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = require_account(fixture, args)?.to_string();
+    if let Some(if_in_state) = args.get("ifInState").and_then(Value::as_str)
+        && if_in_state != fixture.state
+    {
+        return Err(json!({
+            "type": "stateMismatch",
+            "description": format!(
+                "ifInState {if_in_state:?} does not match current state {:?}",
+                fixture.state,
+            ),
+        }));
+    }
+    let creates = args
+        .get("create")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let updates = args
+        .get("update")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let destroys: Vec<String> = args
+        .get("destroy")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let mut created_out = Map::new();
+    let mut not_created = Map::new();
+    let mut updated_out = Map::new();
+    let mut not_updated = Map::new();
+    let mut destroyed_out: Vec<String> = Vec::new();
+    let mut not_destroyed = Map::new();
+
+    let trans = fixture.mutate(|fix| {
+        let mut diff = crate::fixture::MutationDiff::default();
+
+        for (client_id, body) in &creates {
+            match build_mailbox_from_create(fix, body) {
+                Ok(mailbox) => {
+                    let server_id = mailbox.id.clone();
+                    fix.mailboxes.push(mailbox);
+                    diff.mailbox_created.push(server_id.clone());
+                    created_out.insert(
+                        client_id.clone(),
+                        json!({
+                            "id": server_id,
+                            "totalEmails": 0,
+                            "unreadEmails": 0,
+                            "totalThreads": 0,
+                            "unreadThreads": 0,
+                            "myRights": {
+                                "mayReadItems": true,
+                                "mayAddItems": true,
+                                "mayRemoveItems": true,
+                                "maySetSeen": true,
+                                "maySetKeywords": true,
+                                "mayCreateChild": true,
+                                "mayRename": true,
+                                "mayDelete": true,
+                                "maySubmit": true,
+                            },
+                        }),
+                    );
+                }
+                Err(err) => {
+                    not_created.insert(client_id.clone(), err);
+                }
+            }
+        }
+
+        for (id, patch) in &updates {
+            let Some(idx) = fix.mailboxes.iter().position(|m| &m.id == id) else {
+                not_updated.insert(id.clone(), set_error("notFound", "no such mailbox"));
+                continue;
+            };
+            let mut clone = fix.mailboxes[idx].clone();
+            match apply_mailbox_patch(&mut clone, patch) {
+                Ok(()) => {
+                    fix.mailboxes[idx] = clone;
+                    diff.mailbox_updated.push(id.clone());
+                    updated_out.insert(id.clone(), Value::Null);
+                }
+                Err(err) => {
+                    not_updated.insert(id.clone(), err);
+                }
+            }
+        }
+
+        for id in &destroys {
+            // RFC 8621 §2.5: destroying a mailbox that still
+            // contains emails is rejected with `mailboxHasEmail`.
+            // We follow the same shape so ratatoskr's destroy path
+            // sees the realistic failure mode.
+            if fix.emails.iter().any(|e| e.mailbox_ids.contains(id)) {
+                not_destroyed.insert(
+                    id.clone(),
+                    set_error(
+                        "mailboxHasEmail",
+                        "mailbox still contains emails; destroy them first",
+                    ),
+                );
+                continue;
+            }
+            let len_before = fix.mailboxes.len();
+            fix.mailboxes.retain(|m| &m.id != id);
+            if fix.mailboxes.len() < len_before {
+                diff.mailbox_destroyed.push(id.clone());
+                destroyed_out.push(id.clone());
+            } else {
+                not_destroyed.insert(id.clone(), set_error("notFound", "no such mailbox"));
+            }
+        }
+
+        diff
+    });
+
+    Ok(set_response(
+        &account_id,
+        &trans.from_state,
+        &trans.to_state,
+        created_out,
+        not_created,
+        updated_out,
+        not_updated,
+        destroyed_out,
+        not_destroyed,
+    ))
+}
+
+fn build_mailbox_from_create(
+    fix: &Fixture,
+    body: &Value,
+) -> Result<Mailbox, Value> {
+    let body = body.as_object().ok_or_else(|| {
+        set_error("invalidProperties", "create body must be an object")
+    })?;
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| set_error("invalidProperties", "missing name"))?
+        .to_string();
+    let parent_id = body
+        .get("parentId")
+        .and_then(|v| if v.is_null() { None } else { v.as_str().map(String::from) });
+    if let Some(pid) = &parent_id
+        && !fix.mailboxes.iter().any(|m| &m.id == pid)
+    {
+        return Err(set_error(
+            "invalidProperties",
+            &format!("unknown parentId {pid:?}"),
+        ));
+    }
+    let sort_order = body.get("sortOrder").and_then(Value::as_i64);
+    let is_subscribed = body
+        .get("isSubscribed")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let role = body
+        .get("role")
+        .and_then(|v| if v.is_null() { None } else { v.as_str() })
+        .map(crate::fixture::Role::parse)
+        .transpose()
+        .map_err(|e: String| set_error("invalidProperties", &e))?;
+    let id = format!("mock-mailbox-{}", fix.mailboxes.len() + 1);
+    Ok(Mailbox {
+        id,
+        name,
+        role,
+        parent_id,
+        sort_order,
+        is_subscribed,
+    })
+}
+
+fn apply_mailbox_patch(mailbox: &mut Mailbox, patch: &Value) -> Result<(), Value> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| set_error("invalidProperties", "patch must be an object"))?;
+    for (path, value) in obj {
+        match path.as_str() {
+            "name" => {
+                let s = value.as_str().ok_or_else(|| {
+                    set_error("invalidProperties", "name must be a string")
+                })?;
+                mailbox.name = s.to_string();
+            }
+            "parentId" => {
+                if value.is_null() {
+                    mailbox.parent_id = None;
+                } else if let Some(s) = value.as_str() {
+                    mailbox.parent_id = Some(s.to_string());
+                } else {
+                    return Err(set_error(
+                        "invalidProperties",
+                        "parentId must be a string or null",
+                    ));
+                }
+            }
+            "sortOrder" => {
+                if value.is_null() {
+                    mailbox.sort_order = None;
+                } else if let Some(n) = value.as_i64() {
+                    mailbox.sort_order = Some(n);
+                } else {
+                    return Err(set_error(
+                        "invalidProperties",
+                        "sortOrder must be an integer or null",
+                    ));
+                }
+            }
+            "isSubscribed" => {
+                let b = value.as_bool().ok_or_else(|| {
+                    set_error("invalidProperties", "isSubscribed must be a boolean")
+                })?;
+                mailbox.is_subscribed = b;
+            }
+            "role" => {
+                if value.is_null() {
+                    mailbox.role = None;
+                } else if let Some(s) = value.as_str() {
+                    mailbox.role = Some(
+                        crate::fixture::Role::parse(s)
+                            .map_err(|e: String| set_error("invalidProperties", &e))?,
+                    );
+                } else {
+                    return Err(set_error(
+                        "invalidProperties",
+                        "role must be a string or null",
+                    ));
+                }
+            }
+            other => {
+                return Err(set_error(
+                    "invalidProperties",
+                    &format!("v0 mock does not implement patch path {other:?}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── /set helpers ────────────────────────────────────────────────────
+
+fn set_error(kind: &str, description: &str) -> Value {
+    json!({
+        "type": kind,
+        "description": description,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_response(
+    account_id: &str,
+    old_state: &str,
+    new_state: &str,
+    created: Map<String, Value>,
+    not_created: Map<String, Value>,
+    updated: Map<String, Value>,
+    not_updated: Map<String, Value>,
+    destroyed: Vec<String>,
+    not_destroyed: Map<String, Value>,
+) -> Value {
+    let mut out = Map::new();
+    out.insert("accountId".to_string(), Value::String(account_id.to_string()));
+    out.insert("oldState".to_string(), Value::String(old_state.to_string()));
+    out.insert("newState".to_string(), Value::String(new_state.to_string()));
+    out.insert(
+        "created".to_string(),
+        if created.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(created)
+        },
+    );
+    out.insert(
+        "notCreated".to_string(),
+        if not_created.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(not_created)
+        },
+    );
+    out.insert(
+        "updated".to_string(),
+        if updated.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(updated)
+        },
+    );
+    out.insert(
+        "notUpdated".to_string(),
+        if not_updated.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(not_updated)
+        },
+    );
+    out.insert(
+        "destroyed".to_string(),
+        if destroyed.is_empty() {
+            Value::Null
+        } else {
+            Value::Array(destroyed.into_iter().map(Value::String).collect())
+        },
+    );
+    out.insert(
+        "notDestroyed".to_string(),
+        if not_destroyed.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(not_destroyed)
+        },
+    );
+    Value::Object(out)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1010,6 +1638,7 @@ mod tests {
             oauth: crate::fixture::OAuthConfig::default(),
             calendars: vec![],
             events: vec![],
+            change_log: crate::fixture::ChangeLog::default(),
         }
     }
 
@@ -1182,6 +1811,7 @@ mod tests {
             oauth: crate::fixture::OAuthConfig::default(),
             calendars: vec![],
             events: vec![],
+            change_log: crate::fixture::ChangeLog::default(),
         }
     }
 
@@ -1456,6 +2086,7 @@ mod tests {
             oauth: crate::fixture::OAuthConfig::default(),
             calendars: vec![],
             events: vec![],
+            change_log: crate::fixture::ChangeLog::default(),
         }
     }
 

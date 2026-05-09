@@ -53,14 +53,22 @@ checking whether the fact is already in `notes/`.
   JMAP listener (`/oauth/token`). IMAP and SMTP keep their own
   always-accept auth surfaces. See
   `notes/ratatoskr-oauth-surface.md`.
-- One shared fixture per process. Each protocol projects its own wire
-  shape from the same canonical types in `src/fixture.rs`.
-- `Email/changes` / `Mailbox/changes` return the RFC-shaped
-  envelope: empty-delta when `sinceState == fixture.state`,
-  `cannotCalculateChanges` otherwise. Other out-of-scope JMAP
-  methods (`Email/set`, `EmailSubmission/set`, push, etc.) return
-  `unknownMethod`. Out-of-scope IMAP commands (write paths, IDLE,
-  NOTIFY, etc.) return `BAD`.
+- One shared fixture per process, behind a single
+  `Arc<RwLock<Fixture>>` (`shared::FixtureHandle`). Read paths take
+  brief read guards; the JMAP `Email/set` / `Mailbox/set` mutators
+  take a write guard for the duration of the envelope. Guards are
+  never held across `.await` or dispatcher callbacks.
+- Each protocol projects its own wire shape from the same canonical
+  types in `src/fixture.rs`.
+- `Fixture::state` advances on every successful mutation; the
+  `change_log` (bounded at 256 transitions) records per-resource
+  ids per transition. `Email/changes` and `Mailbox/changes` walk
+  it to compute real deltas with RFC 8620 §5.2 dominance applied
+  (created+destroyed cancels, created+updated collapses, etc.).
+  Unknown / evicted `sinceState` returns `cannotCalculateChanges`.
+  Out-of-scope JMAP methods (`EmailSubmission/set`, push,
+  `Thread/get`, etc.) still return `unknownMethod`. Out-of-scope
+  IMAP commands (write paths, IDLE, NOTIFY, etc.) return `BAD`.
 - The session must NOT advertise `urn:ietf:params:jmap:principals`.
   It would pull the client into `Principal/get` and
   `ShareNotification` paths the mock cannot satisfy.
@@ -171,8 +179,12 @@ checking whether the fact is already in `notes/`.
 ## Status
 
 JMAP: complete for v0 (session resource, `Mailbox/get`, `Email/query`,
-`Email/get`, `Mailbox/changes` + `Email/changes` with steady-state
-semantics, full integration test coverage).
+`Email/get`, `Mailbox/changes` + `Email/changes` walking the real
+per-state change log, plus `Email/set` and `Mailbox/set` mutators
+honouring the create / update / destroy maps and the patch shapes
+ratatoskr drives - `keywords` / `keywords/<flag>`, `mailboxIds` /
+`mailboxIds/<id>`, plus `name` / `parentId` / `sortOrder` / `role` /
+`isSubscribed` on mailboxes. Full integration test coverage).
 
 IMAP: complete for v0's read path (greeting, `CAPABILITY`, `LOGIN`/
 `AUTHENTICATE`, `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT`/`EXAMINE`/

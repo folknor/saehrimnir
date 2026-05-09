@@ -15,12 +15,25 @@ trio.
 
 ### Mutation surfaces (highest leverage)
 
-- **[jmap] `Email/set` + `Mailbox/set`.** `src/jmap.rs:120` falls
-  through to `unknownMethod` for any method outside the v0 reads.
-  Needs to accept the changes and reflect them in the next
-  `Email/changes` / `Mailbox/changes` so a delta-after-mutation
-  script can prove the round-trip. Closes the IMAP/JMAP "mutation
-  fixtures remain" gap on the JMAP side.
+- **[jmap] `Email/set` + `Mailbox/set`.** Landed. `src/jmap.rs`
+  now wires both mutators against an `Arc<RwLock<Fixture>>` write
+  path. Creates produce deterministic `mock-email-N` /
+  `mock-mailbox-N` ids; updates honour the `keywords` /
+  `keywords/<flag>` and `mailboxIds` / `mailboxIds/<id>` patch
+  shapes ratatoskr drives, plus `name` / `parentId` / `sortOrder`
+  / `role` / `isSubscribed` on mailboxes. Mutations bump
+  `Fixture::state` to `<seed>.<n>` and append to a bounded
+  `change_log` (256 transitions); `Email/changes` /
+  `Mailbox/changes` walk it with RFC 8620 §5.2 dominance. The
+  delta-after-mutation round-trip is asserted across six
+  integration tests in `tests/api.rs`
+  (`email_set_update_round_trips_through_email_changes`,
+  `email_set_destroy_round_trips`,
+  `email_set_create_round_trips_through_email_get`,
+  `mailbox_set_create_then_destroy_cancels_in_changes`,
+  `mailbox_set_destroy_rejects_non_empty_mailbox`,
+  `email_set_if_in_state_mismatch_rejects_envelope`). Surface
+  documented in `notes/ratatoskr-jmap-surface.md`.
 - **[imap] `UID STORE` (persistent), `UID COPY`, `UID EXPUNGE`.**
   `UID STORE` is wired today as a non-persistent no-op
   (`src/imap.rs:683` - tagged OK plus post-op FETCH untagged, but
