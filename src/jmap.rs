@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::fixture::{Address, Attachment, Body, Disposition, Email, Fixture, Mailbox};
+use crate::shared::FixtureHandle;
 
 /// Wire-level request envelope.
 #[derive(Debug, Deserialize)]
@@ -40,7 +41,7 @@ pub type MethodResponse = (String, Value, String);
 /// response envelope. Errors per call land inside `methodResponses` as
 /// `("error", {...}, callId)`; the envelope itself is always 200.
 pub fn handle(
-    fixture: &Fixture,
+    fixture: &FixtureHandle,
     dispatcher: Option<&std::sync::Arc<crate::lua::Dispatcher>>,
     req: JmapRequest,
 ) -> JmapResponse {
@@ -49,15 +50,20 @@ pub fn handle(
         let (out_name, out_args) = dispatch(fixture, dispatcher, &name, &args);
         responses.push((out_name, out_args, call_id));
     }
+    let session_state = fixture
+        .read()
+        .expect("fixture lock poisoned")
+        .state
+        .clone();
     JmapResponse {
         method_responses: responses,
-        session_state: fixture.state.clone(),
+        session_state,
         created_ids: req.created_ids,
     }
 }
 
 fn dispatch(
-    fixture: &Fixture,
+    fixture: &FixtureHandle,
     dispatcher: Option<&std::sync::Arc<crate::lua::Dispatcher>>,
     name: &str,
     args: &Value,
@@ -96,24 +102,30 @@ fn dispatch(
         }
     }
 
+    // Acquire the read guard *after* the dispatcher callback returns
+    // (callbacks must never run with a fixture lock held - a future
+    // hook that mutates would deadlock) and drop it as soon as the
+    // method handler returns. Each method-call in a batched envelope
+    // gets its own brief acquisition.
+    let fix = fixture.read().expect("fixture lock poisoned");
     match name {
-        "Mailbox/get" => match mailbox_get(fixture, args) {
+        "Mailbox/get" => match mailbox_get(&fix, args) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
-        "Email/query" => match email_query(fixture, args) {
+        "Email/query" => match email_query(&fix, args) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
-        "Email/get" => match email_get(fixture, args) {
+        "Email/get" => match email_get(&fix, args) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
-        "Mailbox/changes" => match mailbox_changes(fixture, args) {
+        "Mailbox/changes" => match mailbox_changes(&fix, args) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
-        "Email/changes" => match email_changes(fixture, args) {
+        "Email/changes" => match email_changes(&fix, args) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
@@ -1065,7 +1077,7 @@ mod tests {
 
     #[test]
     fn dispatch_unknown_method_returns_error() {
-        let f = fix();
+        let f = crate::shared::handle(fix());
         let (name, body) = dispatch(&f, None, "Email/import", &json!({}));
         assert_eq!(name, "error");
         assert_eq!(body.get("type").unwrap(), "unknownMethod");
@@ -1073,7 +1085,7 @@ mod tests {
 
     #[test]
     fn handle_passes_call_id_through_and_echoes_state() {
-        let f = fix();
+        let f = crate::shared::handle(fix());
         let req = JmapRequest {
             using: vec!["urn:ietf:params:jmap:core".into()],
             method_calls: vec![("Mailbox/get".into(), json!({"accountId": "acct"}), "c0".into())],
@@ -1089,7 +1101,7 @@ mod tests {
 
     #[test]
     fn handle_dispatches_each_call_independently() {
-        let f = fix();
+        let f = crate::shared::handle(fix());
         let req = JmapRequest {
             using: vec![],
             method_calls: vec![

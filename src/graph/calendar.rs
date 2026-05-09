@@ -80,12 +80,11 @@ async fn list_calendars(
         return o;
     }
     let _ = headers;
-    let value: Vec<Value> = state
-        .shared
-        .fixture
+    let fixture = state.fixture();
+    let value: Vec<Value> = fixture
         .calendars
         .iter()
-        .map(|c| serialize_calendar(&state.shared.fixture, c))
+        .map(|c| serialize_calendar(&fixture, c))
         .collect();
     ok_json(json!({
         "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#me/calendars",
@@ -102,8 +101,9 @@ async fn get_calendar(
     }) {
         return o;
     }
-    match resolve_calendar(&state.shared.fixture, &calendar) {
-        Some(c) => ok_json(serialize_calendar(&state.shared.fixture, c)),
+    let fixture = state.fixture();
+    match resolve_calendar(&fixture, &calendar) {
+        Some(c) => ok_json(serialize_calendar(&fixture, c)),
         None => error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -122,7 +122,8 @@ async fn list_events(
     }) {
         return o;
     }
-    if resolve_calendar(&state.shared.fixture, &calendar).is_none() {
+    let fixture = state.fixture();
+    if resolve_calendar(&fixture, &calendar).is_none() {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -148,20 +149,16 @@ async fn list_events(
     // so we never materialise the full filtered list. The
     // `nextLink` decision needs the total count, which is one
     // additional pass and still avoids the O(N) clone.
-    let page: Vec<Value> = state
-        .shared
-        .fixture
+    let page: Vec<Value> = fixture
         .events
         .iter()
         .filter(|e| e.calendar_id == calendar)
         .skip(skip as usize)
         .take(top as usize)
-        .map(|e| serialize_event(&state.shared.fixture, e))
+        .map(|e| serialize_event(&fixture, e))
         .collect();
     let next_skip = (skip as usize) + page.len();
-    let has_more = state
-        .shared
-        .fixture
+    let has_more = fixture
         .events
         .iter()
         .filter(|e| e.calendar_id == calendar)
@@ -200,7 +197,8 @@ async fn delta_events(
     }) {
         return o;
     }
-    if resolve_calendar(&state.shared.fixture, &calendar).is_none() {
+    let fixture = state.fixture();
+    if resolve_calendar(&fixture, &calendar).is_none() {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -262,20 +260,16 @@ async fn delta_events(
             );
         }
     };
-    let page: Vec<Value> = state
-        .shared
-        .fixture
+    let page: Vec<Value> = fixture
         .events
         .iter()
         .filter(|e| e.calendar_id == calendar)
         .skip(offset as usize)
         .take(top as usize)
-        .map(|e| serialize_event(&state.shared.fixture, e))
+        .map(|e| serialize_event(&fixture, e))
         .collect();
     let next_offset_val = (offset as usize) + page.len();
-    let has_more = state
-        .shared
-        .fixture
+    let has_more = fixture
         .events
         .iter()
         .filter(|e| e.calendar_id == calendar)
@@ -317,8 +311,9 @@ async fn get_event(
     }) {
         return o;
     }
-    match state.shared.fixture.events.iter().find(|e| e.id == event) {
-        Some(e) => ok_json(serialize_event(&state.shared.fixture, e)),
+    let fixture = state.fixture();
+    match fixture.events.iter().find(|e| e.id == event) {
+        Some(e) => ok_json(serialize_event(&fixture, e)),
         None => error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -346,13 +341,19 @@ async fn create_event(
     Path(calendar): Path<String>,
     body: AxumBody,
 ) -> Response {
-    if resolve_calendar(&state.shared.fixture, &calendar).is_none() {
+    let calendar_known = {
+        let fixture = state.fixture();
+        resolve_calendar(&fixture, &calendar).is_some()
+    };
+    if !calendar_known {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
             &format!("calendar {calendar:?} not declared in fixture"),
         );
     }
+    // calendar_known dropped before we await the body; the read
+    // guard does not span the await.
     let parsed = match parse_json_body(body).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -371,16 +372,20 @@ async fn patch_event(
     Path(event): Path<String>,
     body: AxumBody,
 ) -> Response {
-    let calendar_id = match state.shared.fixture.events.iter().find(|e| e.id == event) {
-        Some(e) => e.calendar_id.clone(),
-        None => {
-            return error(
-                StatusCode::NOT_FOUND,
-                "ResourceNotFound",
-                &format!("event {event:?} not declared in fixture"),
-            );
+    let calendar_id = {
+        let fixture = state.fixture();
+        match fixture.events.iter().find(|e| e.id == event) {
+            Some(e) => e.calendar_id.clone(),
+            None => {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "ResourceNotFound",
+                    &format!("event {event:?} not declared in fixture"),
+                );
+            }
         }
     };
+    // Read guard dropped before the await on the request body.
     let parsed = match parse_json_body(body).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -398,7 +403,11 @@ async fn delete_event(
     State(state): State<AppState>,
     Path(event): Path<String>,
 ) -> Response {
-    if !state.shared.fixture.events.iter().any(|e| e.id == event) {
+    let event_known = {
+        let fixture = state.fixture();
+        fixture.events.iter().any(|e| e.id == event)
+    };
+    if !event_known {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",

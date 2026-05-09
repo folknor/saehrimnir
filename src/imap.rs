@@ -51,7 +51,7 @@ enum State {
 /// is closed or when the shutdown signal interrupts a read.
 pub async fn serve(
     listener: TcpListener,
-    fixture: Arc<Fixture>,
+    fixture: crate::shared::FixtureHandle,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     request_log: crate::request_log::RequestLog,
     mut shutdown: watch::Receiver<bool>,
@@ -92,7 +92,7 @@ pub async fn serve(
 /// consult it before generating their default responses.
 pub async fn serve_connection<S>(
     stream: S,
-    fixture: Arc<Fixture>,
+    fixture: crate::shared::FixtureHandle,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     request_log: crate::request_log::RequestLog,
     shutdown: &mut watch::Receiver<bool>,
@@ -135,7 +135,7 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     reader: BufReader<ReadHalf<S>>,
     writer: WriteHalf<S>,
     state: State,
-    fixture: Arc<Fixture>,
+    fixture: crate::shared::FixtureHandle,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     /// Cross-protocol request log handle. Cheap to clone (it's an
     /// `Arc<Mutex<...>>`); tests that don't care just pass
@@ -175,6 +175,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     /// Read the next top-level command line, racing against shutdown so
     /// SIGTERM during an idle connection exits cleanly.
+    /// Acquire a brief read guard on the shared fixture. Callers must
+    /// drop the guard before any `.await` or dispatcher callback;
+    /// holding it across an await would block every subsequent
+    /// connection attempting a write (`Email/set` / `Mailbox/set` on
+    /// the JMAP listener) and risk deadlock with the dispatcher. In
+    /// practice each command pulls owned data out of the guard
+    /// (`Vec<ListEntry>`, `Counts`, etc.) and writes the wire bytes
+    /// after the guard drops.
+    fn fix_read(&self) -> std::sync::RwLockReadGuard<'_, Fixture> {
+        self.fixture.read().expect("fixture lock poisoned")
+    }
+
     async fn read_command_line(
         &mut self,
         shutdown: &mut watch::Receiver<bool>,
@@ -449,7 +461,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // falls back to substring matching, which is enough for
         // ratatoskr (it only ever sends `*`).
         let _ = reference; // hierarchy reference is unused in v0.
-        let entries = list_mailboxes(&self.fixture);
+        let entries = list_mailboxes(&self.fix_read());
         for e in &entries {
             if !pattern_matches(&pattern, &e.path) {
                 continue;
@@ -479,14 +491,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     .await;
             }
         };
-        let entries = list_mailboxes(&self.fixture);
+        let entries = list_mailboxes(&self.fix_read());
         let entry = entries.iter().find(|e| e.path.eq_ignore_ascii_case(&parsed.name));
         let Some(entry) = entry else {
             return self
                 .write_line(&format!("{tag} NO STATUS unknown mailbox"))
                 .await;
         };
-        let counts = mailbox_counts(&self.fixture, &entry.fixture_id);
+        let counts = mailbox_counts(&self.fix_read(), &entry.fixture_id);
         let mut items = Vec::with_capacity(parsed.items.len());
         for item in &parsed.items {
             let pair = match item.to_ascii_uppercase().as_str() {
@@ -532,7 +544,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     .await;
             }
         };
-        let entries = list_mailboxes(&self.fixture);
+        let entries = list_mailboxes(&self.fix_read());
         let entry = entries.iter().find(|e| e.path.eq_ignore_ascii_case(&name));
         let Some(entry) = entry else {
             // Per RFC, on NO SELECT the connection drops back to
@@ -544,10 +556,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 .await;
         };
 
-        let counts = mailbox_counts(&self.fixture, &entry.fixture_id);
-        let first_unseen_idx = mailbox_messages(&self.fixture, &entry.fixture_id)
-            .iter()
-            .position(|(_, e)| !e.keywords.iter().any(|k| k == "$seen"));
+        // Counts and the first-unseen index are both pure projections
+        // into owned data; each helper borrows the fixture only for
+        // its own call and the result owns no `&Fixture` references,
+        // so the guard drops between calls.
+        let counts = mailbox_counts(&self.fix_read(), &entry.fixture_id);
+        let first_unseen_idx = {
+            let fix = self.fix_read();
+            mailbox_messages(&fix, &entry.fixture_id)
+                .iter()
+                .position(|(_, e)| !e.keywords.iter().any(|k| k == "$seen"))
+        };
         let entry_id = entry.fixture_id.clone();
 
         // Untagged responses, RFC 3501 sec 6.3.1. Order does not
@@ -679,10 +698,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
         }
 
-        // Snapshot the rendered FETCH lines up front so the immutable
-        // borrow on self.fixture can drop before we start writing.
+        // Snapshot the rendered FETCH lines up front so the read
+        // guard drops before we start writing - the writes await on
+        // socket I/O and we must never hold a fixture lock across
+        // `.await`.
         let lines: Vec<String> = if changedsince_matches(changedsince) {
-            mailbox_messages(&self.fixture, &selected_id)
+            let fix = self.fix_read();
+            mailbox_messages(&fix, &selected_id)
                 .into_iter()
                 .filter(|(uid, _)| set.matches(*uid))
                 .map(|(uid, email)| {
@@ -749,18 +771,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .selected
             .clone()
             .expect("Selected state requires selected mailbox");
-        let lines: Vec<String> = mailbox_messages(&self.fixture, &selected_id)
-            .into_iter()
-            .filter(|(uid, _)| set.matches(*uid))
-            .map(|(uid, email)| {
-                let flags = store_op.apply(email);
-                if store_op.silent {
-                    String::new()
-                } else {
-                    format!("* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n")
-                }
-            })
-            .collect();
+        let lines: Vec<String> = {
+            let fix = self.fix_read();
+            mailbox_messages(&fix, &selected_id)
+                .into_iter()
+                .filter(|(uid, _)| set.matches(*uid))
+                .map(|(uid, email)| {
+                    let flags = store_op.apply(email);
+                    if store_op.silent {
+                        String::new()
+                    } else {
+                        format!("* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n")
+                    }
+                })
+                .collect()
+        };
 
         for line in lines {
             if line.is_empty() {
@@ -774,7 +799,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     async fn cmd_uid_search(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
         let selected_id = self.selected.clone().expect("Selected state requires selected mailbox");
-        let messages = mailbox_messages(&self.fixture, &selected_id);
+        // Parse first (no fixture access); the BAD-criteria branch
+        // returns through `.await` and we must not hold the read
+        // guard across that.
         let matches = match parse_uid_search(args) {
             Some(m) => m,
             None => {
@@ -783,11 +810,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     .await;
             }
         };
-        let mut hits: Vec<u32> = messages
-            .iter()
-            .filter(|(uid, e)| matches.matches(*uid, e))
-            .map(|(uid, _)| *uid)
-            .collect();
+        let mut hits: Vec<u32> = {
+            let fix = self.fix_read();
+            mailbox_messages(&fix, &selected_id)
+                .iter()
+                .filter(|(uid, e)| matches.matches(*uid, e))
+                .map(|(uid, _)| *uid)
+                .collect()
+        };
         hits.sort_unstable();
 
         let line = if hits.is_empty() {
@@ -1868,8 +1898,8 @@ mod tests {
     use chrono::TimeZone;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn fixture() -> Arc<Fixture> {
-        Arc::new(Fixture {
+    fn fixture() -> crate::shared::FixtureHandle {
+        crate::shared::handle(Fixture {
             name: "t".into(),
             state: "s1".into(),
             account: Account {
@@ -1884,7 +1914,7 @@ mod tests {
         })
     }
 
-    fn fixture_with_folders() -> Arc<Fixture> {
+    fn fixture_with_folders() -> crate::shared::FixtureHandle {
         use crate::fixture::{Body, Email, Mailbox};
         let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let mk_email = |id: &str, mailbox: &str, seen: bool| Email {
@@ -1909,7 +1939,7 @@ mod tests {
             body: Body::Text("x".into()),
             attachments: vec![],
         };
-        Arc::new(Fixture {
+        crate::shared::handle(Fixture {
             name: "f".into(),
             state: "s1".into(),
             account: Account {
@@ -1991,7 +2021,7 @@ mod tests {
         run_script_with(script, fixture()).await
     }
 
-    async fn run_script_with(script: &[u8], fix: Arc<Fixture>) -> String {
+    async fn run_script_with(script: &[u8], fix: crate::shared::FixtureHandle) -> String {
         let (server, mut client) = tokio::io::duplex(8192);
         let (_tx, rx) = watch::channel(false);
         let server_task = tokio::spawn(async move {

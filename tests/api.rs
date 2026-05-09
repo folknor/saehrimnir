@@ -19,7 +19,7 @@ use saehrimnir::{fixture, lua, routes};
 
 fn router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    routes::router(routes::AppState::for_test(Arc::new(fix)))
+    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -302,7 +302,7 @@ async fn email_get_full_email_shape_with_body_values() {
 
 fn attach_router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap();
-    routes::router(routes::AppState::for_test(Arc::new(fix)))
+    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
 async fn attach_jmap_call(method: &str, args: Value, call_id: &str) -> Value {
@@ -536,7 +536,7 @@ fn router_with_lua_scenario(scenario: &str) -> axum::Router {
     let (fixture, dispatcher) =
         lua::load_source_with_dispatcher(scenario, "@cb-test").unwrap();
     routes::router(
-        routes::AppState::for_test(Arc::new(fixture)).with_dispatcher(Arc::new(dispatcher)),
+        routes::AppState::for_test(saehrimnir::shared::handle(fixture)).with_dispatcher(Arc::new(dispatcher)),
     )
 }
 
@@ -729,7 +729,7 @@ async fn jmap_callback_ids_absent_when_request_omits_them() {
 
 fn router_with_smtp_log(log: saehrimnir::smtp::SubmissionLog) -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    routes::router(routes::AppState::for_test(Arc::new(fix)).with_submission_log(log))
+    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_submission_log(log))
 }
 
 fn sample_submission(from: &str, attachment_size: usize) -> saehrimnir::smtp::Submission {
@@ -847,7 +847,7 @@ fn router_with_logs(
 ) -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
     routes::router(
-        routes::AppState::for_test(Arc::new(fix))
+        routes::AppState::for_test(saehrimnir::shared::handle(fix))
             .with_submission_log(smtp_log)
             .with_request_log(request_log),
     )
@@ -1037,7 +1037,7 @@ async fn test_fixture_step_returns_501_until_change_scripts_land() {
 
 fn router_with_token_store(store: saehrimnir::oauth::TokenStore) -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    routes::router(routes::AppState::for_test(Arc::new(fix)).with_token_store(store))
+    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store))
 }
 
 #[tokio::test]
@@ -1237,7 +1237,7 @@ fn router_with_enforce(store: saehrimnir::oauth::TokenStore) -> axum::Router {
         enforce: true,
         issuer: "https://saehrimnir.test/oauth".to_string(),
     };
-    routes::router(routes::AppState::for_test(Arc::new(fix)).with_token_store(store))
+    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store))
 }
 
 #[tokio::test]
@@ -1290,7 +1290,7 @@ async fn jmap_oauth_fixture_drives_revoked_token_recovery_flow() {
 
     let store = saehrimnir::oauth::TokenStore::default();
     let app = routes::router(
-        routes::AppState::for_test(Arc::new(fix)).with_token_store(store.clone()),
+        routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store.clone()),
     );
 
     // Step 1: client mints a token via the OAuth provider.

@@ -14,16 +14,34 @@
 //! Sharing only the four genuinely-shared handles is the minimum
 //! that keeps the construction sites readable.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::fixture::Fixture;
 use crate::lua::Dispatcher;
 use crate::oauth::TokenStore;
 use crate::request_log::RequestLog;
 
+/// Shared, mutex-protected handle to the live `Fixture`. Cloning is
+/// cheap (an `Arc` bump). Holders acquire `.read()` for the read
+/// paths and `.write()` for the JMAP `Email/set` / `Mailbox/set`
+/// mutators (see `notes/fixture-format.md`). The single fixture-level
+/// lock fits the read-heavy / narrow-mutation profile and avoids the
+/// locking discipline a per-resource scheme would demand. Guards are
+/// held only for the duration of an in-memory walk; never across a
+/// `.await` or a Lua dispatcher callback (those would deadlock on the
+/// next call).
+pub type FixtureHandle = Arc<RwLock<Fixture>>;
+
+/// Construct a `FixtureHandle` around an owned `Fixture`. Centralised
+/// so test helpers and `main.rs` don't have to spell `Arc::new(
+/// RwLock::new(...))` themselves.
+pub fn handle(fixture: Fixture) -> FixtureHandle {
+    Arc::new(RwLock::new(fixture))
+}
+
 #[derive(Clone)]
 pub struct SharedHandles {
-    pub fixture: Arc<Fixture>,
+    pub fixture: FixtureHandle,
     pub dispatcher: Option<Arc<Dispatcher>>,
     pub request_log: RequestLog,
     pub token_store: TokenStore,
@@ -35,7 +53,7 @@ impl SharedHandles {
     /// Used by tests that don't need to drive a specific log; the
     /// per-router `AppState::for_test` helpers funnel through
     /// here.
-    pub fn for_test(fixture: Arc<Fixture>) -> Self {
+    pub fn for_test(fixture: FixtureHandle) -> Self {
         Self {
             fixture,
             dispatcher: None,

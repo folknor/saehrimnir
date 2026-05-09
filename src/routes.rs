@@ -19,7 +19,6 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::fixture::Fixture;
 use crate::jmap::{self, JmapRequest, JmapResponse};
 use crate::oauth::{self, BearerDecision};
 use crate::request_log::RequestEntry;
@@ -52,7 +51,7 @@ impl AppState {
     /// shared handles, an empty SMTP submission log, and a
     /// `"http://localhost"` base URL. Tests that need to drive a
     /// specific log clone the field after construction.
-    pub fn for_test(fixture: Arc<Fixture>) -> Self {
+    pub fn for_test(fixture: crate::shared::FixtureHandle) -> Self {
         Self {
             shared: SharedHandles::for_test(fixture),
             submission_log: smtp::SubmissionLog::default(),
@@ -167,7 +166,7 @@ async fn session(
     headers: HeaderMap,
 ) -> Result<Json<Value>, Response> {
     enforce_bearer(&state, &headers).map_err(|b| *b)?;
-    let fixture = &state.shared.fixture;
+    let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
     let acct_id = &fixture.account.id;
     let acct_name = &fixture.account.name;
     let base = state.base_url.as_str();
@@ -272,6 +271,10 @@ async fn api(
                 detail,
             }
         }));
+    // `jmap::handle` decides between a read and a write guard
+    // internally based on whether the envelope contains a mutating
+    // method (Email/set, Mailbox/set). Passing the handle (not a
+    // guard) keeps the locking decision colocated with the dispatcher.
     Ok(Json(jmap::handle(
         &state.shared.fixture,
         state.shared.dispatcher.as_ref(),
@@ -296,7 +299,14 @@ async fn api(
 /// unbootstrappable. Calling this from each protected handler is
 /// the simplest way to keep the bootstrap routes open.
 fn enforce_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
-    match crate::oauth::check_bearer(&state.shared.fixture, &state.shared.token_store, headers) {
+    // `expect` is fine here: the only path that poisons the fixture
+    // lock is a panic while a handler held the write guard, which
+    // means the process is already in an undefined state and there
+    // is no graceful answer to give the bearer check anyway. Same
+    // rationale as the other `fixture lock poisoned` panics.
+    #[allow(clippy::unwrap_in_result)]
+    let fix = state.shared.fixture.read().expect("fixture lock poisoned");
+    match crate::oauth::check_bearer(&fix, &state.shared.token_store, headers) {
         BearerDecision::Allow => Ok(()),
         BearerDecision::Deny(reason) => Err(Box::new(
             (
@@ -328,7 +338,8 @@ async fn download(
     if let Err(deny) = enforce_bearer(&state, &headers) {
         return *deny;
     }
-    for email in &state.shared.fixture.emails {
+    let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
+    for email in &fixture.emails {
         for att in &email.attachments {
             if att.blob_id == blob_id {
                 // RFC 5987 `filename*=UTF-8''<percent-encoded>`

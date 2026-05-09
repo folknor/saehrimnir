@@ -18,13 +18,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = cli::Args::parse();
 
     let scenario = scenario::load(&args.fixture).map_err(|e| format!("fixture: {e}"))?;
-    eprintln!(
-        "saehrimnir: fixture {:?} loaded ({} mailboxes, {} emails, dispatcher: {})",
-        scenario.fixture.name,
-        scenario.fixture.mailboxes.len(),
-        scenario.fixture.emails.len(),
-        if scenario.dispatcher.is_some() { "yes" } else { "no" },
-    );
+    {
+        let f = scenario.fixture.read().expect("fixture lock poisoned");
+        eprintln!(
+            "saehrimnir: fixture {:?} loaded ({} mailboxes, {} emails, dispatcher: {})",
+            f.name,
+            f.mailboxes.len(),
+            f.emails.len(),
+            if scenario.dispatcher.is_some() { "yes" } else { "no" },
+        );
+    }
     let fixture = Arc::clone(&scenario.fixture);
     let dispatcher = scenario.dispatcher.clone();
 

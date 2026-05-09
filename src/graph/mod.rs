@@ -25,7 +25,6 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use crate::fixture::Fixture;
 use crate::oauth::BearerDecision;
 use crate::shared::SharedHandles;
 
@@ -39,10 +38,19 @@ pub struct AppState {
 impl AppState {
     /// Build an `AppState` around `fixture` with fresh, default
     /// shared handles.
-    pub fn for_test(fixture: Arc<Fixture>) -> Self {
+    pub fn for_test(fixture: crate::shared::FixtureHandle) -> Self {
         Self {
             shared: SharedHandles::for_test(fixture),
         }
+    }
+
+    /// Acquire a brief read guard on the shared fixture. Caller-side
+    /// helpers (`folder_value`, `resolve_folder`, ...) want `&Fixture`
+    /// and the read guard derefs to it. Drop the guard before any
+    /// `.await` or dispatcher call - middleware and `maybe_override`
+    /// must run first.
+    pub(crate) fn fixture(&self) -> std::sync::RwLockReadGuard<'_, crate::fixture::Fixture> {
+        self.shared.fixture.read().expect("fixture lock poisoned")
     }
 
     /// Replace the request log on the shared handle bag.
@@ -116,11 +124,17 @@ async fn enforce_bearer_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    match crate::oauth::check_bearer(
-        &state.shared.fixture,
-        &state.shared.token_store,
-        req.headers(),
-    ) {
+    // Scope the fixture read guard so it drops before `next.run`
+    // awaits the inner handler chain. Holding a read lock across the
+    // await would back up any concurrent writer (`Email/set` /
+    // `Mailbox/set` on the JMAP listener) for the duration of the
+    // chained handler, even though we no longer need the fixture
+    // ourselves.
+    let decision = {
+        let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
+        crate::oauth::check_bearer(&fixture, &state.shared.token_store, req.headers())
+    };
+    match decision {
         BearerDecision::Allow => next.run(req).await,
         BearerDecision::Deny(reason) => {
             error(StatusCode::UNAUTHORIZED, "InvalidAuthenticationToken", &reason)

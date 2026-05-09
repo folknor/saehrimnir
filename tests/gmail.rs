@@ -17,7 +17,7 @@ use saehrimnir::{fixture, gmail, lua};
 
 fn router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    gmail::router(gmail::AppState::for_test(Arc::new(fix)))
+    gmail::router(gmail::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
 async fn get_json(uri: &str) -> (StatusCode, Value) {
@@ -44,7 +44,7 @@ async fn get_json_with(router: axum::Router, uri: &str) -> (StatusCode, Value) {
 
 fn attach_router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap();
-    gmail::router(gmail::AppState::for_test(Arc::new(fix)))
+    gmail::router(gmail::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
 #[tokio::test]
@@ -292,7 +292,7 @@ fn router_with_lua_scenario(scenario: &str) -> axum::Router {
     let (fixture, dispatcher) =
         lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
     gmail::router(
-        gmail::AppState::for_test(Arc::new(fixture)).with_dispatcher(Arc::new(dispatcher)),
+        gmail::AppState::for_test(saehrimnir::shared::handle(fixture)).with_dispatcher(Arc::new(dispatcher)),
     )
 }
 
@@ -359,7 +359,7 @@ async fn gmail_middleware_records_request_log_entries() {
     let request_log = RequestLog::default();
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
     let app = gmail::router(
-        gmail::AppState::for_test(Arc::new(fix)).with_request_log(request_log.clone()),
+        gmail::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(request_log.clone()),
     );
 
     let _ = get_json_via(app.clone(), "/gmail/v1/users/me/profile").await;

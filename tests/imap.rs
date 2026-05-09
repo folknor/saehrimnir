@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 async fn run_with_fixture(script: &[u8]) -> String {
-    let fix = Arc::new(
+    let fix = saehrimnir::shared::handle(
         fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap(),
     );
     let (server, mut client) = tokio::io::duplex(32 * 1024);
@@ -144,7 +144,7 @@ async fn body_literal_size_is_byte_accurate() {
 }
 
 async fn run_with_attach_fixture(script: &[u8]) -> String {
-    let fix = Arc::new(
+    let fix = saehrimnir::shared::handle(
         fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap(),
     );
     let (server, mut client) = tokio::io::duplex(32 * 1024);
@@ -216,7 +216,7 @@ async fn deterministic_two_runs_emit_identical_bytes() {
 async fn run_with_lua_scenario(scenario: &str, imap_script: &[u8]) -> String {
     let (fix, dispatcher) =
         lua::load_source_with_dispatcher(scenario, "@cb-test").unwrap();
-    let fix = Arc::new(fix);
+    let fix = saehrimnir::shared::handle(fix);
     let dispatcher = Some(Arc::new(dispatcher));
     let (server, mut client) = tokio::io::duplex(64 * 1024);
     let (_tx, rx) = watch::channel(false);
@@ -367,7 +367,7 @@ async fn uid_fetch_no_handler_passes_through_silently() {
 }
 
 async fn run_with_imap_small(script: &[u8]) -> String {
-    let fix = Arc::new(fixture::load(std::path::Path::new("fixtures/imap-small.toml")).unwrap());
+    let fix = saehrimnir::shared::handle(fixture::load(std::path::Path::new("fixtures/imap-small.toml")).unwrap());
     let (server, mut client) = tokio::io::duplex(32 * 1024);
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
@@ -418,7 +418,7 @@ async fn imap_dispatch_records_request_log_entries() {
 
     let log = RequestLog::default();
     let log_clone = log.clone();
-    let fix = Arc::new(
+    let fix = saehrimnir::shared::handle(
         fixture::load(std::path::Path::new("fixtures/imap-small.toml")).unwrap(),
     );
 
@@ -465,7 +465,7 @@ async fn imap_uid_fetch_log_distinguishes_body_from_metadata() {
 
     let log = RequestLog::default();
     let log_clone = log.clone();
-    let fix = Arc::new(
+    let fix = saehrimnir::shared::handle(
         fixture::load(std::path::Path::new("fixtures/imap-small.toml")).unwrap(),
     );
 

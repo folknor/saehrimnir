@@ -9,16 +9,19 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::fixture::{self, Fixture};
+use crate::fixture;
 use crate::lua::{self, Dispatcher};
+use crate::shared::{self, FixtureHandle};
 
 /// Bundles the validated fixture with the dellingr-backed callback
 /// dispatcher (if any). All five protocol layers share these via
 /// `Arc` so a single `Mutex<State>` services dispatch requests from
-/// any worker thread.
+/// any worker thread. The fixture itself sits behind a single
+/// `RwLock` so the JMAP `Email/set` / `Mailbox/set` mutators can take
+/// a write guard without disturbing the read paths.
 #[derive(Clone)]
 pub struct Scenario {
-    pub fixture: Arc<Fixture>,
+    pub fixture: FixtureHandle,
     pub dispatcher: Option<Arc<Dispatcher>>,
 }
 
@@ -34,13 +37,13 @@ pub fn load(path: &Path) -> Result<Scenario, String> {
         let (fixture, dispatcher) =
             lua::load_source_with_dispatcher_and_dir(&source, &chunk_name, dir)?;
         Ok(Scenario {
-            fixture: Arc::new(fixture),
+            fixture: shared::handle(fixture),
             dispatcher: Some(Arc::new(dispatcher)),
         })
     } else {
         let fixture = fixture::load(path)?;
         Ok(Scenario {
-            fixture: Arc::new(fixture),
+            fixture: shared::handle(fixture),
             dispatcher: None,
         })
     }

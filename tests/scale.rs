@@ -10,7 +10,6 @@
 //! materialise everything into a Vec then OOM" bugs that don't
 //! show up at the 2-email scale of `jmap-small`.
 
-use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -25,9 +24,9 @@ use saehrimnir::{fixture, gmail, graph, routes};
 /// Total emails in fixtures/jmap-bulk.lua = 10000 bulk + 1 marker.
 const BULK_TOTAL: u64 = 10_000;
 
-fn bulk_fixture() -> Arc<fixture::Fixture> {
+fn bulk_fixture() -> saehrimnir::shared::FixtureHandle {
     let f = fixture::load(std::path::Path::new("fixtures/jmap-bulk.lua")).unwrap();
-    Arc::new(f)
+    saehrimnir::shared::handle(f)
 }
 
 fn jmap_router() -> axum::Router {

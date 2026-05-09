@@ -305,7 +305,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 
 #[derive(Clone)]
 pub struct UserInfoState {
-    pub fixture: Arc<Fixture>,
+    pub fixture: crate::shared::FixtureHandle,
     pub store: TokenStore,
 }
 
@@ -327,13 +327,14 @@ pub async fn userinfo_endpoint(
     // fixture loader rejects non-email-shaped names at load time
     // (`fixture::is_email_shaped`), so any fixture that survives
     // to here is safe to expose as the `email` claim.
-    let acct = &state.fixture.account;
+    let fixture = state.fixture.read().expect("fixture lock poisoned");
+    let acct = &fixture.account;
     Json(json!({
         "sub": acct.id,
         "email": acct.name,
         "email_verified": true,
         "name": acct.name,
-        "iss": state.fixture.oauth.issuer,
+        "iss": fixture.oauth.issuer,
     }))
     .into_response()
 }

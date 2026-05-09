@@ -20,7 +20,6 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use crate::fixture::Fixture;
 use crate::oauth::BearerDecision;
 use crate::shared::SharedHandles;
 
@@ -34,10 +33,16 @@ pub struct AppState {
 impl AppState {
     /// Build an `AppState` around `fixture` with fresh, default
     /// shared handles.
-    pub fn for_test(fixture: Arc<Fixture>) -> Self {
+    pub fn for_test(fixture: crate::shared::FixtureHandle) -> Self {
         Self {
             shared: SharedHandles::for_test(fixture),
         }
+    }
+
+    /// Acquire a brief read guard on the shared fixture. See
+    /// `graph::AppState::fixture` for the rationale.
+    pub(crate) fn fixture(&self) -> std::sync::RwLockReadGuard<'_, crate::fixture::Fixture> {
+        self.shared.fixture.read().expect("fixture lock poisoned")
     }
 
     /// Replace the request log on the shared handle bag.
@@ -98,11 +103,11 @@ async fn enforce_bearer_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    match crate::oauth::check_bearer(
-        &state.shared.fixture,
-        &state.shared.token_store,
-        req.headers(),
-    ) {
+    let decision = {
+        let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
+        crate::oauth::check_bearer(&fixture, &state.shared.token_store, req.headers())
+    };
+    match decision {
         BearerDecision::Allow => next.run(req).await,
         BearerDecision::Deny(reason) => {
             error(StatusCode::UNAUTHORIZED, &reason, "authError")
