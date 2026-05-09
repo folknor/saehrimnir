@@ -365,3 +365,45 @@ async fn uid_fetch_no_handler_passes_through_silently() {
     assert!(out.contains("* 1 FETCH (UID 1)"));
     assert!(out.contains("c OK UID FETCH completed"));
 }
+
+async fn run_with_imap_small(script: &[u8]) -> String {
+    let fix = Arc::new(fixture::load(std::path::Path::new("fixtures/imap-small.toml")).unwrap());
+    let (server, mut client) = tokio::io::duplex(32 * 1024);
+    let (_tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        imap::serve_connection(server, fix, None, &mut rx).await
+    });
+
+    client.write_all(script).await.unwrap();
+    client.shutdown().await.unwrap();
+
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    task.await.unwrap().unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
+/// `fixtures/imap-small.toml` is the M8 IMAP smoke fixture. It mirrors
+/// jmap-small.toml (same two messages, same Message-IDs, same thread
+/// shape) but adds IMAP-native coverage: $seen on email-001,
+/// $flagged on email-002. This test asserts the keyword -> flag
+/// projection and the resulting UNSEEN counter.
+#[tokio::test]
+async fn imap_small_fixture_projects_seen_and_flagged() {
+    let script = b"\
+        a1 LOGIN \"u\" \"p\"\r\n\
+        a2 STATUS \"INBOX\" (MESSAGES UNSEEN UIDNEXT)\r\n\
+        a3 SELECT \"INBOX\"\r\n\
+        a4 UID FETCH 1:* (UID FLAGS)\r\n\
+        a5 LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+
+    // STATUS: 2 messages, 1 unseen (only email-002 lacks $seen).
+    assert!(out.contains("* STATUS \"INBOX\" (MESSAGES 2 UNSEEN 1 UIDNEXT 3)\r\n"));
+
+    // FETCH FLAGS: UID 1 has \Seen, UID 2 has \Flagged.
+    assert!(out.contains("* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n"));
+    assert!(out.contains("* 2 FETCH (UID 2 FLAGS (\\Flagged))\r\n"));
+    assert!(out.contains("a4 OK UID FETCH completed\r\n"));
+}
