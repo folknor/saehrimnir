@@ -979,6 +979,7 @@ mod tests {
                     attachments: vec![],
                 },
             ],
+            oauth: crate::fixture::OAuthConfig::default(),
         }
     }
 
@@ -1148,6 +1149,7 @@ mod tests {
                 email("a2", "mb-inbox", mk(2026, 1, 15, 12)),
                 email("d", "mb-archive", mk(2026, 1, 15, 9)),
             ],
+            oauth: crate::fixture::OAuthConfig::default(),
         }
     }
 
@@ -1419,6 +1421,7 @@ mod tests {
                 body: Body::Text("hello".into()),
                 attachments: vec![],
             }],
+            oauth: crate::fixture::OAuthConfig::default(),
         }
     }
 

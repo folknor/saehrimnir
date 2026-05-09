@@ -153,6 +153,22 @@ address as `{name, email}`. Fixtures accept two forms:
 
 Internally normalized to the table form before serialization.
 
+## OAuth (optional)
+
+```toml
+[oauth]
+enforce = false                          # default; existing v0 "no auth" baseline
+issuer = "https://saehrimnir.test/oauth" # default; echoed in /oauth/userinfo
+```
+
+When `enforce = false` (default), the JMAP / Graph / Gmail HTTP
+listeners accept any (or no) `Authorization: Bearer` header, matching
+the v0 "no auth" rule. When `enforce = true`, those listeners reject
+requests whose bearer is not in the active token set (managed by
+`crate::oauth::TokenStore`); IMAP and SMTP have their own auth
+surfaces and are unaffected. See `notes/ratatoskr-oauth-surface.md`
+for the full token-issuance / userinfo / invalidation contract.
+
 ## Validation rules
 
 The mock refuses to start (non-zero exit, stderr message) if:

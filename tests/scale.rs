@@ -36,6 +36,7 @@ fn jmap_router() -> axum::Router {
         dispatcher: None,
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -44,6 +45,7 @@ fn graph_router() -> axum::Router {
         fixture: bulk_fixture(),
         dispatcher: None,
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -52,6 +54,7 @@ fn gmail_router() -> axum::Router {
         fixture: bulk_fixture(),
         dispatcher: None,
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 

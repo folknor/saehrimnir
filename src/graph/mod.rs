@@ -25,6 +25,7 @@ use axum::{
 use serde_json::{Value, json};
 
 use crate::fixture::Fixture;
+use crate::oauth::{BearerDecision, TokenStore};
 use crate::request_log::RequestLog;
 
 #[derive(Clone)]
@@ -32,6 +33,7 @@ pub struct AppState {
     pub fixture: Arc<Fixture>,
     pub dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     pub request_log: RequestLog,
+    pub token_store: TokenStore,
 }
 
 /// Consult the Lua dispatcher for `("graph", command)` and convert
@@ -65,7 +67,32 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             log_request,
         ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_bearer_middleware,
+        ))
         .with_state(state)
+}
+
+/// When `fixture.oauth.enforce` is true, reject requests without a
+/// valid `Authorization: Bearer` header before the route handler
+/// runs. Returns the standard Graph error envelope on rejection so
+/// the wire shape matches the rest of the surface.
+async fn enforce_bearer_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    match crate::oauth::check_bearer(
+        &state.fixture,
+        &state.token_store,
+        req.headers(),
+    ) {
+        BearerDecision::Allow => next.run(req).await,
+        BearerDecision::Deny(reason) => {
+            error(StatusCode::UNAUTHORIZED, "InvalidAuthenticationToken", &reason)
+        }
+    }
 }
 
 /// Per-request middleware that records `(method, path)` into the

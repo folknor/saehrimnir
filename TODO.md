@@ -43,25 +43,6 @@ remain unblocked-but-unneeded.
   accounts (JMAP session resource, Graph `/users/{id}/...` paths,
   IMAP per-connection account context).
 
-## OAuth provider
-
-Net-new surface, not yet scoped. Unblocks ratatoskr's manual matrix
-item 9 (`oauth.exchange_code` driven headlessly, since the request
-carries `token_url` and `user_info_url`).
-
-- `POST /oauth/token` for auth-code exchange and refresh-token
-  grant.
-- `GET /oauth/userinfo` returning email + display name from the
-  fixture's account.
-- `POST /test/oauth/invalidate` admin route to mark a token
-  invalid.
-- Cross-cutting: Graph, Gmail, and JMAP listeners currently accept
-  any bearer per the v0 "no auth" rule. Adding bearer validation
-  is a policy break; gate it behind a fixture flag (e.g.
-  `[oauth] enforce = true`) so existing fixtures keep working.
-- New `notes/ratatoskr-oauth-surface.md` documenting what the
-  ratatoskr OAuth client expects on the wire.
-
 ## Calendar (matrix item 10)
 
 Pick Graph calendar *or* CalDAV first based on which client surface

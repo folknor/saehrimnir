@@ -21,6 +21,7 @@ fn router() -> axum::Router {
         fixture: Arc::new(fix),
         dispatcher: None,
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -52,6 +53,7 @@ fn attach_router() -> axum::Router {
         fixture: Arc::new(fix),
         dispatcher: None,
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -303,6 +305,7 @@ fn router_with_lua_scenario(scenario: &str) -> axum::Router {
         fixture: Arc::new(fixture),
         dispatcher: Some(Arc::new(dispatcher)),
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -372,6 +375,7 @@ async fn gmail_middleware_records_request_log_entries() {
         fixture: Arc::new(fix),
         dispatcher: None,
         request_log: request_log.clone(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     });
 
     let _ = get_json_via(app.clone(), "/gmail/v1/users/me/profile").await;

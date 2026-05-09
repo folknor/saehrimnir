@@ -24,6 +24,7 @@ fn router() -> axum::Router {
         dispatcher: None,
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -312,6 +313,7 @@ fn attach_router() -> axum::Router {
         dispatcher: None,
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -550,6 +552,7 @@ fn router_with_lua_scenario(scenario: &str) -> axum::Router {
         dispatcher: Some(Arc::new(dispatcher)),
         submission_log: saehrimnir::smtp::SubmissionLog::default(),
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -747,6 +750,7 @@ fn router_with_smtp_log(log: saehrimnir::smtp::SubmissionLog) -> axum::Router {
         dispatcher: None,
         submission_log: log,
         request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -869,6 +873,7 @@ fn router_with_logs(
         dispatcher: None,
         submission_log: smtp_log,
         request_log,
+        token_store: saehrimnir::oauth::TokenStore::default(),
     })
 }
 
@@ -995,4 +1000,260 @@ async fn test_fixture_step_returns_501_until_change_scripts_land() {
     let v = body_json(resp).await;
     assert_eq!(v["error"], "fixture step not implemented");
     assert!(v["detail"].as_str().unwrap().contains("[[change]]"));
+}
+
+// ── /oauth/* + /test/oauth/invalidate ───────────────────────────────
+
+fn router_with_token_store(store: saehrimnir::oauth::TokenStore) -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
+    routes::router(routes::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        submission_log: saehrimnir::smtp::SubmissionLog::default(),
+        request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: store,
+    })
+}
+
+#[tokio::test]
+async fn oauth_token_authorization_code_grant_mints_active_token() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let app = router_with_token_store(store.clone());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "grant_type=authorization_code\
+                    &code=fixture-code\
+                    &client_id=test\
+                    &client_secret=secret\
+                    &redirect_uri=http://localhost/cb",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let access = v["access_token"].as_str().unwrap();
+    let refresh = v["refresh_token"].as_str().unwrap();
+    assert_eq!(v["token_type"], "Bearer");
+    assert_eq!(v["expires_in"], 3600);
+    assert!(access.starts_with("mock-access-"));
+    assert_ne!(access, refresh);
+
+    // Both tokens are registered in the store.
+    assert!(store.is_active(access));
+    assert!(store.is_active(refresh));
+}
+
+#[tokio::test]
+async fn oauth_token_refresh_grant_works_via_json_body() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let app = router_with_token_store(store.clone());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "grant_type": "refresh_token",
+                        "refresh_token": "rt-abc",
+                        "client_id": "test"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert!(v["access_token"].as_str().unwrap().starts_with("mock-access-"));
+}
+
+#[tokio::test]
+async fn oauth_token_rejects_unsupported_grant_type() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let app = router_with_token_store(store);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("grant_type=password"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp).await;
+    assert_eq!(v["error"], "unsupported_grant_type");
+}
+
+#[tokio::test]
+async fn oauth_userinfo_returns_account_claims_with_active_token() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let token = store.mint("authorization_code", 0xdead_beef);
+
+    let app = router_with_token_store(store);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/userinfo")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["sub"], "account-1");
+    assert_eq!(v["email"], "test@example.com");
+    assert_eq!(v["email_verified"], true);
+    assert_eq!(v["name"], "test@example.com");
+    assert_eq!(v["iss"], "https://saehrimnir.test/oauth");
+}
+
+#[tokio::test]
+async fn oauth_userinfo_rejects_unknown_token() {
+    let app = router_with_token_store(saehrimnir::oauth::TokenStore::default());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/userinfo")
+                .header(header::AUTHORIZATION, "Bearer nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let v = body_json(resp).await;
+    assert_eq!(v["error"], "invalid_token");
+}
+
+#[tokio::test]
+async fn test_oauth_invalidate_drops_token_from_store() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let token = store.mint("authorization_code", 1);
+    assert!(store.is_active(&token));
+
+    let app = router_with_token_store(store.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/oauth/invalidate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"token": token}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(!store.is_active(&token));
+}
+
+#[tokio::test]
+async fn test_oauth_invalidate_unknown_token_is_404() {
+    let app = router_with_token_store(saehrimnir::oauth::TokenStore::default());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/oauth/invalidate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"token": "ghost"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn fixture_reset_clears_token_store_too() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let _ = store.mint("authorization_code", 1);
+    assert_eq!(store.active_count(), 1);
+
+    let app = router_with_token_store(store.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/fixture/reset")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(store.active_count(), 0);
+}
+
+// ── Bearer enforcement ──────────────────────────────────────────────
+
+fn router_with_enforce(store: saehrimnir::oauth::TokenStore) -> axum::Router {
+    use saehrimnir::fixture::OAuthConfig;
+    let mut fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
+    fix.oauth = OAuthConfig {
+        enforce: true,
+        issuer: "https://saehrimnir.test/oauth".to_string(),
+    };
+    routes::router(routes::AppState {
+        fixture: Arc::new(fix),
+        dispatcher: None,
+        submission_log: saehrimnir::smtp::SubmissionLog::default(),
+        request_log: saehrimnir::request_log::RequestLog::default(),
+        token_store: store,
+    })
+}
+
+#[tokio::test]
+async fn jmap_session_enforces_bearer_when_fixture_oauth_enforce_is_true() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let app = router_with_enforce(store.clone());
+    // No header.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .header(header::HOST, "127.0.0.1:9999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let v = body_json(resp).await;
+    assert_eq!(v["status"], 401);
+    assert_eq!(v["type"], "urn:ietf:params:jmap:error:forbidden");
+
+    // With a valid token.
+    let token = store.mint("authorization_code", 1);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

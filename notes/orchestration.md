@@ -216,12 +216,13 @@ feature gate guards these. All routes are scoped under `/test/`.
     `query`).
 - `DELETE /test/requests` -> 204; clears the request log.
 - `POST /test/fixture/reset` -> 204; clears the SMTP submission
-  log AND the request log. The fixture itself is read-only in v0
-  (IMAP `UID STORE` is a non-persistent no-op), so reset is
-  currently equivalent to "clear both logs". When mutation lands
-  (`[[change]]` scripts, persistent UID STORE), the implementation
-  grows here without changing the route shape - harness scripts
-  can rely on the contract.
+  log, the request log, AND the OAuth token store. The fixture
+  itself is read-only in v0 (IMAP `UID STORE` is a non-persistent
+  no-op), so reset is currently equivalent to "clear all three
+  in-memory logs". When mutation lands (`[[change]]` scripts,
+  persistent UID STORE), the implementation grows here without
+  changing the route shape - harness scripts can rely on the
+  contract.
 - `POST /test/fixture/step` -> 501 with body
   `{"error": "fixture step not implemented", "detail": "..."}`.
   Reserved for `[[change]]` script entries (fixture-format growth,
@@ -230,6 +231,22 @@ feature gate guards these. All routes are scoped under `/test/`.
 
 The request log is process-scoped: a fresh saehrimnir start is
 always an empty log.
+
+OAuth provider routes (also mounted on the JMAP listener):
+
+- `POST /oauth/token` - issue an access + refresh token from an
+  authorization-code or refresh-token grant. v0 doesn't validate
+  client credentials.
+- `GET /oauth/userinfo` - read `Authorization: Bearer <token>`,
+  return the fixture account's identity claims, or 401 if the
+  token is unknown.
+- `POST /test/oauth/invalidate` - admin route, body
+  `{"token": "..."}`; drops the token so subsequent requests 401.
+
+Full surface details in `notes/ratatoskr-oauth-surface.md`. Bearer
+enforcement on the mail HTTP listeners (JMAP, Graph, Gmail) is
+opt-in via `[oauth] enforce = true` in the fixture; default keeps
+the v0 "no auth" baseline.
 
 ## Things plan 3 hasn't decided yet
 

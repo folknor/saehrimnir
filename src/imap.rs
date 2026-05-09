@@ -1805,6 +1805,7 @@ mod tests {
             },
             mailboxes: vec![],
             emails: vec![],
+            oauth: crate::fixture::OAuthConfig::default(),
         })
     }
 
@@ -1879,6 +1880,7 @@ mod tests {
                 mk_email("e2", "mb-inbox", false),
                 mk_email("e3", "mb-archive", true),
             ],
+            oauth: crate::fixture::OAuthConfig::default(),
         })
     }
 

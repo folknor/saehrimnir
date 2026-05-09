@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::fixture::Fixture;
 use crate::jmap::{self, JmapRequest, JmapResponse};
+use crate::oauth::{self, BearerDecision, TokenStore};
 use crate::request_log::{RequestEntry, RequestLog};
 use crate::smtp::{self, Submission};
 
@@ -37,9 +38,27 @@ pub struct AppState {
     /// protocol layers so a single `GET /test/requests` snapshot
     /// covers everything the harness has driven. Cheap to clone.
     pub request_log: RequestLog,
+    /// OAuth token store. `/oauth/token` mints into it,
+    /// `/oauth/userinfo` and the bearer-enforcement middleware
+    /// consult it, `/test/oauth/invalidate` and
+    /// `/test/fixture/reset` clear/remove from it.
+    pub token_store: TokenStore,
 }
 
 pub fn router(state: AppState) -> Router {
+    let oauth_token_router: Router = Router::new()
+        .route("/oauth/token", post(oauth::token_endpoint))
+        .with_state(state.token_store.clone());
+    let oauth_invalidate_router: Router = Router::new()
+        .route("/test/oauth/invalidate", post(oauth::invalidate_endpoint))
+        .with_state(state.token_store.clone());
+    let oauth_userinfo_router: Router = Router::new()
+        .route("/oauth/userinfo", get(oauth::userinfo_endpoint))
+        .with_state(oauth::UserInfoState {
+            fixture: Arc::clone(&state.fixture),
+            store: state.token_store.clone(),
+        });
+
     Router::new()
         .route("/", get(root))
         .route("/.well-known/jmap", get(session))
@@ -60,6 +79,9 @@ pub fn router(state: AppState) -> Router {
         .route("/test/fixture/reset", post(reset_fixture))
         .route("/test/fixture/step", post(step_fixture))
         .with_state(state)
+        .merge(oauth_token_router)
+        .merge(oauth_userinfo_router)
+        .merge(oauth_invalidate_router)
 }
 
 async fn root() -> &'static str {
@@ -86,7 +108,11 @@ fn base_url(headers: &HeaderMap) -> String {
 /// `notes/ratatoskr-jmap-surface.md` - advertising `principals`
 /// pulls the client into `Principal/get` and `ShareNotification`
 /// paths the mock can't satisfy in v0).
-async fn session(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
+async fn session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Response> {
+    enforce_bearer(&state, &headers).map_err(|b| *b)?;
     let fixture = &state.fixture;
     let acct_id = &fixture.account.id;
     let acct_name = &fixture.account.name;
@@ -115,7 +141,7 @@ async fn session(State(state): State<AppState>, headers: HeaderMap) -> Json<Valu
         Value::String(acct_id.clone()),
     );
 
-    Json(json!({
+    Ok(Json(json!({
         "capabilities": {
             "urn:ietf:params:jmap:core": {
                 "maxSizeUpload": 50_000_000_u64,
@@ -137,14 +163,19 @@ async fn session(State(state): State<AppState>, headers: HeaderMap) -> Json<Valu
         "uploadUrl": format!("{base}/jmap/upload/{{accountId}}"),
         "eventSourceUrl": format!("{base}/jmap/eventsource/?types={{types}}&closeafter={{closeafter}}&ping={{ping}}"),
         "state": fixture.state
-    }))
+    })))
 }
 
 /// JMAP method-call endpoint. Always 200; per-call errors land in the
 /// envelope's `methodResponses`. JSON parse failures bubble up as 400
 /// via axum's `Json` extractor, which is the right behaviour per RFC
 /// 8620 §3.6.1.
-async fn api(State(state): State<AppState>, Json(req): Json<JmapRequest>) -> Json<JmapResponse> {
+async fn api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<JmapRequest>,
+) -> Result<Json<JmapResponse>, Response> {
+    enforce_bearer(&state, &headers).map_err(|b| *b)?;
     // Record one request-log entry per method-call in the envelope so
     // `GET /test/requests` reflects the granularity ratatoskr cares
     // about (per-method asserts, not per-batch).
@@ -155,7 +186,34 @@ async fn api(State(state): State<AppState>, Json(req): Json<JmapRequest>) -> Jso
             json!({ "call_id": call_id }),
         );
     }
-    Json(jmap::handle(&state.fixture, state.dispatcher.as_ref(), req))
+    Ok(Json(jmap::handle(
+        &state.fixture,
+        state.dispatcher.as_ref(),
+        req,
+    )))
+}
+
+/// Translate a `BearerDecision::Deny` into a JMAP-shaped 401 with a
+/// `urn:ietf:params:jmap:error:forbidden`-shaped body. Real JMAP
+/// servers tend to reply with bare HTTP 401; ratatoskr is fine with
+/// either, and a JSON body keeps the test surface uniform across
+/// the three HTTP-based protocols.
+fn enforce_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    match crate::oauth::check_bearer(&state.fixture, &state.token_store, headers) {
+        BearerDecision::Allow => Ok(()),
+        BearerDecision::Deny(reason) => Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                Json(json!({
+                    "type": "urn:ietf:params:jmap:error:forbidden",
+                    "status": 401,
+                    "detail": reason,
+                })),
+            )
+                .into_response(),
+        )),
+    }
 }
 
 /// Blob-download endpoint per RFC 8620 §6.2. The session resource
@@ -167,8 +225,12 @@ async fn api(State(state): State<AppState>, Json(req): Json<JmapRequest>) -> Jso
 /// `account_id` (single-account in v0).
 async fn download(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((_account_id, blob_id, _name)): Path<(String, String, String)>,
 ) -> Response {
+    if let Err(deny) = enforce_bearer(&state, &headers) {
+        return *deny;
+    }
     for email in &state.fixture.emails {
         for att in &email.attachments {
             if att.blob_id == blob_id {
@@ -316,6 +378,7 @@ async fn clear_requests(State(state): State<AppState>) -> StatusCode {
 async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     state.submission_log.clear();
     state.request_log.clear();
+    state.token_store.clear();
     StatusCode::NO_CONTENT
 }
 

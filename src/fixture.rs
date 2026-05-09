@@ -17,6 +17,32 @@ pub struct Fixture {
     pub account: Account,
     pub mailboxes: Vec<Mailbox>,
     pub emails: Vec<Email>,
+    pub oauth: OAuthConfig,
+}
+
+/// Fixture-side OAuth configuration. Optional in TOML/Lua; defaults
+/// to `enforce = false` so existing fixtures keep behaving like the
+/// "no auth in v0" baseline. When `enforce = true`, the JMAP /
+/// Graph / Gmail HTTP listeners reject requests whose
+/// `Authorization: Bearer <token>` is not in the active token set
+/// (managed by `crate::oauth::TokenStore`). IMAP and SMTP have
+/// their own auth surfaces and are unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub enforce: bool,
+    /// Issuer string echoed back in `userinfo` responses. Most
+    /// fixtures don't care; the default keeps userinfo
+    /// self-consistent without a fixture-side decision.
+    pub issuer: String,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            issuer: "https://saehrimnir.test/oauth".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +192,16 @@ pub(crate) struct RawFixture {
     pub(crate) mailboxes: Vec<RawMailbox>,
     #[serde(default, rename = "email")]
     pub(crate) emails: Vec<RawEmail>,
+    #[serde(default)]
+    pub(crate) oauth: Option<RawOAuth>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawOAuth {
+    #[serde(default)]
+    pub(crate) enforce: bool,
+    #[serde(default)]
+    pub(crate) issuer: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -443,6 +479,17 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    let oauth = match raw.oauth {
+        Some(raw_oauth) => {
+            let default = OAuthConfig::default();
+            OAuthConfig {
+                enforce: raw_oauth.enforce,
+                issuer: raw_oauth.issuer.unwrap_or(default.issuer),
+            }
+        }
+        None => OAuthConfig::default(),
+    };
+
     Ok(Fixture {
         name: raw.name,
         state: raw.state.unwrap_or_else(|| "fixture-state".to_string()),
@@ -452,6 +499,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         },
         mailboxes,
         emails,
+        oauth,
     })
 }
 

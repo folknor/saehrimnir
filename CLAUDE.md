@@ -25,6 +25,11 @@ resource modules), and `notes/` for the per-protocol surface docs.
   categories we'll need to scaffold for later).
 - `notes/ratatoskr-gmail-surface.md` - same shape, for Gmail's REST
   API.
+- `notes/ratatoskr-oauth-surface.md` - mock OAuth 2.0 provider
+  mounted on the JMAP listener (`/oauth/token`,
+  `/oauth/userinfo`, `/test/oauth/invalidate`) plus the
+  fixture-side `[oauth]` block that gates bearer enforcement on
+  the mail listeners.
 - `TODO.md` - what's left, per protocol.
 
 The notes are the source of truth. Do not refer to siblings
@@ -37,9 +42,14 @@ checking whether the fact is already in `notes/`.
   derive entirely from the fixture; no clocks, no random IDs, no
   unsorted iteration. Output uses `serde_json::Map` (BTreeMap-backed)
   for stable key ordering.
-- No auth in v0: every protocol accepts any credential. Bearer,
-  basic, LOGIN, XOAUTH2, OAUTHBEARER all return success without
-  validating.
+- Auth is opt-in: every protocol accepts any credential by default
+  (basic, LOGIN, XOAUTH2, OAUTHBEARER all return success without
+  validating). The HTTP-based listeners (JMAP, Graph, Gmail) can
+  switch to bearer enforcement by setting `[oauth] enforce = true`
+  in the fixture; tokens come from the mock OAuth provider on the
+  JMAP listener (`/oauth/token`). IMAP and SMTP keep their own
+  always-accept auth surfaces. See
+  `notes/ratatoskr-oauth-surface.md`.
 - One shared fixture per process. Each protocol projects its own wire
   shape from the same canonical types in `src/fixture.rs`.
 - `Email/changes` / `Mailbox/changes` return the RFC-shaped
@@ -99,6 +109,12 @@ checking whether the fact is already in `notes/`.
   entry. Read out via `GET /test/requests`, cleared via
   `DELETE /test/requests` or `POST /test/fixture/reset`. See
   `notes/orchestration.md` "Test / admin control plane".
+- `src/oauth.rs` - mock OAuth 2.0 / OIDC provider. `TokenStore` is
+  the analogous `Arc<Mutex<...>>` handle for active tokens, also
+  cleared by `POST /test/fixture/reset`. Endpoints
+  (`/oauth/token`, `/oauth/userinfo`, `/test/oauth/invalidate`)
+  mount on the JMAP HTTP listener; bearer enforcement on the
+  mail listeners is gated by `fixture.oauth.enforce`.
 - `src/routes.rs` - axum router, `AppState`, JMAP HTTP route handlers.
   Also serves the test/admin control plane: `/test/smtp/submissions`,
   `/test/requests`, `/test/fixture/reset`, `/test/fixture/step`.

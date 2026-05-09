@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use saehrimnir::lua::MockExit;
+use saehrimnir::oauth::TokenStore;
 use saehrimnir::request_log::RequestLog;
 use saehrimnir::sentinel::ProtocolPort;
 use saehrimnir::{cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp, tls};
@@ -98,11 +99,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so a single `GET /test/requests` snapshot covers everything.
     let request_log = RequestLog::new();
 
+    // OAuth token store. Cloned into every HTTP-based listener so
+    // bearer enforcement (when the fixture asks for it) sees the
+    // same active set as `/oauth/token` minted into.
+    let token_store = TokenStore::new();
+
     let app = routes::router(routes::AppState {
         fixture: Arc::clone(&fixture),
         dispatcher: dispatcher.clone(),
         submission_log: smtp_log.clone(),
         request_log: request_log.clone(),
+        token_store: token_store.clone(),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -162,6 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fixture: Arc::clone(&fixture),
         dispatcher: dispatcher.clone(),
         request_log: request_log.clone(),
+        token_store: token_store.clone(),
     });
     let graph_shutdown_rx = shutdown_rx.clone();
     let graph_task = tokio::spawn(
@@ -182,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fixture: Arc::clone(&fixture),
         dispatcher: dispatcher.clone(),
         request_log: request_log.clone(),
+        token_store: token_store.clone(),
     });
     let gmail_shutdown_rx = shutdown_rx.clone();
     let gmail_task = tokio::spawn(

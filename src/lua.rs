@@ -179,6 +179,7 @@ impl Builder {
             account,
             mailboxes: self.mailboxes,
             emails: self.emails,
+            oauth: None,
         };
         Ok((raw, self.handlers))
     }
