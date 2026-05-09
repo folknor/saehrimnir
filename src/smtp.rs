@@ -360,6 +360,12 @@ impl Conn {
             // 500 below; record it as well so the log captures
             // ratatoskr's literal command stream including stray
             // empty lines.
+            //
+            // SECURITY TODO (2026-05-09 review): for `AUTH PLAIN
+            // <base64>` / `AUTH LOGIN` / `AUTH XOAUTH2`, `rest`
+            // carries the raw credential. Either redact the
+            // payload here or strip the entry before exposing it
+            // via /test/requests. Tracked in TODO.md "Fix now".
             log.record(
                 "smtp",
                 upper.clone(),

@@ -13,11 +13,12 @@ wire shapes out, byte-stable across runs.
 
 | Protocol | Surface                                          | Notes                                                                  |
 |----------|--------------------------------------------------|------------------------------------------------------------------------|
-| JMAP     | `/jmap/session`, `/.well-known/jmap`, `POST /jmap/api` | Session resource, `Mailbox/get`, `Email/query`, `Email/get`.       |
+| JMAP     | `/jmap/session`, `/.well-known/jmap`, `POST /jmap/api` | Session resource, `Mailbox/get`, `Email/query`, `Email/get`, `Mailbox/changes` and `Email/changes` with steady-state semantics (empty delta on matching `sinceState`, `cannotCalculateChanges` otherwise). |
 | IMAP     | TCP, plaintext                                   | Full initial-sync read path: greeting, CAPABILITY, LOGIN/AUTHENTICATE, ENABLE QRESYNC, LIST, STATUS, SELECT/EXAMINE/CLOSE, UID SEARCH, UID FETCH (with RFC 822 body emission), CONDSTORE CHANGEDSINCE. |
 | SMTP     | TCP, plaintext                                   | Submission only. EHLO, AUTH (PLAIN/LOGIN/XOAUTH2/OAUTHBEARER), MAIL FROM, RCPT TO, DATA with dot-stuffing reversal. Submissions captured in an in-memory log tests can introspect. |
-| Microsoft Graph | `/v1.0/me/mailFolders/...`                | Folder enumeration (list, by-id, by-well-known-alias, childFolders), message list with `$filter` / `$top` / `$skiptoken` / `$orderby` / `$count`, delta sync (initial dump, follow-up no-op, `$deltatoken=latest` shortcut). Catchall returns the Graph error envelope for unimplemented resources. |
+| Microsoft Graph | `/v1.0/me/mailFolders/...`, `/v1.0/me/calendars/...`, `/v1.0/me/events/...` | Mail: folder enumeration (list, by-id, by-well-known-alias, childFolders), message list with `$filter` / `$top` / `$skiptoken` / `$orderby` / `$count`, delta sync. Calendar: list / by-id / `default` alias, events list with pagination, `calendarView/delta`, single-event GET, plus echo-mode POST/PATCH/DELETE that record bodies in the request log without mutating the fixture. Catchall returns the Graph error envelope for unimplemented resources. |
 | Gmail    | `/gmail/v1/users/me/...`                         | Profile, labels, threads (list with `q=after:YYYY/M/D` and `nextPageToken`, full thread fetch with MIME payload), history (read-only no-op), attachments (404 stub), sendAs (empty). |
+| OAuth 2.0 | `/oauth/token`, `/oauth/userinfo` (mounted on the JMAP listener) | Authorization-code and refresh-token grants, OIDC userinfo projecting the fixture account. Bearer enforcement on JMAP/Graph/Gmail is opt-in via `[oauth] enforce = true` in the fixture; default keeps the v0 "no auth" baseline. |
 
 Each protocol projects from the same canonical types in
 `src/fixture.rs`; no fixture-format changes when a new protocol
@@ -89,9 +90,9 @@ seeded `SmallRng`. `fixtures/jmap-bulk.lua` shows the shape; loads
   sentinel, env vars.
 - `notes/fixture-format.md` - fixture shape and validation rules
   (shared by the TOML and Lua loaders).
-- `notes/ratatoskr-{jmap,imap,smtp,graph,gmail}-surface.md` - per-
-  protocol cheat sheets distilled from ratatoskr's client code, with
-  `crates/<proto>/src/...:LL` citations.
+- `notes/ratatoskr-{jmap,imap,smtp,graph,gmail,oauth}-surface.md` -
+  per-protocol cheat sheets distilled from ratatoskr's client code,
+  with `crates/<proto>/src/...:LL` citations.
 
 ## Running
 
@@ -125,13 +126,38 @@ calling code reads the file to extract the per-protocol port.
 protocol against the live process, sends SIGTERM, and verifies a
 clean exit within the 1-second graceful-shutdown budget.
 
+## Test / admin control plane
+
+A handful of tests-only routes mounted on the JMAP HTTP listener
+let harness scripts inspect and reset the binary's in-memory state
+across cohort cycles without restarting it:
+
+- `GET /test/smtp/submissions` / `DELETE /test/smtp/submissions` -
+  parsed projection of every captured SMTP submission.
+- `GET /test/requests` / `DELETE /test/requests` - cross-protocol
+  request log spanning every dispatch event across the five
+  protocol layers (`(protocol, command, received_at, detail)`).
+- `POST /test/fixture/reset` - clear the SMTP submission log, the
+  request log, and the OAuth token store. The fixture itself is
+  read-only in v0; this route grows when `[[change]]` scripts land.
+- `POST /test/fixture/step` - reserved for `[[change]]` scripts;
+  returns 501 today so harness scripts detect the gap rather than
+  silently no-op.
+- `POST /test/oauth/invalidate` - drop a token from the OAuth
+  store so subsequent userinfo / bearer-enforced requests reject
+  it.
+
+See `notes/orchestration.md` for the full contract.
+
 ## Status
 
-JMAP, IMAP read path, SMTP submission, Graph mail-sync, and Gmail
-mail-sync are complete for v0. The Lua fixture loader (via dellingr)
-covers both the static-fixture surface (`fixture` / `account` /
-`mailbox` / `email` builders plus `bulk_emails` / `bulk_threads`)
-and the dynamic surface (`on(...)` callbacks, `wait`, `mock_done`,
-`mock_fail`). Future increments grow the fixture shape (calendar
-events, contacts, attachments, drive files) and add sibling resource
-modules inside `src/graph/` and `src/gmail/`. See `TODO.md`.
+JMAP (including incremental `*/changes` methods), IMAP read path,
+SMTP submission, Graph mail-sync + calendar, Gmail mail-sync, and
+the OAuth 2.0 / OIDC provider are complete for v0. The Lua fixture
+loader (via dellingr) covers both the static-fixture surface
+(`fixture` / `account` / `mailbox` / `email` builders plus
+`bulk_emails` / `bulk_threads`) and the dynamic surface (`on(...)`
+callbacks, `wait`, `mock_done`, `mock_fail`). Future increments
+grow the fixture shape (incremental change scripts, contacts,
+adversarial-shape MIME) and add sibling resource modules inside
+`src/graph/` and `src/gmail/`. See `TODO.md`.

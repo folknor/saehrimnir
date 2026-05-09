@@ -40,7 +40,7 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::get,
 };
 use chrono::SecondsFormat;
 use serde_json::{Map, Value, json};
@@ -137,6 +137,18 @@ async fn list_events(
         .or(q.skip)
         .unwrap_or(0);
 
+    // Pagination math (verified 2026-05-09):
+    //   skip=0/top=2/total=5 -> page=2, next_skip=2, link emitted.
+    //   skip=2/top=2         -> page=2, next_skip=4, link emitted.
+    //   skip=4/top=1         -> page=1, next_skip=5, no link.
+    //   skip=10/total=5      -> page=0, next_skip=10, no link.
+    //
+    // PERF TODO (2026-05-09 review): the `Vec<&Event>` allocation
+    // walks every event in the fixture per request, which is
+    // O(N) work amortising to O(N²) over many pages. Replace
+    // with a chained iterator (filter().skip().take().map()) and
+    // a separate filter().count() if `total` is needed. Tracked
+    // in TODO.md "Fix now".
     let all: Vec<&Event> = state
         .fixture
         .events
@@ -190,6 +202,20 @@ async fn delta_events(
             &format!("calendar {calendar:?} not declared in fixture"),
         );
     }
+    // The "no changes vs no token" branch hinges on
+    // `q.deltatoken.is_some()`. An empty `?$deltatoken=` parses
+    // as `Some("")` per `odata::OdataQuery::parse`, so a client
+    // that sends an empty token still hits the follow-up branch
+    // (correct: any acknowledged token means "I've seen the
+    // initial dump").
+    //
+    // Spec deviation (acknowledged 2026-05-09): real Graph
+    // paginates the initial dump with `@odata.nextLink` and only
+    // emits `@odata.deltaLink` on the final page. v0 doesn't
+    // paginate the initial dump at all and emits `deltaLink`
+    // immediately. Acceptable for current ratatoskr smokes; if a
+    // calendar grows past EVENTS_DEFAULT_TOP, add nextLink-style
+    // pagination to the initial branch (TODO.md "Fix soon").
     let q = odata::OdataQuery::parse(raw_query.as_deref());
     let value: Vec<Value> = if q.deltatoken.is_some() {
         // Follow-up call with a delta cursor; nothing has changed.
@@ -203,6 +229,8 @@ async fn delta_events(
             .map(|e| serialize_event(&state.fixture, e))
             .collect()
     };
+    // Byte-stable delta link: derives from `fixture.state` which
+    // is constant within a process lifetime.
     let delta_link = format!(
         "https://graph.microsoft.com/v1.0/me/calendars/{calendar}/calendarView/delta?$deltatoken=d.{}",
         state.fixture.state
@@ -236,6 +264,24 @@ async fn get_event(
 }
 
 // ── Mutation echoes ─────────────────────────────────────────────────
+//
+// The fixture is read-only in v0, so POST/PATCH/DELETE never
+// mutate state. Each handler echoes the parsed body into the
+// response (real Graph also echoes on POST/PATCH) and appends the
+// body to the cross-protocol request log under `detail.body`, so
+// tests can assert on what the client tried to write.
+//
+// Two known deviations from real Graph, accepted for v0:
+//   - PATCH on an unknown event id silently 200s with
+//     `calendarId: "unknown"`. Real Graph 404s. TODO.md "Fix now".
+//   - DELETE on an unknown event id always 204s. Real Graph 404s.
+//     TODO.md "Fix now".
+//
+// PERF TODO (2026-05-09 review): the parsed body (capped at 1MB
+// by `parse_json_body`) is cloned into the request log entry.
+// Long-running scenarios accumulate it. Capping the request log
+// itself addresses the symptom; storing only body size/hash here
+// is a smaller alternative.
 
 async fn create_event(
     State(state): State<AppState>,
@@ -432,5 +478,3 @@ fn parse_skiptoken(t: Option<&str>) -> Option<u32> {
     s.strip_prefix("s.")?.parse().ok()
 }
 
-#[allow(unused_imports)]
-use {delete as _delete, patch as _patch, post as _post};

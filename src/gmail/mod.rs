@@ -52,6 +52,9 @@ pub fn maybe_override(
 /// Build the Gmail router. v0 mounts mail handlers under
 /// `/gmail/v1/users/me/`; everything else is caught by
 /// [`not_implemented`].
+/// See `graph::router` for the full rationale on layer ordering;
+/// same semantics apply here. `enforce_bearer_middleware` ends up
+/// outermost; denied requests skip `log_request`.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(mail::router())

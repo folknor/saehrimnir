@@ -86,6 +86,13 @@ impl TokenStore {
 
     /// Mint a new access token. Returns the token string. The token
     /// is registered as active before this returns.
+    ///
+    /// Note on the `mock-access-` prefix: refresh tokens issued by
+    /// `token_endpoint` reuse this prefix, with collision-avoidance
+    /// guaranteed by the monotonic counter (the second `mint()` call
+    /// always sees counter+1) rather than by the prefix or by
+    /// `body_hash`. Future code that filters tokens by prefix should
+    /// not assume this string distinguishes access from refresh.
     pub fn mint(&self, grant_type: &str, body_hash: u64) -> String {
         let mut inner = self.0.lock().expect("oauth token store poisoned");
         inner.counter += 1;
@@ -121,6 +128,16 @@ impl TokenStore {
     /// zero. Wired through `POST /test/fixture/reset` so harness
     /// scripts get deterministic token strings across cohort
     /// cycles.
+    ///
+    /// Determinism gotcha: after `clear()` the next `mint()` call
+    /// reproduces the *same* token string as before the reset
+    /// (counter back to 0 + same body hash). That is the contract -
+    /// harness scripts get byte-identical wire output across
+    /// resets - but a stale assertion holding the old string and
+    /// asserting it is invalid will silently re-validate if the
+    /// caller mints with the same body. Tests that need
+    /// resurrected-token detection should compare token identity
+    /// against a `snapshot()` taken before the reset.
     pub fn clear(&self) {
         let mut inner = self.0.lock().expect("oauth token store poisoned");
         inner.tokens.clear();
@@ -138,6 +155,18 @@ impl TokenStore {
 
 /// FNV-1a 64-bit. Tiny, fast, and avoids pulling another crate in
 /// for what is just a deterministic body fingerprint.
+///
+/// Single-pass over `&body`; `parse_token_body` parses the same
+/// bytes separately at the call site (the buffer is already in
+/// memory by then). Reviewers occasionally suspect a double scan,
+/// so the layout is documented here.
+///
+/// Security note: FNV-1a is reversible. Anyone holding a minted
+/// token can recover (or brute-force) the originating request
+/// body, which contains `client_secret` if the client sent one.
+/// This is acceptable because saehrimnir is a test mock bound to
+/// loopback and the body is bounded by axum's default extractor
+/// cap, but do not lift this scheme into a real-auth context.
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -217,6 +246,13 @@ fn parse_token_body(headers: &HeaderMap, body: &[u8]) -> HashMap<String, String>
     } else {
         // application/x-www-form-urlencoded (or unknown). Lenient
         // parser: split on `&`, then `=`, percent-decode each side.
+        // Bespoke instead of pulling in `form_urlencoded` so the
+        // OAuth module stays dependency-free; keep it under 30
+        // lines (urldecode + hex_nibble + this) so the cost-of-
+        // ownership case for the inline implementation stays
+        // honest. Behaviour deviates from the URL spec on
+        // malformed `%XY` sequences (we pass them through as
+        // literal bytes) - real ratatoskr never sends those.
         let s = std::str::from_utf8(body).unwrap_or("");
         s.split('&')
             .filter(|p| !p.is_empty())
@@ -287,6 +323,11 @@ pub async fn userinfo_endpoint(
         return unauthorized("token is unknown or has been invalidated");
     }
 
+    // `email` and `name` both source from `account.name` because v0
+    // has no separate `account.email` field. Account `name` is
+    // documented as email-shaped in `notes/fixture-format.md`. If a
+    // fixture sets `name = "Display Name"` (non-email) the userinfo
+    // claim follows along; that's a fixture bug, not a wire bug.
     let acct = &state.fixture.account;
     Json(json!({
         "sub": acct.id,
@@ -299,6 +340,11 @@ pub async fn userinfo_endpoint(
 }
 
 fn unauthorized(detail: &str) -> Response {
+    // `WWW-Authenticate: Bearer` (bare). RFC 6750 §3 expects the
+    // full form `Bearer realm="...", error="invalid_token",
+    // error_description="..."`; ratatoskr accepts the bare form.
+    // Lift to the full form when an interop test or a more
+    // pedantic OAuth client points at the mock.
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Bearer")],

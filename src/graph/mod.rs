@@ -60,6 +60,16 @@ pub fn maybe_override(
 
 /// Build the Graph router. v0 mounts mail handlers under
 /// `/v1.0/me/`; everything else is caught by [`not_implemented`].
+///
+/// Layer order matters: axum applies layers in reverse declaration
+/// order ("onion" semantics), so the bearer-enforcement layer ends
+/// up *outermost* and `log_request` runs only for allowed requests.
+/// That is intentional - denied requests skip the request log
+/// entirely, no auth-bypassed-but-logged paradox - but tests
+/// asserting "no extra calls happened" cannot see denied probes.
+/// (Observed during 2026-05-09 review.) The `not_implemented`
+/// fallback is *inside* both layers, so 404s still get logged when
+/// auth allows them through.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(mail::router())

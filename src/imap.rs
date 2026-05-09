@@ -215,6 +215,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             // For UID FETCH / UID SEARCH / etc. we record the
             // sub-command so test assertions can target the verb
             // ratatoskr actually issued, not just "UID".
+            // Per-command record. Note that this fires *once* per
+            // dispatched line, never per matched message - so a
+            // `UID FETCH 1:*` against a 1M-row fixture records a
+            // single entry, not a million. See the FETCH handler
+            // for the per-message work.
+            //
+            // The bare-`UID` branch (no sub-command) records as
+            // `"UID"`, which conflates a malformed line with a
+            // legitimate-but-empty UID command. The dispatcher
+            // BADs the response in either case so the conflation
+            // is invisible to the wire client; tests that need to
+            // distinguish should inspect `detail.args`.
             let recorded = if cmd_upper == "UID" {
                 let sub = parsed
                     .args
@@ -230,6 +242,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             } else {
                 cmd_upper.clone()
             };
+            // SECURITY TODO (2026-05-09 review): `parsed.args` for
+            // LOGIN / AUTHENTICATE PLAIN carries user credentials
+            // verbatim. Either redact at this site or strip the
+            // entry before exposing it via /test/requests. Tracked
+            // in TODO.md "Fix now".
             log.record(
                 "imap",
                 recorded,

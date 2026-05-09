@@ -303,6 +303,22 @@ const QUERY_LIMIT_CAP: u64 = 256;
 // When `[[change]]` scripts ship, this dispatch grows a state machine
 // that walks an ordered list of `(state, created, updated,
 // destroyed)` deltas. The RFC-shaped envelope below stays the same.
+//
+// RFC conformance points verified during the 2026-05-09 review and
+// preserved here so a regression trips a known assertion:
+//
+//   - `Email/changes` always emits `updatedProperties: null`. RFC
+//     §4.2 lets the server set this to `null` when it cannot
+//     determine which subset of properties changed; "all
+//     properties" is the safe fallback.
+//   - `Mailbox/changes` deliberately *omits* `updatedProperties`;
+//     RFC §2.5 does not define that field for mailboxes.
+//   - Missing `sinceState` returns `invalidArguments` per RFC
+//     §3.2 (required-arg violation).
+//   - Mismatched `sinceState` returns `cannotCalculateChanges`
+//     per RFC §3.2 (the canonical "client must full-resync"
+//     signal).
+//   - Unknown `accountId` returns `accountNotFound`.
 
 fn mailbox_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?;

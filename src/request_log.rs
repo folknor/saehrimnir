@@ -43,6 +43,13 @@ pub struct RequestEntry {
 /// log is process-scoped and grows for the life of the binary
 /// unless a test clears it via `DELETE /test/requests` or
 /// `POST /test/fixture/reset`.
+///
+/// Every method `expect("request log mutex poisoned")`. Critical
+/// sections are tiny (push, clone, clear) and panic-free, so
+/// poisoning is unreachable today. If a future panic *under* the
+/// lock surfaces here, the binary dies; that's intentional - a
+/// process-wide restart is preferable to silently degraded
+/// recording in a test mock.
 #[derive(Debug, Clone, Default)]
 pub struct RequestLog(Arc<Mutex<Vec<RequestEntry>>>);
 

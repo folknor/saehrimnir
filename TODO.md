@@ -4,6 +4,164 @@ Running task list, ordered by what ratatoskr is actively waiting on.
 Per-protocol design notes live alongside in `notes/`; this file just
 tracks what's next.
 
+## From the 2026-05-09 multi-agent review
+
+Findings from a four-agent (security / bugs / perf / arch) review
+of the work landed in commits `de89827..3b87085`. Walk-backs,
+verified-correct invariants, and accepted trade-offs are recorded
+as inline comments at the relevant code sites; only items that
+need work end up here.
+
+### Fix now (security, correctness, perf hot spots)
+
+- **[security] Credential leakage in the request log.** SMTP
+  `AUTH PLAIN <base64>` / `LOGIN` / `XOAUTH2` flows through
+  `dispatch()` at `src/smtp.rs:362-368` and the full `rest` of the
+  line lands in `detail.args` of the request log, which is exposed
+  unauthenticated via `GET /test/requests` on the JMAP listener.
+  IMAP has the same shape: `LOGIN <user> <pass>` and
+  `AUTHENTICATE PLAIN <base64>` continuation lines flow through
+  `src/imap.rs:233-237`. Fix: in both recorders, special-case the
+  auth verbs and store only the mechanism name (first whitespace
+  token of `rest`), not the secret payload.
+- **[perf+security] Unbounded RequestLog growth + clone-under-
+  lock.** `src/request_log.rs` has no row cap; `snapshot()` clones
+  the whole `Vec` while holding the cross-protocol mutex, so a
+  `GET /test/requests` against a long-lived process stalls every
+  listener. The Graph mutation echo at
+  `src/graph/calendar.rs::create_event`/`patch_event` writes
+  up-to-1MB parsed JSON bodies into `detail.body` per request,
+  accelerating the growth. Fix: cap as a drop-oldest ring (~100k
+  entries), and have `snapshot()` `mem::take` into a local `Vec`
+  so the clone happens after the lock drops; consider capping
+  per-entry detail size too, or storing the body's size/hash
+  instead of the parsed `Value`.
+- **[perf] `list_events` / `delta_events` materialise the full
+  filtered Vec before pagination.** `src/graph/calendar.rs::
+  list_events` and `delta_events`. `O(N²)` over many pages on a
+  large fixture. Fix: chain
+  `.iter().filter().skip().take().map().collect()` directly; use
+  a separate `.filter().count()` if `total` is needed for
+  `nextLink` decisions.
+- **[bugs] PATCH/DELETE on unknown event ids silently succeed.**
+  `src/graph/calendar.rs::patch_event` echoes with
+  `calendarId: "unknown"` and 200; `delete_event` always 204s.
+  Real Graph 404s. Fix: return the standard `ResourceNotFound`
+  error envelope when the event id isn't declared, mirroring the
+  GET-side behaviour.
+
+### Fix soon (cleanup, ergonomics, smaller bugs)
+
+- **[arch] `Option<RequestLog>` asymmetry in `imap::serve` /
+  `smtp::serve`.** The `Option` exists only because the log was
+  added later; `RequestLog` is a cheap-clone `Arc<Mutex<...>>`
+  with a `Default` impl. Fix: drop the `Option`, drop the
+  `if let Some(log)` guards, have unit tests pass
+  `RequestLog::new()`.
+- **[arch] AppState duplication across `routes`/`graph`/`gmail`.**
+  Five fields × three places. Fix: extract a `SharedHandles {
+  fixture, dispatcher, request_log, token_store }` that each
+  AppState embeds via `pub shared`; protocol-specific extras
+  (e.g. `submission_log` on `routes::AppState`) live alongside.
+  Don't unify the AppStates themselves - axum's `State<T>`
+  typing makes them path-distinct.
+- **[arch] Test ergonomics.** Every test spells out four-to-five
+  AppState fields. Fix: `impl AppState { pub fn for_test(fixture:
+  Arc<Fixture>) -> Self }` per module, returning fresh handles by
+  default. Tests that need to drive a specific log clone the
+  field after construction.
+- **[security] `Content-Disposition` filename interpolated
+  unquoted.** `src/routes.rs::download` builds `format!("{};
+  filename=\"{}\"", ...)`. A fixture-supplied name containing
+  `"` or CRLF splices headers. Fix: use
+  `filename*=UTF-8''<percent-encoded>` or reject names containing
+  CTL / `"`.
+- **[security] `base_url()` echoes the `Host` header into the
+  JMAP session resource.** `src/routes.rs::base_url`. A client
+  sending `Host: evil.com` causes the session to advertise
+  `apiUrl: http://evil.com/jmap/api`. Fix: derive the base from
+  the bound listen address (thread it through `AppState`) or
+  whitelist to loopback.
+- **[bugs] `/test/fixture/reset` does not reset `Dispatcher`
+  `call_index` counters.** Documented in
+  `src/routes.rs::reset_fixture`. Fix: add a
+  `Dispatcher::reset_counts()` and call it; or amend the
+  docstring to say the call_index never resets and is a feature.
+- **[perf] JMAP `api()` records per method-call with one mutex
+  acquire each.** `src/routes.rs::api`. N `push`es under N lock
+  acquisitions for batches up to 16 calls. Fix: collect entries
+  locally, then `extend` once.
+- **[arch] `/test/fixture/{reset,step}` policy buried in
+  doc-comments.** `reset_fixture` documents what it does and
+  doesn't reset; `step_fixture` 501s with a `TODO.md` pointer. A
+  year from now nobody will grep doc-comments. Fix: expand the
+  "Test / admin control plane" section in `notes/orchestration.md`
+  with what each route must do once `[[change]]` lands and the
+  expected response shapes; have the route-handler comments point
+  at that section instead of being the source of truth.
+- **[arch] `RequestEntry.detail` key conventions undocumented.**
+  Each protocol's middleware/dispatch picks ad-hoc keys
+  (`call_id`, `query`, `tag`, `args`, `body`). Fix: add a
+  `notes/request-log.md` (or per-protocol surface-doc section)
+  listing the per-protocol detail-key contract.
+- **[bugs] `parse_ts` for events lacks event-id context.**
+  `src/fixture.rs::normalize_with_dir` event branch. Mailbox /
+  email parse errors include the id; event timestamps don't.
+  Fix: `.map_err(|e| format!("event {:?} start: {e}", ev.id))?`
+  for both `start` and `end`.
+- **[bugs] `delta_events` first-call deviates from real Graph.**
+  Documented in `src/graph/calendar.rs::delta_events`. Fix:
+  paginate the initial dump with `@odata.nextLink` until
+  exhausted, then emit `@odata.deltaLink`.
+- **[bugs] No uniqueness check on calendar `is_default = true`.**
+  Documented as intentional in `Calendar`'s doc-comment in
+  `src/fixture.rs`, but cheap to tighten. Fix: at load time,
+  reject fixtures with more than one default calendar.
+- **[security] `email` claim sources from `acct.name`, not an
+  `email` field.** Documented in
+  `src/oauth.rs::userinfo_endpoint`. Fix: validate that
+  `account.name` is email-shaped at load time, or add a separate
+  `account.email` field to the fixture format.
+- **[bugs] `received_at` makes `RequestEntry` JSON output
+  non-byte-stable.** Documented in `src/request_log.rs`. Fix
+  (when a test forces it): `#[serde(skip_serializing)]` behind
+  an opt-in flag, or expose a `snapshot_stable()` that strips
+  timestamps.
+
+### Eventually (only when something forces it)
+
+- **[security] WWW-Authenticate header is bare `"Bearer"`.**
+  Documented in `src/oauth.rs::unauthorized`. Lift to the full
+  RFC 6750 form when an interop test or pedantic OAuth client
+  points at the mock.
+- **[security] FNV-1a body fingerprint in OAuth tokens is
+  reversible.** Documented in `src/oauth.rs::fnv1a64`.
+  Acceptable for a loopback-bound mock; revisit if the listener
+  ever binds non-loopback.
+- **[security] All `/test/*` routes are unauthenticated.**
+  Documented in `src/routes.rs::router`. Acceptable while
+  `main.rs` only binds 127.0.0.1; gate behind `--enable-admin`
+  or a Unix socket if a non-loopback bind ever lands.
+- **[security] All `Mutex::lock().expect("...poisoned")`
+  panics.** Documented in `src/request_log.rs`. Acceptable
+  today (no panic-prone code under any of the locks); revisit
+  if a panic-under-the-lock path appears.
+- **[arch] Bespoke `urldecode` in `src/oauth.rs` could be
+  `form_urlencoded::parse`.** Documented in
+  `src/oauth.rs::parse_token_body`. Replace if the OAuth module
+  grows beyond its current scope.
+- **[bugs] Refresh tokens reuse the `mock-access-` prefix.**
+  Documented in `src/oauth.rs::TokenStore::mint`. Take a
+  `prefix: &str` argument if any code ever filters by prefix.
+- **[perf] IMAP per-line `json!` allocation + mutex acquire on
+  every dispatched line.** Documented in
+  `src/imap.rs::dispatch`. Folds into the RequestLog cap fix
+  above; not a standalone item.
+- **[perf] `log_request` middleware records 404s through
+  `not_implemented`.** `src/graph/mod.rs::log_request`,
+  `src/gmail/mod.rs::log_request`. Folds into the RequestLog
+  cap fix.
+
 ## Fixture format growth
 
 The incremental-sync item is now actively wanted for M8; the

@@ -45,6 +45,34 @@ pub struct AppState {
     pub token_store: TokenStore,
 }
 
+/// Bearer-enforcement coverage on this router (verified
+/// 2026-05-09):
+///
+/// Gated when `fixture.oauth.enforce = true`:
+///   - `GET /.well-known/jmap`, `GET /jmap/session`,
+///     `POST /jmap/api`, `GET /jmap/download/...` (each handler
+///     calls `enforce_bearer` directly).
+///
+/// Always reachable, even with enforcement on:
+///   - `GET /` - static `"saehrimnir\n"` banner; intended health
+///     probe.
+///   - `POST /oauth/token`, `GET /oauth/userinfo`,
+///     `POST /test/oauth/invalidate` - OAuth bootstrap, must not
+///     be bearer-gated or the client cannot mint a token.
+///   - `GET /test/smtp/submissions`, `DELETE /test/smtp/submissions`,
+///     `GET /test/requests`, `DELETE /test/requests`,
+///     `POST /test/fixture/reset`, `POST /test/fixture/step` -
+///     test-only admin routes; safe because `main.rs` binds the
+///     listener on `127.0.0.1` only.
+///
+/// 404-via-axum-default (no bypass risk):
+///   - `/jmap/upload/{accountId}` and `/jmap/eventsource/...`
+///     are advertised in the session resource but unrouted here.
+///
+/// SECURITY TODO (2026-05-09 review): if a future flag exposes a
+/// non-loopback bind, every `/test/*` route becomes a remote-
+/// control surface. Gate them behind `--enable-admin` or a
+/// process-only Unix socket at that point.
 pub fn router(state: AppState) -> Router {
     let oauth_token_router: Router = Router::new()
         .route("/oauth/token", post(oauth::token_endpoint))
@@ -198,6 +226,17 @@ async fn api(
 /// servers tend to reply with bare HTTP 401; ratatoskr is fine with
 /// either, and a JSON body keeps the test surface uniform across
 /// the three HTTP-based protocols.
+///
+/// Why this is a per-handler helper rather than a tower middleware
+/// (cf. `graph/mod.rs::enforce_bearer_middleware`,
+/// `gmail/mod.rs::enforce_bearer_middleware`): the OAuth sub-
+/// routers (`/oauth/token`, `/oauth/userinfo`,
+/// `/test/oauth/invalidate`) are merged into this same router and
+/// must NOT be bearer-gated - they're how the client mints a
+/// token in the first place. Layering bearer middleware on the
+/// JMAP router would lock those out and make the surface
+/// unbootstrappable. Calling this from each protected handler is
+/// the simplest way to keep the bootstrap routes open.
 fn enforce_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     match crate::oauth::check_bearer(&state.fixture, &state.token_store, headers) {
         BearerDecision::Allow => Ok(()),
@@ -366,15 +405,25 @@ async fn clear_requests(State(state): State<AppState>) -> StatusCode {
 
 // ── Test-only fixture admin ─────────────────────────────────────────
 
-/// Reset all in-process mutable state to the post-load baseline.
-/// Today that is exactly two pieces: the SMTP submission log and
-/// the cross-protocol request log. The fixture itself is read-only
-/// in v0 (IMAP `UID STORE` is a non-persistent no-op), so resetting
-/// is purely a log-clearing operation. When mutation lands
-/// (`[[change]]` scripts, persistent UID STORE, etc.), the
-/// implementation grows here without changing the route shape.
-/// Returns 204 unconditionally so harness scripts get a stable
-/// contract.
+/// Reset in-process mutable state to the post-load baseline. The
+/// fixture itself is read-only in v0 (IMAP `UID STORE` is a
+/// non-persistent no-op), so reset is currently a multi-handle
+/// log-clearing operation. When mutation lands (`[[change]]`
+/// scripts, persistent UID STORE, etc.), the implementation grows
+/// here without changing the route shape. Returns 204
+/// unconditionally so harness scripts get a stable contract.
+///
+/// What is reset:
+///   - SMTP submission log
+///   - cross-protocol request log
+///   - OAuth token store (tokens dropped, counter back to 0)
+///
+/// What is NOT reset (gap acknowledged 2026-05-09 review):
+///   - the Lua dispatcher's per-(protocol, command) `call_index`
+///     counters. A scenario asserting `req.call_index == 1`
+///     after reset will see the counter continue advancing.
+///     Either add `Dispatcher::reset_counts()` here, or amend
+///     this comment - tracked in TODO.md "Fix soon".
 async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     state.submission_log.clear();
     state.request_log.clear();
