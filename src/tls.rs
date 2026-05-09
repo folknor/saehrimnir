@@ -29,7 +29,7 @@ pub fn make_acceptor() -> Result<TlsAcceptor, String> {
     let cert_der: CertificateDer<'static> =
         CertificateDer::from(certified.cert.der().to_vec());
     let key_der: PrivateKeyDer<'static> =
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()));
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
