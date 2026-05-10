@@ -252,6 +252,91 @@ runs:
 - `state` tokens are the fixture-level `state` field, or a stable
   default if absent. They never change during a run.
 
+## Incremental change scripts (Lua only, v0)
+
+A `change(...)` call in a Lua scenario adds one named entry to the
+fixture's incremental-sync script. Each entry is a `ChangeStep` with
+an `id` plus zero-or-more op buckets. The harness drives steps via
+`POST /test/fixture/step` (see `notes/orchestration.md`); each
+step's ops accumulate into a single `Fixture::mutate` call so the
+change_log gains exactly one transition per step. RFC 8620 §5.2
+dominance applies naturally on subsequent `Email/changes` walks.
+
+```lua
+change({
+    id = "new",                                -- required, unique within script
+    email_create = {
+        {
+            id = "email-003",
+            mailbox_ids = { "mb-inbox" },
+            received_at = "2026-01-15T12:00:00Z",
+            from = "carol@example.com",
+            to = { "test@example.com" },
+            subject = "Lunch?",
+            body_text = "Free at 12:30?",
+            message_id = { "<003@example.com>" },
+        },
+    },
+    email_update = {
+        { id = "email-002", keywords = { "$seen", "$flagged" } },
+    },
+    email_move = {
+        { id = "email-002", mailbox_ids = { "mb-archive" } },
+    },
+    email_destroy = { "email-001" },
+    mailbox_create = {
+        { id = "mb-projects", name = "Projects" },
+    },
+    mailbox_update = {
+        { id = "mb-inbox", sort_order = 5 },
+    },
+    mailbox_destroy = { "mb-old" },
+    event_create = { ... },
+    event_update = { { id = "ev-1", subject = "Renamed" } },
+    event_destroy = { "ev-0" },
+})
+```
+
+Op contracts:
+
+- **`email_create`**: array of email tables. Same field set as the
+  top-level `email` builder, minus `attachments` (rejected at
+  script load - revisit when a fixture wants delta-time
+  attachment scenarios). Mailbox ids are validated against the
+  fixture state at apply time, so a step that creates a mailbox
+  earlier in its op list can then create an email into it.
+- **`email_update`**: array of `{ id, keywords?, mailbox_ids? }`.
+  Each emits a JMAP-shape patch (`keywords` and / or `mailboxIds`
+  full-replace) routed through the same `apply_email_patch` the
+  JMAP `Email/set` mutator uses. At least one of the two fields
+  must be present.
+- **`email_move`**: array of `{ id, mailbox_ids }`. Wire-equivalent
+  to `email_update` with a `mailbox_ids` full-replace; the step
+  handler additionally reports the id under
+  `changes.emails.moved` in the response so harness asserts can
+  distinguish a move from a flag flip.
+- **`email_destroy`**: array of email-id strings.
+- **`mailbox_create`**: array of mailbox tables (same fields as
+  the top-level `mailbox` builder). Apply time validates the
+  declared `parent_id` and rejects duplicates.
+- **`mailbox_update`**: array of `{ id, name?, parent_id?,
+  sort_order?, role?, is_subscribed? }`. Routes through
+  `apply_mailbox_patch`.
+- **`mailbox_destroy`**: array of mailbox-id strings. Apply
+  rejects destroy if any email still references the mailbox.
+- **`event_create` / `event_update` / `event_destroy`**: same
+  shapes for calendar events, projecting through the Graph
+  `calendarView/delta` path. Patches use plain RFC3339 strings
+  for `start` / `end` (the change-script projection), not the
+  Graph nested `start.dateTime` form.
+
+`fixtures/jmap-incremental.lua` is the canonical example.
+
+TOML support is deliberately deferred. The Lua surface is the
+forcing function for ratatoskr's incremental-sync round-trip
+tests; a TOML projection lands once a second fixture proves the
+static format is worth maintaining.
+
 ## Reserved for v1+
 
 - Multiple accounts per fixture (the `[account]` shape is already
@@ -260,5 +345,5 @@ runs:
 - Multipart MIME via `body_path` (multipart/alternative HTML+text).
 - Failure injection: `[fault]` blocks scoped to method calls (slow
   responses, retryable errors, `cannotCalculateChanges`).
-- Incremental change scripts: `[[change]]` entries that advance state
-  tokens between sync passes.
+- TOML `[[change]]` projection of the Lua change-script surface.
+- Attachments inside change-script `email_create` ops.

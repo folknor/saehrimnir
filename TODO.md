@@ -112,11 +112,27 @@ Both granularity items shipped together:
   paging is already achievable via `wait(ms)` inside an `on()`
   callback (a documented recipe in `notes/fixture-format.md`
   closes the third).
-- **Incremental sequence fixture.** A scripted timeline of
-  new + change + delete + move events so a single steady-state
-  script can assert the delta path handles all four. Drives
-  `POST /test/fixture/step` (currently 501) and the change-script
-  item under "Fixture format growth" below.
+- **Incremental sequence fixture.** Landed.
+  `fixtures/jmap-incremental.lua` exercises the new + change +
+  delete + move trio across four named steps, driven by
+  `POST /test/fixture/step`. The Lua surface gained a
+  `change({...})` builder with `email_create` /
+  `email_update` / `email_move` / `email_destroy` plus their
+  mailbox and event siblings; ops route through the same
+  `apply_email_patch` / `apply_mailbox_patch` the JMAP
+  mutators use, so the wire semantics match `Email/set`
+  exactly. Steps apply atomically: a single `Fixture::mutate`
+  per step, with per-op rewind on error so the cursor never
+  advances past a half-applied step. `POST /test/fixture/reset`
+  now rewinds the fixture image back to the post-load
+  baseline (cloned once at startup) and zeros the cursor, so a
+  harness can re-run the same script in one process. End-to-
+  end coverage in `tests/step.rs` walks the full script and
+  asserts the resulting diffs surface through JMAP
+  `Email/changes` and an IMAP `STATUS` round-trip on the same
+  fixture handle. Surface documented in
+  `notes/fixture-format.md` and the contract in
+  `notes/orchestration.md`.
 
 ### M9 prerequisite (lower priority)
 
@@ -192,16 +208,15 @@ The incremental-sync item is now actively wanted for M8; the
 adversarial-shape items unblock JMAP-depth scenarios; the rest
 remain unblocked-but-unneeded.
 
-- Incremental sync change scripts. `[[change]]` entries (or a Lua
-  equivalent) that advance state tokens between phases - JMAP
-  state, IMAP UIDVALIDITY/HIGHESTMODSEQ bumps, Graph deltatokens,
-  Gmail historyId. **No longer parked** - ratatoskr needs
-  new/change/delete/move scenarios to exercise incremental sync
-  paths. JMAP `Email/changes` / `Mailbox/changes` are already wired
-  with steady-state semantics (empty delta on matching state,
-  `cannotCalculateChanges` otherwise); change scripts grow this
-  into a real state machine. Also drives the test control plane's
-  `POST /test/fixture/step`, which currently returns 501.
+- Incremental sync change scripts. The Lua `change({...})` surface
+  shipped (see "Incremental sequence fixture" above); TOML
+  `[[change]]` projection is deferred until a TOML fixture wants
+  it. Future growth on the same surface: attachments inside
+  `email_create` ops (currently rejected at script load), and
+  bumping IMAP UIDVALIDITY / HIGHESTMODSEQ from a step (today's
+  IMAP state derives mechanically from `Fixture::state`, so a
+  step's state advance already moves HIGHESTMODSEQ; bumping
+  UIDVALIDITY would need a fixture-side knob).
 - Authoring hooks for adversarial-shape fixtures: duplicate
   `Message-Id` across emails (today's `normalize` rejects it as a
   cross-reference error, so this is a validator carve-out plus

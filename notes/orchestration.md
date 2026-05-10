@@ -231,29 +231,57 @@ feature gate guards these. All routes are scoped under `/test/`.
     asserting `req.call_index == 1` after reset gets a clean
     window).
 
-  The fixture itself stays read-only in v0; IMAP `UID STORE` is
-  a non-persistent no-op. When `[[change]]` scripts land
-  (fixture-format growth in `TODO.md`), reset gains a "rewind to
-  the initial state" bullet here without changing the route
-  shape: 204 stays, the contract stays, the implementation
-  grows.
-- `POST /test/fixture/step` -> 501 with body
-  `{"error": "fixture step not implemented", "detail": "..."}`.
-  Reserved for `[[change]]` script entries; returns 501 today
-  so harness scripts can detect the gap rather than silently
-  no-op. Once change scripts land, the contract becomes:
+  Reset additionally rewinds the fixture image itself to the
+  post-load baseline (cloned once at startup into
+  `SharedHandles::baseline`) and zeros the
+  `change_cursor`. A harness can re-run the same `change(...)`
+  script in one process by hitting reset between runs; the
+  fixture is back to its pristine post-load shape and step-1
+  applies again.
+- `POST /test/fixture/step` -> apply the cursor's current step
+  from the Lua-authored change script. Body is JSON; both `{}`
+  and an empty body are valid. An optional `{"expect": "step-id"}`
+  guard verifies the cursor is on the named step; mismatch
+  returns 409 without advancing.
 
-  - 200 + `{"step": "<id>", "applied": true}` when a step ran
-    (state-token bumps and any synthetic add/move/delete on the
-    fixture image take effect before the response returns; the
-    next `GET /test/requests` shows the resulting dispatches in
-    the standard shape).
-  - 200 + `{"step": null, "applied": false}` when no further
-    steps exist (the harness has reached the end of the script).
-  - 400 with the standard error envelope for malformed bodies.
+  Steps are applied atomically: every op in the step accumulates
+  into one `MutationDiff` routed through one `Fixture::mutate`
+  call, so the change_log gains exactly one transition per step
+  and protocol delta walks observe the step as a single unit.
+  Per-op errors rewind any partial mutation; the cursor stays
+  put.
 
-  Until `[[change]]` is wired, the route returns 501 to stay
-  visibly out of scope.
+  Response shapes:
+
+  - 200 + step-applied envelope when the cursor advances:
+    ```text
+    { "ok": true, "fixture": "<name>", "step": "<id>",
+      "applied": 1, "cursor": <new-position>,
+      "changes": {
+        "emails":    { "created": [], "updated": [],
+                       "destroyed": [], "moved": [] },
+        "mailboxes": { "created": [], "updated": [],
+                       "destroyed": [] },
+        "events":    { "created": [], "updated": [],
+                       "destroyed": [] }
+      },
+      "state": "<post-step JMAP state token>" }
+    ```
+    `changes.emails.moved` overlaps with `changes.emails.updated`
+    (a move is wire-equivalent to a `mailboxIds` update for
+    delta-walking purposes). The split is presentation-only so
+    a harness can distinguish move from flag-flip without
+    re-walking the resulting state.
+  - 200 + `{"ok": true, "fixture": "...", "step": null,
+    "applied": false}` when the cursor is past the script end.
+  - 400 + standard error envelope for a malformed body.
+  - 409 + `{"error": "expect mismatch", "cursor_step": "...",
+    "expect": "..."}` when the body's `expect` doesn't match
+    the cursor's current step.
+  - 422 + `{"error": "step apply failed", "step": "...",
+    "op_index": N, "kind": "...", "detail": "..."}` when an op
+    rejects (unknown id, duplicate id, invalid patch, ...).
+    The fixture is not mutated; the cursor does not advance.
 
 The request log is process-scoped: a fresh saehrimnir start is
 always an empty log. The log is a 100k-entry drop-oldest ring

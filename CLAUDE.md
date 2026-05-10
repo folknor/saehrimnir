@@ -128,7 +128,10 @@ checking whether the fact is already in `notes/`.
   mail listeners is gated by `fixture.oauth.enforce`.
 - `src/routes.rs` - axum router, `AppState`, JMAP HTTP route handlers.
   Also serves the test/admin control plane: `/test/smtp/submissions`,
-  `/test/requests`, `/test/fixture/reset`, `/test/fixture/step`.
+  `/test/requests`, `/test/fixture/reset` (rewinds the fixture image
+  to the post-load baseline + clears volatile state),
+  `/test/fixture/step` (cursor-driven application of the Lua-authored
+  `change(...)` script; one Transition per step, atomic apply).
 - `src/jmap.rs` - JMAP request envelope, dispatcher, per-method
   handlers.
 - `src/imap.rs` - IMAP listener, connection state machine, command
@@ -174,6 +177,9 @@ checking whether the fact is already in `notes/`.
 - `fixtures/jmap-oauth.toml` - bearer-enforced
   (`[oauth] enforce = true`) variant of jmap-small. Drives the
   revoked-token-recovery flow asserted in `tests/api.rs`.
+- `fixtures/jmap-incremental.lua` - 2-mailbox / 2-email baseline
+  plus a 4-step `change({...})` script (new + change + delete +
+  move). Drives the integration tests in `tests/step.rs`.
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status
