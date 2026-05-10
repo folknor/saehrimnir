@@ -1,0 +1,578 @@
+//! Google Calendar v3 calendar list + events handlers.
+//!
+//! Projection follows
+//! `<ratatoskr>/crates/calendar/src/google.rs`'s deserialiser
+//! shape (camelCase `dateTime` / `timeZone`, etc.). Mutations
+//! (POST / PATCH / DELETE) write through `Fixture::mutate` and
+//! record `event_*` transitions parallel to Graph / CalDAV /
+//! JMAP, so a Google Calendar create surfaces in a Graph
+//! `calendarView/delta` follow-up.
+//!
+//! Sync-token semantics:
+//!
+//! - No token: full event list. Final page emits
+//!   `nextSyncToken`; mid-pages emit `nextPageToken` only.
+//! - Token equals current `state`: empty `items[]`, same token
+//!   echoed as `nextSyncToken`.
+//! - Token unknown / evicted: HTTP 410 (`reason:
+//!   "fullSyncRequired"`). ratatoskr's `google_calendar_sync_
+//!   events_impl` matches on `"410"` or `"sync token"` to fall
+//!   back to a full re-sync.
+
+use axum::{
+    Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete as delete_route, get, patch},
+};
+use chrono::SecondsFormat;
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+
+use super::{AppState, error, ok_json};
+use crate::fixture::{Address, Calendar, Event, Fixture, MutationDiff};
+
+const DEFAULT_PAGE_SIZE: usize = 250;
+const MAX_PAGE_SIZE: usize = 2500;
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/calendar/v3/users/me/calendarList", get(calendar_list))
+        .route(
+            "/calendar/v3/calendars/{calendar}/events",
+            get(list_events).post(create_event),
+        )
+        .route(
+            "/calendar/v3/calendars/{calendar}/events/{event}",
+            patch(patch_event).delete(delete_event_route()),
+        )
+}
+
+// Workaround: axum's `MethodRouter::delete` re-exports clash with
+// our `delete_route` rename above. Wrap the handler so the axum
+// re-export resolves correctly via the `routing` import.
+fn delete_event_route()
+-> axum::routing::MethodRouter<AppState>
+{
+    delete_route(delete_event)
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ListParams {
+    #[serde(default, rename = "syncToken")]
+    sync_token: Option<String>,
+    #[serde(default, rename = "pageToken")]
+    page_token: Option<String>,
+    #[serde(default, rename = "timeMin")]
+    _time_min: Option<String>,
+    #[serde(default, rename = "timeMax")]
+    _time_max: Option<String>,
+    #[serde(default, rename = "singleEvents")]
+    _single_events: Option<bool>,
+    #[serde(default, rename = "maxResults")]
+    max_results: Option<usize>,
+    #[serde(default, rename = "orderBy")]
+    _order_by: Option<String>,
+}
+
+// ── calendarList ────────────────────────────────────────────────────
+
+async fn calendar_list(State(state): State<AppState>) -> Response {
+    if let Some(o) = super::maybe_override(&state, "calendar_list", |_| Ok(())) {
+        return o;
+    }
+    let fixture = state.fixture();
+    let items: Vec<Value> = fixture.calendars.iter().map(serialize_calendar).collect();
+    ok_json(json!({
+        "kind": "calendar#calendarList",
+        "etag": format!("etag-{}", fixture.state),
+        "items": items,
+    }))
+}
+
+fn serialize_calendar(c: &Calendar) -> Value {
+    let mut obj = Map::new();
+    obj.insert("kind".into(), Value::String("calendar#calendarListEntry".into()));
+    obj.insert("id".into(), Value::String(c.id.clone()));
+    obj.insert("summary".into(), Value::String(c.name.clone()));
+    if let Some(color) = &c.color {
+        obj.insert(
+            "backgroundColor".into(),
+            Value::String(color.clone()),
+        );
+    }
+    if c.is_default {
+        obj.insert("primary".into(), Value::Bool(true));
+    }
+    obj.insert("accessRole".into(), Value::String("owner".into()));
+    Value::Object(obj)
+}
+
+// ── events list ─────────────────────────────────────────────────────
+
+async fn list_events(
+    State(state): State<AppState>,
+    Path(calendar): Path<String>,
+    Query(params): Query<ListParams>,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "list_events", |s| {
+        crate::lua::req_set_str(s, "calendar", &calendar)?;
+        if let Some(t) = &params.sync_token {
+            crate::lua::req_set_str(s, "sync_token", t)?;
+        }
+        Ok(())
+    }) {
+        return o;
+    }
+
+    let fixture = state.fixture();
+    if !fixture.calendars.iter().any(|c| c.id == calendar) {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("calendar {calendar:?} not declared in fixture"),
+            "notFound",
+        );
+    }
+
+    if let Some(token) = params.sync_token.as_deref()
+        && !is_known_state(&fixture, token)
+    {
+        return error(
+            StatusCode::GONE,
+            "sync token expired or not recognised; full sync required",
+            "fullSyncRequired",
+        );
+    }
+
+    if params.sync_token.as_deref() == Some(fixture.state.as_str()) {
+        return ok_json(json!({
+            "kind": "calendar#events",
+            "summary": calendar,
+            "items": [],
+            "nextSyncToken": fixture.state,
+        }));
+    }
+
+    let mut all: Vec<&Event> = fixture
+        .events
+        .iter()
+        .filter(|e| e.calendar_id == calendar)
+        .collect();
+    all.sort_by(|a, b| a.id.cmp(&b.id));
+    let total = all.len();
+    let page_size = params
+        .max_results
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let offset = parse_page_token(params.page_token.as_deref()).unwrap_or(0);
+    if offset > total {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "pageToken offset exceeds total",
+            "badRequest",
+        );
+    }
+    let end = (offset + page_size).min(total);
+    let items: Vec<Value> = all[offset..end].iter().map(|e| serialize_event(e)).collect();
+
+    let mut body = Map::new();
+    body.insert("kind".into(), Value::String("calendar#events".into()));
+    body.insert("summary".into(), Value::String(calendar));
+    body.insert("items".into(), Value::Array(items));
+    if end < total {
+        body.insert(
+            "nextPageToken".into(),
+            Value::String(encode_page_token(end)),
+        );
+    } else {
+        body.insert(
+            "nextSyncToken".into(),
+            Value::String(fixture.state.clone()),
+        );
+    }
+    ok_json(Value::Object(body))
+}
+
+fn serialize_event(e: &Event) -> Value {
+    let mut obj = Map::new();
+    obj.insert("kind".into(), Value::String("calendar#event".into()));
+    obj.insert("id".into(), Value::String(e.id.clone()));
+    obj.insert(
+        "iCalUID".into(),
+        Value::String(format!("{}@saehrimnir.test", e.id)),
+    );
+    obj.insert("etag".into(), Value::String(format!("etag-{}", e.id)));
+    obj.insert("status".into(), Value::String("confirmed".into()));
+    obj.insert("summary".into(), Value::String(e.subject.clone()));
+    if let Some(d) = &e.body_text {
+        obj.insert("description".into(), Value::String(d.clone()));
+    }
+    if let Some(loc) = &e.location {
+        obj.insert("location".into(), Value::String(loc.clone()));
+    }
+
+    let (start_obj, end_obj) = serialize_event_times(e);
+    obj.insert("start".into(), start_obj);
+    obj.insert("end".into(), end_obj);
+
+    if let Some(org) = &e.organizer {
+        let mut o = Map::new();
+        o.insert("email".into(), Value::String(org.email.clone()));
+        if let Some(n) = &org.name {
+            o.insert("displayName".into(), Value::String(n.clone()));
+        }
+        obj.insert("organizer".into(), Value::Object(o));
+    }
+    if !e.attendees.is_empty() {
+        let attendees: Vec<Value> = e
+            .attendees
+            .iter()
+            .map(|a| {
+                let mut m = Map::new();
+                m.insert("email".into(), Value::String(a.email.clone()));
+                if let Some(n) = &a.name {
+                    m.insert("displayName".into(), Value::String(n.clone()));
+                }
+                m.insert(
+                    "responseStatus".into(),
+                    Value::String("needsAction".into()),
+                );
+                Value::Object(m)
+            })
+            .collect();
+        obj.insert("attendees".into(), Value::Array(attendees));
+    }
+    Value::Object(obj)
+}
+
+fn serialize_event_times(e: &Event) -> (Value, Value) {
+    if e.is_all_day {
+        let start = json!({"date": e.start.format("%Y-%m-%d").to_string()});
+        let end = json!({"date": e.end.format("%Y-%m-%d").to_string()});
+        (start, end)
+    } else {
+        let start = json!({
+            "dateTime": e.start.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "timeZone": "UTC",
+        });
+        let end = json!({
+            "dateTime": e.end.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "timeZone": "UTC",
+        });
+        (start, end)
+    }
+}
+
+// ── mutations ───────────────────────────────────────────────────────
+
+async fn create_event(
+    State(state): State<AppState>,
+    Path(calendar): Path<String>,
+    body: axum::body::Body,
+) -> Response {
+    {
+        let fixture = state.fixture();
+        if !fixture.calendars.iter().any(|c| c.id == calendar) {
+            return error(
+                StatusCode::NOT_FOUND,
+                &format!("calendar {calendar:?} not declared in fixture"),
+                "notFound",
+            );
+        }
+    }
+    let parsed = match parse_json_body(body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    state.shared.request_log.record(
+        "gcal",
+        format!("POST /calendar/v3/calendars/{calendar}/events"),
+        json!({"body": parsed}),
+    );
+
+    let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+    let event = match build_event_from_create(&fix, &calendar, &parsed) {
+        Ok(e) => e,
+        Err(resp) => return *resp,
+    };
+    let server_id = event.id.clone();
+    let view = event.clone();
+    let _ = fix.mutate(|f| {
+        f.events.push(event);
+        MutationDiff {
+            event_created: vec![server_id.clone()],
+            ..Default::default()
+        }
+    });
+    (StatusCode::OK, axum::Json(serialize_event(&view))).into_response()
+}
+
+async fn patch_event(
+    State(state): State<AppState>,
+    Path((calendar, event_id)): Path<(String, String)>,
+    body: axum::body::Body,
+) -> Response {
+    {
+        let fixture = state.fixture();
+        if !fixture
+            .events
+            .iter()
+            .any(|e| e.id == event_id && e.calendar_id == calendar)
+        {
+            return error(
+                StatusCode::NOT_FOUND,
+                &format!("event {event_id:?} not in calendar {calendar:?}"),
+                "notFound",
+            );
+        }
+    }
+    let parsed = match parse_json_body(body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    state.shared.request_log.record(
+        "gcal",
+        format!("PATCH /calendar/v3/calendars/{calendar}/events/{event_id}"),
+        json!({"body": parsed}),
+    );
+
+    let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+    let Some(idx) = fix.events.iter().position(|e| e.id == event_id) else {
+        return error(StatusCode::NOT_FOUND, "event vanished", "notFound");
+    };
+    let mut clone = fix.events[idx].clone();
+    if let Err(resp) = apply_event_patch(&mut clone, &parsed) {
+        return *resp;
+    }
+    let view = clone.clone();
+    let id_for_diff = event_id.clone();
+    let _ = fix.mutate(|f| {
+        f.events[idx] = clone;
+        MutationDiff {
+            event_updated: vec![id_for_diff.clone()],
+            ..Default::default()
+        }
+    });
+    ok_json(serialize_event(&view))
+}
+
+async fn delete_event(
+    State(state): State<AppState>,
+    Path((calendar, event_id)): Path<(String, String)>,
+) -> Response {
+    {
+        let fixture = state.fixture();
+        if !fixture
+            .events
+            .iter()
+            .any(|e| e.id == event_id && e.calendar_id == calendar)
+        {
+            return error(
+                StatusCode::NOT_FOUND,
+                &format!("event {event_id:?} not in calendar {calendar:?}"),
+                "notFound",
+            );
+        }
+    }
+    state.shared.request_log.record(
+        "gcal",
+        format!("DELETE /calendar/v3/calendars/{calendar}/events/{event_id}"),
+        json!({"id": event_id}),
+    );
+
+    let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+    let id_for_diff = event_id.clone();
+    let parent = fix
+        .events
+        .iter()
+        .find(|e| e.id == id_for_diff)
+        .map(|e| e.calendar_id.clone());
+    let _ = fix.mutate(|f| {
+        let len_before = f.events.len();
+        f.events.retain(|e| e.id != id_for_diff);
+        if f.events.len() < len_before {
+            MutationDiff {
+                event_destroyed: vec![id_for_diff.clone()],
+                event_destroyed_parents: vec![parent.clone().unwrap_or_default()],
+                ..Default::default()
+            }
+        } else {
+            MutationDiff::default()
+        }
+    });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ── parsing helpers ─────────────────────────────────────────────────
+
+fn build_event_from_create(
+    fix: &Fixture,
+    calendar: &str,
+    body: &Value,
+) -> Result<Event, Box<Response>> {
+    let obj = body.as_object().ok_or_else(|| {
+        Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "create body must be a JSON object",
+            "badRequest",
+        ))
+    })?;
+    let summary = obj
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let description = obj
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let location = obj
+        .get("location")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let (start, end, is_all_day) = parse_event_times(obj.get("start"), obj.get("end"))
+        .ok_or_else(|| {
+            Box::new(error(
+                StatusCode::BAD_REQUEST,
+                "start / end missing or malformed",
+                "badRequest",
+            ))
+        })?;
+
+    let organizer = obj.get("organizer").and_then(parse_address);
+    let attendees: Vec<Address> = obj
+        .get("attendees")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(parse_address).collect())
+        .unwrap_or_default();
+
+    let id = format!("mock-event-{}", fix.events.len() + 1);
+    Ok(Event {
+        id,
+        calendar_id: calendar.to_string(),
+        subject: summary,
+        body_preview: None,
+        body_text: description,
+        start,
+        end,
+        location,
+        organizer,
+        attendees,
+        is_all_day,
+    })
+}
+
+fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response>> {
+    let obj = body.as_object().ok_or_else(|| {
+        Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "patch must be a JSON object",
+            "badRequest",
+        ))
+    })?;
+    if let Some(s) = obj.get("summary").and_then(Value::as_str) {
+        event.subject = s.to_string();
+    }
+    if let Some(v) = obj.get("description") {
+        event.body_text = v.as_str().map(str::to_string);
+    }
+    if let Some(v) = obj.get("location") {
+        event.location = v.as_str().map(str::to_string);
+    }
+    if (obj.contains_key("start") || obj.contains_key("end"))
+        && let Some((s, e, all_day)) = parse_event_times(obj.get("start"), obj.get("end"))
+    {
+        event.start = s;
+        event.end = e;
+        event.is_all_day = all_day;
+    }
+    if let Some(arr) = obj.get("attendees").and_then(Value::as_array) {
+        event.attendees = arr.iter().filter_map(parse_address).collect();
+    }
+    Ok(())
+}
+
+fn parse_event_times(
+    start: Option<&Value>,
+    end: Option<&Value>,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, bool)> {
+    let s = start?;
+    let e = end?;
+    if let (Some(sdt), Some(edt)) = (parse_date_time(s), parse_date_time(e)) {
+        return Some((sdt, edt, false));
+    }
+    let sd = s.get("date").and_then(Value::as_str)?;
+    let ed = e.get("date").and_then(Value::as_str)?;
+    let sdt = chrono::NaiveDate::parse_from_str(sd, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)?
+        .and_utc();
+    let edt = chrono::NaiveDate::parse_from_str(ed, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)?
+        .and_utc();
+    Some((sdt, edt, true))
+}
+
+fn parse_date_time(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = v.get("dateTime")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn parse_address(v: &Value) -> Option<Address> {
+    let email = v.get("email").and_then(Value::as_str)?.to_string();
+    let name = v
+        .get("displayName")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(Address { email, name })
+}
+
+async fn parse_json_body(body: axum::body::Body) -> Result<Value, Response> {
+    let bytes = match axum::body::to_bytes(body, 1_048_576).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                &format!("failed to read body: {e}"),
+                "badRequest",
+            ));
+        }
+    };
+    if bytes.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(&bytes).map_err(|e| {
+        error(
+            StatusCode::BAD_REQUEST,
+            &format!("body is not JSON: {e}"),
+            "invalidRequest",
+        )
+    })
+}
+
+// ── shared helpers ──────────────────────────────────────────────────
+
+fn is_known_state(fixture: &Fixture, state: &str) -> bool {
+    if state == fixture.state {
+        return true;
+    }
+    if state == fixture.change_log_seed() {
+        return true;
+    }
+    fixture
+        .change_log_transitions()
+        .any(|t| t.from_state == state || t.to_state == state)
+}
+
+fn encode_page_token(offset: usize) -> String {
+    format!("p.{offset}")
+}
+
+fn parse_page_token(t: Option<&str>) -> Option<usize> {
+    t?.strip_prefix("p.")?.parse().ok()
+}

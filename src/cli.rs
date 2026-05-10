@@ -37,6 +37,13 @@ pub struct Args {
     #[arg(long = "gmail-port", default_value_t = 0)]
     pub gmail_port: u16,
 
+    /// Google Calendar mock port. `0` (default) picks an ephemeral
+    /// port; the chosen port lands in the readiness file under
+    /// `GCAL <port>`. Mounts `/calendar/v3/users/me/calendarList`
+    /// and `/calendar/v3/calendars/{id}/events[/...]`.
+    #[arg(long = "gcal-port", default_value_t = 0)]
+    pub gcal_port: u16,
+
     /// Google People API mock port. `0` (default) picks an ephemeral
     /// port; the chosen port lands in the readiness file under
     /// `PEOPLE <port>`. Mounts `/v1/people/me/connections` and

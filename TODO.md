@@ -49,7 +49,17 @@ Original scope notes preserved below for reference.
   surface; capability list and `urn:ietf:params:jmap:calendars`
   exclusion line in `CLAUDE.md` updated.
 
-### Google Calendar
+### Google Calendar - landed
+
+Sibling listener to Gmail at `--gcal-port` exposing
+`/calendar/v3/users/me/calendarList` and
+`/calendar/v3/calendars/{id}/events[/...]`. Sentinel grows
+`GCAL <port>`; brokkr orchestration plumbs
+`RATATOSKR_TEST_GCAL_ENDPOINT`. ratatoskr-side endpoint
+override hasn't landed yet. See `notes/ratatoskr-gcal-surface.md`
+and `tests/gcal.rs`.
+
+Original scope notes preserved.
 
 ratatoskr at `crates/calendar/src/google.rs` hits
 `https://www.googleapis.com/calendar/v3` - a *different host*

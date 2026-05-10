@@ -29,6 +29,10 @@ resource modules), and `notes/` for the per-protocol surface docs.
   People API contacts (`/v1/people/me/connections` +
   `/v1/otherContacts`). Hosted on a separate listener since real
   People API uses a different host from Gmail.
+- `notes/ratatoskr-gcal-surface.md` - same shape, for Google
+  Calendar v3 (`/calendar/v3/users/me/calendarList` +
+  `/calendar/v3/calendars/{id}/events[/...]`). Sibling listener
+  to Gmail.
 - `notes/ratatoskr-oauth-surface.md` - mock OAuth 2.0 provider
   mounted on the JMAP listener (`/oauth/token`,
   `/oauth/userinfo`, `/test/oauth/invalidate`) plus the
@@ -182,6 +186,16 @@ checking whether the fact is already in `notes/`.
   `Calendar` / `Event` fixture types; PUT/DELETE mutate through
   `Fixture::mutate` so Graph `calendarView/delta` observes
   CalDAV writes.
+- `src/gcal/` - Google Calendar v3 mock (sibling listener to
+  Gmail). `mod.rs` (router, AppState, bearer middleware,
+  `serve` entry, catchall 404), `events.rs`
+  (`/calendar/v3/users/me/calendarList`,
+  `/calendar/v3/calendars/{id}/events` GET / POST,
+  `.../events/{id}` PATCH / DELETE; sync-token + pageToken
+  paging; Google-shaped `dateTime`+`timeZone` for timed events
+  and `date` for all-day; mutations write through
+  `Fixture::mutate` and record `event_*` transitions parallel
+  to Graph / CalDAV / JMAP).
 - `src/people/` - Google People API mock (sibling listener to
   Gmail; real People API lives on a separate host). `mod.rs`
   (router, AppState, bearer middleware, `serve` entry,
@@ -219,6 +233,12 @@ checking whether the fact is already in `notes/`.
   binary, polls for the readiness sentinel, hits a real network
   endpoint, sends SIGTERM, asserts a clean exit. Closes the
   coverage gap that `scripts/smoke.sh` covers manually.
+- `tests/gcal.rs` - Google Calendar integration tests via
+  `tower::ServiceExt::oneshot`. Covers calendarList, events
+  listing with paging + syncToken + 410 recovery, create /
+  patch / delete round-trip, and a cross-protocol assertion
+  that a Google-Calendar create surfaces in a Graph
+  `calendarView/delta`.
 - `tests/people.rs` - People API integration tests via
   `tower::ServiceExt::oneshot`. Covers the no-token bootstrap
   + paging via `nextPageToken`, the same-token empty-delta
@@ -383,6 +403,22 @@ use the Graph `{ id, "@removed": { reason: "deleted" } }` shape.
 Catchall returns the Graph error envelope so unimplemented
 resources are visibly out-of-scope. Sibling files for drive /
 groups / EWS drop in later.
+
+Google Calendar v3: complete for v0. Sibling listener to Gmail
+on `--gcal-port`. `GET /calendar/v3/users/me/calendarList` (id
++ summary + backgroundColor + primary + accessRole=owner). `GET
+/calendar/v3/calendars/{id}/events` with `syncToken` /
+`pageToken` / `maxResults` paging, `nextSyncToken` emitted on
+the final page only, unknown token returns HTTP 410
+(`fullSyncRequired` reason - matches the substrings ratatoskr's
+recovery checks for). `POST` / `PATCH` / `DELETE` write through
+`Fixture::mutate` and record `event_*` transitions parallel to
+Graph / CalDAV / JMAP, so a Google-Calendar create surfaces in
+a Graph `calendarView/delta` follow-up. Sentinel grows
+`GCAL <port>`; brokkr orchestration plumbs
+`RATATOSKR_TEST_GCAL_ENDPOINT`. ratatoskr-side override
+parallel to `RATATOSKR_TEST_GMAIL_ENDPOINT` hasn't landed
+yet - listener is ready when it does.
 
 Google People API: complete for v0's contacts read path. Sibling
 listener to Gmail (real People API lives on a different host).

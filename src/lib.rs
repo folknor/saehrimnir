@@ -13,6 +13,7 @@
 pub mod caldav;
 pub mod cli;
 pub mod fixture;
+pub mod gcal;
 pub mod gmail;
 pub mod graph;
 pub mod imap;

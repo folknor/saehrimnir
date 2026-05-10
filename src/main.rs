@@ -74,6 +74,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let people_addr = people_listener.local_addr()?;
     eprintln!("saehrimnir: people listening on {people_addr}");
 
+    // Google Calendar listener (sibling to Gmail; real Google
+    // Calendar shares the googleapis.com host but is prefixed by
+    // /calendar/v3 - separate listener keeps the protocol
+    // separation clean).
+    let gcal_listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.gcal_port)).await?;
+    let gcal_addr = gcal_listener.local_addr()?;
+    eprintln!("saehrimnir: gcal listening on {gcal_addr}");
+
     sentinel::write_ready(
         &args.readiness_file,
         &[
@@ -104,6 +113,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProtocolPort {
                 name: "PEOPLE",
                 port: people_addr.port(),
+            },
+            ProtocolPort {
+                name: "GCAL",
+                port: gcal_addr.port(),
             },
         ],
     )
@@ -260,10 +273,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move { caldav::serve(caldav_listener, caldav_state, caldav_shutdown_rx).await });
 
     // Google People API server.
-    let people_state = saehrimnir::people::AppState { shared };
+    let people_state = saehrimnir::people::AppState {
+        shared: shared.clone(),
+    };
     let people_shutdown_rx = shutdown_rx.clone();
     let people_task = tokio::spawn(async move {
         saehrimnir::people::serve(people_listener, people_state, people_shutdown_rx).await
+    });
+
+    // Google Calendar server.
+    let gcal_state = saehrimnir::gcal::AppState { shared };
+    let gcal_shutdown_rx = shutdown_rx.clone();
+    let gcal_task = tokio::spawn(async move {
+        saehrimnir::gcal::serve(gcal_listener, gcal_state, gcal_shutdown_rx).await
     });
 
     // Race the OS signal handler against any mock_done()/mock_fail()
@@ -306,6 +328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = gmail_task.await;
         let _ = caldav_task.await;
         let _ = people_task.await;
+        let _ = gcal_task.await;
     };
     match tokio::time::timeout(SHUTDOWN_BUDGET, drain).await {
         Ok(()) => eprintln!("saehrimnir: clean shutdown"),
