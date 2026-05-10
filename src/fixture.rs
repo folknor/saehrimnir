@@ -366,6 +366,14 @@ pub enum ChangeOp {
     MailboxDestroy {
         id: String,
     },
+    EventCreate(Box<Event>),
+    EventUpdate {
+        id: String,
+        patch: serde_json::Value,
+    },
+    EventDestroy {
+        id: String,
+    },
 }
 
 /// Fixture-side OAuth configuration. Optional in TOML/Lua; defaults

@@ -22,8 +22,8 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use crate::fixture::{
-    self, Fixture, RawAccount, RawAddress, RawAttachment, RawEmail, RawFixture, RawMailbox,
-    RawOAuth,
+    self, ChangeOp, ChangeStep, Event, Fixture, Mailbox, RawAccount, RawAddress, RawAttachment,
+    RawEmail, RawFixture, RawMailbox, RawOAuth, Role,
 };
 use crate::templates;
 
@@ -116,8 +116,9 @@ pub fn load_source_with_dispatcher_and_dir(
         std::mem::take(&mut extras.builder)
     };
 
-    let (raw, handlers) = builder.into_parts()?;
-    let fixture = fixture::normalize_with_dir(raw, fixture_dir)?;
+    let (raw, change_script, handlers) = builder.into_parts()?;
+    let mut fixture = fixture::normalize_with_dir(raw, fixture_dir)?;
+    fixture.change_script = change_script;
     let dispatcher = Dispatcher::new(state, handlers);
     Ok((fixture, dispatcher))
 }
@@ -165,10 +166,16 @@ struct Builder {
     /// in the State's registry until the Dispatcher releases it (or
     /// the VM tears down).
     handlers: HandlerMap,
+    /// Incremental-sync script accumulated via `change({...})`. Each
+    /// entry is one named step the harness drives via
+    /// `POST /test/fixture/step`. Threaded onto the resulting
+    /// `Fixture` (post-normalize) so the step handler can read it
+    /// without re-parsing the script.
+    change_script: Vec<ChangeStep>,
 }
 
 impl Builder {
-    fn into_parts(self) -> Result<(RawFixture, HandlerMap), String> {
+    fn into_parts(self) -> Result<(RawFixture, Vec<ChangeStep>, HandlerMap), String> {
         let Some(name) = self.name else {
             return Err("scenario must call fixture { name = ... }".to_string());
         };
@@ -185,7 +192,7 @@ impl Builder {
             calendars: vec![],
             events: vec![],
         };
-        Ok((raw, self.handlers))
+        Ok((raw, self.change_script, self.handlers))
     }
 }
 
@@ -210,6 +217,8 @@ fn install_builders(state: &mut State) {
     state.set_global("bulk_mailboxes");
     state.push_rust_fn(builder_on);
     state.set_global("on");
+    state.push_rust_fn(builder_change);
+    state.set_global("change");
     state.push_rust_fn(builder_wait);
     state.set_global("wait");
     state.push_rust_fn(builder_mock_done);
@@ -785,6 +794,602 @@ fn read_attachment_array_at_top(
         out.push(raw);
     }
     Ok(out)
+}
+
+/// `change { id = "...", email_create = {...}, email_update = {...},
+/// email_move = {...}, email_destroy = {...}, mailbox_create = {...},
+/// mailbox_update = {...}, mailbox_destroy = {...}, event_create = {...},
+/// event_update = {...}, event_destroy = {...} }`
+///
+/// One named entry in the incremental-sync script. Steps land in the
+/// fixture's `change_script` and are applied atomically, in order, by
+/// `POST /test/fixture/step`. Every op is optional; a step that names
+/// only a couple of buckets is fine.
+///
+/// Op shapes:
+/// - `email_create`: array of email tables (same fields as the
+///   top-level `email` builder, minus `attachments` which the change-
+///   script v0 rejects). Validated against the current fixture's
+///   mailbox set at apply time.
+/// - `email_update`: array of `{ id, keywords?, mailbox_ids? }`
+///   tables. Each emits a JMAP-shape patch (`{"keywords": {...},
+///   "mailboxIds": {...}}`) routed through `apply_email_patch` at
+///   apply time, so the wire semantics match `Email/set` exactly.
+/// - `email_move`: array of `{ id, mailbox_ids }`. Applies as a
+///   regular `mailboxIds` full-replace update; the step handler
+///   surfaces the id under `changes.emails.moved` so harness asserts
+///   can distinguish a move from a flag flip.
+/// - `email_destroy`: array of email-id strings.
+/// - `mailbox_create`: array of mailbox tables (same fields as the
+///   top-level `mailbox` builder).
+/// - `mailbox_update`: array of `{ id, name?, parent_id?, sort_order?,
+///   role?, is_subscribed? }`. Patch routes through
+///   `apply_mailbox_patch`.
+/// - `mailbox_destroy`: array of mailbox-id strings.
+/// - `event_create`: array of event tables (id, calendar_id, subject,
+///   start, end, plus optional body_preview, body_text, location,
+///   organizer, attendees, is_all_day).
+/// - `event_update`: array of `{ id, subject?, start?, end?, location?,
+///   body_text? }`. Patch is a JSON object the Graph-side `event_set`
+///   path applies field-by-field at apply time.
+/// - `event_destroy`: array of event-id strings.
+fn builder_change(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "change")?;
+    let id = read_string(state, 1, "id")?;
+
+    let mut ops: Vec<ChangeOp> = Vec::new();
+
+    // email_create: read each entry as a RawEmail and normalise it
+    // against the builder's current mailbox set. We deliberately
+    // resolve mailbox refs against the *baseline* mailboxes (the
+    // ones declared in the script before `change(...)` ran);
+    // mailboxes added by an earlier `mailbox_create` op in another
+    // step are not visible at script-load time, which means
+    // create-mailbox-then-create-email-into-it must live inside the
+    // same `change({...})` step (handled below by mailbox_create
+    // running first at apply time).
+    read_email_create(state, 1, &mut ops)?;
+
+    // email_update / email_move: shaped as { id, ... }; each op
+    // emits a JMAP-style patch.
+    read_email_update(state, 1, &mut ops)?;
+    read_email_move(state, 1, &mut ops)?;
+
+    // email_destroy: array of id strings.
+    read_id_destroy(state, 1, "email_destroy", &mut ops, |id| {
+        ChangeOp::EmailDestroy { id }
+    })?;
+
+    // Mailbox ops.
+    read_mailbox_create(state, 1, &mut ops)?;
+    read_mailbox_update(state, 1, &mut ops)?;
+    read_id_destroy(state, 1, "mailbox_destroy", &mut ops, |id| {
+        ChangeOp::MailboxDestroy { id }
+    })?;
+
+    // Event ops.
+    read_event_create(state, 1, &mut ops)?;
+    read_event_update(state, 1, &mut ops)?;
+    read_id_destroy(state, 1, "event_destroy", &mut ops, |id| {
+        ChangeOp::EventDestroy { id }
+    })?;
+
+    builder_mut(state)?
+        .change_script
+        .push(ChangeStep { id, ops });
+    Ok(0)
+}
+
+// ── Per-op readers for the change builder ───────────────────────────
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_email_create(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "email_create")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"email_create\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    let mut entries: Vec<RawEmail> = Vec::with_capacity(len);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("email_create entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let raw = read_raw_email_at(state, entry_idx)?;
+        if !raw.attachments.is_empty() {
+            state.pop(2);
+            return fail(
+                state,
+                format!(
+                    "email_create entry {i}: attachments are not supported in change scripts (v0)"
+                ),
+            );
+        }
+        state.pop(1);
+        entries.push(raw);
+    }
+    state.pop(1);
+    // Normalise each entry against the builder's mailbox set. The
+    // set is a snapshot at script-load time; ops added by later
+    // change steps don't affect this lookup.
+    let mb_ids: HashMap<String, ()> = builder_mut(state)?
+        .mailboxes
+        .iter()
+        .map(|m| (m.id.clone(), ()))
+        .collect();
+    for (i, raw) in entries.into_iter().enumerate() {
+        let email = match crate::fixture::normalize_email(raw, &mb_ids, std::path::Path::new(".")) {
+            Ok(e) => e,
+            Err(e) => return fail(state, format!("email_create entry {}: {e}", i + 1)),
+        };
+        ops.push(ChangeOp::EmailCreate(Box::new(email)));
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_email_update(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "email_update")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"email_update\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("email_update entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let mut patch = serde_json::Map::new();
+        // Optional `keywords`: full-replace as JMAP `{flag: true}` map.
+        let kw_typ = lookup(state, entry_idx, "keywords")?;
+        match kw_typ {
+            LuaType::Nil => {}
+            LuaType::Table => {
+                let keywords = read_string_array_at_top(state, "keywords")?;
+                let mut m = serde_json::Map::new();
+                for k in keywords {
+                    m.insert(k, serde_json::Value::Bool(true));
+                }
+                patch.insert("keywords".into(), serde_json::Value::Object(m));
+            }
+            _ => {
+                state.pop(3);
+                return fail(state, format!("email_update entry {i}: keywords must be an array"));
+            }
+        }
+        state.pop(1);
+        // Optional `mailbox_ids`: full-replace as JMAP `{id: true}` map.
+        let mb_typ = lookup(state, entry_idx, "mailbox_ids")?;
+        match mb_typ {
+            LuaType::Nil => {}
+            LuaType::Table => {
+                let ids = read_string_array_at_top(state, "mailbox_ids")?;
+                let mut m = serde_json::Map::new();
+                for k in ids {
+                    m.insert(k, serde_json::Value::Bool(true));
+                }
+                patch.insert("mailboxIds".into(), serde_json::Value::Object(m));
+            }
+            _ => {
+                state.pop(3);
+                return fail(state, format!("email_update entry {i}: mailbox_ids must be an array"));
+            }
+        }
+        state.pop(1);
+        state.pop(1);
+        if patch.is_empty() {
+            return fail(
+                state,
+                format!("email_update entry {i}: at least one of keywords / mailbox_ids must be set"),
+            );
+        }
+        ops.push(ChangeOp::EmailUpdate {
+            id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    state.pop(1);
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_email_move(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "email_move")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"email_move\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("email_move entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let mailbox_ids = read_string_array(state, entry_idx, "mailbox_ids")?;
+        if mailbox_ids.is_empty() {
+            state.pop(2);
+            return fail(
+                state,
+                format!("email_move entry {i}: mailbox_ids must be non-empty"),
+            );
+        }
+        state.pop(1);
+        ops.push(ChangeOp::EmailMove { id, mailbox_ids });
+    }
+    state.pop(1);
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_id_destroy<F>(
+    state: &mut State,
+    t: isize,
+    key: &str,
+    ops: &mut Vec<ChangeOp>,
+    mk: F,
+) -> dellingr::Result<()>
+where
+    F: Fn(String) -> ChangeOp,
+{
+    let typ = lookup(state, t, key)?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, format!("field {key:?} must be an array"));
+        }
+    }
+    let ids = read_string_array_at_top(state, key)?;
+    state.pop(1);
+    for id in ids {
+        ops.push(mk(id));
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_mailbox_create(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "mailbox_create")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"mailbox_create\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    let mut raws: Vec<RawMailbox> = Vec::with_capacity(len);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("mailbox_create entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let mb = RawMailbox {
+            id: read_string(state, entry_idx, "id")?,
+            name: read_string(state, entry_idx, "name")?,
+            role: read_string_opt(state, entry_idx, "role")?,
+            parent_id: read_string_opt(state, entry_idx, "parent_id")?,
+            sort_order: read_int_opt(state, entry_idx, "sort_order")?,
+            is_subscribed: read_bool_opt(state, entry_idx, "is_subscribed")?,
+        };
+        state.pop(1);
+        raws.push(mb);
+    }
+    state.pop(1);
+    for raw in raws {
+        let role = match raw.role.as_deref() {
+            Some(s) => Some(Role::parse(s).map_err(|e| {
+                state.error(ErrorKind::InternalError(format!(
+                    "mailbox_create {:?}: {e}",
+                    raw.id
+                )))
+            })?),
+            None => None,
+        };
+        ops.push(ChangeOp::MailboxCreate(Box::new(Mailbox {
+            id: raw.id,
+            name: raw.name,
+            role,
+            parent_id: raw.parent_id,
+            sort_order: raw.sort_order,
+            is_subscribed: raw.is_subscribed.unwrap_or(true),
+        })));
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_mailbox_update(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "mailbox_update")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"mailbox_update\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("mailbox_update entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let mut patch = serde_json::Map::new();
+        if let Some(name) = read_string_opt(state, entry_idx, "name")? {
+            patch.insert("name".into(), serde_json::Value::String(name));
+        }
+        if let Some(parent_id) = read_string_opt(state, entry_idx, "parent_id")? {
+            patch.insert("parentId".into(), serde_json::Value::String(parent_id));
+        }
+        if let Some(sort_order) = read_int_opt(state, entry_idx, "sort_order")? {
+            patch.insert(
+                "sortOrder".into(),
+                serde_json::Value::Number(serde_json::Number::from(sort_order)),
+            );
+        }
+        if let Some(role) = read_string_opt(state, entry_idx, "role")? {
+            patch.insert("role".into(), serde_json::Value::String(role));
+        }
+        if let Some(is_subscribed) = read_bool_opt(state, entry_idx, "is_subscribed")? {
+            patch.insert(
+                "isSubscribed".into(),
+                serde_json::Value::Bool(is_subscribed),
+            );
+        }
+        state.pop(1);
+        if patch.is_empty() {
+            return fail(
+                state,
+                format!("mailbox_update entry {i}: at least one field must be set"),
+            );
+        }
+        ops.push(ChangeOp::MailboxUpdate {
+            id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    state.pop(1);
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_event_create(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "event_create")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"event_create\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("event_create entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let calendar_id = read_string(state, entry_idx, "calendar_id")?;
+        let subject = read_string(state, entry_idx, "subject")?;
+        let body_preview = read_string_opt(state, entry_idx, "body_preview")?;
+        let body_text = read_string_opt(state, entry_idx, "body_text")?;
+        let start_raw = read_string(state, entry_idx, "start")?;
+        let end_raw = read_string(state, entry_idx, "end")?;
+        let location = read_string_opt(state, entry_idx, "location")?;
+        let organizer = read_address_opt(state, entry_idx, "organizer")?;
+        let attendees = read_address_array_opt(state, entry_idx, "attendees")?;
+        let is_all_day = read_bool_opt(state, entry_idx, "is_all_day")?.unwrap_or(false);
+        state.pop(1);
+        let start = match crate::fixture::parse_ts(&start_raw) {
+            Ok(t) => t,
+            Err(e) => {
+                return fail(state, format!("event_create entry {i} start: {e}"));
+            }
+        };
+        let end = match crate::fixture::parse_ts(&end_raw) {
+            Ok(t) => t,
+            Err(e) => {
+                return fail(state, format!("event_create entry {i} end: {e}"));
+            }
+        };
+        ops.push(ChangeOp::EventCreate(Box::new(Event {
+            id,
+            calendar_id,
+            subject,
+            body_preview,
+            body_text,
+            start,
+            end,
+            location,
+            organizer: organizer.map(crate::fixture::Address::from),
+            attendees: attendees
+                .into_iter()
+                .map(crate::fixture::Address::from)
+                .collect(),
+            is_all_day,
+        })));
+    }
+    state.pop(1);
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_event_update(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "event_update")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"event_update\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("event_update entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let mut patch = serde_json::Map::new();
+        if let Some(s) = read_string_opt(state, entry_idx, "subject")? {
+            patch.insert("subject".into(), serde_json::Value::String(s));
+        }
+        if let Some(s) = read_string_opt(state, entry_idx, "start")? {
+            patch.insert("start".into(), serde_json::Value::String(s));
+        }
+        if let Some(s) = read_string_opt(state, entry_idx, "end")? {
+            patch.insert("end".into(), serde_json::Value::String(s));
+        }
+        if let Some(s) = read_string_opt(state, entry_idx, "location")? {
+            patch.insert("location".into(), serde_json::Value::String(s));
+        }
+        if let Some(s) = read_string_opt(state, entry_idx, "body_text")? {
+            patch.insert("body_text".into(), serde_json::Value::String(s));
+        }
+        state.pop(1);
+        if patch.is_empty() {
+            return fail(
+                state,
+                format!("event_update entry {i}: at least one field must be set"),
+            );
+        }
+        ops.push(ChangeOp::EventUpdate {
+            id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    state.pop(1);
+    Ok(())
+}
+
+/// Read a `RawEmail` from the table at index `t`. Mirrors the field
+/// list in `builder_email` but parameterised on the table index so the
+/// change-script `email_create` reader can reuse it for sub-tables.
+fn read_raw_email_at(state: &mut State, t: isize) -> dellingr::Result<RawEmail> {
+    Ok(RawEmail {
+        id: read_string(state, t, "id")?,
+        thread_id: read_string_opt(state, t, "thread_id")?,
+        mailbox_ids: read_string_array(state, t, "mailbox_ids")?,
+        keywords: read_string_array_opt(state, t, "keywords")?,
+        size: read_int_opt(state, t, "size")?,
+        received_at: read_string(state, t, "received_at")?,
+        sent_at: read_string_opt(state, t, "sent_at")?,
+        from: read_address_opt(state, t, "from")?,
+        to: read_address_array_opt(state, t, "to")?,
+        cc: read_address_array_opt(state, t, "cc")?,
+        bcc: read_address_array_opt(state, t, "bcc")?,
+        reply_to: read_address_array_opt(state, t, "reply_to")?,
+        subject: read_string_opt(state, t, "subject")?,
+        preview: read_string_opt(state, t, "preview")?,
+        message_id: read_string_array_opt(state, t, "message_id")?,
+        in_reply_to: read_string_array_opt(state, t, "in_reply_to")?,
+        references: read_string_array_opt(state, t, "references")?,
+        has_attachment: read_bool_opt(state, t, "has_attachment")?,
+        body_text: read_string_opt(state, t, "body_text")?,
+        attachments: read_attachment_array_opt(state, t, "attachments")?,
+    })
 }
 
 // ── Stack helpers ───────────────────────────────────────────────────
