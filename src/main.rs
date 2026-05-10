@@ -113,8 +113,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the inbound Host header. main.rs binds 127.0.0.1, so the
     // string ends up shaped like "http://127.0.0.1:NNNN".
     let base_url = format!("http://{jmap_addr}");
+    // Post-load baseline used by `POST /test/fixture/reset` to
+    // rewind the fixture image. Cloned once before any handler
+    // can mutate. The Arc keeps SharedHandles cheap to clone.
+    let baseline = Arc::new(
+        fixture
+            .read()
+            .expect("fixture lock poisoned")
+            .clone(),
+    );
     let shared = saehrimnir::shared::SharedHandles {
         fixture: Arc::clone(&fixture),
+        baseline,
+        change_cursor: Arc::new(std::sync::Mutex::new(0)),
         dispatcher: dispatcher.clone(),
         request_log: request_log.clone(),
         token_store: token_store.clone(),

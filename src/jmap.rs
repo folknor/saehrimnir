@@ -1167,7 +1167,7 @@ fn build_email_from_create(
     Ok((server_id, email))
 }
 
-fn apply_email_patch(email: &mut Email, patch: &Value) -> Result<(), Value> {
+pub(crate) fn apply_email_patch(email: &mut Email, patch: &Value) -> Result<(), Value> {
     let obj = patch
         .as_object()
         .ok_or_else(|| set_error("invalidProperties", "patch must be an object"))?;
@@ -1410,7 +1410,7 @@ fn build_mailbox_from_create(
     })
 }
 
-fn apply_mailbox_patch(mailbox: &mut Mailbox, patch: &Value) -> Result<(), Value> {
+pub(crate) fn apply_mailbox_patch(mailbox: &mut Mailbox, patch: &Value) -> Result<(), Value> {
     let obj = patch
         .as_object()
         .ok_or_else(|| set_error("invalidProperties", "patch must be an object"))?;
@@ -1639,6 +1639,7 @@ mod tests {
             calendars: vec![],
             events: vec![],
             change_log: crate::fixture::ChangeLog::default(),
+            change_script: Vec::new(),
         }
     }
 
@@ -1812,6 +1813,7 @@ mod tests {
             calendars: vec![],
             events: vec![],
             change_log: crate::fixture::ChangeLog::default(),
+            change_script: Vec::new(),
         }
     }
 
@@ -2087,6 +2089,7 @@ mod tests {
             calendars: vec![],
             events: vec![],
             change_log: crate::fixture::ChangeLog::default(),
+            change_script: Vec::new(),
         }
     }
 

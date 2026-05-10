@@ -32,6 +32,15 @@ pub struct Fixture {
     /// `state`. JMAP `Email/changes` / `Mailbox/changes` walk this
     /// log to compute deltas between two known states.
     pub change_log: ChangeLog,
+    /// Optional incremental-sync script. Populated by the Lua
+    /// `change({...})` builder; empty for fixtures (TOML or Lua)
+    /// that don't author any. The harness drives steps via
+    /// `POST /test/fixture/step`; each step is applied atomically
+    /// through `Fixture::mutate` so its full diff lands in one
+    /// `Transition`. The script itself is read-only state on the
+    /// fixture image and is restored on `POST /test/fixture/reset`
+    /// alongside the rest of the baseline.
+    pub change_script: Vec<ChangeStep>,
 }
 
 /// Bounded ring of recent state transitions.
@@ -306,6 +315,57 @@ fn dedup_preserving_order(v: &mut Vec<String>) {
     let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(v.len());
     v.retain(|id| seen.insert(id.clone()));
+}
+
+/// One named entry in the incremental-sync script. Authored via
+/// the Lua `change({ id = "...", ... })` builder. Steps are
+/// applied atomically: the handler accumulates every op's resource
+/// touch into one `MutationDiff` and routes it through a single
+/// `Fixture::mutate` call, so the change_log gains exactly one
+/// `Transition` per step. That keeps `Email/changes` collapse rules
+/// natural - within-step create+destroy cancels, create+update
+/// collapses, etc. - even when a step does several things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeStep {
+    pub id: String,
+    pub ops: Vec<ChangeOp>,
+}
+
+/// A single mutation in a [`ChangeStep`]. Patches use the same wire
+/// shape as JMAP `Email/set` / `Mailbox/set` (`keywords` /
+/// `keywords/<flag>`, `mailboxIds` / `mailboxIds/<id>`, plus the
+/// mailbox metadata properties), so the step handler can route them
+/// through `crate::jmap::apply_email_patch` /
+/// `crate::jmap::apply_mailbox_patch` rather than reimplementing.
+///
+/// `EmailMove` is a convenience alias for "update the email's
+/// `mailboxIds` to this exact set". It applies as a regular update
+/// (the diff lands in `email_updated`) but the step handler also
+/// surfaces it under `changes.emails.moved` in the response so test
+/// harnesses can distinguish a move from a flag flip without
+/// re-walking the resulting state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeOp {
+    EmailCreate(Box<Email>),
+    EmailUpdate {
+        id: String,
+        patch: serde_json::Value,
+    },
+    EmailMove {
+        id: String,
+        mailbox_ids: Vec<String>,
+    },
+    EmailDestroy {
+        id: String,
+    },
+    MailboxCreate(Box<Mailbox>),
+    MailboxUpdate {
+        id: String,
+        patch: serde_json::Value,
+    },
+    MailboxDestroy {
+        id: String,
+    },
 }
 
 /// Fixture-side OAuth configuration. Optional in TOML/Lua; defaults
@@ -740,110 +800,8 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
 
     let mut emails = Vec::with_capacity(raw.emails.len());
     for em in raw.emails {
-        if em.mailbox_ids.is_empty() {
-            return Err(format!("email {:?}: mailbox_ids must not be empty", em.id));
-        }
-        for mid in &em.mailbox_ids {
-            if !mb_ids.contains_key(mid) {
-                return Err(format!(
-                    "email {:?}: mailbox_ids contains unknown {mid:?}",
-                    em.id
-                ));
-            }
-        }
-
-        let body = match em.body_text {
-            Some(t) => Body::Text(t),
-            None => {
-                return Err(format!(
-                    "email {:?}: must declare body_text (body_path/body_html not yet implemented)",
-                    em.id
-                ));
-            }
-        };
-
-        let received_at =
-            parse_ts(&em.received_at).map_err(|e| format!("email {:?} received_at: {e}", em.id))?;
-        let sent_at = match em.sent_at {
-            Some(s) => parse_ts(&s).map_err(|e| format!("email {:?} sent_at: {e}", em.id))?,
-            None => received_at,
-        };
-
-        let size = em.size.unwrap_or_else(|| match &body {
-            Body::Text(s) => i64::try_from(s.len()).unwrap_or(i64::MAX),
-        });
-
-        let mut attachments = Vec::with_capacity(em.attachments.len());
-        let mut blob_ids: HashMap<String, ()> = HashMap::new();
-        for raw_att in em.attachments {
-            if blob_ids.insert(raw_att.blob_id.clone(), ()).is_some() {
-                return Err(format!(
-                    "email {:?}: duplicate attachment blob_id {:?}",
-                    em.id, raw_att.blob_id
-                ));
-            }
-            let disposition = match raw_att.disposition.as_deref() {
-                Some(s) => Disposition::parse(s)
-                    .map_err(|e| format!("email {:?} attachment {:?}: {e}", em.id, raw_att.blob_id))?,
-                None => Disposition::Attachment,
-            };
-            let blob_path = fixture_dir.join(&raw_att.data_path);
-            let data = std::fs::read(&blob_path).map_err(|e| {
-                format!(
-                    "email {:?} attachment {:?}: read {}: {e}",
-                    em.id,
-                    raw_att.blob_id,
-                    blob_path.display()
-                )
-            })?;
-            let size = raw_att
-                .size
-                .unwrap_or_else(|| i64::try_from(data.len()).unwrap_or(i64::MAX));
-            attachments.push(Attachment {
-                blob_id: raw_att.blob_id,
-                name: raw_att.name,
-                content_type: raw_att.content_type,
-                size,
-                disposition,
-                cid: raw_att.cid,
-                data,
-            });
-        }
-
-        let has_attachment = match em.has_attachment {
-            Some(false) if !attachments.is_empty() => {
-                return Err(format!(
-                    "email {:?}: has_attachment=false but {} attachment(s) declared",
-                    em.id,
-                    attachments.len()
-                ));
-            }
-            Some(b) => b,
-            None => !attachments.is_empty(),
-        };
-
-        emails.push(Email {
-            thread_id: em.thread_id.unwrap_or_else(|| em.id.clone()),
-            id: em.id,
-            mailbox_ids: em.mailbox_ids,
-            keywords: em.keywords,
-            size,
-            received_at,
-            sent_at,
-            from: em.from.map(Address::from),
-            to: em.to.into_iter().map(Address::from).collect(),
-            cc: em.cc.into_iter().map(Address::from).collect(),
-            bcc: em.bcc.into_iter().map(Address::from).collect(),
-            reply_to: em.reply_to.into_iter().map(Address::from).collect(),
-            subject: em.subject,
-            preview: em.preview,
-            message_id: em.message_id,
-            in_reply_to: em.in_reply_to,
-            references: em.references,
-            has_attachment,
-            body,
-            attachments,
-        });
+        let email = normalize_email(em, &mb_ids, fixture_dir)?;
+        emails.push(email);
     }
 
     let oauth = match raw.oauth {
@@ -927,6 +885,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         calendars,
         events,
         change_log,
+        change_script: Vec::new(),
     })
 }
 
@@ -934,6 +893,126 @@ pub fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| format!("invalid RFC3339 timestamp {s:?}: {e}"))
+}
+
+/// Normalise one [`RawEmail`] into a typed [`Email`]: timestamp parsing,
+/// body extraction, attachment loading, and cross-reference checks
+/// against `mb_ids` (the set of mailbox ids known to the surrounding
+/// fixture). Factored out so the change-script apply path can reuse the
+/// same validation when an `email_create` op fires at runtime.
+///
+/// `mb_ids` is the surrounding mailbox-id set keyed for `O(1)` lookup
+/// the same way the load-time validator builds it; the change-script
+/// path passes a freshly-built set from the live fixture's mailboxes.
+pub(crate) fn normalize_email(
+    em: RawEmail,
+    mb_ids: &HashMap<String, ()>,
+    fixture_dir: &Path,
+) -> Result<Email, String> {
+    if em.mailbox_ids.is_empty() {
+        return Err(format!("email {:?}: mailbox_ids must not be empty", em.id));
+    }
+    for mid in &em.mailbox_ids {
+        if !mb_ids.contains_key(mid) {
+            return Err(format!(
+                "email {:?}: mailbox_ids contains unknown {mid:?}",
+                em.id
+            ));
+        }
+    }
+
+    let body = match em.body_text {
+        Some(t) => Body::Text(t),
+        None => {
+            return Err(format!(
+                "email {:?}: must declare body_text (body_path/body_html not yet implemented)",
+                em.id
+            ));
+        }
+    };
+
+    let received_at =
+        parse_ts(&em.received_at).map_err(|e| format!("email {:?} received_at: {e}", em.id))?;
+    let sent_at = match em.sent_at {
+        Some(s) => parse_ts(&s).map_err(|e| format!("email {:?} sent_at: {e}", em.id))?,
+        None => received_at,
+    };
+
+    let size = em.size.unwrap_or_else(|| match &body {
+        Body::Text(s) => i64::try_from(s.len()).unwrap_or(i64::MAX),
+    });
+
+    let mut attachments = Vec::with_capacity(em.attachments.len());
+    let mut blob_ids: HashMap<String, ()> = HashMap::new();
+    for raw_att in em.attachments {
+        if blob_ids.insert(raw_att.blob_id.clone(), ()).is_some() {
+            return Err(format!(
+                "email {:?}: duplicate attachment blob_id {:?}",
+                em.id, raw_att.blob_id
+            ));
+        }
+        let disposition = match raw_att.disposition.as_deref() {
+            Some(s) => Disposition::parse(s)
+                .map_err(|e| format!("email {:?} attachment {:?}: {e}", em.id, raw_att.blob_id))?,
+            None => Disposition::Attachment,
+        };
+        let blob_path = fixture_dir.join(&raw_att.data_path);
+        let data = std::fs::read(&blob_path).map_err(|e| {
+            format!(
+                "email {:?} attachment {:?}: read {}: {e}",
+                em.id,
+                raw_att.blob_id,
+                blob_path.display()
+            )
+        })?;
+        let size = raw_att
+            .size
+            .unwrap_or_else(|| i64::try_from(data.len()).unwrap_or(i64::MAX));
+        attachments.push(Attachment {
+            blob_id: raw_att.blob_id,
+            name: raw_att.name,
+            content_type: raw_att.content_type,
+            size,
+            disposition,
+            cid: raw_att.cid,
+            data,
+        });
+    }
+
+    let has_attachment = match em.has_attachment {
+        Some(false) if !attachments.is_empty() => {
+            return Err(format!(
+                "email {:?}: has_attachment=false but {} attachment(s) declared",
+                em.id,
+                attachments.len()
+            ));
+        }
+        Some(b) => b,
+        None => !attachments.is_empty(),
+    };
+
+    Ok(Email {
+        thread_id: em.thread_id.unwrap_or_else(|| em.id.clone()),
+        id: em.id,
+        mailbox_ids: em.mailbox_ids,
+        keywords: em.keywords,
+        size,
+        received_at,
+        sent_at,
+        from: em.from.map(Address::from),
+        to: em.to.into_iter().map(Address::from).collect(),
+        cc: em.cc.into_iter().map(Address::from).collect(),
+        bcc: em.bcc.into_iter().map(Address::from).collect(),
+        reply_to: em.reply_to.into_iter().map(Address::from).collect(),
+        subject: em.subject,
+        preview: em.preview,
+        message_id: em.message_id,
+        in_reply_to: em.in_reply_to,
+        references: em.references,
+        has_attachment,
+        body,
+        attachments,
+    })
 }
 
 /// Cheap email-shape check for `account.name`. Not RFC 5322

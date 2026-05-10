@@ -14,7 +14,7 @@
 //! Sharing only the four genuinely-shared handles is the minimum
 //! that keeps the construction sites readable.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::fixture::Fixture;
 use crate::lua::Dispatcher;
@@ -42,6 +42,19 @@ pub fn handle(fixture: Fixture) -> FixtureHandle {
 #[derive(Clone)]
 pub struct SharedHandles {
     pub fixture: FixtureHandle,
+    /// Immutable post-load snapshot of the fixture. Cloned once at
+    /// startup and held behind an `Arc` so cloning the handle bag
+    /// is still a pointer bump. `POST /test/fixture/reset` rewinds
+    /// `fixture` to this image so a harness can re-run the same
+    /// `[[change]]` script in one process. Cleared on TLS test
+    /// helpers via `for_test`, which seeds it from the live
+    /// fixture (the test never mutates).
+    pub baseline: Arc<Fixture>,
+    /// Cursor over `Fixture::change_script`. Advanced by
+    /// `POST /test/fixture/step`; reset to 0 by
+    /// `POST /test/fixture/reset`. Process-scoped; never
+    /// persisted.
+    pub change_cursor: Arc<Mutex<usize>>,
     pub dispatcher: Option<Arc<Dispatcher>>,
     pub request_log: RequestLog,
     pub token_store: TokenStore,
@@ -54,8 +67,11 @@ impl SharedHandles {
     /// per-router `AppState::for_test` helpers funnel through
     /// here.
     pub fn for_test(fixture: FixtureHandle) -> Self {
+        let baseline = Arc::new(fixture.read().expect("fixture lock poisoned").clone());
         Self {
             fixture,
+            baseline,
+            change_cursor: Arc::new(Mutex::new(0)),
             dispatcher: None,
             request_log: RequestLog::default(),
             token_store: TokenStore::default(),

@@ -2158,6 +2158,7 @@ mod tests {
             calendars: vec![],
             events: vec![],
             change_log: crate::fixture::ChangeLog::default(),
+            change_script: Vec::new(),
         })
     }
 
@@ -2236,6 +2237,7 @@ mod tests {
             calendars: vec![],
             events: vec![],
             change_log: crate::fixture::ChangeLog::default(),
+            change_script: Vec::new(),
         })
     }
 
