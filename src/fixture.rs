@@ -697,6 +697,125 @@ pub(crate) struct RawFixture {
     pub(crate) contact_folders: Vec<RawContactFolder>,
     #[serde(default, rename = "contact")]
     pub(crate) contacts: Vec<RawContact>,
+    #[serde(default, rename = "change")]
+    pub(crate) change_script: Vec<RawChangeStep>,
+}
+
+/// One named step in the TOML projection of the change-script
+/// surface. Each bucket mirrors the Lua `change({...})` field with
+/// the same name; every bucket is optional so a step that names just
+/// one op kind is valid TOML.
+///
+/// The op order inside the resulting [`ChangeStep`] matches the Lua
+/// reader: email_create / email_update / email_move / email_destroy,
+/// then mailbox, then event, then contact_folder, then contact. The
+/// step handler walks ops in the produced order, so this also fixes
+/// the apply order (mailbox_create runs before email_create that
+/// references it within the same step, etc.).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawChangeStep {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) email_create: Vec<RawEmail>,
+    #[serde(default)]
+    pub(crate) email_update: Vec<RawEmailUpdate>,
+    #[serde(default)]
+    pub(crate) email_move: Vec<RawEmailMove>,
+    #[serde(default)]
+    pub(crate) email_destroy: Vec<String>,
+    #[serde(default)]
+    pub(crate) mailbox_create: Vec<RawMailbox>,
+    #[serde(default)]
+    pub(crate) mailbox_update: Vec<RawMailboxUpdate>,
+    #[serde(default)]
+    pub(crate) mailbox_destroy: Vec<String>,
+    #[serde(default)]
+    pub(crate) event_create: Vec<RawEvent>,
+    #[serde(default)]
+    pub(crate) event_update: Vec<RawEventUpdate>,
+    #[serde(default)]
+    pub(crate) event_destroy: Vec<String>,
+    #[serde(default)]
+    pub(crate) contact_folder_create: Vec<RawContactFolder>,
+    #[serde(default)]
+    pub(crate) contact_folder_update: Vec<RawContactFolderUpdate>,
+    #[serde(default)]
+    pub(crate) contact_folder_destroy: Vec<String>,
+    #[serde(default)]
+    pub(crate) contact_create: Vec<RawContact>,
+    #[serde(default)]
+    pub(crate) contact_update: Vec<RawContactUpdate>,
+    #[serde(default)]
+    pub(crate) contact_destroy: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawEmailUpdate {
+    pub(crate) id: String,
+    /// Full-replace keyword set; `Some(vec![])` clears all flags.
+    /// Absent leaves keywords untouched.
+    #[serde(default)]
+    pub(crate) keywords: Option<Vec<String>>,
+    /// Full-replace mailbox membership.
+    #[serde(default)]
+    pub(crate) mailbox_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawEmailMove {
+    pub(crate) id: String,
+    pub(crate) mailbox_ids: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawMailboxUpdate {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[serde(default)]
+    pub(crate) parent_id: Option<String>,
+    #[serde(default)]
+    pub(crate) sort_order: Option<i64>,
+    #[serde(default)]
+    pub(crate) role: Option<String>,
+    #[serde(default)]
+    pub(crate) is_subscribed: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawEventUpdate {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) subject: Option<String>,
+    #[serde(default)]
+    pub(crate) start: Option<String>,
+    #[serde(default)]
+    pub(crate) end: Option<String>,
+    #[serde(default)]
+    pub(crate) location: Option<String>,
+    #[serde(default)]
+    pub(crate) body_text: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawContactFolderUpdate {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) parent_folder_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawContactUpdate {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) folder_id: Option<String>,
+    /// Full-replace email list when present.
+    #[serde(default)]
+    pub(crate) emails: Option<Vec<RawContactEmail>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1090,6 +1209,16 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    // Change-script projection. Normalised against the *baseline*
+    // mailbox set declared in the same fixture; mailboxes that a
+    // later step's `mailbox_create` op introduces are not visible
+    // here (matching the Lua loader's snapshot semantics, see
+    // `src/lua.rs::read_email_create`).
+    let mut change_script: Vec<ChangeStep> = Vec::with_capacity(raw.change_script.len());
+    for raw_step in raw.change_script {
+        change_script.push(normalize_change_step(raw_step, &mb_ids, fixture_dir)?);
+    }
+
     let state = raw.state.unwrap_or_else(|| "fixture-state".to_string());
     let change_log = ChangeLog::seed(&state);
     Ok(Fixture {
@@ -1107,8 +1236,265 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         contact_folders,
         contacts,
         change_log,
-        change_script: Vec::new(),
+        change_script,
     })
+}
+
+/// Project one [`RawChangeStep`] into a [`ChangeStep`]. Op order in
+/// the produced `Vec<ChangeOp>` matches the Lua change builder
+/// (`src/lua.rs::builder_change`); patches are constructed in the
+/// same JMAP-shape the Lua loader emits, so a TOML and Lua change
+/// step that name the same fields produce byte-identical
+/// `ChangeStep`s. Used by both the TOML loader and (transitively)
+/// by the Lua loader's mailbox/contact/event op readers; the
+/// email_create path here additionally validates against the
+/// fixture's baseline mailbox set, matching what the Lua side does.
+fn normalize_change_step(
+    raw: RawChangeStep,
+    mb_ids: &HashMap<String, ()>,
+    fixture_dir: &Path,
+) -> Result<ChangeStep, String> {
+    let id = raw.id;
+    let mut ops: Vec<ChangeOp> = Vec::new();
+
+    for em in raw.email_create {
+        if !em.attachments.is_empty() {
+            return Err(format!(
+                "change step {id:?}: email_create entry {:?}: attachments are not supported in change scripts (v0)",
+                em.id
+            ));
+        }
+        let email_id = em.id.clone();
+        let email = normalize_email(em, mb_ids, fixture_dir)
+            .map_err(|e| format!("change step {id:?}: email_create entry {email_id:?}: {e}"))?;
+        ops.push(ChangeOp::EmailCreate(Box::new(email)));
+    }
+    for u in raw.email_update {
+        let mut patch = serde_json::Map::new();
+        if let Some(kw) = u.keywords {
+            let mut m = serde_json::Map::new();
+            for k in kw {
+                m.insert(k, serde_json::Value::Bool(true));
+            }
+            patch.insert("keywords".into(), serde_json::Value::Object(m));
+        }
+        if let Some(mids) = u.mailbox_ids {
+            let mut m = serde_json::Map::new();
+            for k in mids {
+                m.insert(k, serde_json::Value::Bool(true));
+            }
+            patch.insert("mailboxIds".into(), serde_json::Value::Object(m));
+        }
+        if patch.is_empty() {
+            return Err(format!(
+                "change step {id:?}: email_update entry {:?}: at least one of keywords / mailbox_ids must be set",
+                u.id
+            ));
+        }
+        ops.push(ChangeOp::EmailUpdate {
+            id: u.id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    for m in raw.email_move {
+        if m.mailbox_ids.is_empty() {
+            return Err(format!(
+                "change step {id:?}: email_move entry {:?}: mailbox_ids must be non-empty",
+                m.id
+            ));
+        }
+        ops.push(ChangeOp::EmailMove {
+            id: m.id,
+            mailbox_ids: m.mailbox_ids,
+        });
+    }
+    for d in raw.email_destroy {
+        ops.push(ChangeOp::EmailDestroy { id: d });
+    }
+
+    for mb in raw.mailbox_create {
+        let role = mb
+            .role
+            .as_deref()
+            .map(Role::parse)
+            .transpose()
+            .map_err(|e| format!("change step {id:?}: mailbox_create {:?}: {e}", mb.id))?;
+        ops.push(ChangeOp::MailboxCreate(Box::new(Mailbox {
+            id: mb.id,
+            name: mb.name,
+            role,
+            parent_id: mb.parent_id,
+            sort_order: mb.sort_order,
+            is_subscribed: mb.is_subscribed.unwrap_or(true),
+        })));
+    }
+    for u in raw.mailbox_update {
+        let mut patch = serde_json::Map::new();
+        if let Some(name) = u.name {
+            patch.insert("name".into(), serde_json::Value::String(name));
+        }
+        if let Some(p) = u.parent_id {
+            patch.insert("parentId".into(), serde_json::Value::String(p));
+        }
+        if let Some(s) = u.sort_order {
+            patch.insert(
+                "sortOrder".into(),
+                serde_json::Value::Number(serde_json::Number::from(s)),
+            );
+        }
+        if let Some(r) = u.role {
+            patch.insert("role".into(), serde_json::Value::String(r));
+        }
+        if let Some(b) = u.is_subscribed {
+            patch.insert("isSubscribed".into(), serde_json::Value::Bool(b));
+        }
+        if patch.is_empty() {
+            return Err(format!(
+                "change step {id:?}: mailbox_update entry {:?}: at least one field must be set",
+                u.id
+            ));
+        }
+        ops.push(ChangeOp::MailboxUpdate {
+            id: u.id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    for d in raw.mailbox_destroy {
+        ops.push(ChangeOp::MailboxDestroy { id: d });
+    }
+
+    for ev in raw.event_create {
+        let start = parse_ts(&ev.start)
+            .map_err(|e| format!("change step {id:?}: event_create {:?} start: {e}", ev.id))?;
+        let end = parse_ts(&ev.end)
+            .map_err(|e| format!("change step {id:?}: event_create {:?} end: {e}", ev.id))?;
+        ops.push(ChangeOp::EventCreate(Box::new(Event {
+            id: ev.id,
+            calendar_id: ev.calendar_id,
+            subject: ev.subject,
+            body_preview: ev.body_preview,
+            body_text: ev.body_text,
+            start,
+            end,
+            location: ev.location,
+            organizer: ev.organizer.map(Address::from),
+            attendees: ev.attendees.into_iter().map(Address::from).collect(),
+            is_all_day: ev.is_all_day,
+        })));
+    }
+    for u in raw.event_update {
+        let mut patch = serde_json::Map::new();
+        if let Some(s) = u.subject {
+            patch.insert("subject".into(), serde_json::Value::String(s));
+        }
+        if let Some(s) = u.start {
+            patch.insert("start".into(), serde_json::Value::String(s));
+        }
+        if let Some(s) = u.end {
+            patch.insert("end".into(), serde_json::Value::String(s));
+        }
+        if let Some(s) = u.location {
+            patch.insert("location".into(), serde_json::Value::String(s));
+        }
+        if let Some(s) = u.body_text {
+            patch.insert("body_text".into(), serde_json::Value::String(s));
+        }
+        if patch.is_empty() {
+            return Err(format!(
+                "change step {id:?}: event_update entry {:?}: at least one field must be set",
+                u.id
+            ));
+        }
+        ops.push(ChangeOp::EventUpdate {
+            id: u.id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    for d in raw.event_destroy {
+        ops.push(ChangeOp::EventDestroy { id: d });
+    }
+
+    for cf in raw.contact_folder_create {
+        ops.push(ChangeOp::ContactFolderCreate(Box::new(ContactFolder {
+            id: cf.id,
+            display_name: cf.display_name,
+            parent_folder_id: cf.parent_folder_id,
+            is_default: cf.is_default,
+        })));
+    }
+    for u in raw.contact_folder_update {
+        let mut patch = serde_json::Map::new();
+        if let Some(n) = u.display_name {
+            patch.insert("display_name".into(), serde_json::Value::String(n));
+        }
+        if let Some(p) = u.parent_folder_id {
+            patch.insert(
+                "parent_folder_id".into(),
+                serde_json::Value::String(p),
+            );
+        }
+        if patch.is_empty() {
+            return Err(format!(
+                "change step {id:?}: contact_folder_update entry {:?}: at least one field must be set",
+                u.id
+            ));
+        }
+        ops.push(ChangeOp::ContactFolderUpdate {
+            id: u.id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    for d in raw.contact_folder_destroy {
+        ops.push(ChangeOp::ContactFolderDestroy { id: d });
+    }
+
+    for c in raw.contact_create {
+        ops.push(ChangeOp::ContactCreate(Box::new(Contact {
+            id: c.id,
+            folder_id: c.folder_id,
+            display_name: c.display_name,
+            emails: c.emails.into_iter().map(ContactEmail::from).collect(),
+        })));
+    }
+    for u in raw.contact_update {
+        let mut patch = serde_json::Map::new();
+        if let Some(n) = u.display_name {
+            patch.insert("display_name".into(), serde_json::Value::String(n));
+        }
+        if let Some(f) = u.folder_id {
+            patch.insert("folder_id".into(), serde_json::Value::String(f));
+        }
+        if let Some(emails) = u.emails {
+            let arr: Vec<serde_json::Value> = emails
+                .into_iter()
+                .map(|e| {
+                    let ContactEmail { address, name } = ContactEmail::from(e);
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("address".into(), serde_json::Value::String(address));
+                    if let Some(n) = name {
+                        obj.insert("name".into(), serde_json::Value::String(n));
+                    }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            patch.insert("emails".into(), serde_json::Value::Array(arr));
+        }
+        if patch.is_empty() {
+            return Err(format!(
+                "change step {id:?}: contact_update entry {:?}: at least one field must be set",
+                u.id
+            ));
+        }
+        ops.push(ChangeOp::ContactUpdate {
+            id: u.id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    for d in raw.contact_destroy {
+        ops.push(ChangeOp::ContactDestroy { id: d });
+    }
+
+    Ok(ChangeStep { id, ops })
 }
 
 pub fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {

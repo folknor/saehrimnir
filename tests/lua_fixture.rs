@@ -92,6 +92,18 @@ fn lua_fixture_matches_equivalent_toml() {
 }
 
 #[test]
+fn lua_incremental_fixture_matches_equivalent_toml() {
+    let from_toml = fixture::load(Path::new("fixtures/jmap-incremental.toml")).unwrap();
+    let from_lua = fixture::load(Path::new("fixtures/jmap-incremental.lua")).unwrap();
+    assert_eq!(from_toml, from_lua);
+    // Spot-check that the change script actually populated rather
+    // than passing trivially as two empty Vecs.
+    assert_eq!(from_toml.change_script.len(), 4);
+    assert_eq!(from_toml.change_script[0].id, "new");
+    assert_eq!(from_toml.change_script[3].id, "move");
+}
+
+#[test]
 fn lua_attach_fixture_matches_equivalent_toml() {
     let from_toml = fixture::load(Path::new("fixtures/jmap-attach.toml")).unwrap();
     let from_lua = fixture::load(Path::new("fixtures/jmap-attach.lua")).unwrap();

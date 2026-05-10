@@ -197,6 +197,11 @@ impl Builder {
             events: vec![],
             contact_folders: self.contact_folders,
             contacts: self.contacts,
+            // Lua change_script lives in `Builder::change_script`
+            // (fully-typed `Vec<ChangeStep>`) and is grafted onto
+            // the Fixture after `normalize_with_dir` returns; the
+            // RawFixture pathway is TOML-only.
+            change_script: vec![],
         };
         Ok((raw, self.change_script, self.handlers))
     }

@@ -291,15 +291,21 @@ runs:
 - `state` tokens are the fixture-level `state` field, or a stable
   default if absent. They never change during a run.
 
-## Incremental change scripts (Lua only, v0)
+## Incremental change scripts
 
-A `change(...)` call in a Lua scenario adds one named entry to the
-fixture's incremental-sync script. Each entry is a `ChangeStep` with
-an `id` plus zero-or-more op buckets. The harness drives steps via
-`POST /test/fixture/step` (see `notes/orchestration.md`); each
-step's ops accumulate into a single `Fixture::mutate` call so the
-change_log gains exactly one transition per step. RFC 8620 §5.2
-dominance applies naturally on subsequent `Email/changes` walks.
+Both authoring formats project to the same `Vec<ChangeStep>` on the
+loaded fixture. A Lua `change(...)` call (or one TOML `[[change]]`
+table) adds one named entry to the fixture's incremental-sync
+script. Each entry is a `ChangeStep` with an `id` plus zero-or-more
+op buckets. The harness drives steps via `POST /test/fixture/step`
+(see `notes/orchestration.md`); each step's ops accumulate into a
+single `Fixture::mutate` call so the change_log gains exactly one
+transition per step. RFC 8620 §5.2 dominance applies naturally on
+subsequent `Email/changes` walks.
+
+`fixtures/jmap-incremental.lua` and `fixtures/jmap-incremental.toml`
+are equivalent fixtures asserted byte-identical by
+`tests/lua_fixture.rs::lua_incremental_fixture_matches_equivalent_toml`.
 
 ```lua
 change({
@@ -389,12 +395,54 @@ Op contracts:
   a folder created by an earlier op in the same step).
 - **`contact_destroy`**: array of contact-id strings.
 
-`fixtures/jmap-incremental.lua` is the canonical example.
+### TOML projection
 
-TOML support is deliberately deferred. The Lua surface is the
-forcing function for ratatoskr's incremental-sync round-trip
-tests; a TOML projection lands once a second fixture proves the
-static format is worth maintaining.
+The TOML form mirrors the Lua surface field-for-field. Each step is
+a `[[change]]` table; per-op buckets are `[[change.email_create]]`
+arrays of inline tables (or `email_destroy = [...]` / similar for
+the id-only buckets). Patch shape and op order match the Lua loader
+exactly, so the produced `ChangeStep`s are byte-identical:
+
+```toml
+[[change]]
+id = "new"
+
+[[change.email_create]]
+id = "email-003"
+mailbox_ids = ["mb-inbox"]
+received_at = "2026-01-15T12:00:00Z"
+from = "carol@example.com"
+to = ["test@example.com"]
+subject = "Lunch?"
+body_text = "Free at 12:30?"
+message_id = ["<003@example.com>"]
+
+[[change]]
+id = "change"
+
+[[change.email_update]]
+id = "email-002"
+keywords = ["$seen", "$flagged"]
+
+[[change]]
+id = "delete"
+email_destroy = ["email-001"]
+
+[[change]]
+id = "move"
+
+[[change.email_move]]
+id = "email-002"
+mailbox_ids = ["mb-archive"]
+```
+
+Same op contracts apply (attachments rejected in `email_create`,
+`email_move.mailbox_ids` non-empty, every `*_update` requires at
+least one field set, etc.). TOML patches never use the JMAP
+camelCase wire form directly; the fields are the friendly Lua names
+(`mailbox_ids`, `parent_id`, `sort_order`, `is_subscribed`) and the
+loader rewrites them into the JMAP-shape patch the apply layer
+expects.
 
 ## Reserved for v1+
 
@@ -404,5 +452,4 @@ static format is worth maintaining.
 - Multipart MIME via `body_path` (multipart/alternative HTML+text).
 - Failure injection: `[fault]` blocks scoped to method calls (slow
   responses, retryable errors, `cannotCalculateChanges`).
-- TOML `[[change]]` projection of the Lua change-script surface.
 - Attachments inside change-script `email_create` ops.

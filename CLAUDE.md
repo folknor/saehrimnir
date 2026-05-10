@@ -206,9 +206,12 @@ checking whether the fact is already in `notes/`.
 - `fixtures/jmap-oauth.toml` - bearer-enforced
   (`[oauth] enforce = true`) variant of jmap-small. Drives the
   revoked-token-recovery flow asserted in `tests/api.rs`.
-- `fixtures/jmap-incremental.lua` - 2-mailbox / 2-email baseline
-  plus a 4-step `change({...})` script (new + change + delete +
-  move). Drives the integration tests in `tests/step.rs`.
+- `fixtures/jmap-incremental.lua` and
+  `fixtures/jmap-incremental.toml` - equivalent 2-mailbox /
+  2-email baseline plus a 4-step change script (new + change +
+  delete + move). Lua form drives the integration tests in
+  `tests/step.rs`; TOML form is asserted byte-equivalent in
+  `tests/lua_fixture.rs`.
 - `fixtures/graph-contacts-small.toml` - 2 contact folders + 4
   contacts exercising the full Graph contact wire shape (bare-
   string sugar, `{name, address}` tables, multi-address contacts,

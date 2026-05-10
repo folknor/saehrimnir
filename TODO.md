@@ -2,183 +2,15 @@
 
 Running task list, ordered by what ratatoskr is actively waiting on.
 Per-protocol design notes live alongside in `notes/`; this file just
-tracks what's next.
-
-## Ratatoskr-driven gaps (2026-05-09 audit)
-
-Ten items ratatoskr's sync code is actively waiting on, ordered
-roughly by leverage. Items 1, 2, 3, and 9 are tightly coupled -
-they all need the fixture to become writable / steppable, which
-`POST /test/fixture/step` is the natural seam for. Lifting the
-read-only fixture invariant is the prerequisite for the mutation
-trio.
-
-### Mutation surfaces (highest leverage)
-
-- **[jmap] `Email/set` + `Mailbox/set`.** Landed. `src/jmap.rs`
-  now wires both mutators against an `Arc<RwLock<Fixture>>` write
-  path. Creates produce deterministic `mock-email-N` /
-  `mock-mailbox-N` ids; updates honour the `keywords` /
-  `keywords/<flag>` and `mailboxIds` / `mailboxIds/<id>` patch
-  shapes ratatoskr drives, plus `name` / `parentId` / `sortOrder`
-  / `role` / `isSubscribed` on mailboxes. Mutations bump
-  `Fixture::state` to `<seed>.<n>` and append to a bounded
-  `change_log` (256 transitions); `Email/changes` /
-  `Mailbox/changes` walk it with RFC 8620 §5.2 dominance. The
-  delta-after-mutation round-trip is asserted across six
-  integration tests in `tests/api.rs`
-  (`email_set_update_round_trips_through_email_changes`,
-  `email_set_destroy_round_trips`,
-  `email_set_create_round_trips_through_email_get`,
-  `mailbox_set_create_then_destroy_cancels_in_changes`,
-  `mailbox_set_destroy_rejects_non_empty_mailbox`,
-  `email_set_if_in_state_mismatch_rejects_envelope`). Surface
-  documented in `notes/ratatoskr-jmap-surface.md`.
-- **[imap] `UID STORE` (persistent), `UID COPY`, `UID EXPUNGE`.**
-  Landed. All three now take a write guard on the shared fixture,
-  mutate in place, and bump `Fixture::state` so the change rolls
-  forward into the JMAP `Email/changes` delta. `UID STORE`
-  translates IMAP wire flags (`\Seen`, `\Flagged`, `\Draft`,
-  `\Answered`, `\Deleted`) to / from fixture keywords; `UID COPY`
-  adds the target mailbox to the email's `mailbox_ids[]` (unknown
-  target -> `NO [TRYCREATE]`); `UID EXPUNGE` removes
-  `\Deleted`-flagged messages from the current mailbox, destroying
-  the email entirely when its last membership drops. Five new
-  integration tests in `tests/imap.rs`
-  (`uid_store_persists_across_fetches`,
-  `uid_copy_makes_email_visible_in_target_mailbox`,
-  `uid_copy_unknown_mailbox_returns_no_trycreate`,
-  `uid_expunge_drops_only_deleted_flagged_messages`,
-  `uid_expunge_without_deleted_flag_is_noop`). Surface documented
-  in `notes/ratatoskr-imap-surface.md`.
-- **[graph] Calendar mutations surface in delta.** Landed.
-  `POST /v1.0/me/calendars/{id}/events`, `PATCH /v1.0/me/events/
-  {id}`, and `DELETE /v1.0/me/events/{id}` now mutate the shared
-  fixture under a write guard. The change log gained
-  `event_created` / `event_updated` / `event_destroyed` id sets;
-  `calendarView/delta` walks them between the client-supplied
-  `$deltatoken` and the current state. Created and updated events
-  project as full bodies; destroyed events emit Graph-shaped
-  tombstones (`{ id, "@removed": { reason: "deleted" } }`).
-  Unknown / evicted token falls back to a fresh bootstrap.
-  Asserted end-to-end in `tests/graph.rs::
-  graph_calendar_mutations_round_trip_through_delta` (create +
-  patch + delete in one envelope, then a follow-up delta returns
-  all three changes plus a deltaLink that shows empty on the next
-  call).
-
-### Request-log granularity (landed)
-
-Both granularity items shipped together:
-
-- **[imap]** `UID FETCH` log rows now expose `detail.attrs` (parsed
-  FETCH item list as stable string labels: `"UID"`, `"FLAGS"`,
-  `"BODY[]"`, `"BODY[N]"`, `"BODY[N.MIME]"`, ...) and
-  `detail.body` (true when any item asks for message bytes,
-  false for metadata-only fetches). Lets a steady-state delta
-  test soften to "no body refetch" while still permitting a
-  flag-only reconciliation pass. Contract documented in
-  `notes/request-log.md`.
-- **[jmap]** Method-call log rows now surface `detail.account_id`
-  (when present), `detail.ids` (when the call carries a string-
-  typed `ids[]`), and `detail.properties` (when the call carries a
-  string-typed `properties[]`). Distinguishes a metadata-only
-  `Email/get` (e.g. `properties=["id","keywords"]`) from a body
-  fetch (`properties=[..., "bodyValues"]`) without re-deriving it
-  from response shape. Filter args / result references are
-  deliberately left out: shape-sensitive, would bloat the log.
-
-### OAuth-enforced fixture (M6.9 closeout, landed)
-
-- **Revocation toggle + checked-in fixture variant.**
-  `fixtures/jmap-oauth.toml` is the canonical bearer-enforced
-  scenario (`[oauth] enforce = true`). The full revoked-token-
-  recovery walk (mint -> sync -> revoke -> 401 -> re-mint -> sync)
-  is asserted end-to-end in
-  `tests/api.rs::jmap_oauth_fixture_drives_revoked_token_recovery_flow`.
-  The Lua loader gained a parallel `oauth { enforce, issuer }`
-  builder so dynamic scenarios can opt in too.
-
-### Fixture breadth (M8 exit + M9 prep)
-
-- **Larger named fixtures.** `fixtures/jmap-bulk.lua` is the 10k
-  case; the `bulk_emails` / `bulk_threads` / `bulk_mailboxes`
-  builders make medium (~1k), huge-thread, and many-folders
-  fixtures one-liners. Author them as M9 sync benchmarks need them.
-- **Edge-case fixtures.** Duplicate `Message-Id`, malformed MIME,
-  configurable per-page latency. The first two need the validator
-  carve-out + `body_raw_bytes` escape hatch tracked under
-  "Authoring hooks for adversarial-shape fixtures" below; slow
-  paging is already achievable via `wait(ms)` inside an `on()`
-  callback (a documented recipe in `notes/fixture-format.md`
-  closes the third).
-- **Incremental sequence fixture.** Landed.
-  `fixtures/jmap-incremental.lua` exercises the new + change +
-  delete + move trio across four named steps, driven by
-  `POST /test/fixture/step`. The Lua surface gained a
-  `change({...})` builder with `email_create` /
-  `email_update` / `email_move` / `email_destroy` plus their
-  mailbox and event siblings; ops route through the same
-  `apply_email_patch` / `apply_mailbox_patch` the JMAP
-  mutators use, so the wire semantics match `Email/set`
-  exactly. Steps apply atomically: a single `Fixture::mutate`
-  per step, with per-op rewind on error so the cursor never
-  advances past a half-applied step. `POST /test/fixture/reset`
-  now rewinds the fixture image back to the post-load
-  baseline (cloned once at startup) and zeros the cursor, so a
-  harness can re-run the same script in one process. End-to-
-  end coverage in `tests/step.rs` walks the full script and
-  asserts the resulting diffs surface through JMAP
-  `Email/changes` and an IMAP `STATUS` round-trip on the same
-  fixture handle. Surface documented in
-  `notes/fixture-format.md` and the contract in
-  `notes/orchestration.md`.
-
-### M9 prerequisite (landed)
-
-- **Deterministic timing knobs.** Landed.
-  `POST /test/latency` accepts `{global_ms, per_protocol}`;
-  `GET /test/latency` returns the current snapshot. Each
-  protocol's dispatch entry (JMAP `api`, Graph + Gmail
-  middleware, IMAP per-command, SMTP per-command) sleeps for
-  `global + per_protocol[<tag>]` ms before doing real work.
-  `POST /test/fixture/reset` drops every entry. Wired across all
-  five protocols; integration coverage in `tests/api.rs`
-  (`test_latency_round_trips_through_post_and_get`,
-  `test_latency_actually_delays_jmap_dispatch`,
-  `test_latency_rejects_malformed`).
-- **Server-side state snapshot.** Landed.
-  `GET /test/snapshot-state` returns a thin JSON projection of
-  the fixture's current mailboxes / emails / events (id +
-  metadata only; no body bytes or attachment data). Lets a
-  harness verify post-step state without re-walking every
-  protocol. Surface documented in
-  `notes/orchestration.md`.
+tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
 ## From the 2026-05-09 multi-agent review
 
-Findings from a four-agent (security / bugs / perf / arch) review
-of the work landed in commits `de89827..3b87085`. Walk-backs,
-verified-correct invariants, and accepted trade-offs are recorded
-as inline comments at the relevant code sites; only items that
-need work end up here.
-
-### Fix now
-
-All four "Fix now" items from the 2026-05-09 review are landed
-(SMTP / IMAP auth-payload redaction, RequestLog ring cap +
-take-then-clone snapshot, list_events streaming pagination,
-PATCH/DELETE 404 on unknown event ids). Remaining work is
-the "Fix soon" backlog below.
-
-### Fix soon (cleanup, ergonomics, smaller bugs)
-
-- ~~**[bugs] `received_at` makes `RequestEntry` JSON output
-  non-byte-stable.**~~ Landed.
-  `GET /test/requests?stable=true` strips `received_at` from
-  every entry; without the flag the wall-clock timestamp is
-  retained. Implementation in `src/routes.rs::list_requests`,
-  test in `tests/api.rs::test_requests_stable_strips_received_at`.
+Findings from a four-agent (security / bugs / perf / arch) review of
+the work landed in commits `de89827..3b87085`. Walk-backs, verified-
+correct invariants, and accepted trade-offs are recorded as inline
+comments at the relevant code sites; only items that need work end
+up here.
 
 ### Eventually (only when something forces it)
 
@@ -207,8 +39,8 @@ the "Fix soon" backlog below.
   `prefix: &str` argument if any code ever filters by prefix.
 - **[perf] IMAP per-line `json!` allocation + mutex acquire on
   every dispatched line.** Documented in
-  `src/imap.rs::dispatch`. Folds into the RequestLog cap fix
-  above; not a standalone item.
+  `src/imap.rs::dispatch`. Folds into the RequestLog cap fix;
+  not a standalone item.
 - **[perf] `log_request` middleware records 404s through
   `not_implemented`.** `src/graph/mod.rs::log_request`,
   `src/gmail/mod.rs::log_request`. Folds into the RequestLog
@@ -216,19 +48,15 @@ the "Fix soon" backlog below.
 
 ## Fixture format growth
 
-The incremental-sync item is now actively wanted for M8; the
-adversarial-shape items unblock JMAP-depth scenarios; the rest
+The adversarial-shape items unblock JMAP-depth scenarios; the rest
 remain unblocked-but-unneeded.
 
-- Incremental sync change scripts. The Lua `change({...})` surface
-  shipped (see "Incremental sequence fixture" above); TOML
-  `[[change]]` projection is deferred until a TOML fixture wants
-  it. Future growth on the same surface: attachments inside
-  `email_create` ops (currently rejected at script load), and
-  bumping IMAP UIDVALIDITY / HIGHESTMODSEQ from a step (today's
-  IMAP state derives mechanically from `Fixture::state`, so a
-  step's state advance already moves HIGHESTMODSEQ; bumping
-  UIDVALIDITY would need a fixture-side knob).
+- Future growth on the change-script surface: attachments inside
+  `email_create` ops (currently rejected at load), and bumping
+  IMAP UIDVALIDITY / HIGHESTMODSEQ from a step (today's IMAP
+  state derives mechanically from `Fixture::state`, so a step's
+  state advance already moves HIGHESTMODSEQ; bumping UIDVALIDITY
+  would need a fixture-side knob).
 - Authoring hooks for adversarial-shape fixtures: duplicate
   `Message-Id` across emails (today's `normalize` rejects it as a
   cross-reference error, so this is a validator carve-out plus
@@ -251,47 +79,10 @@ remain unblocked-but-unneeded.
   account. Lifting requires per-protocol tweaks to surface multiple
   accounts (JMAP session resource, Graph `/users/{id}/...` paths,
   IMAP per-connection account context).
-
-## CalDAV (landed)
-
-The CalDAV surface ratatoskr's `CalDavClient` exercises is wired
-in v0. New listener (`--caldav-port`), new module
-(`src/caldav/{mod, xml, ical}.rs`), and a scout doc
-(`notes/ratatoskr-caldav-surface.md`). Reuses the existing
-`Calendar` / `Event` fixture types so the same `[[calendar]]` /
-`[[event]]` declarations drive both Graph and CalDAV. Implemented:
-
-- `PROPFIND /` and `/.well-known/caldav` -> `current-user-principal`.
-- `PROPFIND /principals/{user}/` -> `calendar-home-set`.
-- `PROPFIND /calendars/{user}/` Depth=1 -> calendar listing with
-  displayname, ctag, color, privilege-set, supported-component-set.
-- `PROPFIND /calendars/{user}/{cal}/` Depth=0 -> ctag + props;
-  Depth=1 -> event listing (getetag + getcontenttype).
-- `REPORT calendar-multiget` -> per-href ical body + 404 propstat
-  for unknown hrefs.
-- `REPORT calendar-query` -> server-side `time-range` filter on
-  VEVENT with half-open [start, end) overlap semantics.
-- `GET /calendars/{user}/{cal}/{event}.ics` -> iCalendar body +
-  `ETag` header.
-- `PUT` -> parse VEVENT, mutate fixture (create or update) under
-  `Fixture::mutate`. `If-Match` honoured: stale ETag returns 412,
-  `If-Match: *` requires existing event.
-- `DELETE` -> remove event + record `event_destroyed`. `If-Match`
-  honoured.
-- `OPTIONS` -> `DAV: 1, calendar-access` + Allow list.
-
-Mutations route through the same `Fixture::mutate` seam Graph
-calendar uses, so `event_created` / `event_updated` /
-`event_destroyed` land on the change_log and a subsequent Graph
-`calendarView/delta` walk observes the CalDAV write through the
-same id sets. End-to-end coverage in `tests/caldav.rs` including
-a cross-protocol assertion that a CalDAV PUT surfaces in Graph
-delta.
-
-Out of scope for v0 (revisit when a fixture forces it): MKCALENDAR,
-PROPPATCH, ACLs, delegation, free-busy, scheduling (iTIP / iMIP),
-VEVENT recurrence (RRULE / EXDATE), VALARM, attachments, per-event
-VTIMEZONE.
+- Larger named fixtures beyond `fixtures/jmap-bulk.lua`. The
+  `bulk_emails` / `bulk_threads` / `bulk_mailboxes` builders make
+  medium (~1k), huge-thread, and many-folders fixtures one-liners.
+  Author them as M9 sync benchmarks need them.
 
 ## IMAP (lower-priority follow-ups)
 
@@ -311,18 +102,6 @@ v0 mail-sync, calendar, and contacts are complete. Remaining future
 Graph work, in roughly the order the next fixture is likely to
 need it:
 
-- ~~Contact sync (`contact_sync.rs`).~~ Landed.
-  `src/graph/contacts.rs` covers the `/v1.0/me/contactFolders`,
-  `/v1.0/me/contacts`, and `/contactFolders/{id}/contacts/delta`
-  surfaces ratatoskr's `graph_contacts_initial_sync` /
-  `graph_contacts_delta_sync` exercise. `[[contact_folder]]` /
-  `[[contact]]` TOML + Lua builders, change-script ops
-  (`contact_create` / `contact_update` / `contact_destroy` plus
-  the folder counterparts), `fixtures/graph-contacts-small.toml`
-  + `fixtures/graph-contacts-incremental.lua`, and integration
-  coverage in `tests/graph.rs` + `tests/step.rs`. Surface
-  documented in `notes/ratatoskr-graph-surface.md` "Contacts"
-  section.
 - Master category list (`label_sync.rs`).
 - Group enumeration (`group_sync.rs`).
 - OneDrive resumable upload sessions (`onedrive.rs`) - needed once
@@ -353,17 +132,19 @@ v0 mail-sync surface is complete. Future Gmail work:
   `sendAs[]`; once a fixture grows `[account.signature]` we honour
   it both ways.
 
+## CalDAV (future work)
+
+v0 surface is complete (see `CLAUDE.md` "Status"). Out of scope
+until a fixture forces it: MKCALENDAR, PROPPATCH, ACLs, delegation,
+free-busy, scheduling (iTIP / iMIP), VEVENT recurrence (RRULE /
+EXDATE), VALARM, attachments, per-event VTIMEZONE.
+
 ## Lua dynamic surface
 
 Phase 2 callbacks (`on(protocol, command, fn)`) are wired across all
 five protocols, mapped via `Override::Tagged { status, message }`.
 What's left on the Lua side:
 
-- ~~Anchor release on handler overwrite.~~ Landed.
-  `builder_on` now drops the builder borrow before calling
-  `state.release_anchor` on the previous anchor, so re-registering
-  the same `(protocol, command)` no longer leaks the old slotmap
-  entry.
 - SMTP `cmd_auth` callback hook. Skipped from the initial fanout
   because AUTH-time fault injection isn't a common scenario; the
   helper exists, adding the hook is one line if a fixture wants
