@@ -22,8 +22,8 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use crate::fixture::{
-    self, ChangeOp, ChangeStep, Contact, ContactEmail, ContactFolder, Event, Fixture, Mailbox,
-    RawAccount, RawAddress, RawAttachment, RawEmail, RawFixture, RawMailbox, RawOAuth, Role,
+    self, ChangeOp, ChangeStep, ContactEmail, Fixture, RawAccount, RawAddress, RawAttachment,
+    RawEmail, RawFixture, RawMailbox, RawOAuth,
 };
 use crate::templates;
 
@@ -425,6 +425,62 @@ fn builder_contact(state: &mut State) -> dellingr::Result<u8> {
         emails,
     });
     Ok(0)
+}
+
+/// Same as [`read_contact_email_array_opt`] but distinguishes
+/// "absent" from "empty". Returns `None` for Nil, `Some(vec)` for
+/// any Table (even empty). Used by the change-script
+/// `contact_update` reader where the shared op-builder needs to
+/// distinguish "don't touch the emails field" from "replace it
+/// with the empty list".
+#[allow(clippy::cast_possible_wrap)]
+fn read_contact_email_array_opt_present(
+    state: &mut State,
+    t: isize,
+    key: &str,
+) -> dellingr::Result<Option<Vec<crate::fixture::RawContactEmail>>> {
+    let typ = lookup(state, t, key)?;
+    let result: dellingr::Result<Option<Vec<crate::fixture::RawContactEmail>>> = match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(None);
+        }
+        LuaType::Table => {
+            // Read inline (matching the body of read_contact_email_array_opt).
+            let arr = state.get_top() as isize;
+            let len = state.table_len(arr);
+            let mut out = Vec::with_capacity(len);
+            for i in 1..=len {
+                state.push_number(i as f64);
+                state.get_table_raw(arr)?;
+                let entry_typ = state.typ(-1);
+                match entry_typ {
+                    LuaType::String => {
+                        out.push(crate::fixture::RawContactEmail::Bare(state.to_string(-1)?));
+                        state.pop(1);
+                    }
+                    LuaType::Table => {
+                        let entry_idx = state.get_top() as isize;
+                        let address = read_string(state, entry_idx, "address")?;
+                        let name = read_string_opt(state, entry_idx, "name")?;
+                        state.pop(1);
+                        out.push(crate::fixture::RawContactEmail::Full { address, name });
+                    }
+                    _ => {
+                        state.pop(1);
+                        return fail(
+                            state,
+                            format!("field {key:?} entry {i} must be a string or {{address, name}} table"),
+                        );
+                    }
+                }
+            }
+            Ok(Some(out))
+        }
+        _ => fail(state, format!("field {key:?} must be an array")),
+    };
+    state.pop(1);
+    result
 }
 
 #[allow(clippy::cast_possible_wrap)]
@@ -1014,17 +1070,14 @@ fn read_contact_folder_create(
             return fail(state, format!("contact_folder_create entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
-        let id = read_string(state, entry_idx, "id")?;
-        let display_name = read_string(state, entry_idx, "display_name")?;
-        let parent_folder_id = read_string_opt(state, entry_idx, "parent_folder_id")?;
-        let is_default = read_bool_opt(state, entry_idx, "is_default")?.unwrap_or(false);
+        let raw = crate::fixture::RawContactFolder {
+            id: read_string(state, entry_idx, "id")?,
+            display_name: read_string(state, entry_idx, "display_name")?,
+            parent_folder_id: read_string_opt(state, entry_idx, "parent_folder_id")?,
+            is_default: read_bool_opt(state, entry_idx, "is_default")?.unwrap_or(false),
+        };
         state.pop(1);
-        ops.push(ChangeOp::ContactFolderCreate(Box::new(ContactFolder {
-            id,
-            display_name,
-            parent_folder_id,
-            is_default,
-        })));
+        ops.push(crate::fixture::contact_folder_create_op(raw));
     }
     state.pop(1);
     Ok(())
@@ -1059,27 +1112,16 @@ fn read_contact_folder_update(
         }
         let entry_idx = state.get_top() as isize;
         let id = read_string(state, entry_idx, "id")?;
-        let mut patch = serde_json::Map::new();
-        if let Some(name) = read_string_opt(state, entry_idx, "display_name")? {
-            patch.insert("display_name".into(), serde_json::Value::String(name));
-        }
-        if let Some(parent) = read_string_opt(state, entry_idx, "parent_folder_id")? {
-            patch.insert(
-                "parent_folder_id".into(),
-                serde_json::Value::String(parent),
-            );
-        }
+        let display_name = read_string_opt(state, entry_idx, "display_name")?;
+        let parent_folder_id = read_string_opt(state, entry_idx, "parent_folder_id")?;
         state.pop(1);
-        if patch.is_empty() {
-            return fail(
-                state,
-                format!("contact_folder_update entry {i}: at least one field must be set"),
-            );
-        }
-        ops.push(ChangeOp::ContactFolderUpdate {
-            id,
-            patch: serde_json::Value::Object(patch),
-        });
+        let op = crate::fixture::contact_folder_update_op(id, display_name, parent_folder_id)
+            .map_err(|e| {
+                state.error(ErrorKind::InternalError(format!(
+                    "contact_folder_update entry {i}: {e}"
+                )))
+            })?;
+        ops.push(op);
     }
     state.pop(1);
     Ok(())
@@ -1113,17 +1155,14 @@ fn read_contact_create(
             return fail(state, format!("contact_create entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
-        let id = read_string(state, entry_idx, "id")?;
-        let folder_id = read_string(state, entry_idx, "folder_id")?;
-        let display_name = read_string_opt(state, entry_idx, "display_name")?;
-        let raw_emails = read_contact_email_array_opt(state, entry_idx, "emails")?;
+        let raw = crate::fixture::RawContact {
+            id: read_string(state, entry_idx, "id")?,
+            folder_id: read_string(state, entry_idx, "folder_id")?,
+            display_name: read_string_opt(state, entry_idx, "display_name")?,
+            emails: read_contact_email_array_opt(state, entry_idx, "emails")?,
+        };
         state.pop(1);
-        ops.push(ChangeOp::ContactCreate(Box::new(Contact {
-            id,
-            folder_id,
-            display_name,
-            emails: raw_emails.into_iter().map(ContactEmail::from).collect(),
-        })));
+        ops.push(crate::fixture::contact_create_op(raw));
     }
     state.pop(1);
     Ok(())
@@ -1158,59 +1197,18 @@ fn read_contact_update(
         }
         let entry_idx = state.get_top() as isize;
         let id = read_string(state, entry_idx, "id")?;
-        let mut patch = serde_json::Map::new();
-        if let Some(name) = read_string_opt(state, entry_idx, "display_name")? {
-            patch.insert("display_name".into(), serde_json::Value::String(name));
-        }
-        if let Some(folder) = read_string_opt(state, entry_idx, "folder_id")? {
-            patch.insert("folder_id".into(), serde_json::Value::String(folder));
-        }
-        // emails: full-replace if present.
-        let emails_typ = lookup(state, entry_idx, "emails")?;
-        let has_emails = match emails_typ {
-            LuaType::Nil => {
-                state.pop(1);
-                false
-            }
-            LuaType::Table => {
-                state.pop(1);
-                true
-            }
-            _ => {
-                state.pop(2);
-                return fail(
-                    state,
-                    format!("contact_update entry {i}: emails must be an array"),
-                );
-            }
-        };
-        if has_emails {
-            let raw = read_contact_email_array_opt(state, entry_idx, "emails")?;
-            let arr_value: Vec<serde_json::Value> = raw
-                .into_iter()
-                .map(|e| {
-                    let ContactEmail { address, name } = ContactEmail::from(e);
-                    let mut obj = serde_json::Map::new();
-                    obj.insert("address".into(), serde_json::Value::String(address));
-                    if let Some(n) = name {
-                        obj.insert("name".into(), serde_json::Value::String(n));
-                    }
-                    serde_json::Value::Object(obj)
-                })
-                .collect();
-            patch.insert("emails".into(), serde_json::Value::Array(arr_value));
-        }
+        let display_name = read_string_opt(state, entry_idx, "display_name")?;
+        let folder_id = read_string_opt(state, entry_idx, "folder_id")?;
+        let emails = read_contact_email_array_opt_present(state, entry_idx, "emails")?
+            .map(|raws| raws.into_iter().map(ContactEmail::from).collect());
         state.pop(1);
-        if patch.is_empty() {
-            return fail(
-                state,
-                format!("contact_update entry {i}: at least one field must be set"),
-            );
-        }
-        ops.push(ChangeOp::ContactUpdate {
-            id,
-            patch: serde_json::Value::Object(patch),
-        });
+        let op = crate::fixture::contact_update_op(id, display_name, folder_id, emails)
+            .map_err(|e| {
+                state.error(ErrorKind::InternalError(format!(
+                    "contact_update entry {i}: {e}"
+                )))
+            })?;
+        ops.push(op);
     }
     state.pop(1);
     Ok(())
@@ -1317,54 +1315,16 @@ fn read_email_update(
         }
         let entry_idx = state.get_top() as isize;
         let id = read_string(state, entry_idx, "id")?;
-        let mut patch = serde_json::Map::new();
-        // Optional `keywords`: full-replace as JMAP `{flag: true}` map.
-        let kw_typ = lookup(state, entry_idx, "keywords")?;
-        match kw_typ {
-            LuaType::Nil => {}
-            LuaType::Table => {
-                let keywords = read_string_array_at_top(state, "keywords")?;
-                let mut m = serde_json::Map::new();
-                for k in keywords {
-                    m.insert(k, serde_json::Value::Bool(true));
-                }
-                patch.insert("keywords".into(), serde_json::Value::Object(m));
-            }
-            _ => {
-                state.pop(3);
-                return fail(state, format!("email_update entry {i}: keywords must be an array"));
-            }
-        }
+        let keywords = read_string_array_opt_present(state, entry_idx, "keywords")?;
+        let mailbox_ids = read_string_array_opt_present(state, entry_idx, "mailbox_ids")?;
         state.pop(1);
-        // Optional `mailbox_ids`: full-replace as JMAP `{id: true}` map.
-        let mb_typ = lookup(state, entry_idx, "mailbox_ids")?;
-        match mb_typ {
-            LuaType::Nil => {}
-            LuaType::Table => {
-                let ids = read_string_array_at_top(state, "mailbox_ids")?;
-                let mut m = serde_json::Map::new();
-                for k in ids {
-                    m.insert(k, serde_json::Value::Bool(true));
-                }
-                patch.insert("mailboxIds".into(), serde_json::Value::Object(m));
-            }
-            _ => {
-                state.pop(3);
-                return fail(state, format!("email_update entry {i}: mailbox_ids must be an array"));
-            }
-        }
-        state.pop(1);
-        state.pop(1);
-        if patch.is_empty() {
-            return fail(
-                state,
-                format!("email_update entry {i}: at least one of keywords / mailbox_ids must be set"),
-            );
-        }
-        ops.push(ChangeOp::EmailUpdate {
-            id,
-            patch: serde_json::Value::Object(patch),
-        });
+        let op = crate::fixture::email_update_op(id, keywords, mailbox_ids)
+            .map_err(|e| {
+                state.error(ErrorKind::InternalError(format!(
+                    "email_update entry {i}: {e}"
+                )))
+            })?;
+        ops.push(op);
     }
     state.pop(1);
     Ok(())
@@ -1400,15 +1360,13 @@ fn read_email_move(
         let entry_idx = state.get_top() as isize;
         let id = read_string(state, entry_idx, "id")?;
         let mailbox_ids = read_string_array(state, entry_idx, "mailbox_ids")?;
-        if mailbox_ids.is_empty() {
-            state.pop(2);
-            return fail(
-                state,
-                format!("email_move entry {i}: mailbox_ids must be non-empty"),
-            );
-        }
         state.pop(1);
-        ops.push(ChangeOp::EmailMove { id, mailbox_ids });
+        let op = crate::fixture::email_move_op(id, mailbox_ids).map_err(|e| {
+            state.error(ErrorKind::InternalError(format!(
+                "email_move entry {i}: {e}"
+            )))
+        })?;
+        ops.push(op);
     }
     state.pop(1);
     Ok(())
@@ -1487,23 +1445,13 @@ fn read_mailbox_create(
     }
     state.pop(1);
     for raw in raws {
-        let role = match raw.role.as_deref() {
-            Some(s) => Some(Role::parse(s).map_err(|e| {
-                state.error(ErrorKind::InternalError(format!(
-                    "mailbox_create {:?}: {e}",
-                    raw.id
-                )))
-            })?),
-            None => None,
-        };
-        ops.push(ChangeOp::MailboxCreate(Box::new(Mailbox {
-            id: raw.id,
-            name: raw.name,
-            role,
-            parent_id: raw.parent_id,
-            sort_order: raw.sort_order,
-            is_subscribed: raw.is_subscribed.unwrap_or(true),
-        })));
+        let mb_id = raw.id.clone();
+        let op = crate::fixture::mailbox_create_op(raw).map_err(|e| {
+            state.error(ErrorKind::InternalError(format!(
+                "mailbox_create {mb_id:?}: {e}"
+            )))
+        })?;
+        ops.push(op);
     }
     Ok(())
 }
@@ -1537,39 +1485,26 @@ fn read_mailbox_update(
         }
         let entry_idx = state.get_top() as isize;
         let id = read_string(state, entry_idx, "id")?;
-        let mut patch = serde_json::Map::new();
-        if let Some(name) = read_string_opt(state, entry_idx, "name")? {
-            patch.insert("name".into(), serde_json::Value::String(name));
-        }
-        if let Some(parent_id) = read_string_opt(state, entry_idx, "parent_id")? {
-            patch.insert("parentId".into(), serde_json::Value::String(parent_id));
-        }
-        if let Some(sort_order) = read_int_opt(state, entry_idx, "sort_order")? {
-            patch.insert(
-                "sortOrder".into(),
-                serde_json::Value::Number(serde_json::Number::from(sort_order)),
-            );
-        }
-        if let Some(role) = read_string_opt(state, entry_idx, "role")? {
-            patch.insert("role".into(), serde_json::Value::String(role));
-        }
-        if let Some(is_subscribed) = read_bool_opt(state, entry_idx, "is_subscribed")? {
-            patch.insert(
-                "isSubscribed".into(),
-                serde_json::Value::Bool(is_subscribed),
-            );
-        }
+        let name = read_string_opt(state, entry_idx, "name")?;
+        let parent_id = read_string_opt(state, entry_idx, "parent_id")?;
+        let sort_order = read_int_opt(state, entry_idx, "sort_order")?;
+        let role = read_string_opt(state, entry_idx, "role")?;
+        let is_subscribed = read_bool_opt(state, entry_idx, "is_subscribed")?;
         state.pop(1);
-        if patch.is_empty() {
-            return fail(
-                state,
-                format!("mailbox_update entry {i}: at least one field must be set"),
-            );
-        }
-        ops.push(ChangeOp::MailboxUpdate {
+        let op = crate::fixture::mailbox_update_op(
             id,
-            patch: serde_json::Value::Object(patch),
-        });
+            name,
+            parent_id,
+            sort_order,
+            role,
+            is_subscribed,
+        )
+        .map_err(|e| {
+            state.error(ErrorKind::InternalError(format!(
+                "mailbox_update entry {i}: {e}"
+            )))
+        })?;
+        ops.push(op);
     }
     state.pop(1);
     Ok(())
@@ -1603,46 +1538,26 @@ fn read_event_create(
             return fail(state, format!("event_create entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
-        let id = read_string(state, entry_idx, "id")?;
-        let calendar_id = read_string(state, entry_idx, "calendar_id")?;
-        let subject = read_string(state, entry_idx, "subject")?;
-        let body_preview = read_string_opt(state, entry_idx, "body_preview")?;
-        let body_text = read_string_opt(state, entry_idx, "body_text")?;
-        let start_raw = read_string(state, entry_idx, "start")?;
-        let end_raw = read_string(state, entry_idx, "end")?;
-        let location = read_string_opt(state, entry_idx, "location")?;
-        let organizer = read_address_opt(state, entry_idx, "organizer")?;
-        let attendees = read_address_array_opt(state, entry_idx, "attendees")?;
-        let is_all_day = read_bool_opt(state, entry_idx, "is_all_day")?.unwrap_or(false);
+        let raw = crate::fixture::RawEvent {
+            id: read_string(state, entry_idx, "id")?,
+            calendar_id: read_string(state, entry_idx, "calendar_id")?,
+            subject: read_string(state, entry_idx, "subject")?,
+            body_preview: read_string_opt(state, entry_idx, "body_preview")?,
+            body_text: read_string_opt(state, entry_idx, "body_text")?,
+            start: read_string(state, entry_idx, "start")?,
+            end: read_string(state, entry_idx, "end")?,
+            location: read_string_opt(state, entry_idx, "location")?,
+            organizer: read_address_opt(state, entry_idx, "organizer")?,
+            attendees: read_address_array_opt(state, entry_idx, "attendees")?,
+            is_all_day: read_bool_opt(state, entry_idx, "is_all_day")?.unwrap_or(false),
+        };
         state.pop(1);
-        let start = match crate::fixture::parse_ts(&start_raw) {
-            Ok(t) => t,
-            Err(e) => {
-                return fail(state, format!("event_create entry {i} start: {e}"));
-            }
-        };
-        let end = match crate::fixture::parse_ts(&end_raw) {
-            Ok(t) => t,
-            Err(e) => {
-                return fail(state, format!("event_create entry {i} end: {e}"));
-            }
-        };
-        ops.push(ChangeOp::EventCreate(Box::new(Event {
-            id,
-            calendar_id,
-            subject,
-            body_preview,
-            body_text,
-            start,
-            end,
-            location,
-            organizer: organizer.map(crate::fixture::Address::from),
-            attendees: attendees
-                .into_iter()
-                .map(crate::fixture::Address::from)
-                .collect(),
-            is_all_day,
-        })));
+        let op = crate::fixture::event_create_op(raw).map_err(|e| {
+            state.error(ErrorKind::InternalError(format!(
+                "event_create entry {i} {e}"
+            )))
+        })?;
+        ops.push(op);
     }
     state.pop(1);
     Ok(())
@@ -1677,33 +1592,19 @@ fn read_event_update(
         }
         let entry_idx = state.get_top() as isize;
         let id = read_string(state, entry_idx, "id")?;
-        let mut patch = serde_json::Map::new();
-        if let Some(s) = read_string_opt(state, entry_idx, "subject")? {
-            patch.insert("subject".into(), serde_json::Value::String(s));
-        }
-        if let Some(s) = read_string_opt(state, entry_idx, "start")? {
-            patch.insert("start".into(), serde_json::Value::String(s));
-        }
-        if let Some(s) = read_string_opt(state, entry_idx, "end")? {
-            patch.insert("end".into(), serde_json::Value::String(s));
-        }
-        if let Some(s) = read_string_opt(state, entry_idx, "location")? {
-            patch.insert("location".into(), serde_json::Value::String(s));
-        }
-        if let Some(s) = read_string_opt(state, entry_idx, "body_text")? {
-            patch.insert("body_text".into(), serde_json::Value::String(s));
-        }
+        let subject = read_string_opt(state, entry_idx, "subject")?;
+        let start = read_string_opt(state, entry_idx, "start")?;
+        let end = read_string_opt(state, entry_idx, "end")?;
+        let location = read_string_opt(state, entry_idx, "location")?;
+        let body_text = read_string_opt(state, entry_idx, "body_text")?;
         state.pop(1);
-        if patch.is_empty() {
-            return fail(
-                state,
-                format!("event_update entry {i}: at least one field must be set"),
-            );
-        }
-        ops.push(ChangeOp::EventUpdate {
-            id,
-            patch: serde_json::Value::Object(patch),
-        });
+        let op = crate::fixture::event_update_op(id, subject, start, end, location, body_text)
+            .map_err(|e| {
+                state.error(ErrorKind::InternalError(format!(
+                    "event_update entry {i}: {e}"
+                )))
+            })?;
+        ops.push(op);
     }
     state.pop(1);
     Ok(())
@@ -1867,6 +1768,28 @@ fn read_string_array_opt(
     let result = match typ {
         LuaType::Nil => Ok(Vec::new()),
         LuaType::Table => read_string_array_at_top(state, key),
+        _ => fail(state, format!("field {key:?} must be an array")),
+    };
+    state.pop(1);
+    result
+}
+
+/// Like [`read_string_array_opt`] but distinguishes "field absent"
+/// from "field present and empty". Returns `None` for Nil; returns
+/// `Some(vec)` for a Table (even if empty). Used by the change-
+/// script update readers, where the shared op-builder helpers in
+/// `fixture.rs` need the absent-vs-empty distinction (an `email_update`
+/// patch with `keywords = {}` clears all flags; an absent `keywords`
+/// field is a no-op for that key).
+fn read_string_array_opt_present(
+    state: &mut State,
+    t: isize,
+    key: &str,
+) -> dellingr::Result<Option<Vec<String>>> {
+    let typ = lookup(state, t, key)?;
+    let result = match typ {
+        LuaType::Nil => Ok(None),
+        LuaType::Table => read_string_array_at_top(state, key).map(Some),
         _ => fail(state, format!("field {key:?} must be an array")),
     };
     state.pop(1);

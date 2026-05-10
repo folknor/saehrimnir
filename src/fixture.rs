@@ -1421,15 +1421,261 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     })
 }
 
+/// Build an `EmailUpdate` op from the (id, keywords?, mailbox_ids?)
+/// tuple both authoring paths produce. Centralises the JMAP patch
+/// shape (`keywords` / `mailboxIds` as `{flag-or-id: true}` maps);
+/// callers that need a per-entry error context wrap the returned
+/// error with their own framing.
+pub(crate) fn email_update_op(
+    id: String,
+    keywords: Option<Vec<String>>,
+    mailbox_ids: Option<Vec<String>>,
+) -> Result<ChangeOp, &'static str> {
+    let mut patch = serde_json::Map::new();
+    if let Some(kw) = keywords {
+        patch.insert("keywords".into(), bool_map(kw));
+    }
+    if let Some(mids) = mailbox_ids {
+        patch.insert("mailboxIds".into(), bool_map(mids));
+    }
+    if patch.is_empty() {
+        return Err("at least one of keywords / mailbox_ids must be set");
+    }
+    Ok(ChangeOp::EmailUpdate {
+        id,
+        patch: serde_json::Value::Object(patch),
+    })
+}
+
+/// Build an `EmailMove` op. Empty `mailbox_ids` is rejected (a move
+/// to nowhere would orphan the email).
+pub(crate) fn email_move_op(
+    id: String,
+    mailbox_ids: Vec<String>,
+) -> Result<ChangeOp, &'static str> {
+    if mailbox_ids.is_empty() {
+        return Err("mailbox_ids must be non-empty");
+    }
+    Ok(ChangeOp::EmailMove { id, mailbox_ids })
+}
+
+/// Build a `MailboxCreate` op. Role string is parsed into the
+/// canonical [`Role`] enum if present.
+pub(crate) fn mailbox_create_op(raw: RawMailbox) -> Result<ChangeOp, String> {
+    let role = raw.role.as_deref().map(Role::parse).transpose()?;
+    Ok(ChangeOp::MailboxCreate(Box::new(Mailbox {
+        id: raw.id,
+        name: raw.name,
+        role,
+        parent_id: raw.parent_id,
+        sort_order: raw.sort_order,
+        is_subscribed: raw.is_subscribed.unwrap_or(true),
+    })))
+}
+
+/// Build a `MailboxUpdate` op from the JMAP-shape patch fields.
+/// Field names follow `Mailbox/set` wire convention (camelCase) so
+/// the produced patch routes through the same `apply_mailbox_patch`
+/// the JMAP `Mailbox/set` mutator uses.
+pub(crate) fn mailbox_update_op(
+    id: String,
+    name: Option<String>,
+    parent_id: Option<String>,
+    sort_order: Option<i64>,
+    role: Option<String>,
+    is_subscribed: Option<bool>,
+) -> Result<ChangeOp, &'static str> {
+    let mut patch = serde_json::Map::new();
+    if let Some(name) = name {
+        patch.insert("name".into(), serde_json::Value::String(name));
+    }
+    if let Some(p) = parent_id {
+        patch.insert("parentId".into(), serde_json::Value::String(p));
+    }
+    if let Some(s) = sort_order {
+        patch.insert(
+            "sortOrder".into(),
+            serde_json::Value::Number(serde_json::Number::from(s)),
+        );
+    }
+    if let Some(r) = role {
+        patch.insert("role".into(), serde_json::Value::String(r));
+    }
+    if let Some(b) = is_subscribed {
+        patch.insert("isSubscribed".into(), serde_json::Value::Bool(b));
+    }
+    if patch.is_empty() {
+        return Err("at least one field must be set");
+    }
+    Ok(ChangeOp::MailboxUpdate {
+        id,
+        patch: serde_json::Value::Object(patch),
+    })
+}
+
+/// Build an `EventCreate` op. Parses RFC 3339 start / end timestamps;
+/// the resulting `Event` carries the live fixture's organizer /
+/// attendee / location semantics.
+pub(crate) fn event_create_op(raw: RawEvent) -> Result<ChangeOp, String> {
+    let id_for_msg = raw.id.clone();
+    let start = parse_ts(&raw.start).map_err(|e| format!("{id_for_msg:?} start: {e}"))?;
+    let end = parse_ts(&raw.end).map_err(|e| format!("{id_for_msg:?} end: {e}"))?;
+    Ok(ChangeOp::EventCreate(Box::new(Event {
+        id: raw.id,
+        calendar_id: raw.calendar_id,
+        subject: raw.subject,
+        body_preview: raw.body_preview,
+        body_text: raw.body_text,
+        start,
+        end,
+        location: raw.location,
+        organizer: raw.organizer.map(Address::from),
+        attendees: raw.attendees.into_iter().map(Address::from).collect(),
+        is_all_day: raw.is_all_day,
+    })))
+}
+
+/// Build an `EventUpdate` op. Field names follow the change-script
+/// projection (snake_case `body_text`, plain RFC 3339 `start` / `end`
+/// strings rather than the Graph nested `start.dateTime` form).
+pub(crate) fn event_update_op(
+    id: String,
+    subject: Option<String>,
+    start: Option<String>,
+    end: Option<String>,
+    location: Option<String>,
+    body_text: Option<String>,
+) -> Result<ChangeOp, &'static str> {
+    let mut patch = serde_json::Map::new();
+    if let Some(s) = subject {
+        patch.insert("subject".into(), serde_json::Value::String(s));
+    }
+    if let Some(s) = start {
+        patch.insert("start".into(), serde_json::Value::String(s));
+    }
+    if let Some(s) = end {
+        patch.insert("end".into(), serde_json::Value::String(s));
+    }
+    if let Some(s) = location {
+        patch.insert("location".into(), serde_json::Value::String(s));
+    }
+    if let Some(s) = body_text {
+        patch.insert("body_text".into(), serde_json::Value::String(s));
+    }
+    if patch.is_empty() {
+        return Err("at least one field must be set");
+    }
+    Ok(ChangeOp::EventUpdate {
+        id,
+        patch: serde_json::Value::Object(patch),
+    })
+}
+
+/// Build a `ContactFolderCreate` op.
+pub(crate) fn contact_folder_create_op(raw: RawContactFolder) -> ChangeOp {
+    ChangeOp::ContactFolderCreate(Box::new(ContactFolder {
+        id: raw.id,
+        display_name: raw.display_name,
+        parent_folder_id: raw.parent_folder_id,
+        is_default: raw.is_default,
+    }))
+}
+
+/// Build a `ContactFolderUpdate` op. Field names are snake_case
+/// (no JMAP wire equivalent).
+pub(crate) fn contact_folder_update_op(
+    id: String,
+    display_name: Option<String>,
+    parent_folder_id: Option<String>,
+) -> Result<ChangeOp, &'static str> {
+    let mut patch = serde_json::Map::new();
+    if let Some(n) = display_name {
+        patch.insert("display_name".into(), serde_json::Value::String(n));
+    }
+    if let Some(p) = parent_folder_id {
+        patch.insert(
+            "parent_folder_id".into(),
+            serde_json::Value::String(p),
+        );
+    }
+    if patch.is_empty() {
+        return Err("at least one field must be set");
+    }
+    Ok(ChangeOp::ContactFolderUpdate {
+        id,
+        patch: serde_json::Value::Object(patch),
+    })
+}
+
+/// Build a `ContactCreate` op.
+pub(crate) fn contact_create_op(raw: RawContact) -> ChangeOp {
+    ChangeOp::ContactCreate(Box::new(Contact {
+        id: raw.id,
+        folder_id: raw.folder_id,
+        display_name: raw.display_name,
+        emails: raw.emails.into_iter().map(ContactEmail::from).collect(),
+    }))
+}
+
+/// Build a `ContactUpdate` op. The `emails` field, when provided,
+/// is a full-replace projection.
+pub(crate) fn contact_update_op(
+    id: String,
+    display_name: Option<String>,
+    folder_id: Option<String>,
+    emails: Option<Vec<ContactEmail>>,
+) -> Result<ChangeOp, &'static str> {
+    let mut patch = serde_json::Map::new();
+    if let Some(n) = display_name {
+        patch.insert("display_name".into(), serde_json::Value::String(n));
+    }
+    if let Some(f) = folder_id {
+        patch.insert("folder_id".into(), serde_json::Value::String(f));
+    }
+    if let Some(emails) = emails {
+        let arr: Vec<serde_json::Value> = emails
+            .into_iter()
+            .map(|e| {
+                let ContactEmail { address, name } = e;
+                let mut obj = serde_json::Map::new();
+                obj.insert("address".into(), serde_json::Value::String(address));
+                if let Some(n) = name {
+                    obj.insert("name".into(), serde_json::Value::String(n));
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        patch.insert("emails".into(), serde_json::Value::Array(arr));
+    }
+    if patch.is_empty() {
+        return Err("at least one field must be set");
+    }
+    Ok(ChangeOp::ContactUpdate {
+        id,
+        patch: serde_json::Value::Object(patch),
+    })
+}
+
+/// JMAP-shape `{key: true}` map for a `Vec<String>` of keywords or
+/// mailbox ids. Both `Email/set` (apply layer) and the change-script
+/// patch builders consume this shape.
+fn bool_map(keys: Vec<String>) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for k in keys {
+        m.insert(k, serde_json::Value::Bool(true));
+    }
+    serde_json::Value::Object(m)
+}
+
 /// Project one [`RawChangeStep`] into a [`ChangeStep`]. Op order in
 /// the produced `Vec<ChangeOp>` matches the Lua change builder
-/// (`src/lua.rs::builder_change`); patches are constructed in the
-/// same JMAP-shape the Lua loader emits, so a TOML and Lua change
-/// step that name the same fields produce byte-identical
-/// `ChangeStep`s. Used by both the TOML loader and (transitively)
-/// by the Lua loader's mailbox/contact/event op readers; the
-/// email_create path here additionally validates against the
-/// fixture's baseline mailbox set, matching what the Lua side does.
+/// (`src/lua.rs::builder_change`); patches are constructed via the
+/// per-op helper functions above so a TOML and Lua change step
+/// that name the same fields produce byte-identical `ChangeStep`s.
+/// Used by both the TOML loader and (transitively) by the Lua
+/// loader; the email_create path here additionally validates
+/// against the fixture's baseline mailbox set, matching what the
+/// Lua side does.
 fn normalize_change_step(
     raw: RawChangeStep,
     mb_ids: &HashMap<String, ()>,
@@ -1451,225 +1697,97 @@ fn normalize_change_step(
         ops.push(ChangeOp::EmailCreate(Box::new(email)));
     }
     for u in raw.email_update {
-        let mut patch = serde_json::Map::new();
-        if let Some(kw) = u.keywords {
-            let mut m = serde_json::Map::new();
-            for k in kw {
-                m.insert(k, serde_json::Value::Bool(true));
-            }
-            patch.insert("keywords".into(), serde_json::Value::Object(m));
-        }
-        if let Some(mids) = u.mailbox_ids {
-            let mut m = serde_json::Map::new();
-            for k in mids {
-                m.insert(k, serde_json::Value::Bool(true));
-            }
-            patch.insert("mailboxIds".into(), serde_json::Value::Object(m));
-        }
-        if patch.is_empty() {
-            return Err(format!(
-                "change step {id:?}: email_update entry {:?}: at least one of keywords / mailbox_ids must be set",
-                u.id
-            ));
-        }
-        ops.push(ChangeOp::EmailUpdate {
-            id: u.id,
-            patch: serde_json::Value::Object(patch),
-        });
+        let entry_id = u.id.clone();
+        ops.push(email_update_op(u.id, u.keywords, u.mailbox_ids).map_err(|e| {
+            format!("change step {id:?}: email_update entry {entry_id:?}: {e}")
+        })?);
     }
     for m in raw.email_move {
-        if m.mailbox_ids.is_empty() {
-            return Err(format!(
-                "change step {id:?}: email_move entry {:?}: mailbox_ids must be non-empty",
-                m.id
-            ));
-        }
-        ops.push(ChangeOp::EmailMove {
-            id: m.id,
-            mailbox_ids: m.mailbox_ids,
-        });
+        let entry_id = m.id.clone();
+        ops.push(email_move_op(m.id, m.mailbox_ids).map_err(|e| {
+            format!("change step {id:?}: email_move entry {entry_id:?}: {e}")
+        })?);
     }
     for d in raw.email_destroy {
         ops.push(ChangeOp::EmailDestroy { id: d });
     }
 
     for mb in raw.mailbox_create {
-        let role = mb
-            .role
-            .as_deref()
-            .map(Role::parse)
-            .transpose()
-            .map_err(|e| format!("change step {id:?}: mailbox_create {:?}: {e}", mb.id))?;
-        ops.push(ChangeOp::MailboxCreate(Box::new(Mailbox {
-            id: mb.id,
-            name: mb.name,
-            role,
-            parent_id: mb.parent_id,
-            sort_order: mb.sort_order,
-            is_subscribed: mb.is_subscribed.unwrap_or(true),
-        })));
+        let entry_id = mb.id.clone();
+        ops.push(mailbox_create_op(mb).map_err(|e| {
+            format!("change step {id:?}: mailbox_create {entry_id:?}: {e}")
+        })?);
     }
     for u in raw.mailbox_update {
-        let mut patch = serde_json::Map::new();
-        if let Some(name) = u.name {
-            patch.insert("name".into(), serde_json::Value::String(name));
-        }
-        if let Some(p) = u.parent_id {
-            patch.insert("parentId".into(), serde_json::Value::String(p));
-        }
-        if let Some(s) = u.sort_order {
-            patch.insert(
-                "sortOrder".into(),
-                serde_json::Value::Number(serde_json::Number::from(s)),
-            );
-        }
-        if let Some(r) = u.role {
-            patch.insert("role".into(), serde_json::Value::String(r));
-        }
-        if let Some(b) = u.is_subscribed {
-            patch.insert("isSubscribed".into(), serde_json::Value::Bool(b));
-        }
-        if patch.is_empty() {
-            return Err(format!(
-                "change step {id:?}: mailbox_update entry {:?}: at least one field must be set",
-                u.id
-            ));
-        }
-        ops.push(ChangeOp::MailboxUpdate {
-            id: u.id,
-            patch: serde_json::Value::Object(patch),
-        });
+        let entry_id = u.id.clone();
+        ops.push(
+            mailbox_update_op(
+                u.id,
+                u.name,
+                u.parent_id,
+                u.sort_order,
+                u.role,
+                u.is_subscribed,
+            )
+            .map_err(|e| {
+                format!("change step {id:?}: mailbox_update entry {entry_id:?}: {e}")
+            })?,
+        );
     }
     for d in raw.mailbox_destroy {
         ops.push(ChangeOp::MailboxDestroy { id: d });
     }
 
     for ev in raw.event_create {
-        let start = parse_ts(&ev.start)
-            .map_err(|e| format!("change step {id:?}: event_create {:?} start: {e}", ev.id))?;
-        let end = parse_ts(&ev.end)
-            .map_err(|e| format!("change step {id:?}: event_create {:?} end: {e}", ev.id))?;
-        ops.push(ChangeOp::EventCreate(Box::new(Event {
-            id: ev.id,
-            calendar_id: ev.calendar_id,
-            subject: ev.subject,
-            body_preview: ev.body_preview,
-            body_text: ev.body_text,
-            start,
-            end,
-            location: ev.location,
-            organizer: ev.organizer.map(Address::from),
-            attendees: ev.attendees.into_iter().map(Address::from).collect(),
-            is_all_day: ev.is_all_day,
-        })));
+        ops.push(
+            event_create_op(ev)
+                .map_err(|e| format!("change step {id:?}: event_create {e}"))?,
+        );
     }
     for u in raw.event_update {
-        let mut patch = serde_json::Map::new();
-        if let Some(s) = u.subject {
-            patch.insert("subject".into(), serde_json::Value::String(s));
-        }
-        if let Some(s) = u.start {
-            patch.insert("start".into(), serde_json::Value::String(s));
-        }
-        if let Some(s) = u.end {
-            patch.insert("end".into(), serde_json::Value::String(s));
-        }
-        if let Some(s) = u.location {
-            patch.insert("location".into(), serde_json::Value::String(s));
-        }
-        if let Some(s) = u.body_text {
-            patch.insert("body_text".into(), serde_json::Value::String(s));
-        }
-        if patch.is_empty() {
-            return Err(format!(
-                "change step {id:?}: event_update entry {:?}: at least one field must be set",
-                u.id
-            ));
-        }
-        ops.push(ChangeOp::EventUpdate {
-            id: u.id,
-            patch: serde_json::Value::Object(patch),
-        });
+        let entry_id = u.id.clone();
+        ops.push(
+            event_update_op(u.id, u.subject, u.start, u.end, u.location, u.body_text)
+                .map_err(|e| {
+                    format!("change step {id:?}: event_update entry {entry_id:?}: {e}")
+                })?,
+        );
     }
     for d in raw.event_destroy {
         ops.push(ChangeOp::EventDestroy { id: d });
     }
 
     for cf in raw.contact_folder_create {
-        ops.push(ChangeOp::ContactFolderCreate(Box::new(ContactFolder {
-            id: cf.id,
-            display_name: cf.display_name,
-            parent_folder_id: cf.parent_folder_id,
-            is_default: cf.is_default,
-        })));
+        ops.push(contact_folder_create_op(cf));
     }
     for u in raw.contact_folder_update {
-        let mut patch = serde_json::Map::new();
-        if let Some(n) = u.display_name {
-            patch.insert("display_name".into(), serde_json::Value::String(n));
-        }
-        if let Some(p) = u.parent_folder_id {
-            patch.insert(
-                "parent_folder_id".into(),
-                serde_json::Value::String(p),
-            );
-        }
-        if patch.is_empty() {
-            return Err(format!(
-                "change step {id:?}: contact_folder_update entry {:?}: at least one field must be set",
-                u.id
-            ));
-        }
-        ops.push(ChangeOp::ContactFolderUpdate {
-            id: u.id,
-            patch: serde_json::Value::Object(patch),
-        });
+        let entry_id = u.id.clone();
+        ops.push(
+            contact_folder_update_op(u.id, u.display_name, u.parent_folder_id)
+                .map_err(|e| {
+                    format!(
+                        "change step {id:?}: contact_folder_update entry {entry_id:?}: {e}"
+                    )
+                })?,
+        );
     }
     for d in raw.contact_folder_destroy {
         ops.push(ChangeOp::ContactFolderDestroy { id: d });
     }
 
     for c in raw.contact_create {
-        ops.push(ChangeOp::ContactCreate(Box::new(Contact {
-            id: c.id,
-            folder_id: c.folder_id,
-            display_name: c.display_name,
-            emails: c.emails.into_iter().map(ContactEmail::from).collect(),
-        })));
+        ops.push(contact_create_op(c));
     }
     for u in raw.contact_update {
-        let mut patch = serde_json::Map::new();
-        if let Some(n) = u.display_name {
-            patch.insert("display_name".into(), serde_json::Value::String(n));
-        }
-        if let Some(f) = u.folder_id {
-            patch.insert("folder_id".into(), serde_json::Value::String(f));
-        }
-        if let Some(emails) = u.emails {
-            let arr: Vec<serde_json::Value> = emails
-                .into_iter()
-                .map(|e| {
-                    let ContactEmail { address, name } = ContactEmail::from(e);
-                    let mut obj = serde_json::Map::new();
-                    obj.insert("address".into(), serde_json::Value::String(address));
-                    if let Some(n) = name {
-                        obj.insert("name".into(), serde_json::Value::String(n));
-                    }
-                    serde_json::Value::Object(obj)
-                })
-                .collect();
-            patch.insert("emails".into(), serde_json::Value::Array(arr));
-        }
-        if patch.is_empty() {
-            return Err(format!(
-                "change step {id:?}: contact_update entry {:?}: at least one field must be set",
-                u.id
-            ));
-        }
-        ops.push(ChangeOp::ContactUpdate {
-            id: u.id,
-            patch: serde_json::Value::Object(patch),
-        });
+        let entry_id = u.id.clone();
+        let emails = u
+            .emails
+            .map(|v| v.into_iter().map(ContactEmail::from).collect());
+        ops.push(
+            contact_update_op(u.id, u.display_name, u.folder_id, emails).map_err(|e| {
+                format!("change step {id:?}: contact_update entry {entry_id:?}: {e}")
+            })?,
+        );
     }
     for d in raw.contact_destroy {
         ops.push(ChangeOp::ContactDestroy { id: d });

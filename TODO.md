@@ -74,17 +74,21 @@ correct invariants and accepted trade-offs are omitted.
   `tests/caldav.rs::caldav_etag_and_ctag_are_per_resource_not_fixture_wide`
   asserts that an unrelated PUT in cal-work doesn't bump
   cal-personal's CTag or ev-001's ETag.
-- **[arch] Two parallel `ChangeOp` producers with drift-prone
-  patch construction.** `src/lua.rs::builder_change` (and
-  per-op readers) and `src/fixture.rs::normalize_change_step`
-  build identical patch shapes (`keywords` / `mailboxIds`
-  camelCase, mailbox patch keys, contact `emails` array
-  projection, etc.). The byte-identity test in
-  `tests/lua_fixture.rs` catches divergence at the resulting
-  `ChangeStep` level but per-step error messages diverge
-  silently. Push the Lua readers further into building
-  `Raw*Update` structs and route both sides through one
-  shared `normalize_change_step`.
+- ~~**[arch] Two parallel `ChangeOp` producers with drift-prone
+  patch construction.**~~ Landed. Per-op builder helpers
+  (`email_update_op`, `email_move_op`, `mailbox_create_op`,
+  `mailbox_update_op`, `event_create_op`, `event_update_op`,
+  `contact_folder_create_op`, `contact_folder_update_op`,
+  `contact_create_op`, `contact_update_op`) live in
+  `src/fixture.rs` next to `normalize_change_step`. Both the
+  TOML loader and the Lua per-op readers call them, so the
+  patch JSON shape (camelCase JMAP keys, snake_case for
+  change-script-only resources, `bool_map` for keywords /
+  mailboxIds, etc.) lives in exactly one place. Lua got a new
+  `read_string_array_opt_present` helper that distinguishes
+  Nil from empty Table (needed by the shared helper's
+  Option<T> contract). Future field additions touch one site
+  per resource family.
 - ~~**[arch] `step_fixture` calls `mutate(|_f| diff)` after
   already mutating the fixture in `apply_change_step`,
   violating the closure-only-mutator contract.**~~ Landed.
