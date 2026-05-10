@@ -889,10 +889,12 @@ async fn handle_delete(state: &AppState, path: &str, headers: &HeaderMap) -> Res
         }
     }
     let id = fixture.events[idx].id.clone();
+    let parent = fixture.events[idx].calendar_id.clone();
     fixture.mutate(|f| {
         f.events.remove(idx);
         crate::fixture::MutationDiff {
             event_destroyed: vec![id.clone()],
+            event_destroyed_parents: vec![parent.clone()],
             ..Default::default()
         }
     });

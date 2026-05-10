@@ -243,7 +243,7 @@ async fn delta_events(
     // single-shot equivalent v0 can provide.
     if let Some(token) = q.deltatoken.as_deref() {
         let raw = odata::decode_deltatoken(token).unwrap_or("");
-        if let Some(delta) = fixture.event_delta_since(raw) {
+        if let Some(delta) = fixture.event_delta_since(raw, &calendar) {
             let mut value: Vec<Value> = Vec::new();
             for id in delta.created.iter().chain(delta.updated.iter()) {
                 if let Some(e) = fixture
@@ -254,6 +254,9 @@ async fn delta_events(
                     value.push(serialize_event(&fixture, e));
                 }
             }
+            // Tombstones are pre-filtered to this calendar by
+            // `event_delta_since`; sibling-calendar destroys never
+            // surface here.
             for id in &delta.destroyed {
                 value.push(graph_event_tombstone(id));
             }
@@ -527,12 +530,21 @@ async fn delete_event(
     {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
         let event_id = event.clone();
+        // Snapshot the parent calendar BEFORE retain, so the
+        // tombstone the change_log records carries the right
+        // parent for per-calendar delta filtering.
+        let parent = fix
+            .events
+            .iter()
+            .find(|e| e.id == event_id)
+            .map(|e| e.calendar_id.clone());
         let _ = fix.mutate(|f| {
             let len_before = f.events.len();
             f.events.retain(|e| e.id != event_id);
             if f.events.len() < len_before {
                 MutationDiff {
                     event_destroyed: vec![event_id.clone()],
+                    event_destroyed_parents: vec![parent.clone().unwrap_or_default()],
                     ..Default::default()
                 }
             } else {

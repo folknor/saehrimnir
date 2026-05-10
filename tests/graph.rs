@@ -738,6 +738,66 @@ async fn graph_delete_event_404s_unknown_id() {
 
 // ── Calendar mutation round-trip through events/delta ──────────────
 
+/// Regression: a tombstone for an event destroyed in calendar A
+/// must NOT surface in calendar B's `calendarView/delta` walk. The
+/// destroyed-id walk used to ignore parent_id; folder/calendar
+/// scoping is now enforced via `event_destroyed_parents` on each
+/// transition.
+#[tokio::test]
+async fn graph_calendar_view_delta_does_not_leak_tombstones_across_calendars() {
+    let app = calendar_router();
+
+    // Bootstrap cal-personal (empty) and capture its deltaLink.
+    let (_, v) = get_json_with(
+        app.clone(),
+        "/v1.0/me/calendars/cal-personal/calendarView/delta",
+    )
+    .await;
+    assert_eq!(v["value"].as_array().unwrap().len(), 0);
+    let cal_personal_link = v["@odata.deltaLink"].as_str().unwrap().to_string();
+
+    // Delete an event that lives in cal-work.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1.0/me/events/ev-001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // cal-personal's follow-up delta must be empty: the destroy
+    // happened in a sibling calendar.
+    let path = cal_personal_link
+        .split_once("/v1.0/")
+        .map(|(_, s)| format!("/v1.0/{s}"))
+        .expect("deltaLink starts with /v1.0/");
+    let (status, v) = get_json_with(app.clone(), &path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v["value"].as_array().unwrap().len(),
+        0,
+        "cal-personal saw cross-calendar tombstone: {v:?}"
+    );
+
+    // Sanity: cal-work's delta DOES see the tombstone.
+    let (_, v) = get_json_with(
+        app,
+        "/v1.0/me/calendars/cal-work/calendarView/delta?$deltatoken=d.fixture-state",
+    )
+    .await;
+    let value = v["value"].as_array().unwrap();
+    assert!(
+        value.iter().any(|e| e["id"] == "ev-001"
+            && e["@removed"]["reason"] == "deleted"),
+        "cal-work missed the tombstone it should see: {value:?}"
+    );
+}
+
 /// Create + patch + delete events, then verify each shows up in the
 /// next `calendarView/delta` cycle. Proves the mutation surface
 /// actually persists into the change log and round-trips through

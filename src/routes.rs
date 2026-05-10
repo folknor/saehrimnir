@@ -1172,6 +1172,14 @@ fn apply_change_step(
                 diff.event_updated.push(id.clone());
             }
             ChangeOp::EventDestroy { id } => {
+                // Snapshot the parent calendar BEFORE the retain
+                // (the event is gone afterwards) so the tombstone
+                // carries the right calendar_id for delta filtering.
+                let parent = fix
+                    .events
+                    .iter()
+                    .find(|e| &e.id == id)
+                    .map(|e| e.calendar_id.clone());
                 let len_before = fix.events.len();
                 fix.events.retain(|e| &e.id != id);
                 if fix.events.len() == len_before {
@@ -1183,6 +1191,8 @@ fn apply_change_step(
                     ));
                 }
                 diff.event_destroyed.push(id.clone());
+                diff.event_destroyed_parents
+                    .push(parent.expect("event existed before retain"));
             }
             ChangeOp::ContactFolderCreate(folder) => {
                 let folder = (**folder).clone();
@@ -1313,6 +1323,14 @@ fn apply_change_step(
                 diff.contact_updated.push(id.clone());
             }
             ChangeOp::ContactDestroy { id } => {
+                // Snapshot the parent folder BEFORE retain so the
+                // tombstone the change_log records carries the right
+                // folder_id for per-folder contacts/delta filtering.
+                let parent = fix
+                    .contacts
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .map(|c| c.folder_id.clone());
                 let len_before = fix.contacts.len();
                 fix.contacts.retain(|c| &c.id != id);
                 if fix.contacts.len() == len_before {
@@ -1324,6 +1342,8 @@ fn apply_change_step(
                     ));
                 }
                 diff.contact_destroyed.push(id.clone());
+                diff.contact_destroyed_parents
+                    .push(parent.expect("contact existed before retain"));
             }
         }
     }

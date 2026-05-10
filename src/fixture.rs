@@ -90,9 +90,22 @@ pub struct Transition {
     pub event_created: Vec<String>,
     pub event_updated: Vec<String>,
     pub event_destroyed: Vec<String>,
+    /// Parallel to `event_destroyed`: the `calendar_id` each
+    /// destroyed event lived in. Captured at destroy time because
+    /// the event is gone from the fixture by the time the delta
+    /// walker reads it. Lets `event_delta_since` filter tombstones
+    /// to a specific calendar so a per-calendar `calendarView/delta`
+    /// doesn't surface tombstones for sibling calendars. Length
+    /// must equal `event_destroyed`.
+    pub event_destroyed_parents: Vec<String>,
     pub contact_created: Vec<String>,
     pub contact_updated: Vec<String>,
     pub contact_destroyed: Vec<String>,
+    /// Parallel to `contact_destroyed`: the `folder_id` each
+    /// destroyed contact lived in. Same role as
+    /// `event_destroyed_parents`; lets folder-scoped
+    /// `contacts/delta` filter tombstones.
+    pub contact_destroyed_parents: Vec<String>,
     pub contact_folder_created: Vec<String>,
     pub contact_folder_updated: Vec<String>,
     pub contact_folder_destroyed: Vec<String>,
@@ -102,6 +115,11 @@ pub struct Transition {
 /// closure passed to [`Fixture::mutate`]; the caller never constructs
 /// transitions directly. An all-empty `MutationDiff` is treated as a
 /// no-op: the state token does not bump and no transition is recorded.
+///
+/// `event_destroyed_parents` / `contact_destroyed_parents` carry the
+/// parent (calendar_id / folder_id) for each destroyed id so the
+/// per-calendar / per-folder delta walkers can filter tombstones.
+/// Producers must push to both vectors at the same time.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MutationDiff {
     pub email_created: Vec<String>,
@@ -113,9 +131,11 @@ pub struct MutationDiff {
     pub event_created: Vec<String>,
     pub event_updated: Vec<String>,
     pub event_destroyed: Vec<String>,
+    pub event_destroyed_parents: Vec<String>,
     pub contact_created: Vec<String>,
     pub contact_updated: Vec<String>,
     pub contact_destroyed: Vec<String>,
+    pub contact_destroyed_parents: Vec<String>,
     pub contact_folder_created: Vec<String>,
     pub contact_folder_updated: Vec<String>,
     pub contact_folder_destroyed: Vec<String>,
@@ -203,9 +223,11 @@ impl Fixture {
                 event_created: vec![],
                 event_updated: vec![],
                 event_destroyed: vec![],
+                event_destroyed_parents: vec![],
                 contact_created: vec![],
                 contact_updated: vec![],
                 contact_destroyed: vec![],
+                contact_destroyed_parents: vec![],
                 contact_folder_created: vec![],
                 contact_folder_updated: vec![],
                 contact_folder_destroyed: vec![],
@@ -226,13 +248,25 @@ impl Fixture {
             event_created: diff.event_created,
             event_updated: diff.event_updated,
             event_destroyed: diff.event_destroyed,
+            event_destroyed_parents: diff.event_destroyed_parents,
             contact_created: diff.contact_created,
             contact_updated: diff.contact_updated,
             contact_destroyed: diff.contact_destroyed,
+            contact_destroyed_parents: diff.contact_destroyed_parents,
             contact_folder_created: diff.contact_folder_created,
             contact_folder_updated: diff.contact_folder_updated,
             contact_folder_destroyed: diff.contact_folder_destroyed,
         };
+        debug_assert_eq!(
+            trans.event_destroyed.len(),
+            trans.event_destroyed_parents.len(),
+            "event_destroyed_parents must be parallel to event_destroyed"
+        );
+        debug_assert_eq!(
+            trans.contact_destroyed.len(),
+            trans.contact_destroyed_parents.len(),
+            "contact_destroyed_parents must be parallel to contact_destroyed"
+        );
         if self.change_log.transitions.len() >= ChangeLog::MAX_TRANSITIONS {
             self.change_log.transitions.pop_front();
         }
@@ -278,10 +312,19 @@ impl Fixture {
     /// deltaLink. Tokens older than the seed (or evicted from the
     /// bounded ring) return `None`; the Graph layer converts that to
     /// a full re-bootstrap.
-    pub fn event_delta_since(&self, since: &str) -> Option<DeltaSet> {
-        self.delta_since(since, |t| {
-            (&t.event_created, &t.event_updated, &t.event_destroyed)
-        })
+    ///
+    /// Created and updated ids are filtered to the named calendar by
+    /// the caller (it can read each event's current `calendar_id`).
+    /// Destroyed ids must be filtered here because the event is gone
+    /// from the fixture; that's what `event_destroyed_parents` is
+    /// for.
+    pub fn event_delta_since(&self, since: &str, calendar_id: &str) -> Option<DeltaSet> {
+        self.delta_since_filtered_destroys(
+            since,
+            |t| (&t.event_created, &t.event_updated, &t.event_destroyed),
+            |t| Some(&t.event_destroyed_parents),
+            calendar_id,
+        )
     }
 
     /// Contact-side analogue. Drives the Graph
@@ -291,14 +334,22 @@ impl Fixture {
     /// the seed (or evicted from the bounded ring) return `None`;
     /// the Graph layer translates that to a 410 Gone (which
     /// ratatoskr handles by re-bootstrapping with a full sync).
-    pub fn contact_delta_since(&self, since: &str) -> Option<DeltaSet> {
-        self.delta_since(since, |t| {
-            (
-                &t.contact_created,
-                &t.contact_updated,
-                &t.contact_destroyed,
-            )
-        })
+    ///
+    /// Same parent-filtering shape as `event_delta_since`: tombstones
+    /// are scoped to the named folder via `contact_destroyed_parents`.
+    pub fn contact_delta_since(&self, since: &str, folder_id: &str) -> Option<DeltaSet> {
+        self.delta_since_filtered_destroys(
+            since,
+            |t| {
+                (
+                    &t.contact_created,
+                    &t.contact_updated,
+                    &t.contact_destroyed,
+                )
+            },
+            |t| Some(&t.contact_destroyed_parents),
+            folder_id,
+        )
     }
 
     /// Contact-folder-side analogue.
@@ -309,6 +360,83 @@ impl Fixture {
                 &t.contact_folder_updated,
                 &t.contact_folder_destroyed,
             )
+        })
+    }
+
+    /// Like [`Self::delta_since`], but the destroyed walk is filtered
+    /// by a parent id (calendar / folder). For each transition the
+    /// `parents` projector returns a `Vec<String>` parallel to the
+    /// destroyed list; only destroyed ids whose corresponding parent
+    /// matches `parent_id` are accumulated.
+    fn delta_since_filtered_destroys<'a, F, G>(
+        &'a self,
+        since: &str,
+        project: F,
+        parents: G,
+        parent_id: &str,
+    ) -> Option<DeltaSet>
+    where
+        F: Fn(&'a Transition) -> (&'a Vec<String>, &'a Vec<String>, &'a Vec<String>),
+        G: Fn(&'a Transition) -> Option<&'a Vec<String>>,
+    {
+        if since == self.state {
+            return Some(DeltaSet::default());
+        }
+        let seed_known = since == self.change_log.seed;
+        let head_known = self
+            .change_log
+            .transitions
+            .iter()
+            .any(|t| t.from_state == since);
+        if !seed_known && !head_known {
+            return None;
+        }
+        let mut started = seed_known;
+        let mut created: Vec<String> = Vec::new();
+        let mut updated: Vec<String> = Vec::new();
+        let mut destroyed: Vec<String> = Vec::new();
+        for t in &self.change_log.transitions {
+            if !started {
+                if t.from_state == since {
+                    started = true;
+                } else {
+                    continue;
+                }
+            }
+            let (c, u, d) = project(t);
+            created.extend(c.iter().cloned());
+            updated.extend(u.iter().cloned());
+            // Only keep destroyed ids whose parent is the requested
+            // one. Producers must keep the parents vec parallel to
+            // the destroyed vec; if it's missing entirely (legacy /
+            // empty transition) skip.
+            if let Some(p) = parents(t)
+                && p.len() == d.len()
+            {
+                for (id, parent) in d.iter().zip(p.iter()) {
+                    if parent == parent_id {
+                        destroyed.push(id.clone());
+                    }
+                }
+            }
+        }
+        let cancel: std::collections::HashSet<String> = created
+            .iter()
+            .filter(|id| destroyed.contains(id))
+            .cloned()
+            .collect();
+        created.retain(|id| !cancel.contains(id));
+        destroyed.retain(|id| !cancel.contains(id));
+        let in_created: std::collections::HashSet<String> = created.iter().cloned().collect();
+        let in_destroyed: std::collections::HashSet<String> = destroyed.iter().cloned().collect();
+        updated.retain(|id| !in_created.contains(id) && !in_destroyed.contains(id));
+        dedup_preserving_order(&mut created);
+        dedup_preserving_order(&mut updated);
+        dedup_preserving_order(&mut destroyed);
+        Some(DeltaSet {
+            created,
+            updated,
+            destroyed,
         })
     }
 

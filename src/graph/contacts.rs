@@ -324,7 +324,7 @@ async fn delta_contacts(
     // bootstrap is a coherent v0 stand-in).
     if let Some(token) = q.deltatoken.as_deref() {
         let raw = odata::decode_deltatoken(token).unwrap_or("");
-        if let Some(delta) = fixture.contact_delta_since(raw) {
+        if let Some(delta) = fixture.contact_delta_since(raw, &folder_id) {
             let mut value: Vec<Value> = Vec::new();
             for id in delta.created.iter().chain(delta.updated.iter()) {
                 if let Some(c) = fixture
@@ -335,6 +335,9 @@ async fn delta_contacts(
                     value.push(serialize_contact(c));
                 }
             }
+            // Tombstones are pre-filtered to this folder by
+            // `contact_delta_since`; sibling-folder destroys never
+            // surface here.
             for id in &delta.destroyed {
                 value.push(graph_contact_tombstone(id));
             }

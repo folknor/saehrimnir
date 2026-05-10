@@ -25,16 +25,16 @@ correct invariants and accepted trade-offs are omitted.
   `tests/step.rs::fixture_step_rewind_covers_contacts_and_contact_folders`.
   Future-proofing (clone-then-swap restructure) tracked under
   the closure-only-mutator architectural item.
-- **[bugs] Graph `calendarView/delta` and `contacts/delta` emit
-  cross-collection tombstones.** `src/graph/calendar.rs:248-256`
-  and `src/graph/contacts.rs:329-336`. The `created` / `updated`
-  loops correctly filter by `calendar_id` / `folder_id`, but the
-  `destroyed` loop emits a tombstone for every id in the cross-
-  collection delta. Folder A's delta receives tombstones for
-  events destroyed in folder B. Thread parent-id into the
-  destroyed-id walk (record `(id, parent_id)` on the destroyed
-  list in `Transition`, or capture pre-destroy parent in
-  `apply_change_step`).
+- ~~**[bugs] Graph `calendarView/delta` and `contacts/delta` emit
+  cross-collection tombstones.**~~ Landed. `Transition` /
+  `MutationDiff` gained `event_destroyed_parents` and
+  `contact_destroyed_parents` parallel vectors capturing the
+  calendar / folder each destroyed resource lived in. Producers
+  (CalDAV DELETE, Graph calendar DELETE, change-script
+  EventDestroy / ContactDestroy) snapshot the parent before the
+  retain. `event_delta_since` / `contact_delta_since` now take a
+  `parent_id` arg and pre-filter tombstones. Regression test
+  `tests/graph.rs::graph_calendar_view_delta_does_not_leak_tombstones_across_calendars`.
 - ~~**[bugs] IMAP `BODY[HEADER]` for raw-bytes emails includes
   one extra `\r\n`.**~~ Landed. `src/imap.rs::split_raw` now
   returns the header slice ending at `i + 2` (matching what the
