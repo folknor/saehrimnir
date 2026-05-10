@@ -41,17 +41,15 @@ correct invariants and accepted trade-offs are omitted.
   structured `render_rfc822_headers` emits). Test in
   `tests/imap.rs::body_raw_bytes_emits_verbatim_through_imap_fetch`
   updated.
-- **[security] CalDAV listener never enforces
-  `fixture.oauth.enforce`.** `src/caldav/mod.rs::router` /
-  `dispatch` mounts no bearer middleware, so PUT / DELETE
-  mutate fixture state with no `Authorization` header even when
-  every other HTTP listener (JMAP, Graph, Gmail) requires a
-  token. Loopback bind makes it unexploitable today, but the
-  enforcement asymmetry breaks the contract documented in
-  `notes/ratatoskr-oauth-surface.md`. Add a middleware mirror of
-  `graph/mod.rs::enforce_bearer_middleware`; update
-  `notes/ratatoskr-oauth-surface.md` to extend coverage to
-  CalDAV.
+- ~~**[security] CalDAV listener never enforces
+  `fixture.oauth.enforce`.**~~ Landed.
+  `src/caldav/mod.rs::enforce_bearer_middleware` mirrors the Graph
+  pattern, returning a bare `401 + WWW-Authenticate: Bearer` on
+  rejection (CalDAV has no shared body schema). Regression test
+  `tests/caldav.rs::caldav_enforces_bearer_when_oauth_enforce_is_true`
+  walks every CalDAV verb. Docs in
+  `notes/ratatoskr-oauth-surface.md` and
+  `notes/fixture-format.md` extended to mention CalDAV.
 - ~~**[security] CalDAV iCal `ORGANIZER` / `ATTENDEE` email
   addresses are emitted verbatim.**~~ Landed.
   `src/caldav/ical.rs::sanitize_address` strips control bytes
@@ -92,16 +90,15 @@ correct invariants and accepted trade-offs are omitted.
   surface (`record_transition(diff) -> Transition`) so the step
   path's intent is explicit, or restructure `apply_change_step`
   to fill a closure-local working copy.
-- **[bugs] Lua `email_create` baseline-mailbox snapshot is taken
-  at the wrong moment.** `src/lua.rs:1267-1272` reads
-  `builder_mut(state)?.mailboxes` at `change(...)` invocation
-  time, so the snapshot is "set declared so far in script
-  order", not "load-time baseline" as the inline doc and
-  `CLAUDE.md` claim. A script that interleaves
-  `mailbox(...)` and `change(...)` calls behaves
-  unintuitively. Either capture the baseline once at script
-  finalize (or first `change(...)` call), or document the
-  ordering requirement loudly in `notes/fixture-format.md`.
+- ~~**[bugs] Lua `email_create` baseline-mailbox snapshot is taken
+  at the wrong moment.**~~ Documented. The early sanity check at
+  `src/lua.rs::read_email_create` is duplicated by the
+  authoritative apply-time check in `apply_change_step`, so the
+  fix is to clarify the contract rather than restructure: place
+  every `mailbox(...)` declaration before any `change(...)` call
+  in Lua scripts, and apply-time validation catches anything the
+  early check would have missed. Inline comment + the
+  `notes/fixture-format.md` `email_create` op contract updated.
 
 ### Fix soon
 

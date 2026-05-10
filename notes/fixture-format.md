@@ -282,13 +282,17 @@ enforce = false                          # default; existing v0 "no auth" baseli
 issuer = "https://saehrimnir.test/oauth" # default; echoed in /oauth/userinfo
 ```
 
-When `enforce = false` (default), the JMAP / Graph / Gmail HTTP
-listeners accept any (or no) `Authorization: Bearer` header, matching
-the v0 "no auth" rule. When `enforce = true`, those listeners reject
-requests whose bearer is not in the active token set (managed by
-`crate::oauth::TokenStore`); IMAP and SMTP have their own auth
-surfaces and are unaffected. See `notes/ratatoskr-oauth-surface.md`
-for the full token-issuance / userinfo / invalidation contract.
+When `enforce = false` (default), the JMAP / Graph / Gmail / CalDAV
+HTTP listeners accept any (or no) `Authorization: Bearer` header,
+matching the v0 "no auth" rule. When `enforce = true`, those
+listeners reject requests whose bearer is not in the active token
+set (managed by `crate::oauth::TokenStore`); IMAP and SMTP have
+their own auth surfaces and are unaffected. CalDAV's rejection is
+a bare `401` with `WWW-Authenticate: Bearer` (no shared error
+envelope; the JMAP / Graph / Gmail listeners each return their own
+protocol-shaped rejection body). See
+`notes/ratatoskr-oauth-surface.md` for the full token-issuance /
+userinfo / invalidation contract.
 
 The Lua loader exposes the same block via the `oauth` builder:
 
@@ -404,6 +408,15 @@ Op contracts:
   attachment scenarios). Mailbox ids are validated against the
   fixture state at apply time, so a step that creates a mailbox
   earlier in its op list can then create an email into it.
+  Lua-only ergonomics note: when authoring in Lua, place every
+  `mailbox(...)` declaration before any `change(...)` call. The
+  Lua loader runs an early sanity check on `email_create` mailbox
+  references using whichever mailboxes were declared *so far in
+  script order*; if a `change(...)` precedes the `mailbox(...)`
+  declaration, that early check sees an empty set and rejects
+  even though apply-time would have allowed it. The TOML loader
+  has no equivalent ordering pitfall (the whole document is
+  parsed before validation runs).
 - **`email_update`**: array of `{ id, keywords?, mailbox_ids? }`.
   Each emits a JMAP-shape patch (`keywords` and / or `mailboxIds`
   full-replace) routed through the same `apply_email_patch` the

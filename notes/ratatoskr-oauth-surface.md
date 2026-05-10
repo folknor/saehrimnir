@@ -85,6 +85,11 @@ When `true`:
   `{"error": {"code": "InvalidAuthenticationToken", "message": "..."}}`.
 - Gmail `/gmail/v1/...` -> 401 with the Gmail error envelope
   (reason: `authError`).
+- CalDAV (every verb on the CalDAV listener) -> 401 with empty
+  body and a `WWW-Authenticate: Bearer` header. CalDAV has no
+  shared response-body schema, so the rejection is the bare HTTP
+  `401`; clients identify the listener by header rather than by
+  body shape.
 - IMAP and SMTP are unaffected; they have their own auth surfaces.
 
 The bearer must be present in the `TokenStore`. Tokens get there

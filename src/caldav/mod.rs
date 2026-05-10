@@ -32,8 +32,9 @@ pub mod xml;
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
 };
@@ -41,6 +42,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+use crate::oauth::BearerDecision;
 use crate::shared::SharedHandles;
 
 #[derive(Clone)]
@@ -61,11 +63,48 @@ impl AppState {
 /// install a single `any` fallback that dispatches internally on
 /// `(method, path)`. The verb name is matched textually so the
 /// extension verbs flow through without a custom `MethodFilter`.
+///
+/// Bearer enforcement layers in front of dispatch when
+/// `fixture.oauth.enforce` is true, mirroring the Graph / Gmail /
+/// JMAP listeners. CalDAV has no shared error-envelope schema; the
+/// rejection is a bare `401 Unauthorized` with a
+/// `WWW-Authenticate: Bearer` header.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", any(dispatch))
         .route("/{*rest}", any(dispatch))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_bearer_middleware,
+        ))
         .with_state(state)
+}
+
+/// When `fixture.oauth.enforce` is true, reject CalDAV requests
+/// without a valid `Authorization: Bearer` header before dispatch.
+/// Without this layer, a fixture that flips bearer enforcement on
+/// would still let CalDAV `PUT` / `DELETE` mutate state with no
+/// token - breaking parity with the JMAP / Graph / Gmail listeners.
+async fn enforce_bearer_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Drop the read guard before `next.run` awaits so we don't pin
+    // the lock across the inner handler chain (which itself takes
+    // the read or write guard).
+    let decision = {
+        let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
+        crate::oauth::check_bearer(&fixture, &state.shared.token_store, req.headers())
+    };
+    match decision {
+        BearerDecision::Allow => next.run(req).await,
+        BearerDecision::Deny(_reason) => Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", "Bearer")
+            .body(Body::empty())
+            .expect("static 401 response builds"),
+    }
 }
 
 /// Spawn the CalDAV listener bound to `listener`. Uses

@@ -18,6 +18,19 @@ fn router() -> axum::Router {
     caldav::router(caldav::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
+fn router_with_enforce(store: saehrimnir::oauth::TokenStore) -> axum::Router {
+    use saehrimnir::fixture::OAuthConfig;
+    let mut fix =
+        fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
+    fix.oauth = OAuthConfig {
+        enforce: true,
+        issuer: "https://saehrimnir.test/oauth".to_string(),
+    };
+    let handle = saehrimnir::shared::handle(fix);
+    let shared = saehrimnir::shared::SharedHandles::for_test(handle).with_token_store(store);
+    caldav::router(caldav::AppState { shared })
+}
+
 async fn send(method: &str, uri: &str, depth: Option<&str>, body: &str) -> (StatusCode, String) {
     send_with(router(), method, uri, depth, body).await
 }
@@ -652,4 +665,50 @@ async fn propfind_unknown_calendar_returns_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Bearer enforcement parity with the JMAP / Graph / Gmail
+/// listeners: when `fixture.oauth.enforce` is true, every CalDAV
+/// verb must reject requests without a valid bearer. Pre-fix CalDAV
+/// silently bypassed enforcement, leaving PUT / DELETE reachable
+/// with no token.
+#[tokio::test]
+async fn caldav_enforces_bearer_when_oauth_enforce_is_true() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let app = router_with_enforce(store.clone());
+
+    // No header: every CalDAV verb returns 401 + WWW-Authenticate.
+    for method in ["OPTIONS", "PROPFIND", "GET", "PUT", "DELETE", "REPORT"] {
+        let req = Request::builder()
+            .method(Method::from_bytes(method.as_bytes()).unwrap())
+            .uri("/calendars/account-1/cal-work/")
+            .header(header::HOST, "127.0.0.1:0")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method}: expected 401"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("WWW-Authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer"),
+            "{method}: missing WWW-Authenticate"
+        );
+    }
+
+    // With a valid token, the same OPTIONS request succeeds.
+    let token = store.mint("authorization_code", 1);
+    let req = Request::builder()
+        .method("OPTIONS")
+        .uri("/calendars/account-1/cal-work/")
+        .header(header::HOST, "127.0.0.1:0")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

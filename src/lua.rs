@@ -1261,9 +1261,18 @@ fn read_email_create(
         entries.push(raw);
     }
     state.pop(1);
-    // Normalise each entry against the builder's mailbox set. The
-    // set is a snapshot at script-load time; ops added by later
-    // change steps don't affect this lookup.
+    // Normalise each entry against the mailbox set declared *so far*
+    // in script order. This is an early-error convenience for the
+    // common case where every `mailbox(...)` declaration comes before
+    // any `change(...)` call; later mailbox declarations or
+    // mailbox_create ops in earlier change steps are not reflected
+    // here. The authoritative check happens at apply time
+    // (`src/routes.rs::apply_change_step::EmailCreate`), which sees
+    // the live fixture including everything an earlier op in the
+    // current step has added - so a script that creates a mailbox
+    // in one op and an email pointing at it in the next op of the
+    // same step works fine even though the load-time check would
+    // not have known about the mailbox.
     let mb_ids: HashMap<String, ()> = builder_mut(state)?
         .mailboxes
         .iter()
