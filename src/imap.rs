@@ -2309,6 +2309,8 @@ mod tests {
             contact_folders: vec![],
             contacts: vec![],
             mailbox_uid_history: HashMap::new(),
+            synthetic_event_seq: 0,
+            synthetic_email_seq: 0,
         })
     }
 
@@ -2392,6 +2394,8 @@ mod tests {
             contact_folders: vec![],
             contacts: vec![],
             mailbox_uid_history: HashMap::new(),
+            synthetic_event_seq: 0,
+            synthetic_email_seq: 0,
         };
         // Test fixture - rebuild as if loaded.
         fix.rebuild_uid_history();

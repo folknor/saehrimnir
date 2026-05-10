@@ -13,50 +13,12 @@ Google Calendar). Only items that need work end up here.
 
 ### Fix now
 
-- **[bugs] `event_delta_since` doesn't filter `created` / `updated`
-  by parent calendar; JMAP `CalendarEvent/changes` over-reports.**
-  `src/fixture.rs:549-551` extends only `destroyed` through the
-  parent filter; `created` / `updated` walks every transition
-  unconditionally. Combined with the union-across-calendars walk
-  in `src/jmap_calendar.rs:279-304`, an event created in cal A
-  shows up in cal B's per-calendar walk too. The cross-cal
-  `seen.insert` dedupe hides single-event cases but loses
-  per-calendar dominance: an event created in A and destroyed in
-  B in the same window survives as `created`. No JMAP test
-  covers multi-calendar deltas. Fix is to thread the parent
-  filter through `created` / `updated` walks too, then drop the
-  cross-cal union and call once with no filter (or extend
-  `delta_since_filtered_destroys` to a `delta_since_filtered_all`
-  that filters every set).
-- **[bugs] People `is_known_state` accepts mid-history tokens and
-  silently drops tombstones.** `src/people/contacts.rs:186-196`
-  treats any retained `from_state` / `to_state` / seed as known.
-  The handler then has only two branches: `token == fixture.state`
-  → empty; else → full *live* list with no `metadata.deleted:
-  true` tombstones. Notes/ratatoskr-people-surface.md explicitly
-  requires unknown-token → 410 to drive ratatoskr's recovery, but
-  any retained intermediate state slips past as "known" and
-  ratatoskr never sees the tombstone for a destroyed contact.
-  Two-line fix: tighten `is_known_state` to current-only
-  (everything else 410), or actually walk the change_log and
-  emit deleted-Person entries per `contact_destroyed` /
-  `contact_destroyed_parents`.
-- **[bugs] gcal events list has the same stale-token tombstone
-  gap.** `src/gcal/events.rs:138-194`: when `syncToken !=
-  fixture.state` but is_known, falls through to a full live-events
-  listing. `event_destroyed` change-log entries never surface as
-  the `status: "cancelled"` tombstones notes/ratatoskr-gcal-
-  surface.md documents and ratatoskr's `:189-200` cancelled-
-  routing branch reads. Same fix shape as the People item above.
-- **[bugs] JMAP `CalendarEvent/set` and gcal create synthesize
-  ids from `events.len() + 1`, colliding after a destroy.**
-  `src/jmap_calendar.rs:485` and `src/gcal/events.rs:451`. Fixture
-  declares `mock-event-1`/`mock-event-2`, JMAP destroys 1, JMAP
-  creates → `mock-event-2`, collides with the still-live event.
-  Determinism + UID-stability are project invariants; an in-test
-  Lua scenario doing destroy-then-create reaches this trivially.
-  Replace with a monotonic counter on `Fixture` (parallel to the
-  IMAP UID history) that only ever increments.
+All four Fix-now items in this slice have landed:
+`event_delta_since` parent-filter leak, People stale-token
+tombstone gap, gcal stale-token tombstone gap, and the
+`mock-event-{len+1}` id collision. See commits `467e5a7`,
+`a76c126`, and the id-collision commit. Regression tests in
+`tests/jmap_calendar.rs`, `tests/people.rs`, `tests/gcal.rs`.
 
 ### Fix soon
 
@@ -168,16 +130,13 @@ Google Calendar). Only items that need work end up here.
   fails in prod. Document in the People surface notes; reject
   unknown fields if a fixture cares.
 
-### Test coverage gaps to close alongside the fixes above
+### Test coverage gaps closed in this slice
 
-- No JMAP test for cross-calendar `CalendarEvent/changes` (hides
-  the `event_delta_since` parent-filter bug above).
-- No People test for stale-but-retained `syncToken` (hides the
-  tombstone gap).
-- No gcal test for `syncToken`-driven cancellation tombstones
-  after a delete (same shape as the People gap).
-- No JMAP / gcal test asserting id uniqueness across destroy →
-  create (hides the `mock-event-{len+1}` collision).
+All four gaps from the original review now have regression tests:
+`calendar_event_changes_does_not_leak_across_calendars`,
+`connections_emits_metadata_deleted_tombstone_after_destroy`,
+`list_events_emits_cancelled_tombstone_after_destroy`,
+`mint_event_id_does_not_collide_after_unrelated_destroy`.
 
 ## From the 2026-05-10 multi-agent review (earlier slice)
 

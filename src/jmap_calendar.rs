@@ -401,7 +401,7 @@ pub(crate) fn calendar_event_set(
     }))
 }
 
-fn build_event_from_create(fix: &Fixture, body: &Value) -> Result<(String, Event), Value> {
+fn build_event_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, Event), Value> {
     let obj = body
         .as_object()
         .ok_or_else(|| set_error("invalidProperties", "create body must be an object"))?;
@@ -458,7 +458,7 @@ fn build_event_from_create(fix: &Fixture, body: &Value) -> Result<(String, Event
 
     let (organizer, attendees) = parse_participants(obj.get("participants"));
 
-    let server_id = format!("mock-event-{}", fix.events.len() + 1);
+    let server_id = fix.mint_event_id();
     Ok((
         server_id.clone(),
         Event {

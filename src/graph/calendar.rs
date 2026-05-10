@@ -431,7 +431,7 @@ async fn create_event(
                 );
             }
         };
-        let event = match build_event_from_create(&fix, &calendar_id, &parsed) {
+        let event = match build_event_from_create(&mut fix, &calendar_id, &parsed) {
             Ok(e) => e,
             Err(resp) => return *resp,
         };
@@ -563,7 +563,7 @@ async fn delete_event(
 // ── Mutation helpers ────────────────────────────────────────────────
 
 fn build_event_from_create(
-    fix: &Fixture,
+    fix: &mut Fixture,
     calendar_id: &str,
     body: &Value,
 ) -> Result<Event, Box<Response>> {
@@ -612,7 +612,7 @@ fn build_event_from_create(
         .and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(parse_graph_attendee).collect())
         .unwrap_or_default();
-    let id = format!("mock-event-{}", fix.events.len() + 1);
+    let id = fix.mint_event_id();
     Ok(Event {
         id,
         calendar_id: calendar_id.to_string(),

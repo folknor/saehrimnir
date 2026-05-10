@@ -324,6 +324,70 @@ async fn calendar_event_set_creates_visible_in_changes_delta() {
 }
 
 #[tokio::test]
+async fn mint_event_id_does_not_collide_after_unrelated_destroy() {
+    // Regression: pre-fix every create site computed
+    // `format!("mock-event-{}", events.len() + 1)`. After a
+    // destroy of any event, `events.len()` shrank, so the next
+    // create reused an id that might still be live for a
+    // sibling. Now the synthetic_event_seq counter on Fixture
+    // advances monotonically.
+    let r = router();
+
+    // Create event 1 → counter advances to 3 (fixture seeds with 2 events).
+    let c1 = jmap_call(
+        &r,
+        "CalendarEvent/set",
+        json!({
+            "accountId": "account-1",
+            "create": {
+                "a": {
+                    "calendarIds": {"cal-work": true},
+                    "title": "first",
+                    "start": "2026-04-01T10:00:00",
+                    "duration": "PT15M"
+                }
+            }
+        }),
+    )
+    .await;
+    let id1 = c1[1]["created"]["a"]["id"].as_str().unwrap().to_string();
+
+    // Destroy a *different* event (ev-001, declared in the
+    // fixture). The pre-fix code would now report events.len()
+    // == 2, so the next create's id collides with id1.
+    let _ = jmap_call(
+        &r,
+        "CalendarEvent/set",
+        json!({"accountId": "account-1", "destroy": ["ev-001"]}),
+    )
+    .await;
+
+    // Create event 2 → must NOT reuse id1.
+    let c2 = jmap_call(
+        &r,
+        "CalendarEvent/set",
+        json!({
+            "accountId": "account-1",
+            "create": {
+                "b": {
+                    "calendarIds": {"cal-work": true},
+                    "title": "second",
+                    "start": "2026-04-02T10:00:00",
+                    "duration": "PT15M"
+                }
+            }
+        }),
+    )
+    .await;
+    let id2 = c2[1]["created"]["b"]["id"].as_str().unwrap().to_string();
+
+    assert_ne!(
+        id1, id2,
+        "second create must mint a fresh id; pre-fix `events.len()+1` reused {id1}"
+    );
+}
+
+#[tokio::test]
 async fn calendar_event_changes_does_not_leak_across_calendars() {
     // Regression: pre-fix, `event_delta_since` filtered tombstones
     // by parent calendar but left created/updated unfiltered, so a

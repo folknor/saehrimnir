@@ -337,7 +337,7 @@ async fn create_event(
     );
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-    let event = match build_event_from_create(&fix, &calendar, &parsed) {
+    let event = match build_event_from_create(&mut fix, &calendar, &parsed) {
         Ok(e) => e,
         Err(resp) => return *resp,
     };
@@ -452,7 +452,7 @@ async fn delete_event(
 // ── parsing helpers ─────────────────────────────────────────────────
 
 fn build_event_from_create(
-    fix: &Fixture,
+    fix: &mut Fixture,
     calendar: &str,
     body: &Value,
 ) -> Result<Event, Box<Response>> {
@@ -493,7 +493,7 @@ fn build_event_from_create(
         .map(|arr| arr.iter().filter_map(parse_address).collect())
         .unwrap_or_default();
 
-    let id = format!("mock-event-{}", fix.events.len() + 1);
+    let id = fix.mint_event_id();
     Ok(Event {
         id,
         calendar_id: calendar.to_string(),

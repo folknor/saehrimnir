@@ -63,6 +63,19 @@ pub struct Fixture {
     /// IMAP-specific bookkeeping kept in the canonical Fixture so
     /// every mutation site updates exactly one place.
     pub mailbox_uid_history: std::collections::HashMap<String, Vec<Option<String>>>,
+    /// Monotonic counter for synthesized `mock-event-N` ids
+    /// produced by mutating handlers (JMAP `CalendarEvent/set` /
+    /// gcal POST / Graph POST events). Initialised at load time
+    /// to one past the highest `mock-event-N` already declared
+    /// in the fixture, then incremented exactly once per mint via
+    /// [`Self::mint_event_id`]. Never decremented or reset short
+    /// of `/test/fixture/reset` (which restores the post-load
+    /// baseline). Pre-fix every site used `events.len() + 1`,
+    /// which collided with still-live ids after a destroy.
+    pub synthetic_event_seq: u64,
+    /// Monotonic counter for synthesized `mock-email-N` ids;
+    /// same shape as `synthetic_event_seq`.
+    pub synthetic_email_seq: u64,
 }
 
 /// Bounded ring of recent state transitions.
@@ -318,6 +331,23 @@ pub struct DeltaSet {
 }
 
 impl Fixture {
+    /// Mint a fresh synthesized event id of the form
+    /// `mock-event-N`. The counter advances monotonically across
+    /// the fixture lifetime; never reuses an id even after the
+    /// underlying event is destroyed. Reset only via
+    /// `/test/fixture/reset` (which restores the post-load
+    /// baseline).
+    pub fn mint_event_id(&mut self) -> String {
+        self.synthetic_event_seq += 1;
+        format!("mock-event-{}", self.synthetic_event_seq)
+    }
+
+    /// Email-side analogue of [`Self::mint_event_id`].
+    pub fn mint_email_id(&mut self) -> String {
+        self.synthetic_email_seq += 1;
+        format!("mock-email-{}", self.synthetic_email_seq)
+    }
+
     /// Apply a mutation, record its transition, and bump `state`.
     /// The closure is the only thing allowed to touch the fixture
     /// fields; it returns the resource-id diff so we can capture it
@@ -1598,6 +1628,18 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
 
     let state = raw.state.unwrap_or_else(|| "fixture-state".to_string());
     let change_log = ChangeLog::seed(&state);
+    // Seed the counter to the larger of (a) the highest declared
+    // `mock-X-N` suffix and (b) the loaded resource count. (a) is
+    // the strict collision-avoidance guarantee. (b) preserves the
+    // pre-fix wire shape: a fixture with two `email-001` /
+    // `email-002` declared emails (no `mock-email-` ids) used to
+    // mint `mock-email-3` because the old code did `len() + 1`.
+    // Tests pin that value, so the counter starts at len when no
+    // mock-prefixed declarations beat it.
+    let synthetic_event_seq = max_mock_seq(events.iter().map(|e| e.id.as_str()), "mock-event-")
+        .max(events.len() as u64);
+    let synthetic_email_seq = max_mock_seq(emails.iter().map(|e| e.id.as_str()), "mock-email-")
+        .max(emails.len() as u64);
     Ok(Fixture {
         name: raw.name,
         state,
@@ -1615,7 +1657,21 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         change_log,
         change_script,
         mailbox_uid_history,
+        synthetic_event_seq,
+        synthetic_email_seq,
     })
+}
+
+/// Highest `<prefix>N` suffix value seen across `ids`. Used at
+/// load time to seed `synthetic_event_seq` / `synthetic_email_seq`
+/// so the first synthesized id is strictly greater than any
+/// pre-declared one. Ids that don't match the prefix or have a
+/// non-numeric suffix are ignored.
+fn max_mock_seq<'a, I: Iterator<Item = &'a str>>(ids: I, prefix: &str) -> u64 {
+    ids.filter_map(|id| id.strip_prefix(prefix))
+        .filter_map(|n| n.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Build an `EmailUpdate` op from the (id, keywords?, mailbox_ids?)

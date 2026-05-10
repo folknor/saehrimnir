@@ -1159,7 +1159,7 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
 }
 
 fn build_email_from_create(
-    fix: &Fixture,
+    fix: &mut Fixture,
     body: &Value,
 ) -> Result<(String, Email), Value> {
     let body = body.as_object().ok_or_else(|| {
@@ -1183,7 +1183,7 @@ fn build_email_from_create(
         .and_then(Value::as_object)
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
-    let server_id = format!("mock-email-{}", fix.emails.len() + 1);
+    let server_id = fix.mint_email_id();
     // Determinism: a create-into-empty-fixture must produce the
     // same timestamp every run. The fixture has no clock; we anchor
     // to a fixed epoch so byte-stable transcripts hold even when
@@ -1702,6 +1702,8 @@ mod tests {
             contact_folders: vec![],
             contacts: vec![],
             mailbox_uid_history: std::collections::HashMap::new(),
+            synthetic_event_seq: 0,
+            synthetic_email_seq: 0,
         }
     }
 
@@ -1880,6 +1882,8 @@ mod tests {
             contact_folders: vec![],
             contacts: vec![],
             mailbox_uid_history: std::collections::HashMap::new(),
+            synthetic_event_seq: 0,
+            synthetic_email_seq: 0,
         }
     }
 
@@ -2160,6 +2164,8 @@ mod tests {
             contact_folders: vec![],
             contacts: vec![],
             mailbox_uid_history: std::collections::HashMap::new(),
+            synthetic_event_seq: 0,
+            synthetic_email_seq: 0,
         }
     }
 
