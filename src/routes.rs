@@ -524,14 +524,16 @@ async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     if let Some(d) = &state.shared.dispatcher {
         d.reset_counts();
     }
+    // Lock-ordering convention: when both the cursor mutex and the
+    // fixture rwlock are needed, acquire the cursor first. Matches
+    // `step_fixture`'s order so a future change that holds both
+    // simultaneously can't deadlock against either.
+    let mut cursor = state.shared.change_cursor.lock().expect("cursor lock poisoned");
     {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
         *fix = (*state.shared.baseline).clone();
     }
-    {
-        let mut cursor = state.shared.change_cursor.lock().expect("cursor lock poisoned");
-        *cursor = 0;
-    }
+    *cursor = 0;
     StatusCode::NO_CONTENT
 }
 

@@ -142,21 +142,20 @@ correct invariants and accepted trade-offs are omitted.
   expand the change_log to record per-move source/destination.
   Same shape applies to event `calendar_id` moves once those
   get patch support.
-- **[bugs] `step_fixture` and `reset_fixture` acquire locks in
-  opposite orders.** `src/routes.rs:770-771` (cursor →
-  fixture) vs `src/routes.rs:528-533` (fixture → cursor).
-  Axum's per-route handler serialization makes deadlock hard
-  to trip today, but the inversion is a real lock-ordering
-  bug. Pick one global order and apply it to both.
-- **[security] `RequestLog::snapshot` race window.**
-  `src/request_log.rs:113-131`. The `mem::take` → drop guard →
-  clone → reacquire dance allows entries that arrive during
-  the clone to be returned in the snapshot but evicted from
-  the live deque after the cap-reapplication, so a follow-up
-  `GET /test/requests` returns fewer rows than the previous
-  call. Either accept the contract as a single-shot drain
-  (return `out`, leave deque empty) or hold the lock for the
-  full clone+restore.
+- ~~**[bugs] `step_fixture` and `reset_fixture` acquire locks in
+  opposite orders.**~~ Landed. Both now follow cursor → fixture;
+  the convention is documented inline in `reset_fixture`.
+  Reset's prior pattern used scoped blocks so the inversion was
+  actually unreachable, but unifying the order future-proofs
+  against any change that holds both simultaneously.
+- ~~**[security] `RequestLog::snapshot` race window.**~~ Landed.
+  Replaced the steal-clone-restore dance with a single
+  hold-the-lock-and-clone. Avoids the eviction race entirely;
+  realistic stall is sub-millisecond against the 100k cap.
+  Folds the related `[perf] RequestLog::snapshot deep-clones
+  twice` follow-up - now it's exactly one clone of the live
+  deque per call. The handler-side `?stable=true` rebuild of
+  `Value` per row remains as a separate item below.
 - **[bugs] CalDAV `xml::body_requests_prop` is a substring
   match.** `src/caldav/xml.rs:32-46` matches
   `calendar-multiget` against any element containing the
@@ -189,13 +188,14 @@ correct invariants and accepted trade-offs are omitted.
   cross-refs so the apply path is infallible (the validation
   loops at lines 897-906, 944-953, 992-994 already exist), or
   snapshot only the touched indices.
-- **[perf] `RequestLog::snapshot` deep-clones twice.**
-  `src/request_log.rs:113-131` plus `src/routes.rs:484-493`
-  rebuilds a fresh `Value` per row for `?stable=true`. With
-  cap = 100_000 and rich JSON details, steady-state per-call
-  working set is ~100MB. Take ownership in the handler;
-  serialize directly from `RequestEntry` borrows via a view
-  struct.
+- **[perf] `?stable=true` rebuilds a fresh `Value` per row.**
+  `src/routes.rs:484-493` walks the snapshot and clones every
+  `detail: Value` into a fresh `json!({...})` to strip
+  `received_at`. With cap = 100k and rich JSON details that's
+  the dominant per-call working set. Serialize directly from
+  `RequestEntry` borrows via a view struct rather than rebuilding
+  the JSON tree. The internal-clone half of this item landed via
+  the `RequestLog::snapshot` simplification above.
 - **[perf] IMAP `RFC822.SIZE` re-renders the entire body just
   to take `.len()`.** `src/imap.rs:1699-1701`. Combined with
   every other `BODY[*]` attribute on the same fetch line,

@@ -18,7 +18,6 @@
 //! ordering issues in CI logs.
 
 use std::collections::VecDeque;
-use std::mem;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -105,29 +104,19 @@ impl RequestLog {
         }
     }
 
-    /// Steal the current contents for read-out. The mutex is
-    /// released before the (potentially large) materialisation
-    /// into `Vec`, so a `GET /test/requests` against a long-lived
-    /// process doesn't stall every listener for the duration of
-    /// the copy.
+    /// Snapshot the current contents for read-out. Holds the mutex
+    /// for the duration of the clone so a concurrent `record` /
+    /// `extend` blocks briefly (typical: a 100k-entry clone is on
+    /// the order of milliseconds; the deque is bounded at
+    /// `REQUEST_LOG_CAP`). Pre-fix this used a steal-clone-restore
+    /// dance that released the lock during the clone, but a
+    /// concurrent push could then arrive and the cap-reapplication
+    /// after splicing could evict entries from the LIVE deque that
+    /// had just been handed back in the snapshot - a follow-up
+    /// `GET /test/requests` would silently return fewer rows.
     pub fn snapshot(&self) -> Vec<RequestEntry> {
-        let mut taken = {
-            let mut g = self.0.lock().expect("request log mutex poisoned");
-            mem::take(&mut *g)
-        };
-        let out: Vec<RequestEntry> = taken.iter().cloned().collect();
-        let mut g = self.0.lock().expect("request log mutex poisoned");
-        if !g.is_empty() {
-            // Concurrent pushes landed while we were cloning;
-            // splice them after the taken history (preserving
-            // chronological order) and re-apply the ring cap.
-            taken.append(&mut g);
-            while taken.len() > REQUEST_LOG_CAP {
-                taken.pop_front();
-            }
-        }
-        *g = taken;
-        out
+        let g = self.0.lock().expect("request log mutex poisoned");
+        g.iter().cloned().collect()
     }
 
     pub fn clear(&self) {
