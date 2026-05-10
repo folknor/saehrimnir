@@ -132,16 +132,17 @@ correct invariants and accepted trade-offs are omitted.
   one VEVENT is rejected ("multiple VEVENTs"), an empty body
   is rejected ("must contain a VEVENT"). PUT path 400s on
   either error.
-- **[bugs] Cross-folder contact moves disappear from source-
-  folder delta.** `src/graph/contacts.rs:329-336`. A
-  `contact_update` patch that changes `folder_id` from A to B
-  fires `contact_updated`; folder A's delta walk filters by
-  current `folder_id == A` and finds nothing. Folder A never
-  learns the contact moved away. Either reject `folder_id`
-  patches in `apply_contact_patch` (force destroy+create), or
-  expand the change_log to record per-move source/destination.
-  Same shape applies to event `calendar_id` moves once those
-  get patch support.
+- ~~**[bugs] Cross-folder contact moves disappear from source-
+  folder delta.**~~ Landed.
+  `src/routes.rs::apply_contact_patch` rejects any `folder_id`
+  update where the new value differs from the current
+  `folder_id`. Real Microsoft Graph doesn't expose `folder_id`
+  as a writable property on contacts either; clients move via
+  destroy + create, which surface in both source and
+  destination folders' deltas through the existing
+  `contact_destroyed` / `contact_created` machinery. Same
+  shape will apply to event `calendar_id` moves once event
+  patches grow that field.
 - ~~**[bugs] `step_fixture` and `reset_fixture` acquire locks in
   opposite orders.**~~ Landed. Both now follow cursor → fixture;
   the convention is documented inline in `reset_fixture`.

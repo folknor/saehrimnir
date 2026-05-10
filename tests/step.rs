@@ -355,6 +355,67 @@ async fn fixture_step_mutation_is_visible_through_imap_status() {
     );
 }
 
+/// Regression for cross-folder contact moves. The Graph
+/// `contacts/delta` walker filters tombstones by current
+/// `folder_id`, so a `contact_update` that moves a contact from
+/// folder A to folder B would silently disappear from A's delta
+/// (the contact is no longer in A; no contact_destroyed entry is
+/// recorded). Real Graph doesn't expose `folder_id` as a writable
+/// property either; clients destroy + create instead. The mock
+/// rejects the move at apply time so the script author has to use
+/// the supported shape.
+#[tokio::test]
+async fn change_script_contact_folder_id_move_is_rejected() {
+    let scenario = r#"
+        fixture({ name = "contact-move" })
+        account({ id = "a", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        contact_folder({ id = "cf-a", display_name = "A" })
+        contact_folder({ id = "cf-b", display_name = "B" })
+        contact({
+            id = "c-1",
+            folder_id = "cf-a",
+            display_name = "Carol",
+            emails = { "carol@example.com" },
+        })
+        change({
+            id = "move-via-update",
+            contact_update = {
+                { id = "c-1", folder_id = "cf-b" },
+            },
+        })
+    "#;
+    let fix = lua::load_source(scenario, "@contact-move").unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let app = routes::router(routes::AppState::for_test(std::sync::Arc::clone(&handle)));
+
+    let (status, v) = step(&app, json!({ "expect": "move-via-update" })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let detail = v["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("not supported")
+            && detail.contains("contact_destroy")
+            && detail.contains("contact_create"),
+        "error should point at the supported shape: {v:?}"
+    );
+
+    // The contact must remain in cf-a (failed step rewinds).
+    let snap_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/test/snapshot-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let snap = body_json(snap_resp).await;
+    let contacts = snap["contacts"].as_array().unwrap();
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0]["folder_id"], "cf-a");
+}
+
 /// Regression for the IMAP UID stability contract across change-
 /// script mutations. Pre-fix, deleting an email made the freed UID
 /// available for reuse on the next `email_create`; any IMAP client

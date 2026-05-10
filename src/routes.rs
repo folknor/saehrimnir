@@ -1426,6 +1426,26 @@ fn apply_contact_patch(
                 if !folders.iter().any(|f| f.id == id) {
                     return Err(format!("folder_id {id:?} not in fixture"));
                 }
+                if id != contact.folder_id {
+                    // Cross-folder moves can't be expressed as a
+                    // single update because the source-folder
+                    // `contacts/delta` walk filters by current
+                    // `folder_id` and would never see the moved
+                    // contact (it's not in source any more).
+                    // Source-folder clients would silently lose the
+                    // contact from their cache. Real Microsoft Graph
+                    // doesn't expose folder_id as a writable
+                    // property either; clients destroy + create.
+                    // Force the same here so the change_log
+                    // surfaces both sides through the existing
+                    // contact_destroyed / contact_created
+                    // delta-walk machinery.
+                    return Err(format!(
+                        "folder_id update from {old:?} to {new:?} not supported - issue contact_destroy + contact_create instead",
+                        old = contact.folder_id,
+                        new = id,
+                    ));
+                }
                 contact.folder_id = id.to_string();
             }
             "emails" => {
