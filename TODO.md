@@ -4,462 +4,191 @@ Running task list, ordered by what ratatoskr is actively waiting on.
 Per-protocol design notes live alongside in `notes/`; this file just
 tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
-## Today's slice (2026-05-10)
+## From the 2026-05-10 multi-agent review (today's slice)
 
-ratatoskr is waiting on four sæhrimnir surfaces to keep its sync
-test coverage moving. All four land in this slice.
-
-### JMAP Calendar - landed
-
-Capability advertised conditionally on `[[calendar]]` presence;
-`Calendar/get` + `Calendar/changes` + `CalendarEvent/get` +
-`CalendarEvent/changes` + `CalendarEvent/set` wired in
-`src/jmap_calendar.rs`. Cross-protocol delta visibility
-asserted in `tests/jmap_calendar.rs`.
-
-Original scope notes preserved below for reference.
-
-- Advertise `urn:ietf:params:jmap:calendars` in
-  `src/routes.rs`'s session capabilities.
-- `Calendar/get`: no IDs => return all calendars from
-  `fixture.calendars` projected to JMAP shape (`id`, `name`,
-  `color`, `isDefault`, ...). Surfaces `state`.
-- `CalendarEvent/get`: no IDs => return all events. Project
-  fixture `Event` to JSCalendar (`calendarIds`, `title`,
-  `description`, `start` as `LocalDateTime`, `duration` as
-  ISO 8601, `showWithoutTime` for all-day, `locations` map).
-  Surfaces `state`.
-- `CalendarEvent/changes`: walk `change_log` between
-  `sinceState` and current, using the existing
-  `event_created` / `event_updated` / `event_destroyed`
-  transitions (already present from Graph + CalDAV writes).
-  Honour `maxChanges`, emit `hasMoreChanges`. Unknown / evicted
-  `sinceState` returns `cannotCalculateChanges` (ratatoskr
-  triggers a full re-sync on that string).
-- `CalendarEvent/set`: create / update / destroy through
-  `Fixture::mutate`, recording the same `event_*` transitions
-  Graph and CalDAV write today, so a JMAP create surfaces in a
-  subsequent Graph `calendarView/delta` and vice-versa.
-- Integration tests in `tests/jmap_calendar.rs` (or extend
-  `tests/api.rs`) covering the initial-list / get-all /
-  changes-walk / set-create-update-destroy flow plus a
-  cross-protocol assertion that a JMAP `CalendarEvent/set`
-  surfaces in Graph `calendarView/delta`.
-- `notes/ratatoskr-jmap-surface.md` extended with the calendar
-  surface; capability list and `urn:ietf:params:jmap:calendars`
-  exclusion line in `CLAUDE.md` updated.
-
-### Google Calendar - landed
-
-Sibling listener to Gmail at `--gcal-port` exposing
-`/calendar/v3/users/me/calendarList` and
-`/calendar/v3/calendars/{id}/events[/...]`. Sentinel grows
-`GCAL <port>`; brokkr orchestration plumbs
-`RATATOSKR_TEST_GCAL_ENDPOINT`. ratatoskr-side endpoint
-override hasn't landed yet. See `notes/ratatoskr-gcal-surface.md`
-and `tests/gcal.rs`.
-
-Original scope notes preserved.
-
-ratatoskr at `crates/calendar/src/google.rs` hits
-`https://www.googleapis.com/calendar/v3` - a *different host*
-from Gmail's mail surface, so it cannot be mounted on the
-existing Gmail listener. Spawn a sibling `src/gcal/` module
-matching the Gmail layout.
-
-- New `src/gcal/mod.rs` (router, AppState, catchall 404,
-  bearer middleware) + `src/gcal/events.rs` (handlers).
-- New listener bound by `main.rs`; sentinel grows a
-  `gcal_url` field; brokkr orchestration env grows
-  `RTSK_GCAL_URL` (track in `notes/orchestration.md`).
-- Endpoints: `GET /users/me/calendarList`,
-  `GET /calendars/{id}/events` (with `syncToken` /
-  `pageToken` / `timeMin` / `timeMax` / `singleEvents` /
-  `maxResults`), `POST /calendars/{id}/events`,
-  `PATCH .../events/{id}`, `DELETE .../events/{id}`.
-- Event JSON shape: `start.dateTime`+`timeZone` or
-  `start.date` (all-day), `end.*`, `summary`,
-  `description`, `location`, `status`, `organizer`,
-  `attendees`, `htmlLink`, `iCalUID`, `etag`,
-  `recurrence[]`, `visibility`, `transparency`. Tombstones
-  carry `status: "cancelled"`.
-- Sync-token expiry: `syncToken` not present in the
-  log-or-evicted window returns HTTP 410 (ratatoskr's
-  recovery contract).
-- Mutations land via `Fixture::mutate`, recording the same
-  `event_*` transitions so Graph / CalDAV / JMAP all observe
-  Google-side writes.
-- `notes/ratatoskr-gcal-surface.md` (new) documents the
-  surface with `crates/calendar/src/google.rs:LL` citations.
-- Integration tests in `tests/gcal.rs` covering list /
-  events list with paging + sync-token / single-event GET /
-  POST/PATCH/DELETE / 410 recovery / cross-protocol delta
-  visibility.
-
-### Gmail People API contacts - landed
-
-Sibling listener to Gmail at `--people-port` exposing
-`/v1/people/me/connections` and `/v1/otherContacts`. Sentinel
-grows `PEOPLE <port>` and brokkr orchestration plumbs
-`RATATOSKR_TEST_PEOPLE_ENDPOINT`. ratatoskr-side endpoint
-override hasn't landed yet - the listener is already in place
-to receive it. See `notes/ratatoskr-people-surface.md` and
-`tests/people.rs`.
-
-Original scope notes preserved.
-
-ratatoskr at `crates/gmail/src/contacts/` hits
-`https://people.googleapis.com/v1` - again a different host
-from `gmail.googleapis.com`. Same listener pattern as gcal.
-
-- New `src/people/mod.rs` (router, AppState, catchall 404,
-  bearer middleware) + `src/people/contacts.rs`.
-- New listener; sentinel grows `people_url`; brokkr env
-  grows `RTSK_PEOPLE_URL`.
-- `GET /people/me/connections` (`personFields`, `pageSize`,
-  `pageToken`, `syncToken`, `requestSyncToken`).
-- `GET /otherContacts` (`readMask`, `pageSize`, `pageToken`,
-  `syncToken`, `requestSyncToken`).
-- `Person` JSON shape: `resourceName`, `etag`,
-  `metadata.deleted`, `metadata.sources[]`, `names[]`,
-  `emailAddresses[]`, `phoneNumbers[]`, `organizations[]`,
-  `photos[]`. Tombstones: `metadata.deleted = true`.
-- Sync-token recovery: HTTP 410 on evicted token.
-- Project from existing `fixture.contacts` /
-  `fixture.contact_folders`. People API has no folder
-  concept, so the projection collapses folders into a flat
-  connections list (folder-scoped fixtures keep working for
-  Graph; flat-list semantics layered on top for People).
-  `otherContacts` projects from a parallel
-  `fixture.other_contacts` if a fixture provides one;
-  otherwise empty list.
-- `notes/ratatoskr-people-surface.md` (new) with citations.
-- Integration tests in `tests/people.rs`: connections paging,
-  delta sync via `syncToken`, otherContacts paging,
-  sync-token recovery.
-
-### Deeper JMAP fixture families - landed
-
-Slow-paging recipe documented in `notes/fixture-format.md`
-("Slow-paging recipe (Lua-only)"). Cross-protocol malformed-MIME
-injection wired: `Email::raw_bytes` now flows through JMAP
-`Email/get` `bodyValues` and Gmail `threads.get`
-`payload.body.data` in addition to the existing IMAP path; tests
-in `tests/malformed_mime.rs`. No `mime_mode` knob landed -
-`raw_bytes`'s presence is itself the opt-in, mirroring the IMAP
-contract.
-
-Original scope notes preserved below.
-
-- **Slow paging recipe.** Document in
-  `notes/fixture-format.md` how to interleave `wait(ms)` in
-  an `on(protocol, command, fn)` callback to delay specific
-  pages. Include a complete worked example for JMAP
-  `Email/query` with `position`-driven slowdown on the
-  N-th page, and one for Graph `messages` with
-  `$skiptoken`-keyed slowdown. No code change required;
-  `wait(ms)` and `on()` are already wired.
-- **Malformed-MIME injection on JMAP and Gmail.** Today
-  `Email::raw_bytes` only flows through IMAP `UID FETCH`;
-  JMAP `Email/get` synthesizes `bodyValues` from canonical
-  `body_text` (`src/jmap.rs`), and Gmail `threads.get`
-  builds the MIME payload from canonical fields
-  (`src/gmail/mail.rs`). Extend both to honour
-  `raw_bytes` when set:
-  - JMAP `Email/get`: when `raw_bytes` is present, parse
-    headers + bodies straight from the bytes (or surface
-    them via `blobId`-style attachment refs if the test
-    requires that path) so the wire `bodyValues` /
-    `bodyStructure` reflect what the fixture authored,
-    not what we synthesized. Tests assert ratatoskr's
-    JMAP parser tolerates / rejects the expected cases
-    (e.g. CRLF-only bodies, bare-LF, missing
-    boundary, truncated multipart, 8-bit in headers).
-  - Gmail `threads.get`: same - when `raw_bytes` is set,
-    project the parsed view from those bytes rather than
-    rebuilding from canonical fields. The base64url
-    `raw` field on a Gmail message already round-trips
-    bytes verbatim; the new path also feeds the parsed
-    `payload` MIME tree from the same bytes.
-- Reserve a `[email] mime_mode = "raw_only" | "raw_then_canonical"`
-  knob (default unchanged) so a fixture can opt into the
-  malformed path without breaking byte-determinism for
-  the canonical-path consumers (IMAP rendering already
-  prefers `raw_bytes` when present).
-- New fixture `fixtures/jmap-malformed-mime.lua` and
-  matching `tests/malformed_mime.rs` covering at least
-  three malformed shapes per protocol.
-- Update `notes/fixture-format.md` to document
-  `raw_bytes` cross-protocol semantics (was previously
-  IMAP-only).
-
-
-
-## From the 2026-05-10 multi-agent review
-
-Findings from a four-agent (security / bugs / perf / arch) sweep of
-the work landed in commits `8f7798c..7602fdb` (RwLock + change_log,
-JMAP `Email/set` + `Mailbox/set`, IMAP `UID STORE`/`COPY`/`EXPUNGE`,
-Graph calendar mutations + delta, Graph contacts + delta, change-
-script pipeline + `/test/fixture/step` + `/test/fixture/reset`,
-latency knob, stable request log, OAuth-enforced fixture, CalDAV
-listener + module, TOML `[[change]]` projection, `body_raw_bytes`
-escape hatch). Only items that need work end up here; verified-
-correct invariants and accepted trade-offs are omitted.
+Findings from a four-agent (bugs / security / perf / arch) sweep of
+the four commits in today's slice (`2aff7e6..bb2ecef`: JMAP
+calendar, cross-protocol raw_bytes + slow-paging, People API,
+Google Calendar). Only items that need work end up here.
 
 ### Fix now
 
-- ~~**[bugs] `apply_change_step` rewind drops `contacts` /
-  `contact_folders`.**~~ Landed. `src/routes.rs::step_fixture`
-  now snapshots and restores both, alongside emails / mailboxes /
-  events. Regression test
-  `tests/step.rs::fixture_step_rewind_covers_contacts_and_contact_folders`.
-  Future-proofing (clone-then-swap restructure) tracked under
-  the closure-only-mutator architectural item.
-- ~~**[bugs] Graph `calendarView/delta` and `contacts/delta` emit
-  cross-collection tombstones.**~~ Landed. `Transition` /
-  `MutationDiff` gained `event_destroyed_parents` and
-  `contact_destroyed_parents` parallel vectors capturing the
-  calendar / folder each destroyed resource lived in. Producers
-  (CalDAV DELETE, Graph calendar DELETE, change-script
-  EventDestroy / ContactDestroy) snapshot the parent before the
-  retain. `event_delta_since` / `contact_delta_since` now take a
-  `parent_id` arg and pre-filter tombstones. Regression test
-  `tests/graph.rs::graph_calendar_view_delta_does_not_leak_tombstones_across_calendars`.
-- ~~**[bugs] IMAP `BODY[HEADER]` for raw-bytes emails includes
-  one extra `\r\n`.**~~ Landed. `src/imap.rs::split_raw` now
-  returns the header slice ending at `i + 2` (matching what the
-  structured `render_rfc822_headers` emits). Test in
-  `tests/imap.rs::body_raw_bytes_emits_verbatim_through_imap_fetch`
-  updated.
-- ~~**[security] CalDAV listener never enforces
-  `fixture.oauth.enforce`.**~~ Landed.
-  `src/caldav/mod.rs::enforce_bearer_middleware` mirrors the Graph
-  pattern, returning a bare `401 + WWW-Authenticate: Bearer` on
-  rejection (CalDAV has no shared body schema). Regression test
-  `tests/caldav.rs::caldav_enforces_bearer_when_oauth_enforce_is_true`
-  walks every CalDAV verb. Docs in
-  `notes/ratatoskr-oauth-surface.md` and
-  `notes/fixture-format.md` extended to mention CalDAV.
-- ~~**[security] CalDAV iCal `ORGANIZER` / `ATTENDEE` email
-  addresses are emitted verbatim.**~~ Landed.
-  `src/caldav/ical.rs::sanitize_address` strips control bytes
-  and CR/LF before emit; `write_address_line` routes through
-  it. Real RFC-5321 addresses are unaffected. Test in
-  `src/caldav/ical.rs::tests`.
-- ~~**[security] `/test/latency` accepts unbounded `u64` ms.**~~
-  Landed. `src/routes.rs::set_latency` clamps both `global_ms`
-  and per-protocol values at 60_000ms (`LATENCY_MAX_MS`),
-  returning 400 above that. Test
-  `tests/api.rs::test_latency_rejects_values_above_cap`.
-- ~~**[bugs] CalDAV ETag / CTag derive from global `fixture.state`,
-  not per-resource.**~~ Landed. `event_etag` walks the change_log
-  to find the last transition that listed `event_id` in its
-  created / updated / destroyed sets; `calendar_ctag` walks for
-  the last transition that touched any event in the named
-  calendar (using `event_destroyed_parents` for tombstones, the
-  live event's `calendar_id` for created / updated). Both fall
-  back to the change-log seed for resources no transition has
-  touched. New `Fixture::change_log_transitions` /
-  `Fixture::change_log_seed` accessors. Regression test
-  `tests/caldav.rs::caldav_etag_and_ctag_are_per_resource_not_fixture_wide`
-  asserts that an unrelated PUT in cal-work doesn't bump
-  cal-personal's CTag or ev-001's ETag.
-- ~~**[arch] Two parallel `ChangeOp` producers with drift-prone
-  patch construction.**~~ Landed. Per-op builder helpers
-  (`email_update_op`, `email_move_op`, `mailbox_create_op`,
-  `mailbox_update_op`, `event_create_op`, `event_update_op`,
-  `contact_folder_create_op`, `contact_folder_update_op`,
-  `contact_create_op`, `contact_update_op`) live in
-  `src/fixture.rs` next to `normalize_change_step`. Both the
-  TOML loader and the Lua per-op readers call them, so the
-  patch JSON shape (camelCase JMAP keys, snake_case for
-  change-script-only resources, `bool_map` for keywords /
-  mailboxIds, etc.) lives in exactly one place. Lua got a new
-  `read_string_array_opt_present` helper that distinguishes
-  Nil from empty Table (needed by the shared helper's
-  Option<T> contract). Future field additions touch one site
-  per resource family.
-- ~~**[arch] `step_fixture` calls `mutate(|_f| diff)` after
-  already mutating the fixture in `apply_change_step`,
-  violating the closure-only-mutator contract.**~~ Landed.
-  `Fixture` gained `pub fn record_transition(&mut self, diff)`
-  exposing the bump-state + append-transition path explicitly;
-  `mutate` is now a thin closure-wrapper that delegates to it.
-  `step_fixture` calls `record_transition` directly so the
-  read-the-doc-literal is preserved (mutate's closure is the
-  only mutation site for closure-style callers; the change-
-  script path's prior in-place mutation is now the documented
-  reason `record_transition` exists).
-- ~~**[bugs] Lua `email_create` baseline-mailbox snapshot is taken
-  at the wrong moment.**~~ Documented. The early sanity check at
-  `src/lua.rs::read_email_create` is duplicated by the
-  authoritative apply-time check in `apply_change_step`, so the
-  fix is to clarify the contract rather than restructure: place
-  every `mailbox(...)` declaration before any `change(...)` call
-  in Lua scripts, and apply-time validation catches anything the
-  early check would have missed. Inline comment + the
-  `notes/fixture-format.md` `email_create` op contract updated.
+- **[bugs] `event_delta_since` doesn't filter `created` / `updated`
+  by parent calendar; JMAP `CalendarEvent/changes` over-reports.**
+  `src/fixture.rs:549-551` extends only `destroyed` through the
+  parent filter; `created` / `updated` walks every transition
+  unconditionally. Combined with the union-across-calendars walk
+  in `src/jmap_calendar.rs:279-304`, an event created in cal A
+  shows up in cal B's per-calendar walk too. The cross-cal
+  `seen.insert` dedupe hides single-event cases but loses
+  per-calendar dominance: an event created in A and destroyed in
+  B in the same window survives as `created`. No JMAP test
+  covers multi-calendar deltas. Fix is to thread the parent
+  filter through `created` / `updated` walks too, then drop the
+  cross-cal union and call once with no filter (or extend
+  `delta_since_filtered_destroys` to a `delta_since_filtered_all`
+  that filters every set).
+- **[bugs] People `is_known_state` accepts mid-history tokens and
+  silently drops tombstones.** `src/people/contacts.rs:186-196`
+  treats any retained `from_state` / `to_state` / seed as known.
+  The handler then has only two branches: `token == fixture.state`
+  → empty; else → full *live* list with no `metadata.deleted:
+  true` tombstones. Notes/ratatoskr-people-surface.md explicitly
+  requires unknown-token → 410 to drive ratatoskr's recovery, but
+  any retained intermediate state slips past as "known" and
+  ratatoskr never sees the tombstone for a destroyed contact.
+  Two-line fix: tighten `is_known_state` to current-only
+  (everything else 410), or actually walk the change_log and
+  emit deleted-Person entries per `contact_destroyed` /
+  `contact_destroyed_parents`.
+- **[bugs] gcal events list has the same stale-token tombstone
+  gap.** `src/gcal/events.rs:138-194`: when `syncToken !=
+  fixture.state` but is_known, falls through to a full live-events
+  listing. `event_destroyed` change-log entries never surface as
+  the `status: "cancelled"` tombstones notes/ratatoskr-gcal-
+  surface.md documents and ratatoskr's `:189-200` cancelled-
+  routing branch reads. Same fix shape as the People item above.
+- **[bugs] JMAP `CalendarEvent/set` and gcal create synthesize
+  ids from `events.len() + 1`, colliding after a destroy.**
+  `src/jmap_calendar.rs:485` and `src/gcal/events.rs:451`. Fixture
+  declares `mock-event-1`/`mock-event-2`, JMAP destroys 1, JMAP
+  creates → `mock-event-2`, collides with the still-live event.
+  Determinism + UID-stability are project invariants; an in-test
+  Lua scenario doing destroy-then-create reaches this trivially.
+  Replace with a monotonic counter on `Fixture` (parallel to the
+  IMAP UID history) that only ever increments.
 
 ### Fix soon
 
-- ~~**[security] CalDAV PUT can change a stored event's id behind
-  the URL.**~~ Landed. `handle_put` now rejects with 400 when
-  the body's `UID` is present and disagrees with the URL's
-  event id; absent UID continues to fall back to the URL id.
-- ~~**[security] CalDAV `If-Match` quote / weak-validator
-  handling.**~~ Landed. New `if_match_matches` helper +
-  `IfMatchOutcome` enum tolerates comma-separated lists,
-  `W/`-prefixed weak validators, and quoted wildcards (`"*"`).
-  Both PUT and DELETE route through it. Tests exercise quoted
-  wildcard and `W/<etag>` against an existing resource.
-- ~~**[security] CalDAV `mailto:` strip is case-sensitive.**~~
-  Landed. `parse_address` calls a new `strip_mailto_prefix`
-  helper that does a case-insensitive 7-byte prefix check.
-  Test covers `mailto:` / `MAILTO:` / `MailTo:`.
-- ~~**[security] CalDAV multi-VEVENT body silently drops the
-  second event.**~~ Landed. `parse_vevent` returns
-  `Result<ParsedEvent, &'static str>`; a body with more than
-  one VEVENT is rejected ("multiple VEVENTs"), an empty body
-  is rejected ("must contain a VEVENT"). PUT path 400s on
-  either error.
-- ~~**[bugs] Cross-folder contact moves disappear from source-
-  folder delta.**~~ Landed.
-  `src/routes.rs::apply_contact_patch` rejects any `folder_id`
-  update where the new value differs from the current
-  `folder_id`. Real Microsoft Graph doesn't expose `folder_id`
-  as a writable property on contacts either; clients move via
-  destroy + create, which surface in both source and
-  destination folders' deltas through the existing
-  `contact_destroyed` / `contact_created` machinery. Same
-  shape will apply to event `calendar_id` moves once event
-  patches grow that field.
-- ~~**[bugs] `step_fixture` and `reset_fixture` acquire locks in
-  opposite orders.**~~ Landed. Both now follow cursor → fixture;
-  the convention is documented inline in `reset_fixture`.
-  Reset's prior pattern used scoped blocks so the inversion was
-  actually unreachable, but unifying the order future-proofs
-  against any change that holds both simultaneously.
-- ~~**[security] `RequestLog::snapshot` race window.**~~ Landed.
-  Replaced the steal-clone-restore dance with a single
-  hold-the-lock-and-clone. Avoids the eviction race entirely;
-  realistic stall is sub-millisecond against the 100k cap.
-  Folds the related `[perf] RequestLog::snapshot deep-clones
-  twice` follow-up - now it's exactly one clone of the live
-  deque per call. The handler-side `?stable=true` rebuild of
-  `Value` per row remains as a separate item below.
-- ~~**[bugs] CalDAV `xml::body_requests_prop` is a substring
-  match.**~~ Landed. New `xml::requested_props(body)` parses
-  the propfind body once into a `HashSet<String>`, skipping
-  comments, CDATA sections, processing instructions, and
-  `<!DOCTYPE>` declarations. Every PROPFIND handler computes
-  the set at entry and consults it via `contains`; folds in
-  the matching `[perf] CalDAV PROPFIND `body_requests_prop`
-  runs per event per property` item below. `body_requests_prop`
-  remains as a thin wrapper for one-shot tests.
-- ~~**[bugs] CalDAV path parsing accepts duplicated slashes /
-  doesn't percent-decode.**~~ Landed. `parse_path` rejects any
-  trimmed-path segment that's empty (`/calendars//u/cal/` →
-  `Unknown`) and percent-decodes each segment via the new
-  `percent_decode` helper, so calendar / event ids that
-  round-trip through clients carrying `%XX`-encoded chars
-  match. Tests in `tests/caldav.rs`.
-- ~~**[perf] `Fixture::delta_since` cancel set is O(c·d).**~~
-  Landed. Both `delta_since` and `delta_since_filtered_destroys`
-  delegate to a new `apply_dominance_and_dedup` helper that
-  builds `destroyed` membership as `HashSet<&str>` once.
-  `dedup_preserving_order` rewritten to use a `&str`-keyed
-  HashSet plus a keep-mask so it does zero clones per call.
-- ~~**[perf] Graph delta walkers do nested `find` per delta id.**~~
-  Landed. Both `calendarView/delta` and `contacts/delta`
-  build an `id -> &Resource` HashMap (filtered to the
-  requested calendar / folder) once at the top of the handler.
-- ~~**[perf] `step_fixture` clones full `emails` / `mailboxes` /
-  `events` vectors on every step under the write guard.**~~
-  Landed. New `StepTouches::from_step` walks the step's ops
-  once and classifies which categories will be mutated;
-  `step_fixture` only clones the affected vecs (and
-  `mailbox_uid_history` only when an email-shaped op exists).
-  A 10k-email fixture running a contacts-only step now clones
-  just `contacts` instead of every section.
-- ~~**[perf] `?stable=true` rebuilds a fresh `Value` per row.**~~
-  Landed. The handler now serializes through a borrowed
-  `Stable<'a> { protocol, command, detail }` view struct;
-  serde walks each `detail: Value` once at write time, no
-  per-row JSON tree rebuild.
-- ~~**[perf] IMAP `RFC822.SIZE` re-renders the entire body just
-  to take `.len()`.**~~ Landed. New `RenderedRfc822` struct
-  pre-computes (headers, text, full) once per email and
-  `fetch_response_line` lazily populates it on the first body-
-  shaped attr; subsequent attrs read from the cache. Old
-  `render_rfc822` removed; the unit test that called it now
-  uses `RenderedRfc822::for_email(...).full`.
-- ~~**[perf] `split_raw` rerun per raw-bytes attribute.**~~
-  Landed via the `RenderedRfc822` cache: raw-bytes emails go
-  through `split_raw` once at cache-population time and the
-  resulting (headers, text) pair is reused.
-- ~~**[perf] `cmd_uid_fetch` materializes all FETCH lines
-  before writing.**~~ Landed. `cmd_uid_fetch` now snapshots
-  owned `Email` clones under one read guard, drops the guard,
-  and renders+writes one at a time - each entry's render
-  strings can be reclaimed between writes rather than
-  retained for the whole batch. Determinism contract holds
-  because all snapshots happen under the same guard.
-- ~~**[perf] `Email/set` updates and destroys each scan all
-  emails.**~~ Landed for the JMAP path. Updates build an
-  `id -> idx` HashMap once; destroys snapshot mailbox
-  memberships and retain in a single pass against a
-  `HashSet<&str>` of destroy ids. Response order is preserved
-  by walking the request `destroys` list afterwards. The
-  change-script apply path iterates ops rather than batching
-  by kind, so a precomputed map wouldn't help the same way
-  there; not the hot path the reviewer was concerned about.
-- ~~**[perf] CalDAV PROPFIND `body_requests_prop` runs per event
-  per property.**~~ Landed via the `xml::requested_props`
-  refactor above; the prop set is parsed once at PROPFIND
-  entry and threaded through `home_collection_props`,
-  `calendar_props`, `event_resource_props`.
-- ~~**[arch] `apply_contact_patch` / `apply_contact_folder_patch`
-  / `apply_change_event_patch` live in `src/routes.rs`.**~~
-  Landed. All three moved to `src/fixture.rs` as `pub(crate)`
-  helpers next to the change-script op builders, since they
-  operate on canonical fixture types and use the snake_case
-  patch shape the change-script projection emits. JMAP wire-
-  shape patches stay in `src/jmap.rs`; Graph wire-shape event
-  patch stays in `src/graph/calendar.rs`. routes.rs now only
-  orchestrates.
-- ~~**[arch] Patch field-name conventions diverge.**~~ Landed.
-  Convention is now explicit and documented in the comment
-  block at the top of the patch-appliers section in
-  `src/fixture.rs`: JMAP wire-shape patches use camelCase
-  (because they are the JMAP wire); change-script-only
-  patches use snake_case (no wire forcing them, and the
-  canonical types are already snake_case). Graph wire-shape
-  event patch keeps the Graph nested form. The split is
-  intentional, not drift.
-- ~~**[arch] `src/routes.rs` has grown to ~1440 lines.**~~
-  Landed. New `src/test_admin.rs` (~1085 lines) hosts the
-  `/test/*` route family: SMTP-submission introspection,
-  request log, fixture reset / step (with `StepTouches`,
-  `apply_change_step`, `step_apply_error`), latency get/set,
-  snapshot-state. `routes.rs` shrank to ~402 lines and now
-  hosts only the JMAP HTTP handlers + OAuth router merge.
-  `crate::routes::router` calls
-  `.merge(crate::test_admin::router(state))`.
-- ~~**[docs] CalDAV is wired but undocumented in
-  `notes/orchestration.md`, `notes/request-log.md`, and
-  `notes/fixture-format.md`.**~~ Landed. Lifecycle diagram +
-  sentinel content section + env-var count updated for CALDAV
-  in `orchestration.md`; `request-log.md`'s protocol enum
-  gained `"caldav"`; `fixture-format.md`'s "Calendars and
-  events" paragraph rewritten to describe CalDAV as a live
-  consumer alongside Graph.
-- ~~**[docs] `/test/snapshot-state` and `/test/fixture/step`
-  responses miss `contacts` / `contact_folders` in the
-  documented JSON shapes.**~~ Landed. `snapshot-state` now
-  emits both fields too (was missing them; the `step` response
-  already did). `notes/orchestration.md` updated to document
-  both shapes including the new fields.
+- **[bugs] JMAP `apply_event_patch` flips `is_all_day` without
+  recomputing start/end.** `src/jmap_calendar.rs:514-516, 553-581`.
+  A patch that sets `showWithoutTime = true` alone (no start/
+  duration) leaves the event's all-day flag flipped but its
+  start/end timed; subsequent serialization emits an inconsistent
+  shape. Recompute when `is_all_day` changes too, not just when
+  start/duration are present in the patch.
+- **[bugs] JMAP `Calendar/changes` returns `cannotCalculateChanges`
+  on any non-current state, even seed.** `src/jmap_calendar.rs:117-126`.
+  Calendars are static in v0; an event-only mutation bumps
+  `fixture.state` but doesn't touch the calendar resource type.
+  RFC 8620 wants empty deltas for an unchanged resource type.
+  Fix: short-circuit on seed-or-known too, return empty.
+- **[bugs] gcal `apply_event_patch` ignores `organizer`.**
+  `src/gcal/events.rs:467-495`. JMAP's apply_event_patch parses
+  organizer; Graph's deliberately doesn't (Graph clients can't
+  repoint). Real Google clients can. Add the parse, document
+  Graph's omission inline.
+- **[arch] Google-family `error()` argument order is `(message,
+  reason)` while Graph's is `(code, message)`.** Drift is real
+  but underlying envelope shapes genuinely differ - the names
+  should track. Rename the param bindings in
+  `src/{gmail,gcal,people}/mod.rs::error` to `(message, reason)`
+  explicitly; add a one-line doc in each calling out which is
+  which.
+- **[arch] `gcal::AppState` and `people::AppState` lost the
+  `with_request_log` / `with_dispatcher` builders that
+  `gmail::AppState` and `routes::AppState` expose.** Tests
+  reach into `shared.dispatcher` directly. Either add the
+  builders to gcal/people for parity, or remove from
+  gmail/graph if nothing in the tree uses them. Pick one shape.
+- **[perf] People `projected_connections` materialises every
+  contact's JSON before paging.** `src/people/contacts.rs:114,
+  213-217`: collects refs, sorts, maps to `Vec<Value>`, then
+  `drain(offset..end)`. Pages are O(N) per request even when the
+  caller wants page_size = 100. Trivial fix: serialize after
+  slicing (`.iter().skip(offset).take(page_size).map(serialize_
+  person)`).
+- **[security] Request log records full parsed mutation bodies
+  unconditionally.** `src/gcal/events.rs:288-292, 334-338,
+  378-382` insert `{"body": parsed}` (up to 1 MiB JSON) on every
+  POST/PATCH/DELETE. With many calls + the 100k cap, request_log
+  memory grows large between `DELETE /test/requests` calls.
+  Loopback only, but other listeners deliberately keep the
+  body slice small. Either gate behind a knob or truncate.
+
+### Eventually (only when something forces it)
+
+- **[perf] `CalendarEvent/changes` re-walks the change_log per
+  calendar.** `src/jmap_calendar.rs:279-304`. O(C*T) where
+  C = calendar count and T ≤ 256. Fixtures have ≤ ~10 calendars
+  today; ~2,560 string compares per request is fine. Worth a
+  `delta_since_any` helper if a fixture grows >50 calendars.
+- **[perf] `Cow<str>` raw_bytes path always clones.**
+  `src/jmap.rs:917-920`. The Owned arm calls `.to_string()` on
+  an already-borrowed `&str`. `Cow::Borrowed(raw)` would work.
+  Cleanup, not a hot path.
+- **[arch] Three near-identical `mod.rs` files for the
+  Google-family listeners.** `src/{gmail,gcal,people}/mod.rs`
+  duplicate ~70 lines each (bearer middleware, `log_request`,
+  `serve`, Google-shape `error`, `not_implemented`, `ok_json`).
+  Threshold of three is met. Extract a
+  `crate::http_listener::serve_with_shutdown` +
+  `bearer_middleware<F>` + `google_error` once a fourth
+  Google-shape listener appears (Drive resumable uploads is the
+  next candidate).
+- **[arch] `main.rs` listener wiring is 8x repetitive.**
+  `src/main.rs:34-289`. Each new listener edits bind + sentinel
+  entry + spawn + drain. Past the tipping point. Build a
+  `Listener { name, port, factory }` table once Drive / EWS land.
+- **[arch] `src/jmap_calendar.rs` is a flat 800-line file.**
+  Defensible at v0 (single resource family); split into
+  `src/jmap/calendar/{mod,jscalendar,set,changes}.rs` if it grows
+  another resource (e.g. `Calendar/set`, `ParticipantIdentity`).
+- **[arch] `_arc_keepalive` dead helpers.** `src/gcal/mod.rs:167`,
+  `src/people/mod.rs:168`. Copied from a gmail import-warning
+  workaround that no longer applies. Delete.
+- **[arch] JSCalendar participant id scheme is positional
+  (`org`, `att1`, `att2`, ...).** `src/jmap_calendar.rs:225`.
+  Removing one attendee from a fixture renumbers everyone after
+  it. JSCalendar permits arbitrary participant ids; key on a
+  stable hash of email instead. Same shape as the `loc1`
+  hardcode for locations (latent because we only ever emit one).
+- **[bugs] `parse_iso8601_duration` silently drops year and
+  month-`M` components.** `src/jmap_calendar.rs:691-734`. `'Y'`
+  and pre-`T` `'M'` fall into the catchall arm; `buf` keeps
+  growing across the next valid suffix. `"P1Y2M3D"` parses to
+  123 days. v0 fixtures don't author year/month durations, so
+  the failure is silent miscalculation rather than rejection.
+  Reject unknown suffixes once a fixture wants them.
+- **[bugs] gcal POST/PATCH/DELETE accept mutations regardless of
+  `accessRole`.** `src/gcal/events.rs:269-405`. Hidden today
+  because `serialize_calendar` hardcodes `accessRole: "owner"`
+  on every calendar. Once the fixture format grows a per-calendar
+  role, mutations on `reader` / `freeBusyReader` calendars will
+  silently succeed. Pair the unhide-fix with the schema change.
+- **[bugs] People `serialize_person` hardcodes
+  `metadata.deleted: false`.** `src/people/contacts.rs:232`.
+  Becomes wrong the moment any tombstone path lands; harmless
+  until then.
+- **[security] People `_person_fields` / `_read_mask` silently
+  ignored.** `src/people/contacts.rs:55-60`. Real Google enforces
+  field-mask; the mock always emits the full Person shape. Mock
+  is more permissive than reality, which can hide a
+  client-side bug where an over-broad request passes mock CI but
+  fails in prod. Document in the People surface notes; reject
+  unknown fields if a fixture cares.
+
+### Test coverage gaps to close alongside the fixes above
+
+- No JMAP test for cross-calendar `CalendarEvent/changes` (hides
+  the `event_delta_since` parent-filter bug above).
+- No People test for stale-but-retained `syncToken` (hides the
+  tombstone gap).
+- No gcal test for `syncToken`-driven cancellation tombstones
+  after a delete (same shape as the People gap).
+- No JMAP / gcal test asserting id uniqueness across destroy →
+  create (hides the `mock-event-{len+1}` collision).
+
+## From the 2026-05-10 multi-agent review (earlier slice)
+
+Findings from a four-agent sweep of `8f7798c..7602fdb` (RwLock +
+change_log, JMAP `Email/set` + `Mailbox/set`, IMAP `UID STORE` /
+`COPY` / `EXPUNGE`, Graph calendar mutations + delta, Graph
+contacts + delta, change-script pipeline + `/test/fixture/{step,
+reset}`, latency knob, stable request log, OAuth-enforced fixture,
+CalDAV listener, TOML `[[change]]` projection, `body_raw_bytes`
+escape hatch). Fix-now and Fix-soon items have all landed; only
+Eventually items remain.
 
 ### Eventually (only when something forces it)
 
@@ -504,11 +233,10 @@ correct invariants and accepted trade-offs are omitted.
 
 ## From the 2026-05-09 multi-agent review
 
-Findings from a four-agent (security / bugs / perf / arch) review of
-the work landed in commits `de89827..3b87085`. Walk-backs, verified-
-correct invariants, and accepted trade-offs are recorded as inline
-comments at the relevant code sites; only items that need work end
-up here.
+Findings from `de89827..3b87085`. Walk-backs, verified-correct
+invariants, and accepted trade-offs are recorded as inline
+comments at the relevant code sites; only items that need work
+end up here.
 
 ### Eventually (only when something forces it)
 
@@ -570,11 +298,15 @@ Remaining items are unblocked-but-unneeded.
   `bulk_emails` / `bulk_threads` / `bulk_mailboxes` builders make
   medium (~1k), huge-thread, and many-folders fixtures one-liners.
   Author them as M9 sync benchmarks need them.
+- People API `[other_contact]` table for adversarial coverage of
+  `/v1/otherContacts`. Currently the route always returns an
+  empty list. Wire a parallel table when a fixture needs it.
+- Per-calendar `accessRole` so gcal can refuse mutations on
+  read-only calendars (today every calendar serializes as
+  `owner`).
 
 ## IMAP (lower-priority follow-ups)
 
-- Streaming `UID FETCH` is tracked under the 2026-05-10 perf
-  bucket above (`cmd_uid_fetch` materializes all FETCH lines).
 - 200-message FETCH batching boundary. The current handler emits
   all matched FETCH responses in one go. Ratatoskr's client
   batches client-side (`CHUNK_SIZE = 200`), so the wire boundary
@@ -629,6 +361,19 @@ What's left on the Lua side:
   it.
 - Gmail `get_attachment` and `send_as` callback hooks. Skipped
   because both are stubs. Wire when a fixture needs them.
+- Per-protocol callbacks for the new gcal and People listeners
+  (`list_events`, `calendar_list`, `list_connections`,
+  `list_other_contacts` already accept overrides; mutating verbs
+  on gcal don't yet).
+
+## Cross-project follow-ups (ratatoskr-side)
+
+- `RATATOSKR_TEST_PEOPLE_ENDPOINT` and `RATATOSKR_TEST_GCAL_ENDPOINT`
+  overrides parallel to `RATATOSKR_TEST_GMAIL_ENDPOINT`. Today
+  ratatoskr's `PEOPLE_API_BASE` and `GOOGLE_CALENDAR_API_BASE` are
+  hardcoded consts (`crates/gmail/src/contacts/mod.rs:112`,
+  `crates/calendar/src/lib.rs:12`). Sæhrimnir's listeners are in
+  place; ratatoskr just needs the env-driven base URL plumbing.
 
 ## Cosmetic and housekeeping
 
