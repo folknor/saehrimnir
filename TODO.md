@@ -252,14 +252,20 @@ remain unblocked-but-unneeded.
   accounts (JMAP session resource, Graph `/users/{id}/...` paths,
   IMAP per-connection account context).
 
-## CalDAV (matrix item 10, alternative path)
+## Next-protocol-surface ordering
 
-Net-new protocol surface for ratatoskr's calendar smoke; the Graph
-calendar surface (above the line) is already wired, so this is
-only needed if ratatoskr's calendar client ends up speaking CalDAV
-to a non-Graph backend. New `src/caldav.rs` module + new listener
-binding (separate `--caldav-port`) + `notes/ratatoskr-caldav-
-surface.md` scout doc. Endpoints:
+User-confirmed priority for the protocol surfaces below: **Graph
+contacts first, then CalDAV.** Graph contacts has landed (see
+"Microsoft Graph (other future work)" below); CalDAV is up next.
+
+## CalDAV (next)
+
+Net-new protocol surface ratatoskr will speak when its calendar
+client points at a non-Graph backend. New `src/caldav.rs` module
++ new listener binding (separate `--caldav-port`) +
+`notes/ratatoskr-caldav-surface.md` scout doc. Reuses the existing
+`Calendar` / `Event` fixture types so the same `[[calendar]]` /
+`[[event]]` declarations drive both surfaces. Endpoints:
 
 - Principal discovery (`PROPFIND /.well-known/caldav`).
 - Calendar home set (`PROPFIND` on principal).
@@ -281,12 +287,22 @@ surface.md` scout doc. Endpoints:
 
 ## Microsoft Graph (other future work)
 
-v0 mail-sync surface is complete; calendar is promoted above.
-Remaining future Graph work, in roughly the order the next fixture
-is likely to need it:
+v0 mail-sync, calendar, and contacts are complete. Remaining future
+Graph work, in roughly the order the next fixture is likely to
+need it:
 
-- Contact sync (`contact_sync.rs`). Will need `[[contact]]` /
-  `[[contact_folder]]` fixture entries.
+- ~~Contact sync (`contact_sync.rs`).~~ Landed.
+  `src/graph/contacts.rs` covers the `/v1.0/me/contactFolders`,
+  `/v1.0/me/contacts`, and `/contactFolders/{id}/contacts/delta`
+  surfaces ratatoskr's `graph_contacts_initial_sync` /
+  `graph_contacts_delta_sync` exercise. `[[contact_folder]]` /
+  `[[contact]]` TOML + Lua builders, change-script ops
+  (`contact_create` / `contact_update` / `contact_destroy` plus
+  the folder counterparts), `fixtures/graph-contacts-small.toml`
+  + `fixtures/graph-contacts-incremental.lua`, and integration
+  coverage in `tests/graph.rs` + `tests/step.rs`. Surface
+  documented in `notes/ratatoskr-graph-surface.md` "Contacts"
+  section.
 - Master category list (`label_sync.rs`).
 - Group enumeration (`group_sync.rs`).
 - OneDrive resumable upload sessions (`onedrive.rs`) - needed once

@@ -438,6 +438,22 @@ pub enum ChangeOp {
     EventDestroy {
         id: String,
     },
+    ContactFolderCreate(Box<ContactFolder>),
+    ContactFolderUpdate {
+        id: String,
+        patch: serde_json::Value,
+    },
+    ContactFolderDestroy {
+        id: String,
+    },
+    ContactCreate(Box<Contact>),
+    ContactUpdate {
+        id: String,
+        patch: serde_json::Value,
+    },
+    ContactDestroy {
+        id: String,
+    },
 }
 
 /// Fixture-side OAuth configuration. Optional in TOML/Lua; defaults

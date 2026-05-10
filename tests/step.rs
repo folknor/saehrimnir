@@ -312,6 +312,88 @@ async fn run_imap(handle: &saehrimnir::shared::FixtureHandle, script: &[u8]) -> 
     String::from_utf8(buf).unwrap()
 }
 
+/// End-to-end Graph observation: drive a 3-step contact script, then
+/// assert the resulting deltas surface through
+/// `/v1.0/me/contactFolders/{id}/contacts/delta` with the right
+/// RFC-style dominance (created+destroyed cancels; update collapses
+/// against destroyed).
+#[tokio::test]
+async fn fixture_step_mutations_visible_through_graph_contacts_delta() {
+    use saehrimnir::graph;
+
+    let path = std::path::Path::new("fixtures/graph-contacts-incremental.lua");
+    let source = std::fs::read_to_string(path).unwrap();
+    let chunk = format!("@{}", path.display());
+    let fix = lua::load_source_with_dir(&source, &chunk, path.parent().unwrap()).unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let route_state = routes::AppState::for_test(std::sync::Arc::clone(&handle));
+    let graph_state = graph::AppState {
+        shared: route_state.shared.clone(),
+    };
+    let app = routes::router(route_state);
+    let graph_app = graph::router(graph_state);
+
+    // Bootstrap: Graph delta dump returns the two baseline contacts +
+    // a deltaLink pinned to the current state.
+    let baseline = graph_get_json(
+        &graph_app,
+        "/v1.0/me/contactFolders/cf-default/contacts/delta?$select=id",
+    )
+    .await;
+    let baseline_value = baseline["value"].as_array().unwrap();
+    assert_eq!(baseline_value.len(), 2);
+    let baseline_delta = baseline["@odata.deltaLink"].as_str().unwrap().to_string();
+    let baseline_path = baseline_delta
+        .split_once("/v1.0/")
+        .map(|(_, p)| format!("/v1.0/{p}"))
+        .unwrap();
+
+    // Apply all three steps.
+    for expect in ["new", "change", "delete"] {
+        let (status, _) = step(&app, json!({ "expect": expect })).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // Following the baseline deltaLink: created (contact-003), updated
+    // (contact-002), destroyed (contact-001). RFC §5.2 dominance
+    // applies but no within-window collapses fire here.
+    let v = graph_get_json(&graph_app, &baseline_path).await;
+    let mut ids: Vec<String> = v["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["contact-001", "contact-002", "contact-003"]);
+    // contact-001 is the tombstone.
+    let tombstone = v["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == "contact-001")
+        .unwrap();
+    assert_eq!(tombstone["@removed"]["reason"], "deleted");
+}
+
+async fn graph_get_json(app: &axum::Router, uri: &str) -> Value {
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(axum::http::header::HOST, "127.0.0.1:9999")
+                .header(axum::http::header::AUTHORIZATION, "Bearer x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
 #[tokio::test]
 async fn fixture_step_request_log_records_step_endpoint_separately() {
     // The /test/fixture/step route is admin / control-plane and

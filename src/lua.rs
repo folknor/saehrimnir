@@ -22,8 +22,8 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use crate::fixture::{
-    self, ChangeOp, ChangeStep, Event, Fixture, Mailbox, RawAccount, RawAddress, RawAttachment,
-    RawEmail, RawFixture, RawMailbox, RawOAuth, Role,
+    self, ChangeOp, ChangeStep, Contact, ContactEmail, ContactFolder, Event, Fixture, Mailbox,
+    RawAccount, RawAddress, RawAttachment, RawEmail, RawFixture, RawMailbox, RawOAuth, Role,
 };
 use crate::templates;
 
@@ -960,10 +960,254 @@ fn builder_change(state: &mut State) -> dellingr::Result<u8> {
         ChangeOp::EventDestroy { id }
     })?;
 
+    // Contact-folder ops.
+    read_contact_folder_create(state, 1, &mut ops)?;
+    read_contact_folder_update(state, 1, &mut ops)?;
+    read_id_destroy(state, 1, "contact_folder_destroy", &mut ops, |id| {
+        ChangeOp::ContactFolderDestroy { id }
+    })?;
+
+    // Contact ops.
+    read_contact_create(state, 1, &mut ops)?;
+    read_contact_update(state, 1, &mut ops)?;
+    read_id_destroy(state, 1, "contact_destroy", &mut ops, |id| {
+        ChangeOp::ContactDestroy { id }
+    })?;
+
     builder_mut(state)?
         .change_script
         .push(ChangeStep { id, ops });
     Ok(0)
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_contact_folder_create(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "contact_folder_create")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"contact_folder_create\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("contact_folder_create entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let display_name = read_string(state, entry_idx, "display_name")?;
+        let parent_folder_id = read_string_opt(state, entry_idx, "parent_folder_id")?;
+        let is_default = read_bool_opt(state, entry_idx, "is_default")?.unwrap_or(false);
+        state.pop(1);
+        ops.push(ChangeOp::ContactFolderCreate(Box::new(ContactFolder {
+            id,
+            display_name,
+            parent_folder_id,
+            is_default,
+        })));
+    }
+    state.pop(1);
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_contact_folder_update(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "contact_folder_update")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"contact_folder_update\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("contact_folder_update entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let mut patch = serde_json::Map::new();
+        if let Some(name) = read_string_opt(state, entry_idx, "display_name")? {
+            patch.insert("display_name".into(), serde_json::Value::String(name));
+        }
+        if let Some(parent) = read_string_opt(state, entry_idx, "parent_folder_id")? {
+            patch.insert(
+                "parent_folder_id".into(),
+                serde_json::Value::String(parent),
+            );
+        }
+        state.pop(1);
+        if patch.is_empty() {
+            return fail(
+                state,
+                format!("contact_folder_update entry {i}: at least one field must be set"),
+            );
+        }
+        ops.push(ChangeOp::ContactFolderUpdate {
+            id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    state.pop(1);
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_contact_create(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "contact_create")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"contact_create\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("contact_create entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let folder_id = read_string(state, entry_idx, "folder_id")?;
+        let display_name = read_string_opt(state, entry_idx, "display_name")?;
+        let raw_emails = read_contact_email_array_opt(state, entry_idx, "emails")?;
+        state.pop(1);
+        ops.push(ChangeOp::ContactCreate(Box::new(Contact {
+            id,
+            folder_id,
+            display_name,
+            emails: raw_emails.into_iter().map(ContactEmail::from).collect(),
+        })));
+    }
+    state.pop(1);
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_contact_update(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "contact_update")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1);
+            return fail(state, "field \"contact_update\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2);
+            return fail(state, format!("contact_update entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let mut patch = serde_json::Map::new();
+        if let Some(name) = read_string_opt(state, entry_idx, "display_name")? {
+            patch.insert("display_name".into(), serde_json::Value::String(name));
+        }
+        if let Some(folder) = read_string_opt(state, entry_idx, "folder_id")? {
+            patch.insert("folder_id".into(), serde_json::Value::String(folder));
+        }
+        // emails: full-replace if present.
+        let emails_typ = lookup(state, entry_idx, "emails")?;
+        let has_emails = match emails_typ {
+            LuaType::Nil => {
+                state.pop(1);
+                false
+            }
+            LuaType::Table => {
+                state.pop(1);
+                true
+            }
+            _ => {
+                state.pop(2);
+                return fail(
+                    state,
+                    format!("contact_update entry {i}: emails must be an array"),
+                );
+            }
+        };
+        if has_emails {
+            let raw = read_contact_email_array_opt(state, entry_idx, "emails")?;
+            let arr_value: Vec<serde_json::Value> = raw
+                .into_iter()
+                .map(|e| {
+                    let ContactEmail { address, name } = ContactEmail::from(e);
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("address".into(), serde_json::Value::String(address));
+                    if let Some(n) = name {
+                        obj.insert("name".into(), serde_json::Value::String(n));
+                    }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            patch.insert("emails".into(), serde_json::Value::Array(arr_value));
+        }
+        state.pop(1);
+        if patch.is_empty() {
+            return fail(
+                state,
+                format!("contact_update entry {i}: at least one field must be set"),
+            );
+        }
+        ops.push(ChangeOp::ContactUpdate {
+            id,
+            patch: serde_json::Value::Object(patch),
+        });
+    }
+    state.pop(1);
+    Ok(())
 }
 
 // ── Per-op readers for the change builder ───────────────────────────

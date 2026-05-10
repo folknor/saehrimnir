@@ -5,10 +5,10 @@ What the v0 Graph mock has to satisfy. Distilled from
 there; this file is a cheat sheet so we don't have to fan out every
 turn.
 
-Mail-sync and calendar are wired in v0. Other resource categories
-(contacts, OneDrive, groups, labels, public folders via EWS, shared
-mailboxes, webhooks, autodiscover) are listed at the end so the
-next reader knows what scaffolding the module structure has to
+Mail-sync, calendar, and contacts are wired in v0. Other resource
+categories (OneDrive, groups, labels, public folders via EWS,
+shared mailboxes, webhooks, autodiscover) are listed at the end so
+the next reader knows what scaffolding the module structure has to
 accommodate.
 
 ## Calendar (`src/graph/calendar.rs`)
@@ -36,6 +36,46 @@ emailAddress`, and `attendees[].emailAddress` with `type =
 "required"`. Attendee tone (`required`/`optional`) and
 `responseStatus` are not yet projected; add when a fixture forces
 it.
+
+## Contacts (`src/graph/contacts.rs`)
+
+GET endpoints project from `[[contact_folder]]` and `[[contact]]`
+fixture entries; mutations land via change-script ops only (the
+fixture is otherwise read-only across this surface in v0). Wire
+shape matches what ratatoskr's `GraphContact` /
+`GraphContactFolder` deserialise: `id`, `displayName`,
+`emailAddresses` (array of `{ name?, address }`), and
+`parentFolderId`.
+
+| Endpoint | Notes |
+|----------|-------|
+| `GET /v1.0/me/contactFolders` | Paged via `$top` / `$skiptoken`; default top 100, max 250. Order = fixture declaration order. |
+| `GET /v1.0/me/contactFolders/{id}` | `id` accepts the literal id or the alias `default` (resolves to the folder with `is_default = true`). |
+| `GET /v1.0/me/contactFolders/{id}/contacts` | Paged via `$top` / `$skiptoken`; default top 50, max 999 (matches ratatoskr's `?$top=999`). `$select` is parsed and ignored; we always emit the full `id, displayName, emailAddresses, parentFolderId` projection. |
+| `GET /v1.0/me/contactFolders/{id}/contacts/{cid}` | Single contact scoped to a folder. 404 if id mismatches the folder. |
+| `GET /v1.0/me/contacts/{cid}` | Folder-agnostic single-contact resolver. |
+| `GET /v1.0/me/contactFolders/{id}/contacts/delta` | First call (no `$deltatoken`) paginates the full contact dump for the folder, emitting `@odata.deltaLink` only on the final page. Follow-ups walk `Fixture::change_log` between the supplied state and the current state. Created/updated contacts project as full bodies; destroyed contacts emit Graph tombstones (`{ id, "@removed": { reason: "deleted" } }`). `$deltatoken=latest` returns an empty page with a fresh deltaLink (no contact dump). Unknown / evicted token falls back to bootstrap (real Graph emits 410 Gone; ratatoskr handles that by retriggering full sync, so an immediate bootstrap is a coherent v0 stand-in). |
+
+Change-script ops (Lua `change({...})`):
+
+- `contact_folder_create`: array of `{ id, display_name,
+  parent_folder_id?, is_default? }`. Apply rejects duplicate ids
+  and forward references to undeclared parents.
+- `contact_folder_update`: array of `{ id, display_name?,
+  parent_folder_id? }`. At least one field must be set.
+- `contact_folder_destroy`: array of folder-id strings. Apply
+  rejects destroy if any contact still references the folder.
+- `contact_create`: array of `{ id, folder_id, display_name?,
+  emails }`. Same `emails` shape as the static builder: bare
+  string sugar or `{ address, name }` table per entry. Folder is
+  validated at apply time.
+- `contact_update`: array of `{ id, display_name?, folder_id?,
+  emails? }`. `emails`, when present, is a full-replace.
+- `contact_destroy`: array of contact-id strings.
+
+`fixtures/graph-contacts-incremental.lua` exercises the
+new/change/delete trio end-to-end through `contacts/delta`; see
+`tests/step.rs::fixture_step_mutations_visible_through_graph_contacts_delta`.
 
 ## Connection / transport
 
@@ -285,7 +325,6 @@ attachments, this is the moment to fill it in.
 | Module                       | What it syncs                              |
 |------------------------------|--------------------------------------------|
 | `calendar_sync.rs`           | Calendars, events, recurrence, attendees   |
-| `contact_sync.rs`            | Contacts, contactFolders                   |
 | `label_sync.rs`              | Master category list                       |
 | `group_sync.rs`              | M365 groups, mail-enabled distribution     |
 | `onedrive.rs`                | Resumable upload sessions for attachments  |

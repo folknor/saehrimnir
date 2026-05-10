@@ -854,6 +854,16 @@ async fn step_fixture(
                 "updated": trans.event_updated,
                 "destroyed": trans.event_destroyed,
             },
+            "contact_folders": {
+                "created": trans.contact_folder_created,
+                "updated": trans.contact_folder_updated,
+                "destroyed": trans.contact_folder_destroyed,
+            },
+            "contacts": {
+                "created": trans.contact_created,
+                "updated": trans.contact_updated,
+                "destroyed": trans.contact_destroyed,
+            },
         },
         "state": new_state,
     }))
@@ -1105,6 +1115,226 @@ fn apply_change_step(
                 }
                 diff.event_destroyed.push(id.clone());
             }
+            ChangeOp::ContactFolderCreate(folder) => {
+                let folder = (**folder).clone();
+                if fix.contact_folders.iter().any(|f| f.id == folder.id) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "duplicate",
+                        &format!("contact_folder_create {:?}: id already exists", folder.id),
+                    ));
+                }
+                if let Some(parent) = &folder.parent_folder_id
+                    && !fix.contact_folders.iter().any(|f| &f.id == parent)
+                {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "unknownParent",
+                        &format!(
+                            "contact_folder_create {:?}: parent {parent:?} not in fixture",
+                            folder.id
+                        ),
+                    ));
+                }
+                let id = folder.id.clone();
+                fix.contact_folders.push(folder);
+                diff.contact_folder_created.push(id);
+            }
+            ChangeOp::ContactFolderUpdate { id, patch } => {
+                let idx = match fix.contact_folders.iter().position(|f| &f.id == id) {
+                    Some(i) => i,
+                    None => {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "notFound",
+                            &format!("contact_folder_update {id:?}: no such folder"),
+                        ));
+                    }
+                };
+                let mut clone = fix.contact_folders[idx].clone();
+                if let Err(err) = apply_contact_folder_patch(&mut clone, patch) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "invalidPatch",
+                        &format!("contact_folder_update {id:?}: {err}"),
+                    ));
+                }
+                fix.contact_folders[idx] = clone;
+                diff.contact_folder_updated.push(id.clone());
+            }
+            ChangeOp::ContactFolderDestroy { id } => {
+                let still_referenced = fix.contacts.iter().any(|c| &c.folder_id == id);
+                if still_referenced {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "folderHasContacts",
+                        &format!(
+                            "contact_folder_destroy {id:?}: folder still has contacts"
+                        ),
+                    ));
+                }
+                let len_before = fix.contact_folders.len();
+                fix.contact_folders.retain(|f| &f.id != id);
+                if fix.contact_folders.len() == len_before {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "notFound",
+                        &format!("contact_folder_destroy {id:?}: no such folder"),
+                    ));
+                }
+                diff.contact_folder_destroyed.push(id.clone());
+            }
+            ChangeOp::ContactCreate(contact) => {
+                let contact = (**contact).clone();
+                if !fix
+                    .contact_folders
+                    .iter()
+                    .any(|f| f.id == contact.folder_id)
+                {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "unknownFolder",
+                        &format!(
+                            "contact_create {:?}: folder {:?} not in fixture",
+                            contact.id, contact.folder_id
+                        ),
+                    ));
+                }
+                if fix.contacts.iter().any(|c| c.id == contact.id) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "duplicate",
+                        &format!("contact_create {:?}: id already exists", contact.id),
+                    ));
+                }
+                let id = contact.id.clone();
+                fix.contacts.push(contact);
+                diff.contact_created.push(id);
+            }
+            ChangeOp::ContactUpdate { id, patch } => {
+                let idx = match fix.contacts.iter().position(|c| &c.id == id) {
+                    Some(i) => i,
+                    None => {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "notFound",
+                            &format!("contact_update {id:?}: no such contact"),
+                        ));
+                    }
+                };
+                let mut clone = fix.contacts[idx].clone();
+                if let Err(err) = apply_contact_patch(&mut clone, patch, &fix.contact_folders) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "invalidPatch",
+                        &format!("contact_update {id:?}: {err}"),
+                    ));
+                }
+                fix.contacts[idx] = clone;
+                diff.contact_updated.push(id.clone());
+            }
+            ChangeOp::ContactDestroy { id } => {
+                let len_before = fix.contacts.len();
+                fix.contacts.retain(|c| &c.id != id);
+                if fix.contacts.len() == len_before {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "notFound",
+                        &format!("contact_destroy {id:?}: no such contact"),
+                    ));
+                }
+                diff.contact_destroyed.push(id.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_contact_folder_patch(
+    folder: &mut crate::fixture::ContactFolder,
+    patch: &Value,
+) -> Result<(), String> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| "patch must be an object".to_string())?;
+    for (k, v) in obj {
+        match k.as_str() {
+            "display_name" => {
+                folder.display_name = v
+                    .as_str()
+                    .ok_or_else(|| "display_name must be a string".to_string())?
+                    .to_string();
+            }
+            "parent_folder_id" => {
+                folder.parent_folder_id = match v {
+                    Value::Null => None,
+                    Value::String(s) => Some(s.clone()),
+                    _ => return Err("parent_folder_id must be a string or null".to_string()),
+                };
+            }
+            other => return Err(format!("unknown patch field {other:?}")),
+        }
+    }
+    Ok(())
+}
+
+fn apply_contact_patch(
+    contact: &mut crate::fixture::Contact,
+    patch: &Value,
+    folders: &[crate::fixture::ContactFolder],
+) -> Result<(), String> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| "patch must be an object".to_string())?;
+    for (k, v) in obj {
+        match k.as_str() {
+            "display_name" => {
+                contact.display_name = match v {
+                    Value::Null => None,
+                    Value::String(s) => Some(s.clone()),
+                    _ => return Err("display_name must be a string or null".to_string()),
+                };
+            }
+            "folder_id" => {
+                let id = v
+                    .as_str()
+                    .ok_or_else(|| "folder_id must be a string".to_string())?;
+                if !folders.iter().any(|f| f.id == id) {
+                    return Err(format!("folder_id {id:?} not in fixture"));
+                }
+                contact.folder_id = id.to_string();
+            }
+            "emails" => {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| "emails must be an array".to_string())?;
+                let mut out = Vec::with_capacity(arr.len());
+                for e in arr {
+                    let address = e
+                        .get("address")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "emails entry missing address".to_string())?
+                        .to_string();
+                    let name = e
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    out.push(crate::fixture::ContactEmail { address, name });
+                }
+                contact.emails = out;
+            }
+            other => return Err(format!("unknown patch field {other:?}")),
         }
     }
     Ok(())

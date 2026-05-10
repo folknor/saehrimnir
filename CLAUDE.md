@@ -151,9 +151,10 @@ checking whether the fact is already in `notes/`.
   catchall 404, bearer middleware), `odata.rs` (query parsing,
   pagination cursors, envelope), `mail.rs` (mail-sync handlers),
   `calendar.rs` (calendar + event handlers, including echo-mode
-  POST/PATCH/DELETE that record bodies in the request log).
-  Sibling files for contacts / drive / groups / EWS land here when
-  those surfaces are scouted.
+  POST/PATCH/DELETE that record bodies in the request log),
+  `contacts.rs` (contact + contactFolder GETs + contacts/delta
+  walker, mutations via change-script). Sibling files for drive /
+  groups / EWS land here when those surfaces are scouted.
 - `src/gmail/` - Gmail REST mock. `mod.rs` (router, AppState,
   catchall 404), `mail.rs` (profile, labels, threads, history,
   attachments stub, MIME payload builder, hand-rolled base64url).
@@ -189,6 +190,14 @@ checking whether the fact is already in `notes/`.
 - `fixtures/jmap-incremental.lua` - 2-mailbox / 2-email baseline
   plus a 4-step `change({...})` script (new + change + delete +
   move). Drives the integration tests in `tests/step.rs`.
+- `fixtures/graph-contacts-small.toml` - 2 contact folders + 4
+  contacts exercising the full Graph contact wire shape (bare-
+  string sugar, `{name, address}` tables, multi-address contacts,
+  empty-emails contact). Drives the read-path tests in
+  `tests/graph.rs`.
+- `fixtures/graph-contacts-incremental.lua` - 3-step contact
+  change script (new + change + delete) driving the
+  `contacts/delta` round-trip in `tests/step.rs`.
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status
@@ -249,7 +258,7 @@ restarting the binary. Integration tests in `tests/smtp.rs`,
 including a TCP-level STARTTLS round-trip; the route shape is
 covered in `tests/api.rs`.
 
-Graph: mail-sync and calendar are complete for v0. Mail:
+Graph: mail-sync, calendar, and contacts are complete for v0. Mail:
 `/v1.0/me/mailFolders` (list, by-id, by-well-known-alias,
 childFolders), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
 `$skip` / `$skiptoken` / `$filter`), `/v1.0/me/mailFolders/{id}/
@@ -265,9 +274,23 @@ shared fixture, bump `Fixture::state`, and record `event_created`
 the client-supplied `$deltatoken` and the current state, returning
 created/updated events as full bodies and destroyed events as
 Graph tombstones (`{ id, "@removed": { reason: "deleted" } }`).
+Contacts: `/v1.0/me/contactFolders` (paged list + by-id + `default`
+alias), `/v1.0/me/contactFolders/{id}/contacts` (paged list with
+`$top` / `$skiptoken`; `$select` parsed and ignored - we always
+emit the full `id, displayName, emailAddresses, parentFolderId`
+projection ratatoskr's `CONTACT_SELECT` requests),
+`/v1.0/me/contactFolders/{id}/contacts/{cid}` (folder-scoped
+single), `/v1.0/me/contacts/{cid}` (folder-agnostic single),
+`/v1.0/me/contactFolders/{id}/contacts/delta` (initial dump
+paginated to a final-page deltaLink, follow-ups walk the change
+log, `$deltatoken=latest` shortcut, unknown / evicted token falls
+back to bootstrap). Mutations land via change-script ops
+(`contact_create` / `contact_update` / `contact_destroy` plus
+folder counterparts) routed through `Fixture::mutate`; tombstones
+use the Graph `{ id, "@removed": { reason: "deleted" } }` shape.
 Catchall returns the Graph error envelope so unimplemented
-resources are visibly out-of-scope. Sibling files for contacts / drive / groups / EWS
-drop in later.
+resources are visibly out-of-scope. Sibling files for drive /
+groups / EWS drop in later.
 
 Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`
 + `/labels` + `/threads` (list paginated by `nextPageToken`, with

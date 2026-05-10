@@ -193,6 +193,45 @@ the GET endpoints, plus echo-mode POST/PATCH/DELETE that record
 the request body in the cross-protocol request log without
 mutating the fixture (which is read-only in v0).
 
+## Contact folders and contacts (optional)
+
+```toml
+[[contact_folder]]
+id = "cf-default"
+display_name = "Contacts"
+is_default = true             # optional; at most one default per fixture
+parent_folder_id = "cf-root"  # optional; must reference a declared folder
+
+[[contact]]
+id = "contact-001"
+folder_id = "cf-default"      # required; must reference a declared folder
+display_name = "Alice Anderson"  # optional
+emails = [
+    { name = "Alice", address = "alice@example.com" },
+    "alice.anderson@example.org",  # bare-string sugar - same as
+                                   # { address = "...", name = nil }
+]
+```
+
+Validation:
+
+- `contact_folder.id` is unique across folders.
+- At most one folder may have `is_default = true`.
+- `contact_folder.parent_folder_id`, if present, references a
+  previously-declared folder (no forward references).
+- `contact.id` is unique across contacts.
+- `contact.folder_id` references a declared folder.
+
+Contacts and folders project over the Graph
+`/v1.0/me/contactFolders/...` and `/v1.0/me/contacts/...` surfaces;
+the same canonical types feed any future People-API listener when
+that scout doc lands. The Graph mock supports the GET endpoints
+plus the `contacts/delta` walker driven by the change_log.
+
+The Lua loader exposes the same blocks via `contact_folder({...})`
+and `contact({...})` builders; the `emails` field accepts the same
+bare-string-or-table sugar as the TOML form.
+
 ## OAuth (optional)
 
 ```toml
@@ -329,6 +368,26 @@ Op contracts:
   `calendarView/delta` path. Patches use plain RFC3339 strings
   for `start` / `end` (the change-script projection), not the
   Graph nested `start.dateTime` form.
+- **`contact_folder_create`**: array of `{ id, display_name,
+  parent_folder_id?, is_default? }`. Same shape as the top-level
+  `contact_folder` builder. Apply rejects duplicate ids and
+  forward references to undeclared parents.
+- **`contact_folder_update`**: array of `{ id, display_name?,
+  parent_folder_id? }`. At least one field must be set.
+- **`contact_folder_destroy`**: array of folder-id strings. Apply
+  rejects destroy if any contact still references the folder
+  (forces the script author to destroy the contained contacts
+  first).
+- **`contact_create`**: array of `{ id, folder_id, display_name?,
+  emails }`. Same `emails` shape as the static builder. Folder
+  reference is validated at apply time so a step can create the
+  folder earlier in its op list and a contact later.
+- **`contact_update`**: array of `{ id, display_name?,
+  folder_id?, emails? }`. `emails`, when present, is a
+  full-replace. `folder_id` validates against the current
+  fixture's folders at apply time (lets a step move a contact to
+  a folder created by an earlier op in the same step).
+- **`contact_destroy`**: array of contact-id strings.
 
 `fixtures/jmap-incremental.lua` is the canonical example.
 
