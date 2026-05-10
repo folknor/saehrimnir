@@ -18,14 +18,13 @@ correct invariants and accepted trade-offs are omitted.
 
 ### Fix now
 
-- **[bugs] `apply_change_step` rewind drops `contacts` /
-  `contact_folders`.** `src/routes.rs:803-816` snapshots only
-  `emails` / `mailboxes` / `events`; a step that successfully
-  creates a contact and then errors on a later op leaves the
-  contact persisted and the cursor un-advanced, wedging the
-  script. One-line snapshot+restore fix; or restructure the apply
-  path around clone-then-swap so future resource additions don't
-  need a matching rewind line.
+- ~~**[bugs] `apply_change_step` rewind drops `contacts` /
+  `contact_folders`.**~~ Landed. `src/routes.rs::step_fixture`
+  now snapshots and restores both, alongside emails / mailboxes /
+  events. Regression test
+  `tests/step.rs::fixture_step_rewind_covers_contacts_and_contact_folders`.
+  Future-proofing (clone-then-swap restructure) tracked under
+  the closure-only-mutator architectural item.
 - **[bugs] Graph `calendarView/delta` and `contacts/delta` emit
   cross-collection tombstones.** `src/graph/calendar.rs:248-256`
   and `src/graph/contacts.rs:329-336`. The `created` / `updated`
@@ -263,11 +262,12 @@ correct invariants and accepted trade-offs are omitted.
   records under `"caldav"`. `fixture-format.md:233` reads
   "the same canonical types will feed CalDAV when that
   listener lands" - now stale. Update all three.
-- **[docs] `/test/snapshot-state` and `/test/fixture/step`
+- ~~**[docs] `/test/snapshot-state` and `/test/fixture/step`
   responses miss `contacts` / `contact_folders` in the
-  documented JSON shapes.** `notes/orchestration.md:222-232`
-  and `:287-296`. The actual handlers in `src/routes.rs:856-866`
-  emit them.
+  documented JSON shapes.**~~ Landed. `snapshot-state` now
+  emits both fields too (was missing them; the `step` response
+  already did). `notes/orchestration.md` updated to document
+  both shapes including the new fields.
 
 ### Eventually (only when something forces it)
 

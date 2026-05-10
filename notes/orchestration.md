@@ -220,15 +220,20 @@ feature gate guards these. All routes are scoped under `/test/`.
   across runs. Useful for snapshot-style assertions; without
   `?stable=true` the response carries the wall-clock timestamp.
 - `GET /test/snapshot-state` -> JSON projection of the fixture's
-  current mailbox / email / event shape:
+  current mutable state across every resource family:
   ```text
   { "name": "...", "state": "<JMAP state token>",
-    "mailboxes": [{ "id", "name", "role", "parent_id",
-                    "sort_order", "is_subscribed" }],
-    "emails":    [{ "id", "thread_id", "mailbox_ids", "keywords",
-                    "subject", "received_at", "has_attachment" }],
-    "events":    [{ "id", "calendar_id", "subject",
-                    "start", "end", "location" }] }
+    "mailboxes":        [{ "id", "name", "role", "parent_id",
+                           "sort_order", "is_subscribed" }],
+    "emails":           [{ "id", "thread_id", "mailbox_ids",
+                           "keywords", "subject", "received_at",
+                           "has_attachment" }],
+    "events":           [{ "id", "calendar_id", "subject",
+                           "start", "end", "location" }],
+    "contact_folders":  [{ "id", "display_name",
+                           "parent_folder_id", "is_default" }],
+    "contacts":         [{ "id", "folder_id", "display_name",
+                           "emails": [{ "address", "name" }] }] }
   ```
   Body bytes and attachment data are deliberately excluded; tests
   that need the wire body fetch from the protocol's GET surface.
@@ -285,12 +290,16 @@ feature gate guards these. All routes are scoped under `/test/`.
     { "ok": true, "fixture": "<name>", "step": "<id>",
       "applied": 1, "cursor": <new-position>,
       "changes": {
-        "emails":    { "created": [], "updated": [],
-                       "destroyed": [], "moved": [] },
-        "mailboxes": { "created": [], "updated": [],
-                       "destroyed": [] },
-        "events":    { "created": [], "updated": [],
-                       "destroyed": [] }
+        "emails":           { "created": [], "updated": [],
+                              "destroyed": [], "moved": [] },
+        "mailboxes":        { "created": [], "updated": [],
+                              "destroyed": [] },
+        "events":           { "created": [], "updated": [],
+                              "destroyed": [] },
+        "contact_folders":  { "created": [], "updated": [],
+                              "destroyed": [] },
+        "contacts":         { "created": [], "updated": [],
+                              "destroyed": [] }
       },
       "state": "<post-step JMAP state token>" }
     ```

@@ -722,12 +722,42 @@ async fn snapshot_state(State(state): State<AppState>) -> Json<Value> {
             })
         })
         .collect();
+    let contact_folders: Vec<Value> = fix
+        .contact_folders
+        .iter()
+        .map(|f| {
+            json!({
+                "id": f.id,
+                "display_name": f.display_name,
+                "parent_folder_id": f.parent_folder_id,
+                "is_default": f.is_default,
+            })
+        })
+        .collect();
+    let contacts: Vec<Value> = fix
+        .contacts
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "folder_id": c.folder_id,
+                "display_name": c.display_name,
+                "emails": c
+                    .emails
+                    .iter()
+                    .map(|e| json!({ "address": e.address, "name": e.name }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     Json(json!({
         "name": fix.name,
         "state": fix.state,
         "mailboxes": mailboxes,
         "emails": emails,
         "events": events,
+        "contact_folders": contact_folders,
+        "contacts": contacts,
     }))
 }
 
@@ -830,12 +860,16 @@ async fn step_fixture(
             .into_response();
     }
 
-    // Atomic apply: snapshot the mutable fixture sections so we can
-    // rewind on per-op error. Collect the per-op effect lists so the
-    // response can split moves out from regular updates.
+    // Atomic apply: snapshot every mutable fixture section so we can
+    // rewind on per-op error. The snapshot must cover every field
+    // `apply_change_step` is allowed to touch - missing one leaves a
+    // torn write on the failure path. Collect the per-op effect
+    // lists so the response can split moves out from regular updates.
     let saved_emails = fix.emails.clone();
     let saved_mailboxes = fix.mailboxes.clone();
     let saved_events = fix.events.clone();
+    let saved_contacts = fix.contacts.clone();
+    let saved_contact_folders = fix.contact_folders.clone();
 
     let mut diff = crate::fixture::MutationDiff::default();
     let mut moved: Vec<String> = Vec::new();
@@ -847,6 +881,8 @@ async fn step_fixture(
         fix.emails = saved_emails;
         fix.mailboxes = saved_mailboxes;
         fix.events = saved_events;
+        fix.contacts = saved_contacts;
+        fix.contact_folders = saved_contact_folders;
         return (code, Json(payload)).into_response();
     }
 

@@ -208,6 +208,73 @@ async fn fixture_step_expect_mismatch_returns_409_without_advancing() {
 }
 
 #[tokio::test]
+async fn fixture_step_rewind_covers_contacts_and_contact_folders() {
+    // Regression: a step that successfully creates a contact and
+    // then errors on a later op must roll the contact back out.
+    // Previously the snapshot covered only emails / mailboxes /
+    // events, leaving the contact persisted and the cursor
+    // un-advanced - the script became un-replayable.
+    let scenario = r#"
+        fixture({ name = "rewind" })
+        account({ id = "a", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        contact_folder({ id = "cf-1", display_name = "People" })
+        change({
+            id = "creates-contact-then-fails",
+            contact_folder_create = {
+                { id = "cf-2", display_name = "Late additions" },
+            },
+            contact_create = {
+                {
+                    id = "c-1",
+                    folder_id = "cf-2",
+                    display_name = "Carol",
+                    emails = { "carol@example.com" },
+                },
+            },
+            email_destroy = { "missing-email" },
+        })
+    "#;
+    let fix = lua::load_source(scenario, "@rewind").unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let app = routes::router(routes::AppState::for_test(std::sync::Arc::clone(&handle)));
+
+    let (status, _v) = step(&app, json!({})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let snap_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/test/snapshot-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snap_resp.status(), StatusCode::OK);
+    let snap = body_json(snap_resp).await;
+
+    // Both the contact and the contact_folder created earlier in
+    // the step must be rolled back; only the baseline `cf-1` folder
+    // declared at fixture-load time should remain, and no contacts.
+    let folders = snap["contact_folders"].as_array().unwrap();
+    let folder_ids: Vec<&str> = folders.iter().map(|f| f["id"].as_str().unwrap()).collect();
+    assert_eq!(folder_ids, vec!["cf-1"], "snapshot folders: {folders:?}");
+    assert_eq!(
+        snap["contacts"].as_array().unwrap().len(),
+        0,
+        "contact survived rewind: {:?}",
+        snap["contacts"]
+    );
+
+    // Cursor stayed at the failed step; replaying it returns the
+    // same error rather than skipping.
+    let (status, _v) = step(&app, json!({ "expect": "creates-contact-then-fails" })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn fixture_step_reset_rewinds_image_and_cursor() {
     let (app, _handle) = router();
     let s0 = current_state(&app).await;
