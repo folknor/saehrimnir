@@ -37,7 +37,7 @@ brokkr sync-smoke <script.lua>
     │     on BackstopExpired: SIGKILL mock, preserve dir, fail
     │
     ├─ read sentinel content → parse per-protocol ports
-    │     (one line per protocol: JMAP/IMAP/SMTP/GRAPH/GMAIL/CALDAV <port>)
+    │     (one line per protocol: JMAP/IMAP/SMTP/GRAPH/GMAIL/CALDAV/PEOPLE <port>)
     │
     ├─ spawn harness binary
     │     env: RATATOSKR_TEST_JMAP_ENDPOINT=http://127.0.0.1:<jmap-port>
@@ -46,6 +46,7 @@ brokkr sync-smoke <script.lua>
     │          RATATOSKR_TEST_GRAPH_ENDPOINT=http://127.0.0.1:<graph-port>
     │          RATATOSKR_TEST_GMAIL_ENDPOINT=http://127.0.0.1:<gmail-port>
     │          RATATOSKR_TEST_CALDAV_ENDPOINT=http://127.0.0.1:<caldav-port>
+    │          RATATOSKR_TEST_PEOPLE_ENDPOINT=http://127.0.0.1:<people-port>
     │          BROKKR_HARNESS_ARTEFACT_DIR=<run_dir>/harness
     │          BROKKR_TEST_BIN_DIR=<bin dir>
     │          BROKKR_MARKER_FIFO=<fifo path>     (sync-bench only)
@@ -65,7 +66,7 @@ brokkr sync-smoke <script.lua>
                    preserve run dir
 ```
 
-The six env-var names are each configurable via
+The seven env-var names are each configurable via
 `[ratatoskr] test_endpoint_env_<proto>` in ratatoskr's brokkr.toml.
 Plan 3 wires whatever names are configured; we don't hardcode them.
 
@@ -78,7 +79,7 @@ Plan 3 wires whatever names are configured; we don't hardcode them.
   an empty file.
 - **Content:** one line per protocol, each `<NAME> <port>\n`, with
   `<NAME>` upper-case: `JMAP`, `IMAP`, `SMTP`, `GRAPH`, `GMAIL`,
-  `CALDAV`. Every line is always present (we bind every listener,
+  `CALDAV`, `PEOPLE`. Every line is always present (we bind every listener,
   even when the test only cares about one). Brokkr's
   `wait_for_sentinel` doesn't parse the content (it's
   presence-only); plan-3-side code reads the file and picks the

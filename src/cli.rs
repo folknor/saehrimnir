@@ -37,6 +37,15 @@ pub struct Args {
     #[arg(long = "gmail-port", default_value_t = 0)]
     pub gmail_port: u16,
 
+    /// Google People API mock port. `0` (default) picks an ephemeral
+    /// port; the chosen port lands in the readiness file under
+    /// `PEOPLE <port>`. Mounts `/v1/people/me/connections` and
+    /// `/v1/otherContacts` for ratatoskr's contacts client (real
+    /// Google People API lives on a separate host from Gmail, so we
+    /// host it as a sibling listener rather than a path mount).
+    #[arg(long = "people-port", default_value_t = 0)]
+    pub people_port: u16,
+
     /// CalDAV mock port. `0` (default) picks an ephemeral port; the
     /// chosen port lands in the readiness file under `CALDAV <port>`.
     /// Mounts the WebDAV/CalDAV verb surface (PROPFIND, REPORT, GET,

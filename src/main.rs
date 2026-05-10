@@ -67,6 +67,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let caldav_addr = caldav_listener.local_addr()?;
     eprintln!("saehrimnir: caldav listening on {caldav_addr}");
 
+    // Google People API listener (sibling to Gmail; real People API
+    // lives on a different host).
+    let people_listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.people_port)).await?;
+    let people_addr = people_listener.local_addr()?;
+    eprintln!("saehrimnir: people listening on {people_addr}");
+
     sentinel::write_ready(
         &args.readiness_file,
         &[
@@ -93,6 +100,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProtocolPort {
                 name: "CALDAV",
                 port: caldav_addr.port(),
+            },
+            ProtocolPort {
+                name: "PEOPLE",
+                port: people_addr.port(),
             },
         ],
     )
@@ -241,10 +252,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CalDAV server. Reuses the same `SharedHandles` so the
     // request log, latency knob, and fixture image are the same
     // ones the other listeners see.
-    let caldav_state = caldav::AppState { shared };
+    let caldav_state = caldav::AppState {
+        shared: shared.clone(),
+    };
     let caldav_shutdown_rx = shutdown_rx.clone();
     let caldav_task =
         tokio::spawn(async move { caldav::serve(caldav_listener, caldav_state, caldav_shutdown_rx).await });
+
+    // Google People API server.
+    let people_state = saehrimnir::people::AppState { shared };
+    let people_shutdown_rx = shutdown_rx.clone();
+    let people_task = tokio::spawn(async move {
+        saehrimnir::people::serve(people_listener, people_state, people_shutdown_rx).await
+    });
 
     // Race the OS signal handler against any mock_done()/mock_fail()
     // signal raised by a Lua scenario. If the dispatcher is absent
@@ -285,6 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = graph_task.await;
         let _ = gmail_task.await;
         let _ = caldav_task.await;
+        let _ = people_task.await;
     };
     match tokio::time::timeout(SHUTDOWN_BUDGET, drain).await {
         Ok(()) => eprintln!("saehrimnir: clean shutdown"),

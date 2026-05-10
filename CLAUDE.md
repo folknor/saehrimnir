@@ -25,6 +25,10 @@ resource modules), and `notes/` for the per-protocol surface docs.
   categories we'll need to scaffold for later).
 - `notes/ratatoskr-gmail-surface.md` - same shape, for Gmail's REST
   API.
+- `notes/ratatoskr-people-surface.md` - same shape, for Google
+  People API contacts (`/v1/people/me/connections` +
+  `/v1/otherContacts`). Hosted on a separate listener since real
+  People API uses a different host from Gmail.
 - `notes/ratatoskr-oauth-surface.md` - mock OAuth 2.0 provider
   mounted on the JMAP listener (`/oauth/token`,
   `/oauth/userinfo`, `/test/oauth/invalidate`) plus the
@@ -178,6 +182,14 @@ checking whether the fact is already in `notes/`.
   `Calendar` / `Event` fixture types; PUT/DELETE mutate through
   `Fixture::mutate` so Graph `calendarView/delta` observes
   CalDAV writes.
+- `src/people/` - Google People API mock (sibling listener to
+  Gmail; real People API lives on a separate host). `mod.rs`
+  (router, AppState, bearer middleware, `serve` entry,
+  catchall 404), `contacts.rs`
+  (`/v1/people/me/connections` + `/v1/otherContacts` with
+  pageSize / pageToken / syncToken parsing, sync-token
+  recovery via 410). Projects fixture `Contact` entries flat
+  across all folders (People API has no folder concept).
 - `src/gmail/` - Gmail REST mock. `mod.rs` (router, AppState,
   catchall 404), `mail.rs` (profile, labels, threads, history,
   attachments stub, MIME payload builder, hand-rolled base64url).
@@ -207,6 +219,11 @@ checking whether the fact is already in `notes/`.
   binary, polls for the readiness sentinel, hits a real network
   endpoint, sends SIGTERM, asserts a clean exit. Closes the
   coverage gap that `scripts/smoke.sh` covers manually.
+- `tests/people.rs` - People API integration tests via
+  `tower::ServiceExt::oneshot`. Covers the no-token bootstrap
+  + paging via `nextPageToken`, the same-token empty-delta
+  contract, the unknown-token 410 recovery, and `/v1/otherContacts`'s
+  empty-list shape.
 - `tests/caldav.rs` - CalDAV integration tests via
   `tower::ServiceExt::oneshot`. Covers OPTIONS, the discovery
   walk (root + well-known + principal + home + Depth 0/1),
@@ -366,6 +383,23 @@ use the Graph `{ id, "@removed": { reason: "deleted" } }` shape.
 Catchall returns the Graph error envelope so unimplemented
 resources are visibly out-of-scope. Sibling files for drive /
 groups / EWS drop in later.
+
+Google People API: complete for v0's contacts read path. Sibling
+listener to Gmail (real People API lives on a different host).
+`/v1/people/me/connections` (paged with `pageSize` / `pageToken` /
+`syncToken` / `requestSyncToken`; tombstones via
+`metadata.deleted`; `nextSyncToken` on final page only) +
+`/v1/otherContacts` (empty list in v0; fixture format has no
+`[other_contact]` table yet). Sync-token recovery: an unknown
+token returns 410 with the People error envelope, matching the
+substrings ratatoskr's recovery path checks for ("syncToken").
+A token matching the current fixture state returns an empty
+delta + the same token. Catchall returns the People error
+envelope. Mounted on `--people-port`; sentinel grows a
+`PEOPLE <port>\n` line; brokkr orchestration plumbs
+`RATATOSKR_TEST_PEOPLE_ENDPOINT`. ratatoskr-side override
+(parallel to `RATATOSKR_TEST_GMAIL_ENDPOINT`) hasn't landed yet
+- when it does, sæhrimnir is already in place to receive it.
 
 Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`
 + `/labels` + `/threads` (list paginated by `nextPageToken`, with

@@ -21,6 +21,7 @@ pub mod jmap_calendar;
 pub mod latency;
 pub mod lua;
 pub mod oauth;
+pub mod people;
 pub mod request_log;
 pub mod routes;
 pub mod scenario;

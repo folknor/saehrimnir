@@ -86,7 +86,17 @@ matching the Gmail layout.
   POST/PATCH/DELETE / 410 recovery / cross-protocol delta
   visibility.
 
-### Gmail People API contacts
+### Gmail People API contacts - landed
+
+Sibling listener to Gmail at `--people-port` exposing
+`/v1/people/me/connections` and `/v1/otherContacts`. Sentinel
+grows `PEOPLE <port>` and brokkr orchestration plumbs
+`RATATOSKR_TEST_PEOPLE_ENDPOINT`. ratatoskr-side endpoint
+override hasn't landed yet - the listener is already in place
+to receive it. See `notes/ratatoskr-people-surface.md` and
+`tests/people.rs`.
+
+Original scope notes preserved.
 
 ratatoskr at `crates/gmail/src/contacts/` hits
 `https://people.googleapis.com/v1` - again a different host
