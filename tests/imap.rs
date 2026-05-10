@@ -623,6 +623,74 @@ async fn uid_expunge_drops_only_deleted_flagged_messages() {
     assert!(!post.contains("* 2 FETCH"));
 }
 
+#[tokio::test]
+async fn body_raw_bytes_emits_verbatim_through_imap_fetch() {
+    // Adversarial-shape fixture: the email's raw bytes deliberately
+    // claim a multipart/mixed Content-Type but never emit the
+    // boundary, so a strict client will fail to parse. The IMAP
+    // mock must hand the bytes back verbatim - that's the whole
+    // point of the body_raw_bytes escape hatch.
+    let scenario = r#"
+        fixture({ name = "raw" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb-inbox"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "ignored",
+            body_raw_bytes = "From: alice@example.com\r\nSubject: malformed\r\nContent-Type: multipart/mixed; boundary=\"X\"\r\n\r\n--X-but-no-real-boundary\r\nbroken body\r\n",
+        })
+    "#;
+    let imap_script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID FETCH 1 (UID RFC822.SIZE BODY.PEEK[])\r\n\
+        d UID FETCH 1 (BODY.PEEK[HEADER])\r\n\
+        e UID FETCH 1 (BODY.PEEK[TEXT])\r\n\
+        f UID FETCH 1 (BODYSTRUCTURE)\r\n\
+        q LOGOUT\r\n";
+    let out = run_with_lua_scenario(scenario, imap_script).await;
+
+    let raw = "From: alice@example.com\r\nSubject: malformed\r\nContent-Type: multipart/mixed; boundary=\"X\"\r\n\r\n--X-but-no-real-boundary\r\nbroken body\r\n";
+
+    // BODY[] = raw bytes verbatim, RFC822.SIZE = byte length.
+    assert!(out.contains(raw), "BODY[] not verbatim: {out:?}");
+    assert!(
+        out.contains(&format!("RFC822.SIZE {}", raw.len())),
+        "RFC822.SIZE wrong: {out:?}"
+    );
+    assert!(out.contains("c OK UID FETCH completed"));
+
+    // BODY[HEADER] = bytes up to and including the CRLFCRLF.
+    let head = &raw[..raw.find("\r\n\r\n").unwrap() + 4];
+    assert!(
+        out.contains(&format!("BODY[HEADER] {{{}}}\r\n{head}", head.len())),
+        "BODY[HEADER] slice wrong: {out:?}"
+    );
+    assert!(out.contains("d OK UID FETCH completed"));
+
+    // BODY[TEXT] = bytes after CRLFCRLF.
+    let text = &raw[raw.find("\r\n\r\n").unwrap() + 4..];
+    assert!(
+        out.contains(&format!("BODY[TEXT] {{{}}}\r\n{text}", text.len())),
+        "BODY[TEXT] slice wrong: {out:?}"
+    );
+    assert!(out.contains("e OK UID FETCH completed"));
+
+    // BODYSTRUCTURE returns a single text/plain leaf reporting the
+    // raw octet count. Lossy by design (the bytes claim multipart);
+    // this is the documented best-effort answer for raw-bytes emails.
+    assert!(
+        out.contains(&format!(
+            "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \"8BIT\" {} ",
+            raw.len()
+        )),
+        "BODYSTRUCTURE missing raw-leaf shape: {out:?}"
+    );
+    assert!(out.contains("f OK UID FETCH completed"));
+}
+
 /// `UID EXPUNGE` is a no-op when no message in range carries
 /// `\Deleted`: the tagged OK fires but no `* <seq> EXPUNGE` lines
 /// are emitted and the mailbox view is unchanged.

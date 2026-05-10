@@ -616,6 +616,20 @@ pub struct Email {
     pub has_attachment: bool,
     pub body: Body,
     pub attachments: Vec<Attachment>,
+    /// IMAP-wire override. When `Some`, the IMAP layer emits these
+    /// bytes verbatim for `BODY[]` / `RFC822.SIZE` and slices them
+    /// for `BODY[HEADER]` / `BODY[TEXT]` instead of composing from
+    /// the canonical headers + `body` + `attachments`. Lets fixtures
+    /// hand-author malformed MIME (broken boundaries, non-canonical
+    /// header layouts, encoded-word edge cases) for client-tolerance
+    /// tests. JMAP / Gmail / Graph projections ignore this field and
+    /// keep reading from the structured fields, so a fixture that
+    /// wants useful content on the other protocols sets `body_text`
+    /// alongside; a pure-IMAP adversarial fixture can leave
+    /// `body_text` minimal. Mutually exclusive with `attachments`
+    /// (the raw bytes are the entire body, including any MIME
+    /// structure the author wanted).
+    pub raw_bytes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -957,6 +971,9 @@ pub(crate) struct RawEmail {
     pub(crate) has_attachment: Option<bool>,
     #[serde(default)]
     pub(crate) body_text: Option<String>,
+    /// IMAP-wire raw-bytes override. See [`Email::raw_bytes`].
+    #[serde(default)]
+    pub(crate) body_raw_bytes: Option<String>,
     #[serde(default, rename = "attachment")]
     pub(crate) attachments: Vec<RawAttachment>,
 }
@@ -1599,6 +1616,13 @@ pub(crate) fn normalize_email(
         None => !attachments.is_empty(),
     };
 
+    if em.body_raw_bytes.is_some() && !attachments.is_empty() {
+        return Err(format!(
+            "email {:?}: body_raw_bytes is mutually exclusive with attachments (the raw block is the entire body)",
+            em.id
+        ));
+    }
+
     Ok(Email {
         thread_id: em.thread_id.unwrap_or_else(|| em.id.clone()),
         id: em.id,
@@ -1620,6 +1644,7 @@ pub(crate) fn normalize_email(
         has_attachment,
         body,
         attachments,
+        raw_bytes: em.body_raw_bytes,
     })
 }
 

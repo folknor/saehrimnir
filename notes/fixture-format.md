@@ -128,6 +128,48 @@ or require `.eml`? Lean toward adding `body_html` as a parallel field -
 many fixture cases will be "single text/html part" with no need for
 full MIME.
 
+### IMAP raw-bytes escape hatch
+
+A third optional field, `body_raw_bytes`, lets a fixture override
+what the IMAP layer emits for `BODY[]` / `RFC822.SIZE` and the
+`BODY[HEADER]` / `BODY[TEXT]` / `BODY[1]` / `BODY[1.MIME]` slices.
+When set, the IMAP layer hands those bytes back verbatim instead of
+composing from the canonical headers + `body_text` + `attachments`;
+the bytes are split at the first `\r\n\r\n` to derive the header /
+text sub-fetches. Sub-parts (`BODY[N]` for N > 1) return NIL - the
+mock does not parse the raw block. `BODYSTRUCTURE` projects a
+single `text/plain` leaf reporting the raw octet count, which is a
+deliberate lie when the bytes claim multipart but is the best
+syntactically-valid answer the mock can give without parsing.
+
+```toml
+[[email]]
+id = "broken-mp"
+mailbox_ids = ["mb-inbox"]
+received_at = "2026-01-15T10:00:00Z"
+from = "alice@example.com"
+to = ["test@example.com"]
+subject = "malformed"
+body_text = "ignored on the IMAP wire"
+body_raw_bytes = """\
+From: alice@example.com\r
+Subject: malformed\r
+Content-Type: multipart/mixed; boundary="X"\r
+\r
+--X-but-no-real-boundary\r
+broken body\r
+"""
+```
+
+Coexists with `body_text`: structured-projection protocols (JMAP,
+Gmail, Graph) keep reading from `body_text` and ignore the raw
+block, so a fixture can give those clients a sane structured view
+while the IMAP wire shows hand-authored adversarial bytes. Mutually
+exclusive with `attachments` (the raw block IS the entire body, so
+authoring per-attachment metadata alongside is rejected at load
+time). For pure-IMAP adversarial fixtures, `body_text` can be a
+minimal placeholder.
+
 ### Threading
 
 `thread_id` defaults to the email's own `id`, giving each message a

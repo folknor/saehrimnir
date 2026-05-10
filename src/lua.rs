@@ -834,6 +834,7 @@ fn builder_email(state: &mut State) -> dellingr::Result<u8> {
         references: read_string_array_opt(state, 1, "references")?,
         has_attachment: read_bool_opt(state, 1, "has_attachment")?,
         body_text: read_string_opt(state, 1, "body_text")?,
+        body_raw_bytes: read_string_opt(state, 1, "body_raw_bytes")?,
         attachments: read_attachment_array_opt(state, 1, "attachments")?,
     };
     builder_mut(state)?.emails.push(em);
@@ -1723,6 +1724,7 @@ fn read_raw_email_at(state: &mut State, t: isize) -> dellingr::Result<RawEmail> 
         references: read_string_array_opt(state, t, "references")?,
         has_attachment: read_bool_opt(state, t, "has_attachment")?,
         body_text: read_string_opt(state, t, "body_text")?,
+        body_raw_bytes: read_string_opt(state, t, "body_raw_bytes")?,
         attachments: read_attachment_array_opt(state, t, "attachments")?,
     })
 }

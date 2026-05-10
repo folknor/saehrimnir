@@ -1163,6 +1163,7 @@ fn build_email_from_create(
         has_attachment: false,
         body: crate::fixture::Body::Text(String::new()),
         attachments: vec![],
+        raw_bytes: None,
     };
     Ok((server_id, email))
 }
@@ -1611,6 +1612,7 @@ mod tests {
                     has_attachment: false,
                     body: Body::Text("x".into()),
                     attachments: vec![],
+                    raw_bytes: None,
                 },
                 Email {
                     id: "e2".into(),
@@ -1633,6 +1635,7 @@ mod tests {
                     has_attachment: false,
                     body: Body::Text("y".into()),
                     attachments: vec![],
+                    raw_bytes: None,
                 },
             ],
             oauth: crate::fixture::OAuthConfig::default(),
@@ -1771,6 +1774,7 @@ mod tests {
             has_attachment: false,
             body: Body::Text("x".into()),
             attachments: vec![],
+            raw_bytes: None,
         }
     }
 
@@ -2088,6 +2092,7 @@ mod tests {
                 has_attachment: false,
                 body: Body::Text("hello".into()),
                 attachments: vec![],
+                raw_bytes: None,
             }],
             oauth: crate::fixture::OAuthConfig::default(),
             calendars: vec![],

@@ -1763,13 +1763,32 @@ fn flags_for(email: &Email) -> String {
 // multipart bodies, this is the moment to swap in `mail-builder`.
 
 fn render_rfc822(email: &Email) -> String {
+    if let Some(raw) = &email.raw_bytes {
+        return raw.clone();
+    }
     let mut out = render_rfc822_headers(email);
     out.push_str("\r\n");
     out.push_str(&render_rfc822_text_body(email));
     out
 }
 
+/// For raw-bytes emails, slice the verbatim block at the first
+/// `\r\n\r\n` to recover header / body sub-fetches. If no terminator
+/// is present (a fixture deliberately authoring a malformed message
+/// with no header/body separator), the whole block is treated as
+/// headers and the text body comes back empty - lets a client that
+/// fetches `BODY[HEADER]` see what's really there.
+fn split_raw(raw: &str) -> (&str, &str) {
+    match raw.find("\r\n\r\n") {
+        Some(i) => (&raw[..i + 4], &raw[i + 4..]),
+        None => (raw, ""),
+    }
+}
+
 fn render_rfc822_headers(email: &Email) -> String {
+    if let Some(raw) = &email.raw_bytes {
+        return split_raw(raw).0.to_string();
+    }
     let mut out = String::new();
     if let Some(from) = &email.from {
         push_header(&mut out, "From", &format_address(from));
@@ -1825,6 +1844,9 @@ fn render_rfc822_headers(email: &Email) -> String {
 }
 
 fn render_rfc822_text_body(email: &Email) -> String {
+    if let Some(raw) = &email.raw_bytes {
+        return split_raw(raw).1.to_string();
+    }
     if email.attachments.is_empty() {
         return match &email.body {
             Body::Text(t) => normalize_crlf(t),
@@ -1930,8 +1952,16 @@ fn base64_wrapped(input: &[u8]) -> String {
 }
 
 /// Render IMAP `BODYSTRUCTURE` for an email. Single-part text and
-/// multipart/mixed are the only shapes v0 emits.
+/// multipart/mixed are the only shapes v0 emits. Raw-bytes emails
+/// project as a single text/plain leaf reporting the raw octet
+/// count + line count - this is a deliberate lie for adversarial-
+/// shape fixtures (the bytes might be malformed multipart that the
+/// mock cannot honestly summarise), but it gives a syntactically
+/// valid response a non-parsing client can ignore.
 fn render_bodystructure(email: &Email) -> String {
+    if let Some(raw) = &email.raw_bytes {
+        return body_structure_text_leaf(raw, "8BIT", &[("CHARSET", "utf-8")]);
+    }
     if email.attachments.is_empty() {
         let body = match &email.body {
             Body::Text(t) => normalize_crlf(t),
@@ -2014,9 +2044,18 @@ fn format_params(params: &[(&str, &str)]) -> String {
 /// Return the wire bytes for `BODY[N]`. Part 1 is the text body, parts
 /// 2..N+1 are the attachments. For single-part messages, only N=1 is
 /// valid (and equals the body text). Returns `None` for out-of-range
-/// part numbers.
+/// part numbers. Raw-bytes emails answer N=1 with the post-header
+/// slice (matching what `BODY[TEXT]` returns) and `None` for any
+/// other N - the mock does not parse the raw block to discover sub-
+/// parts.
 fn render_part_n(email: &Email, n: u32) -> Option<String> {
     if n == 0 {
+        return None;
+    }
+    if let Some(raw) = &email.raw_bytes {
+        if n == 1 {
+            return Some(split_raw(raw).1.to_string());
+        }
         return None;
     }
     if n == 1 {
@@ -2036,6 +2075,12 @@ fn render_part_n(email: &Email, n: u32) -> Option<String> {
 /// and -Encoding pair.
 fn render_part_n_mime(email: &Email, n: u32) -> Option<String> {
     if n == 0 {
+        return None;
+    }
+    if let Some(raw) = &email.raw_bytes {
+        if n == 1 {
+            return Some(split_raw(raw).0.to_string());
+        }
         return None;
     }
     if email.attachments.is_empty() {
@@ -2196,6 +2241,7 @@ mod tests {
             has_attachment: false,
             body: Body::Text("x".into()),
             attachments: vec![],
+            raw_bytes: None,
         };
         crate::shared::handle(Fixture {
             name: "f".into(),
@@ -2990,6 +3036,7 @@ mod tests {
             has_attachment: false,
             body: Body::Text("hi\nthere".into()),
             attachments: vec![],
+            raw_bytes: None,
         };
         let r = render_rfc822(&e);
         assert!(r.contains("From: Alice <alice@example.com>\r\n"));

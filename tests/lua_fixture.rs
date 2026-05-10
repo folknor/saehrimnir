@@ -92,6 +92,66 @@ fn lua_fixture_matches_equivalent_toml() {
 }
 
 #[test]
+fn body_raw_bytes_loads_and_lives_alongside_body_text() {
+    // Adversarial-shape escape hatch: body_raw_bytes coexists with
+    // body_text. Structured projections (JMAP/Gmail/Graph) read
+    // body_text; the IMAP wire emits body_raw_bytes verbatim.
+    let fix = lua::load_source(
+        r#"
+        fixture({ name = "raw" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "structured view",
+            body_raw_bytes = "From: x@y\r\n\r\nbroken body",
+        })
+        "#,
+        "@raw",
+    )
+    .unwrap();
+    let em = &fix.emails[0];
+    assert!(matches!(&em.body, fixture::Body::Text(t) if t == "structured view"));
+    assert_eq!(em.raw_bytes.as_deref(), Some("From: x@y\r\n\r\nbroken body"));
+}
+
+#[test]
+fn body_raw_bytes_with_attachments_is_rejected() {
+    // The raw block IS the entire body, so attachments make no sense
+    // alongside it. Validation flags this at load time.
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "raw-att" })
+        account({ id = "a", name = "a@b" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "ignored",
+            body_raw_bytes = "raw",
+            attachments = {
+                {
+                    blob_id = "b",
+                    name = "x.txt",
+                    content_type = "text/plain",
+                    data_path = "fixtures/blobs/sample.txt",
+                },
+            },
+        })
+        "#,
+        "@raw-att",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("body_raw_bytes is mutually exclusive with attachments"),
+        "wrong error: {err}"
+    );
+}
+
+#[test]
 fn duplicate_message_id_across_emails_is_accepted() {
     // Adversarial-shape carve-out: two distinct emails sharing the
     // same Message-Id load successfully. None of the per-protocol

@@ -48,8 +48,7 @@ up here.
 
 ## Fixture format growth
 
-The adversarial-shape items unblock JMAP-depth scenarios; the rest
-remain unblocked-but-unneeded.
+Remaining items are unblocked-but-unneeded.
 
 - Future growth on the change-script surface: attachments inside
   `email_create` ops (currently rejected at load), and bumping
@@ -57,15 +56,9 @@ remain unblocked-but-unneeded.
   state derives mechanically from `Fixture::state`, so a step's
   state advance already moves HIGHESTMODSEQ; bumping UIDVALIDITY
   would need a fixture-side knob).
-- Authoring hook for adversarial-shape fixtures: malformed MIME
-  via a `body_raw_bytes = "..."` escape hatch that bypasses the
-  canonical body+attachments projection and emits the bytes
-  verbatim on the IMAP wire. Duplicate `Message-Id` across emails
-  is already accepted (no validator change needed - confirmed and
-  documented in `notes/fixture-format.md`). Slow paged responses
-  are already achievable today via `wait(ms)` inside an `on()`
-  callback - just needs a documented recipe in
-  `notes/fixture-format.md` rather than its own bullet.
+- Documented recipe in `notes/fixture-format.md` for slow paged
+  responses via `wait(ms)` inside an `on()` callback - already
+  achievable today, just needs the writeup.
 - `body_html` parallel to `body_text`. Reserved in
   `notes/fixture-format.md`; not implemented. Pressing once IMAP
   needs to render an HTML wire body or Graph wants HTML rendering.
