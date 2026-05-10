@@ -172,6 +172,10 @@ struct Builder {
     /// `Fixture` (post-normalize) so the step handler can read it
     /// without re-parsing the script.
     change_script: Vec<ChangeStep>,
+    /// Contact folders accumulated via `contact_folder({...})`.
+    contact_folders: Vec<crate::fixture::RawContactFolder>,
+    /// Contacts accumulated via `contact({...})`.
+    contacts: Vec<crate::fixture::RawContact>,
 }
 
 impl Builder {
@@ -191,6 +195,8 @@ impl Builder {
             oauth: self.oauth,
             calendars: vec![],
             events: vec![],
+            contact_folders: self.contact_folders,
+            contacts: self.contacts,
         };
         Ok((raw, self.change_script, self.handlers))
     }
@@ -219,6 +225,10 @@ fn install_builders(state: &mut State) {
     state.set_global("on");
     state.push_rust_fn(builder_change);
     state.set_global("change");
+    state.push_rust_fn(builder_contact_folder);
+    state.set_global("contact_folder");
+    state.push_rust_fn(builder_contact);
+    state.set_global("contact");
     state.push_rust_fn(builder_wait);
     state.set_global("wait");
     state.push_rust_fn(builder_mock_done);
@@ -379,6 +389,83 @@ fn builder_mailbox(state: &mut State) -> dellingr::Result<u8> {
     };
     builder_mut(state)?.mailboxes.push(mb);
     Ok(0)
+}
+
+/// `contact_folder { id, display_name, parent_folder_id?, is_default? }`
+fn builder_contact_folder(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "contact_folder")?;
+    let cf = crate::fixture::RawContactFolder {
+        id: read_string(state, 1, "id")?,
+        display_name: read_string(state, 1, "display_name")?,
+        parent_folder_id: read_string_opt(state, 1, "parent_folder_id")?,
+        is_default: read_bool_opt(state, 1, "is_default")?.unwrap_or(false),
+    };
+    builder_mut(state)?.contact_folders.push(cf);
+    Ok(0)
+}
+
+/// `contact { id, folder_id, display_name?, emails = { "a@b", { name = "X",
+/// address = "x@y" }, ... } }`. Mirrors the address shape used elsewhere:
+/// each entry is either a bare string or a `{name, address}` table.
+fn builder_contact(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "contact")?;
+    let id = read_string(state, 1, "id")?;
+    let folder_id = read_string(state, 1, "folder_id")?;
+    let display_name = read_string_opt(state, 1, "display_name")?;
+    let emails = read_contact_email_array_opt(state, 1, "emails")?;
+    builder_mut(state)?.contacts.push(crate::fixture::RawContact {
+        id,
+        folder_id,
+        display_name,
+        emails,
+    });
+    Ok(0)
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_contact_email_array_opt(
+    state: &mut State,
+    t: isize,
+    key: &str,
+) -> dellingr::Result<Vec<crate::fixture::RawContactEmail>> {
+    let typ = lookup(state, t, key)?;
+    let result: dellingr::Result<Vec<crate::fixture::RawContactEmail>> = match typ {
+        LuaType::Nil => Ok(Vec::new()),
+        LuaType::Table => {
+            let arr = state.get_top() as isize;
+            let len = state.table_len(arr);
+            let mut out = Vec::with_capacity(len);
+            for i in 1..=len {
+                state.push_number(i as f64);
+                state.get_table_raw(arr)?;
+                let entry_typ = state.typ(-1);
+                match entry_typ {
+                    LuaType::String => {
+                        out.push(crate::fixture::RawContactEmail::Bare(state.to_string(-1)?));
+                        state.pop(1);
+                    }
+                    LuaType::Table => {
+                        let entry_idx = state.get_top() as isize;
+                        let address = read_string(state, entry_idx, "address")?;
+                        let name = read_string_opt(state, entry_idx, "name")?;
+                        state.pop(1);
+                        out.push(crate::fixture::RawContactEmail::Full { address, name });
+                    }
+                    _ => {
+                        state.pop(1);
+                        return fail(
+                            state,
+                            format!("field {key:?} entry {i} must be a string or {{address, name}} table"),
+                        );
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => fail(state, format!("field {key:?} must be an array")),
+    };
+    state.pop(1);
+    result
 }
 
 /// Bulk-generate synthetic emails directly into the builder, avoiding

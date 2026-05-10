@@ -26,6 +26,12 @@ pub struct Fixture {
     /// Events scoped to one of the declared calendars by
     /// `calendar_id`. Empty by default.
     pub events: Vec<Event>,
+    /// Contact folders projected over the Graph
+    /// `/v1.0/me/contactFolders/...` surface. Empty by default.
+    pub contact_folders: Vec<ContactFolder>,
+    /// Contacts scoped to a `ContactFolder` by `folder_id`. Empty by
+    /// default.
+    pub contacts: Vec<Contact>,
     /// Per-mutation transition log. Empty at load time (the seed
     /// state is the only known state); each successful `Email/set`
     /// or `Mailbox/set` envelope appends a transition and bumps
@@ -84,6 +90,12 @@ pub struct Transition {
     pub event_created: Vec<String>,
     pub event_updated: Vec<String>,
     pub event_destroyed: Vec<String>,
+    pub contact_created: Vec<String>,
+    pub contact_updated: Vec<String>,
+    pub contact_destroyed: Vec<String>,
+    pub contact_folder_created: Vec<String>,
+    pub contact_folder_updated: Vec<String>,
+    pub contact_folder_destroyed: Vec<String>,
 }
 
 /// Resource-id deltas a single mutator pass produced. Returned by the
@@ -101,6 +113,12 @@ pub struct MutationDiff {
     pub event_created: Vec<String>,
     pub event_updated: Vec<String>,
     pub event_destroyed: Vec<String>,
+    pub contact_created: Vec<String>,
+    pub contact_updated: Vec<String>,
+    pub contact_destroyed: Vec<String>,
+    pub contact_folder_created: Vec<String>,
+    pub contact_folder_updated: Vec<String>,
+    pub contact_folder_destroyed: Vec<String>,
 }
 
 impl MutationDiff {
@@ -114,6 +132,12 @@ impl MutationDiff {
             && self.event_created.is_empty()
             && self.event_updated.is_empty()
             && self.event_destroyed.is_empty()
+            && self.contact_created.is_empty()
+            && self.contact_updated.is_empty()
+            && self.contact_destroyed.is_empty()
+            && self.contact_folder_created.is_empty()
+            && self.contact_folder_updated.is_empty()
+            && self.contact_folder_destroyed.is_empty()
     }
 }
 
@@ -179,6 +203,12 @@ impl Fixture {
                 event_created: vec![],
                 event_updated: vec![],
                 event_destroyed: vec![],
+                contact_created: vec![],
+                contact_updated: vec![],
+                contact_destroyed: vec![],
+                contact_folder_created: vec![],
+                contact_folder_updated: vec![],
+                contact_folder_destroyed: vec![],
             };
         }
         self.change_log.counter += 1;
@@ -196,6 +226,12 @@ impl Fixture {
             event_created: diff.event_created,
             event_updated: diff.event_updated,
             event_destroyed: diff.event_destroyed,
+            contact_created: diff.contact_created,
+            contact_updated: diff.contact_updated,
+            contact_destroyed: diff.contact_destroyed,
+            contact_folder_created: diff.contact_folder_created,
+            contact_folder_updated: diff.contact_folder_updated,
+            contact_folder_destroyed: diff.contact_folder_destroyed,
         };
         if self.change_log.transitions.len() >= ChangeLog::MAX_TRANSITIONS {
             self.change_log.transitions.pop_front();
@@ -245,6 +281,34 @@ impl Fixture {
     pub fn event_delta_since(&self, since: &str) -> Option<DeltaSet> {
         self.delta_since(since, |t| {
             (&t.event_created, &t.event_updated, &t.event_destroyed)
+        })
+    }
+
+    /// Contact-side analogue. Drives the Graph
+    /// `/v1.0/me/contactFolders/{id}/contacts/delta` surface: a
+    /// follow-up call with a known `$deltatoken` returns only the
+    /// contacts that changed since that token. Tokens older than
+    /// the seed (or evicted from the bounded ring) return `None`;
+    /// the Graph layer translates that to a 410 Gone (which
+    /// ratatoskr handles by re-bootstrapping with a full sync).
+    pub fn contact_delta_since(&self, since: &str) -> Option<DeltaSet> {
+        self.delta_since(since, |t| {
+            (
+                &t.contact_created,
+                &t.contact_updated,
+                &t.contact_destroyed,
+            )
+        })
+    }
+
+    /// Contact-folder-side analogue.
+    pub fn contact_folder_delta_since(&self, since: &str) -> Option<DeltaSet> {
+        self.delta_since(since, |t| {
+            (
+                &t.contact_folder_created,
+                &t.contact_folder_updated,
+                &t.contact_folder_destroyed,
+            )
         })
     }
 
@@ -431,6 +495,36 @@ pub struct Event {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactFolder {
+    pub id: String,
+    pub display_name: String,
+    /// Optional parent for nested folders. Graph supports nesting via
+    /// `/v1.0/me/contactFolders/{id}/childFolders`; v0 fixtures stay
+    /// flat, but the field is here so future scenarios can grow into
+    /// it without a schema change.
+    pub parent_folder_id: Option<String>,
+    /// At most one folder per fixture may be `is_default = true`. The
+    /// loader rejects fixtures with multiple defaults; the Graph
+    /// layer surfaces it as the canonical "Contacts" folder a fresh
+    /// Outlook profile creates by default.
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contact {
+    pub id: String,
+    pub folder_id: String,
+    pub display_name: Option<String>,
+    pub emails: Vec<ContactEmail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactEmail {
+    pub address: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub id: String,
     pub name: String,
@@ -583,6 +677,52 @@ pub(crate) struct RawFixture {
     pub(crate) calendars: Vec<RawCalendar>,
     #[serde(default, rename = "event")]
     pub(crate) events: Vec<RawEvent>,
+    #[serde(default, rename = "contact_folder")]
+    pub(crate) contact_folders: Vec<RawContactFolder>,
+    #[serde(default, rename = "contact")]
+    pub(crate) contacts: Vec<RawContact>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawContactFolder {
+    pub(crate) id: String,
+    pub(crate) display_name: String,
+    #[serde(default)]
+    pub(crate) parent_folder_id: Option<String>,
+    #[serde(default)]
+    pub(crate) is_default: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawContact {
+    pub(crate) id: String,
+    pub(crate) folder_id: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) emails: Vec<RawContactEmail>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RawContactEmail {
+    /// Bare address string. Identical sugar to the `email` field on
+    /// emails / events: keeps simple fixtures terse.
+    Bare(String),
+    Full {
+        address: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+}
+
+impl From<RawContactEmail> for ContactEmail {
+    fn from(raw: RawContactEmail) -> Self {
+        match raw {
+            RawContactEmail::Bare(address) => Self { address, name: None },
+            RawContactEmail::Full { address, name } => Self { address, name },
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -878,6 +1018,62 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    // Contact folders + contacts. Same shape as calendars + events:
+    // every contact references a declared folder, ids are unique
+    // within their kind.
+    let mut contact_folder_ids: HashMap<String, ()> = HashMap::new();
+    let mut contact_folders = Vec::with_capacity(raw.contact_folders.len());
+    let mut default_contact_folder_seen: Option<String> = None;
+    for cf in raw.contact_folders {
+        if contact_folder_ids.insert(cf.id.clone(), ()).is_some() {
+            return Err(format!("duplicate contact_folder id {:?}", cf.id));
+        }
+        if cf.is_default {
+            if let Some(prev) = &default_contact_folder_seen {
+                return Err(format!(
+                    "fixture has two default contact folders: {prev:?} and {:?} - is_default = true must be unique",
+                    cf.id
+                ));
+            }
+            default_contact_folder_seen = Some(cf.id.clone());
+        }
+        if let Some(parent) = &cf.parent_folder_id
+            && !contact_folder_ids.contains_key(parent)
+        {
+            // Forward reference: same rule as mailbox parent_id, the
+            // parent must already have been declared.
+            return Err(format!(
+                "contact_folder {:?}: parent_folder_id {parent:?} does not exist",
+                cf.id
+            ));
+        }
+        contact_folders.push(ContactFolder {
+            id: cf.id,
+            display_name: cf.display_name,
+            parent_folder_id: cf.parent_folder_id,
+            is_default: cf.is_default,
+        });
+    }
+    let mut contact_ids: HashMap<String, ()> = HashMap::new();
+    let mut contacts = Vec::with_capacity(raw.contacts.len());
+    for c in raw.contacts {
+        if contact_ids.insert(c.id.clone(), ()).is_some() {
+            return Err(format!("duplicate contact id {:?}", c.id));
+        }
+        if !contact_folder_ids.contains_key(&c.folder_id) {
+            return Err(format!(
+                "contact {:?} references unknown folder {:?}",
+                c.id, c.folder_id
+            ));
+        }
+        contacts.push(Contact {
+            id: c.id,
+            folder_id: c.folder_id,
+            display_name: c.display_name,
+            emails: c.emails.into_iter().map(ContactEmail::from).collect(),
+        });
+    }
+
     let state = raw.state.unwrap_or_else(|| "fixture-state".to_string());
     let change_log = ChangeLog::seed(&state);
     Ok(Fixture {
@@ -892,6 +1088,8 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         oauth,
         calendars,
         events,
+        contact_folders,
+        contacts,
         change_log,
         change_script: Vec::new(),
     })

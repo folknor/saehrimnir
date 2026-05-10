@@ -1640,6 +1640,8 @@ mod tests {
             events: vec![],
             change_log: crate::fixture::ChangeLog::default(),
             change_script: Vec::new(),
+            contact_folders: vec![],
+            contacts: vec![],
         }
     }
 
@@ -1814,6 +1816,8 @@ mod tests {
             events: vec![],
             change_log: crate::fixture::ChangeLog::default(),
             change_script: Vec::new(),
+            contact_folders: vec![],
+            contacts: vec![],
         }
     }
 
@@ -2090,6 +2094,8 @@ mod tests {
             events: vec![],
             change_log: crate::fixture::ChangeLog::default(),
             change_script: Vec::new(),
+            contact_folders: vec![],
+            contacts: vec![],
         }
     }
 
