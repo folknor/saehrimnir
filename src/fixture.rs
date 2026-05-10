@@ -1816,6 +1816,166 @@ fn bool_map(keys: Vec<String>) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
+// ── Patch appliers (change-script side) ─────────────────────────────
+//
+// These operate on canonical fixture types (`Contact`,
+// `ContactFolder`, `Event`) using the snake_case patch shape the
+// change-script projection emits. The JMAP wire-shape patches
+// (`apply_email_patch`, `apply_mailbox_patch`) live in `src/jmap.rs`
+// next to `Email/set` / `Mailbox/set`; the Graph wire-shape event
+// patch (`graph::calendar::apply_event_patch`) decodes Graph's
+// nested `start.dateTime` / `end.dateTime` form. The change-script
+// path keeps its own helper here because flat RFC3339 strings are
+// the projection ratatoskr's harness drives via TOML / Lua.
+
+/// Apply a snake_case patch (`display_name`, `parent_folder_id`)
+/// to a [`ContactFolder`]. Used by change-script
+/// `contact_folder_update` ops.
+pub(crate) fn apply_contact_folder_patch(
+    folder: &mut ContactFolder,
+    patch: &serde_json::Value,
+) -> Result<(), String> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| "patch must be an object".to_string())?;
+    for (k, v) in obj {
+        match k.as_str() {
+            "display_name" => {
+                folder.display_name = v
+                    .as_str()
+                    .ok_or_else(|| "display_name must be a string".to_string())?
+                    .to_string();
+            }
+            "parent_folder_id" => {
+                folder.parent_folder_id = match v {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    _ => return Err("parent_folder_id must be a string or null".to_string()),
+                };
+            }
+            other => return Err(format!("unknown patch field {other:?}")),
+        }
+    }
+    Ok(())
+}
+
+/// Apply a snake_case patch (`display_name`, `folder_id`, `emails`)
+/// to a [`Contact`]. `folder_id` updates that change the value are
+/// rejected: cross-folder moves can't be expressed as a single
+/// update because the source-folder `contacts/delta` walk filters
+/// by current `folder_id` and would never see the moved contact.
+/// Real Microsoft Graph doesn't expose `folder_id` as a writable
+/// property either; clients destroy + create.
+pub(crate) fn apply_contact_patch(
+    contact: &mut Contact,
+    patch: &serde_json::Value,
+    folders: &[ContactFolder],
+) -> Result<(), String> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| "patch must be an object".to_string())?;
+    for (k, v) in obj {
+        match k.as_str() {
+            "display_name" => {
+                contact.display_name = match v {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    _ => return Err("display_name must be a string or null".to_string()),
+                };
+            }
+            "folder_id" => {
+                let id = v
+                    .as_str()
+                    .ok_or_else(|| "folder_id must be a string".to_string())?;
+                if !folders.iter().any(|f| f.id == id) {
+                    return Err(format!("folder_id {id:?} not in fixture"));
+                }
+                if id != contact.folder_id {
+                    return Err(format!(
+                        "folder_id update from {old:?} to {new:?} not supported - issue contact_destroy + contact_create instead",
+                        old = contact.folder_id,
+                        new = id,
+                    ));
+                }
+                contact.folder_id = id.to_string();
+            }
+            "emails" => {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| "emails must be an array".to_string())?;
+                let mut out = Vec::with_capacity(arr.len());
+                for e in arr {
+                    let address = e
+                        .get("address")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "emails entry missing address".to_string())?
+                        .to_string();
+                    let name = e
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    out.push(ContactEmail { address, name });
+                }
+                contact.emails = out;
+            }
+            other => return Err(format!("unknown patch field {other:?}")),
+        }
+    }
+    Ok(())
+}
+
+/// Apply a flat-RFC3339 patch (`subject`, `start`, `end`,
+/// `location`, `body_text`) to an [`Event`]. Mirrors the keys the
+/// change-script `event_update` builder emits. Distinct from
+/// `graph::calendar::apply_event_patch` which decodes Graph's
+/// nested `start.dateTime` shape.
+pub(crate) fn apply_change_event_patch(
+    event: &mut Event,
+    patch: &serde_json::Value,
+) -> Result<(), String> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| "patch must be an object".to_string())?;
+    for (k, v) in obj {
+        match k.as_str() {
+            "subject" => {
+                event.subject = v
+                    .as_str()
+                    .ok_or_else(|| "subject must be a string".to_string())?
+                    .to_string();
+            }
+            "start" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| "start must be an RFC3339 string".to_string())?;
+                event.start = parse_ts(s)?;
+            }
+            "end" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| "end must be an RFC3339 string".to_string())?;
+                event.end = parse_ts(s)?;
+            }
+            "location" => {
+                event.location = match v {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    _ => return Err("location must be a string or null".to_string()),
+                };
+            }
+            "body_text" => {
+                event.body_text = match v {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    _ => return Err("body_text must be a string or null".to_string()),
+                };
+            }
+            other => return Err(format!("unknown patch field {other:?}")),
+        }
+    }
+    Ok(())
+}
+
 /// Project one [`RawChangeStep`] into a [`ChangeStep`]. Op order in
 /// the produced `Vec<ChangeOp>` matches the Lua change builder
 /// (`src/lua.rs::builder_change`); patches are constructed via the

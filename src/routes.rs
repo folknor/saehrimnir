@@ -1250,7 +1250,9 @@ fn apply_change_step(
                         ));
                     }
                 };
-                if let Err(err) = apply_change_event_patch(&mut fix.events[idx], patch) {
+                if let Err(err) =
+                    crate::fixture::apply_change_event_patch(&mut fix.events[idx], patch)
+                {
                     return Err(step_apply_error(
                         &step.id,
                         i,
@@ -1323,7 +1325,7 @@ fn apply_change_step(
                     }
                 };
                 let mut clone = fix.contact_folders[idx].clone();
-                if let Err(err) = apply_contact_folder_patch(&mut clone, patch) {
+                if let Err(err) = crate::fixture::apply_contact_folder_patch(&mut clone, patch) {
                     return Err(step_apply_error(
                         &step.id,
                         i,
@@ -1400,7 +1402,11 @@ fn apply_change_step(
                     }
                 };
                 let mut clone = fix.contacts[idx].clone();
-                if let Err(err) = apply_contact_patch(&mut clone, patch, &fix.contact_folders) {
+                if let Err(err) = crate::fixture::apply_contact_patch(
+                    &mut clone,
+                    patch,
+                    &fix.contact_folders,
+                ) {
                     return Err(step_apply_error(
                         &step.id,
                         i,
@@ -1434,157 +1440,6 @@ fn apply_change_step(
                 diff.contact_destroyed_parents
                     .push(parent.expect("contact existed before retain"));
             }
-        }
-    }
-    Ok(())
-}
-
-fn apply_contact_folder_patch(
-    folder: &mut crate::fixture::ContactFolder,
-    patch: &Value,
-) -> Result<(), String> {
-    let obj = patch
-        .as_object()
-        .ok_or_else(|| "patch must be an object".to_string())?;
-    for (k, v) in obj {
-        match k.as_str() {
-            "display_name" => {
-                folder.display_name = v
-                    .as_str()
-                    .ok_or_else(|| "display_name must be a string".to_string())?
-                    .to_string();
-            }
-            "parent_folder_id" => {
-                folder.parent_folder_id = match v {
-                    Value::Null => None,
-                    Value::String(s) => Some(s.clone()),
-                    _ => return Err("parent_folder_id must be a string or null".to_string()),
-                };
-            }
-            other => return Err(format!("unknown patch field {other:?}")),
-        }
-    }
-    Ok(())
-}
-
-fn apply_contact_patch(
-    contact: &mut crate::fixture::Contact,
-    patch: &Value,
-    folders: &[crate::fixture::ContactFolder],
-) -> Result<(), String> {
-    let obj = patch
-        .as_object()
-        .ok_or_else(|| "patch must be an object".to_string())?;
-    for (k, v) in obj {
-        match k.as_str() {
-            "display_name" => {
-                contact.display_name = match v {
-                    Value::Null => None,
-                    Value::String(s) => Some(s.clone()),
-                    _ => return Err("display_name must be a string or null".to_string()),
-                };
-            }
-            "folder_id" => {
-                let id = v
-                    .as_str()
-                    .ok_or_else(|| "folder_id must be a string".to_string())?;
-                if !folders.iter().any(|f| f.id == id) {
-                    return Err(format!("folder_id {id:?} not in fixture"));
-                }
-                if id != contact.folder_id {
-                    // Cross-folder moves can't be expressed as a
-                    // single update because the source-folder
-                    // `contacts/delta` walk filters by current
-                    // `folder_id` and would never see the moved
-                    // contact (it's not in source any more).
-                    // Source-folder clients would silently lose the
-                    // contact from their cache. Real Microsoft Graph
-                    // doesn't expose folder_id as a writable
-                    // property either; clients destroy + create.
-                    // Force the same here so the change_log
-                    // surfaces both sides through the existing
-                    // contact_destroyed / contact_created
-                    // delta-walk machinery.
-                    return Err(format!(
-                        "folder_id update from {old:?} to {new:?} not supported - issue contact_destroy + contact_create instead",
-                        old = contact.folder_id,
-                        new = id,
-                    ));
-                }
-                contact.folder_id = id.to_string();
-            }
-            "emails" => {
-                let arr = v
-                    .as_array()
-                    .ok_or_else(|| "emails must be an array".to_string())?;
-                let mut out = Vec::with_capacity(arr.len());
-                for e in arr {
-                    let address = e
-                        .get("address")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "emails entry missing address".to_string())?
-                        .to_string();
-                    let name = e
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    out.push(crate::fixture::ContactEmail { address, name });
-                }
-                contact.emails = out;
-            }
-            other => return Err(format!("unknown patch field {other:?}")),
-        }
-    }
-    Ok(())
-}
-
-/// Plain-shape event patch used by change-script `event_update` ops.
-/// Mirrors the keys the Lua builder emits (`subject`, `start`, `end`,
-/// `location`, `body_text`); RFC3339 strings only. Distinct from
-/// `graph::calendar::apply_event_patch` which decodes Graph's nested
-/// `start.dateTime` shape.
-fn apply_change_event_patch(
-    event: &mut crate::fixture::Event,
-    patch: &Value,
-) -> Result<(), String> {
-    let obj = patch
-        .as_object()
-        .ok_or_else(|| "patch must be an object".to_string())?;
-    for (k, v) in obj {
-        match k.as_str() {
-            "subject" => {
-                event.subject = v
-                    .as_str()
-                    .ok_or_else(|| "subject must be a string".to_string())?
-                    .to_string();
-            }
-            "start" => {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| "start must be an RFC3339 string".to_string())?;
-                event.start = crate::fixture::parse_ts(s)?;
-            }
-            "end" => {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| "end must be an RFC3339 string".to_string())?;
-                event.end = crate::fixture::parse_ts(s)?;
-            }
-            "location" => {
-                event.location = match v {
-                    Value::Null => None,
-                    Value::String(s) => Some(s.clone()),
-                    _ => return Err("location must be a string or null".to_string()),
-                };
-            }
-            "body_text" => {
-                event.body_text = match v {
-                    Value::Null => None,
-                    Value::String(s) => Some(s.clone()),
-                    _ => return Err("body_text must be a string or null".to_string()),
-                };
-            }
-            other => return Err(format!("unknown patch field {other:?}")),
         }
     }
     Ok(())

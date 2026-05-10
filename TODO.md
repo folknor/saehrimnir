@@ -228,24 +228,24 @@ correct invariants and accepted trade-offs are omitted.
   refactor above; the prop set is parsed once at PROPFIND
   entry and threaded through `home_collection_props`,
   `calendar_props`, `event_resource_props`.
-- **[arch] `apply_contact_patch` / `apply_contact_folder_patch`
-  / `apply_change_event_patch` live in `src/routes.rs`.**
-  Routes is the HTTP transport seam; canonical-type apply
-  logic belongs alongside the types or in a dedicated patch
-  module. Plus there are now two distinct event-patch shapes
-  (`graph::calendar::apply_event_patch` for Graph wire,
-  `routes::apply_change_event_patch` for the change-script
-  flat-RFC3339 form). Move to `src/fixture/patches.rs` (or
-  onto canonical-type `impl` blocks); keep the JMAP / Graph
-  wire-shape patches in their respective protocol modules.
-- **[arch] Patch field-name conventions diverge.**
-  `apply_mailbox_patch` uses camelCase JMAP names (`parentId`,
-  `sortOrder`, `isSubscribed`); the contact / contact_folder /
-  change-script-event patches use snake_case. Pick a
-  convention per resource family and document it; lean
-  snake_case for change-script-only resources since there's no
-  protocol-wire forcing a name and the canonical types are
-  already snake_case.
+- ~~**[arch] `apply_contact_patch` / `apply_contact_folder_patch`
+  / `apply_change_event_patch` live in `src/routes.rs`.**~~
+  Landed. All three moved to `src/fixture.rs` as `pub(crate)`
+  helpers next to the change-script op builders, since they
+  operate on canonical fixture types and use the snake_case
+  patch shape the change-script projection emits. JMAP wire-
+  shape patches stay in `src/jmap.rs`; Graph wire-shape event
+  patch stays in `src/graph/calendar.rs`. routes.rs now only
+  orchestrates.
+- ~~**[arch] Patch field-name conventions diverge.**~~ Landed.
+  Convention is now explicit and documented in the comment
+  block at the top of the patch-appliers section in
+  `src/fixture.rs`: JMAP wire-shape patches use camelCase
+  (because they are the JMAP wire); change-script-only
+  patches use snake_case (no wire forcing them, and the
+  canonical types are already snake_case). Graph wire-shape
+  event patch keeps the Graph nested form. The split is
+  intentional, not drift.
 - **[arch] `src/routes.rs` has grown to ~1440 lines.** Hosts
   JMAP HTTP, OAuth wiring, SMTP-submission test routes,
   request-log routes, fixture reset, fixture step (with three
@@ -253,16 +253,14 @@ correct invariants and accepted trade-offs are omitted.
   GET/SET, snapshot-state, and an RFC 5987 utility. Split the
   `/test/*` family into `src/routes/test_admin.rs` so the JMAP
   HTTP / OAuth router glue stays scrollable.
-- **[docs] CalDAV is wired but undocumented in
+- ~~**[docs] CalDAV is wired but undocumented in
   `notes/orchestration.md`, `notes/request-log.md`, and
-  `notes/fixture-format.md`.** The sentinel content section
-  (`orchestration.md` line 79) lists the five original
-  protocols; `src/main.rs:94` writes `CALDAV` too. The
-  lifecycle diagram does not list `RATATOSKR_TEST_CALDAV_ENDPOINT`.
-  `request-log.md` enumerates five protocol tags; CalDAV
-  records under `"caldav"`. `fixture-format.md:233` reads
-  "the same canonical types will feed CalDAV when that
-  listener lands" - now stale. Update all three.
+  `notes/fixture-format.md`.**~~ Landed. Lifecycle diagram +
+  sentinel content section + env-var count updated for CALDAV
+  in `orchestration.md`; `request-log.md`'s protocol enum
+  gained `"caldav"`; `fixture-format.md`'s "Calendars and
+  events" paragraph rewritten to describe CalDAV as a live
+  consumer alongside Graph.
 - ~~**[docs] `/test/snapshot-state` and `/test/fixture/step`
   responses miss `contacts` / `contact_folders` in the
   documented JSON shapes.**~~ Landed. `snapshot-state` now

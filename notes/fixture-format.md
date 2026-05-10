@@ -229,11 +229,15 @@ Validation rules:
 - `event.start` and `event.end` are RFC3339; sub-second precision is dropped.
 
 Calendars and events project over the Microsoft Graph
-`/v1.0/me/calendars/...` surface today; the same canonical types
-will feed CalDAV when that listener lands. The Graph mock supports
-the GET endpoints, plus echo-mode POST/PATCH/DELETE that record
-the request body in the cross-protocol request log without
-mutating the fixture (which is read-only in v0).
+`/v1.0/me/calendars/...` surface AND the CalDAV listener (same
+canonical `Calendar` / `Event` types feed both backends). Graph
+covers GET / POST / PATCH / DELETE on `/v1.0/me/events/...` and
+the `calendarView/delta` walker; CalDAV covers PROPFIND
+discovery, REPORT calendar-multiget / calendar-query, GET
+event.ics, and PUT / DELETE with `If-Match`. Mutations in either
+protocol surface in the other's delta path through the shared
+change_log (see `notes/ratatoskr-caldav-surface.md` for the wire
+shape).
 
 ## Contact folders and contacts (optional)
 

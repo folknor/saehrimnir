@@ -24,7 +24,7 @@ Each row carries:
 
 ```
 {
-  "protocol":   "jmap" | "imap" | "smtp" | "graph" | "gmail",
+  "protocol":   "jmap" | "imap" | "smtp" | "graph" | "gmail" | "caldav",
   "command":    string  (protocol-native verb)
   "received_at": RFC 3339 timestamp (wall clock; not byte-stable)
   "detail":     object  (per-protocol structured extras)
