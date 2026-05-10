@@ -1033,7 +1033,11 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
         for (client_id, body) in &creates {
             match build_email_from_create(fix, body) {
                 Ok((server_id, email)) => {
+                    let mailboxes = email.mailbox_ids.clone();
                     fix.emails.push(email);
+                    for mb in &mailboxes {
+                        fix.assign_uid(mb, server_id.clone());
+                    }
                     diff.email_created.push(server_id.clone());
                     created_out.insert(
                         client_id.clone(),
@@ -1061,10 +1065,13 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
                 not_updated.insert(id.clone(), set_error("notFound", "no such email"));
                 continue;
             };
+            let old_mailboxes = fix.emails[idx].mailbox_ids.clone();
             let mut clone = fix.emails[idx].clone();
             match apply_email_patch(&mut clone, patch) {
                 Ok(()) => {
+                    let new_mailboxes = clone.mailbox_ids.clone();
                     fix.emails[idx] = clone;
+                    fix.sync_mailbox_uids(id, &old_mailboxes, &new_mailboxes);
                     diff.email_updated.push(id.clone());
                     updated_out.insert(id.clone(), Value::Null);
                 }
@@ -1076,14 +1083,17 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
 
         // Destroys: drop in place, record id.
         for id in &destroys {
-            let len_before = fix.emails.len();
-            fix.emails.retain(|e| &e.id != id);
-            if fix.emails.len() < len_before {
-                diff.email_destroyed.push(id.clone());
-                destroyed_out.push(id.clone());
-            } else {
+            let Some(idx) = fix.emails.iter().position(|e| &e.id == id) else {
                 not_destroyed.insert(id.clone(), set_error("notFound", "no such email"));
+                continue;
+            };
+            let mailboxes = fix.emails[idx].mailbox_ids.clone();
+            fix.emails.remove(idx);
+            for mb in &mailboxes {
+                fix.retire_uid(mb, id);
             }
+            diff.email_destroyed.push(id.clone());
+            destroyed_out.push(id.clone());
         }
 
         diff
@@ -1645,6 +1655,7 @@ mod tests {
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
+            mailbox_uid_history: std::collections::HashMap::new(),
         }
     }
 
@@ -1822,6 +1833,7 @@ mod tests {
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
+            mailbox_uid_history: std::collections::HashMap::new(),
         }
     }
 
@@ -2101,6 +2113,7 @@ mod tests {
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
+            mailbox_uid_history: std::collections::HashMap::new(),
         }
     }
 

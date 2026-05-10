@@ -870,6 +870,7 @@ async fn step_fixture(
     let saved_events = fix.events.clone();
     let saved_contacts = fix.contacts.clone();
     let saved_contact_folders = fix.contact_folders.clone();
+    let saved_mailbox_uid_history = fix.mailbox_uid_history.clone();
 
     let mut diff = crate::fixture::MutationDiff::default();
     let mut moved: Vec<String> = Vec::new();
@@ -878,11 +879,17 @@ async fn step_fixture(
 
     if let Err((code, payload)) = apply_result {
         // Rewind. The mutation never happened; the cursor stays put.
+        // mailbox_uid_history is part of the rewindable surface
+        // because EmailCreate / EmailUpdate / EmailMove / EmailDestroy
+        // each call assign_uid / retire_uid as they mutate; without
+        // restoring it a half-applied step would leak phantom UID
+        // assignments past the rewind.
         fix.emails = saved_emails;
         fix.mailboxes = saved_mailboxes;
         fix.events = saved_events;
         fix.contacts = saved_contacts;
         fix.contact_folders = saved_contact_folders;
+        fix.mailbox_uid_history = saved_mailbox_uid_history;
         return (code, Json(payload)).into_response();
     }
 
@@ -985,7 +992,11 @@ fn apply_change_step(
                     ));
                 }
                 let id = email.id.clone();
+                let mailboxes = email.mailbox_ids.clone();
                 fix.emails.push(email);
+                for mb in &mailboxes {
+                    fix.assign_uid(mb, id.clone());
+                }
                 diff.email_created.push(id);
             }
             ChangeOp::EmailUpdate { id, patch } => {
@@ -1000,6 +1011,7 @@ fn apply_change_step(
                         ));
                     }
                 };
+                let old_mailboxes = fix.emails[idx].mailbox_ids.clone();
                 let mut clone = fix.emails[idx].clone();
                 if let Err(err) = crate::jmap::apply_email_patch(&mut clone, patch) {
                     return Err(step_apply_error(
@@ -1009,7 +1021,9 @@ fn apply_change_step(
                         &format!("email_update {id:?}: {err}"),
                     ));
                 }
+                let new_mailboxes = clone.mailbox_ids.clone();
                 fix.emails[idx] = clone;
+                fix.sync_mailbox_uids(id, &old_mailboxes, &new_mailboxes);
                 diff.email_updated.push(id.clone());
             }
             ChangeOp::EmailMove { id, mailbox_ids } => {
@@ -1034,20 +1048,25 @@ fn apply_change_step(
                         ));
                     }
                 };
+                let old_mailboxes = fix.emails[idx].mailbox_ids.clone();
                 fix.emails[idx].mailbox_ids = mailbox_ids.clone();
+                fix.sync_mailbox_uids(id, &old_mailboxes, mailbox_ids);
                 diff.email_updated.push(id.clone());
                 moved.push(id.clone());
             }
             ChangeOp::EmailDestroy { id } => {
-                let len_before = fix.emails.len();
-                fix.emails.retain(|e| &e.id != id);
-                if fix.emails.len() == len_before {
+                let Some(idx) = fix.emails.iter().position(|e| &e.id == id) else {
                     return Err(step_apply_error(
                         &step.id,
                         i,
                         "notFound",
                         &format!("email_destroy {id:?}: no such email"),
                     ));
+                };
+                let mailboxes = fix.emails[idx].mailbox_ids.clone();
+                fix.emails.remove(idx);
+                for mb in &mailboxes {
+                    fix.retire_uid(mb, id);
                 }
                 diff.email_destroyed.push(id.clone());
             }

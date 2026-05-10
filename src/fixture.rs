@@ -47,6 +47,22 @@ pub struct Fixture {
     /// fixture image and is restored on `POST /test/fixture/reset`
     /// alongside the rest of the baseline.
     pub change_script: Vec<ChangeStep>,
+    /// Per-mailbox IMAP UID assignment history. Each entry is the
+    /// insertion-ordered list of email ids ever assigned a UID in
+    /// that mailbox. The Nth slot's UID is `N + 1`. Slots flip to
+    /// `None` when an email is removed from the mailbox (delete,
+    /// move out, expunge); slots are NEVER reclaimed, so existing
+    /// UIDs stay put and `UIDNEXT` (= len + 1) only ever grows.
+    /// This is the storage IMAP RFC 3501 §2.3.1.1 requires: a UID
+    /// once assigned must never refer to a different message in
+    /// the same `(UIDVALIDITY, mailbox)` pair, even after the
+    /// original message is gone. Pre-fix the wire derived UIDs
+    /// from filter-then-enumerate over the live email list, which
+    /// silently reused UIDs after deletes / moves and let UIDNEXT
+    /// shrink. JMAP / Graph / CalDAV don't read this field; it's
+    /// IMAP-specific bookkeeping kept in the canonical Fixture so
+    /// every mutation site updates exactly one place.
+    pub mailbox_uid_history: std::collections::HashMap<String, Vec<Option<String>>>,
 }
 
 /// Bounded ring of recent state transitions.
@@ -194,6 +210,97 @@ impl Fixture {
     /// state value when no transition has touched a resource yet.
     pub fn change_log_seed(&self) -> &str {
         &self.change_log.seed
+    }
+
+    /// Read-only view of the per-mailbox UID history. Returns the
+    /// empty slice for an unknown mailbox (no email has ever lived
+    /// there).
+    pub fn uid_history(&self, mailbox_id: &str) -> &[Option<String>] {
+        self.mailbox_uid_history
+            .get(mailbox_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Predicted next UID for `mailbox_id`. Equals
+    /// `uid_history.len() + 1`; monotonically increasing across
+    /// the fixture's lifetime regardless of deletes / moves.
+    pub fn uidnext(&self, mailbox_id: &str) -> u32 {
+        u32::try_from(self.uid_history(mailbox_id).len() + 1).expect("uidnext fits in u32")
+    }
+
+    /// Allocate the next UID slot in `mailbox_id` for `email_id`.
+    /// Pushes onto the history (slot index = uid - 1) and returns
+    /// the assigned UID. Callers must invoke this whenever an
+    /// email gains membership in a mailbox: load-time declaration,
+    /// JMAP `Email/set` create / mailboxIds add, change-script
+    /// `EmailCreate` / `EmailMove`, IMAP `UID COPY`.
+    pub fn assign_uid(&mut self, mailbox_id: &str, email_id: String) -> u32 {
+        let history = self
+            .mailbox_uid_history
+            .entry(mailbox_id.to_string())
+            .or_default();
+        history.push(Some(email_id));
+        u32::try_from(history.len()).expect("uid fits in u32")
+    }
+
+    /// Mark the slot holding `email_id` in `mailbox_id` as retired
+    /// (`None`). Idempotent: missing email or mailbox is a no-op.
+    /// A given email is in a mailbox at most once, so the first
+    /// matching slot wins. The slot is never reclaimed; UIDs
+    /// past it stay assigned.
+    pub fn retire_uid(&mut self, mailbox_id: &str, email_id: &str) {
+        if let Some(history) = self.mailbox_uid_history.get_mut(mailbox_id) {
+            for slot in history.iter_mut() {
+                if slot.as_deref() == Some(email_id) {
+                    *slot = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Sync per-mailbox UID assignments after an in-place edit to
+    /// `email.mailbox_ids`: assign UIDs in newly-joined mailboxes
+    /// and retire UIDs in newly-left ones. Handy for the JMAP /
+    /// change-script paths that apply a JSON patch and don't track
+    /// the membership diff explicitly.
+    pub fn sync_mailbox_uids(
+        &mut self,
+        email_id: &str,
+        old_mailboxes: &[String],
+        new_mailboxes: &[String],
+    ) {
+        for old in old_mailboxes {
+            if !new_mailboxes.iter().any(|n| n == old) {
+                self.retire_uid(old, email_id);
+            }
+        }
+        for new in new_mailboxes {
+            if !old_mailboxes.iter().any(|o| o == new) {
+                self.assign_uid(new, email_id.to_string());
+            }
+        }
+    }
+
+    /// Rebuild `mailbox_uid_history` from the current `emails`
+    /// list, treating each email's membership in each mailbox as a
+    /// fresh load-time declaration. Used by hand-built test
+    /// fixtures (the canonical loader does this in
+    /// `normalize_with_dir`); not for production mutation paths,
+    /// which must use `assign_uid` / `retire_uid` so existing UIDs
+    /// stay stable.
+    #[doc(hidden)]
+    pub fn rebuild_uid_history(&mut self) {
+        self.mailbox_uid_history.clear();
+        for email in &self.emails {
+            for mb in &email.mailbox_ids {
+                self.mailbox_uid_history
+                    .entry(mb.clone())
+                    .or_default()
+                    .push(Some(email.id.clone()));
+            }
+        }
     }
 }
 
@@ -1400,6 +1507,23 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         change_script.push(normalize_change_step(raw_step, &mb_ids, fixture_dir)?);
     }
 
+    // Load-time IMAP UID assignment: each declared email gets its
+    // mailbox UIDs in fixture declaration order. The Nth email
+    // membership in a given mailbox lands at uid N + 1, matching
+    // what the pre-fix filter-then-enumerate path produced for an
+    // unmutated fixture (so existing fixtures, tests, and on-the-
+    // wire UID values are unchanged at load).
+    let mut mailbox_uid_history: std::collections::HashMap<String, Vec<Option<String>>> =
+        std::collections::HashMap::new();
+    for email in &emails {
+        for mb in &email.mailbox_ids {
+            mailbox_uid_history
+                .entry(mb.clone())
+                .or_default()
+                .push(Some(email.id.clone()));
+        }
+    }
+
     let state = raw.state.unwrap_or_else(|| "fixture-state".to_string());
     let change_log = ChangeLog::seed(&state);
     Ok(Fixture {
@@ -1418,6 +1542,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         contacts,
         change_log,
         change_script,
+        mailbox_uid_history,
     })
 }
 

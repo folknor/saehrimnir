@@ -248,13 +248,29 @@ records a transition so the change surfaces in the next JMAP
 (`\Seen`, `\Flagged`, `\Draft`, `\Answered`, `\Deleted`) into
 fixture keywords (`$seen`, ...) and back, supporting `+FLAGS` /
 `-FLAGS` / `FLAGS` plus `.SILENT`. `UID COPY` adds the target
-mailbox id to the matched email's `mailbox_ids[]`; unknown
+mailbox id to the matched email's `mailbox_ids[]` and allocates
+a fresh UID in the target via `Fixture::assign_uid`; unknown
 target returns `NO [TRYCREATE]`. `UID EXPUNGE` drops every
 matched message that carries `\Deleted` from the current
-mailbox, destroying the email entirely when its last mailbox
-membership goes away. Integration tests in `tests/imap.rs`
-drive both the full initial-sync transcript and the persistent
-writeback / copy / expunge round-trips.
+mailbox, retiring its slot in `mailbox_uid_history` (so the UID
+is never reused) and destroying the email entirely when its
+last mailbox membership goes away. Integration tests in
+`tests/imap.rs` drive both the full initial-sync transcript and
+the persistent writeback / copy / expunge round-trips, plus
+RFC 3501 §2.3.1.1 UID-stability regressions.
+
+UIDs are assigned by `Fixture::mailbox_uid_history`: an
+insertion-ordered list of email ids per mailbox. Each addition
+(load-time email declaration, JMAP `Email/set` create / mailboxIds
+add, change-script `EmailCreate` / `EmailMove`, IMAP `UID COPY`)
+calls `Fixture::assign_uid` to push the next slot; deletes /
+moves-out call `retire_uid` to flip the slot to `None`. Slots
+are NEVER reclaimed, so existing UIDs stay stable and UIDNEXT
+(`uid_history.len() + 1`) only ever grows. Sequence numbers are
+the position in the live (non-retired) view, computed by the
+FETCH path. UIDVALIDITY stays pinned at 1 across the fixture
+lifetime; tests that need a UIDVALIDITY bump simulation use
+`POST /test/fixture/reset`.
 
 SMTP: complete for v0's submission path (greeting, EHLO,
 AUTH PLAIN/LOGIN/XOAUTH2/OAUTHBEARER, MAIL FROM, RCPT TO, DATA with

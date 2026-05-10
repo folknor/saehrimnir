@@ -355,6 +355,98 @@ async fn fixture_step_mutation_is_visible_through_imap_status() {
     );
 }
 
+/// Regression for the IMAP UID stability contract across change-
+/// script mutations. Pre-fix, deleting an email made the freed UID
+/// available for reuse on the next `email_create`; any IMAP client
+/// caching by UID would silently see a different message at the
+/// same UID. Tests the full delete-then-create sequence: baseline
+/// has 2 emails (UIDs 1, 2), destroy UID 1, create a third email,
+/// the new email gets UID 3 (NOT UID 1).
+#[tokio::test]
+async fn change_script_destroy_then_create_does_not_reuse_imap_uid() {
+    let scenario = r#"
+        fixture({ name = "uid-stability" })
+        account({ id = "a", name = "test@example.com" })
+        mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox" })
+        email({
+            id = "email-001",
+            mailbox_ids = {"mb-inbox"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "first",
+            message_id = {"<001@x>"},
+        })
+        email({
+            id = "email-002",
+            mailbox_ids = {"mb-inbox"},
+            received_at = "2026-01-15T11:00:00Z",
+            body_text = "second",
+            message_id = {"<002@x>"},
+        })
+        change({
+            id = "destroy",
+            email_destroy = { "email-001" },
+        })
+        change({
+            id = "create",
+            email_create = {
+                {
+                    id = "email-003",
+                    mailbox_ids = {"mb-inbox"},
+                    received_at = "2026-01-15T12:00:00Z",
+                    body_text = "third",
+                    message_id = {"<003@x>"},
+                },
+            },
+        })
+    "#;
+    let fix = lua::load_source(scenario, "@uid-stability").unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let app = routes::router(routes::AppState::for_test(std::sync::Arc::clone(&handle)));
+
+    // Baseline: UIDs 1 and 2 belong to email-001 and email-002.
+    // STATUS UIDNEXT = 3.
+    let baseline = run_imap(
+        &handle,
+        b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID FETCH 1:* (UID)\r\nd STATUS \"INBOX\" (UIDNEXT)\r\ne LOGOUT\r\n",
+    )
+    .await;
+    assert!(baseline.contains("* 1 FETCH (UID 1)"), "baseline: {baseline:?}");
+    assert!(baseline.contains("* 2 FETCH (UID 2)"), "baseline: {baseline:?}");
+    assert!(baseline.contains("UIDNEXT 3"), "baseline UIDNEXT: {baseline:?}");
+
+    // Step "destroy": email-001 (UID 1) goes away.
+    let (status, _) = step(&app, json!({ "expect": "destroy" })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Step "create": email-003 arrives.
+    let (status, _) = step(&app, json!({ "expect": "create" })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // After both steps: email-002 keeps UID 2; email-003 gets UID 3
+    // (NOT UID 1 - that slot is retired). UIDNEXT advances to 4.
+    let after = run_imap(
+        &handle,
+        b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID FETCH 1:* (UID)\r\nd STATUS \"INBOX\" (UIDNEXT)\r\ne LOGOUT\r\n",
+    )
+    .await;
+    assert!(
+        after.contains("* 1 FETCH (UID 2)"),
+        "email-002 should be sequence 1, UID 2 (UID stays put after sibling delete): {after:?}"
+    );
+    assert!(
+        after.contains("* 2 FETCH (UID 3)"),
+        "email-003 should be sequence 2, UID 3 (fresh allocation, not reusing UID 1): {after:?}"
+    );
+    assert!(
+        !after.contains("UID 1)"),
+        "UID 1 must not appear (it was retired by the destroy step): {after:?}"
+    );
+    assert!(
+        after.contains("UIDNEXT 4"),
+        "UIDNEXT should reflect the post-create allocation count, not the live email count: {after:?}"
+    );
+}
+
 async fn run_imap(handle: &saehrimnir::shared::FixtureHandle, script: &[u8]) -> String {
     let fix = std::sync::Arc::clone(handle);
     let (server, mut client) = tokio::io::duplex(32 * 1024);

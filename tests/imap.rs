@@ -612,15 +612,16 @@ async fn uid_expunge_drops_only_deleted_flagged_messages() {
     assert!(out.contains("* 1 EXPUNGE"), "got: {out:?}");
     assert!(!out.contains("* 2 EXPUNGE"));
     assert!(out.contains("d OK UID EXPUNGE completed"));
-    // Post-expunge: UID 1 is gone. UID 2 is the surviving message,
-    // and (since the fixture's enumeration re-numbers from 1 in
-    // each mailbox view) it now fetches as UID 1.
+    // Post-expunge: UID 1 is retired but UID 2 keeps its UID per
+    // RFC 3501 §2.3.1.1 (UIDs must never be reused). The surviving
+    // message takes sequence number 1 (only live message in the
+    // mailbox) but its UID stays 2.
     let post = out.split("d OK UID EXPUNGE completed").nth(1).expect("post-expunge");
     assert!(
-        post.contains("* 1 FETCH (UID 1)"),
-        "surviving message missing post-expunge: {post:?}"
+        post.contains("* 1 FETCH (UID 2)"),
+        "surviving message missing post-expunge or UID was reassigned: {post:?}"
     );
-    assert!(!post.contains("* 2 FETCH"));
+    assert!(!post.contains("UID 1)"), "UID 1 should not have been reused: {post:?}");
 }
 
 #[tokio::test]
@@ -692,6 +693,83 @@ async fn body_raw_bytes_emits_verbatim_through_imap_fetch() {
         "BODYSTRUCTURE missing raw-leaf shape: {out:?}"
     );
     assert!(out.contains("f OK UID FETCH completed"));
+}
+
+/// Regression for the IMAP UID stability contract (RFC 3501
+/// §2.3.1.1): once a UID is assigned to a message in a mailbox, it
+/// must never refer to a different message. Pre-fix the wire
+/// derived UIDs from filter-then-enumerate over the live email
+/// list, so deleting UID 1 silently shifted UID 2 down to UID 1 -
+/// any client cache pointing at UID 1 would now see a different
+/// message without the client knowing the identity changed.
+#[tokio::test]
+async fn uid_expunge_does_not_reuse_uid_after_delete() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID STORE 1 +FLAGS (\\Deleted)\r\n\
+        d UID EXPUNGE 1\r\n\
+        e UID FETCH 1:* (UID)\r\n\
+        f STATUS \"INBOX\" (UIDNEXT)\r\n\
+        g LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+    assert!(out.contains("d OK UID EXPUNGE completed"));
+
+    // After expunging UID 1, the surviving message (UID 2) keeps
+    // UID 2; the addressable UID-1 slot is gone forever. The
+    // sequence number is 1 (only live message) but the UID stays.
+    let post_e = out.split("e OK").next().expect("transcript before e OK");
+    assert!(
+        post_e.contains("* 1 FETCH (UID 2)"),
+        "UID was reused after expunge: {post_e:?}"
+    );
+
+    // UIDNEXT keeps growing across the delete; it never drops back
+    // to the freed value. Pre-fix UIDNEXT was `exists + 1` so a
+    // 2-msg mailbox showed UIDNEXT=3, then after expunging one it
+    // would have shrunk to UIDNEXT=2.
+    assert!(
+        out.contains("UIDNEXT 3"),
+        "UIDNEXT shrank after expunge: {out:?}"
+    );
+}
+
+/// Regression for the cross-mailbox UID stability contract: COPY
+/// allocates a fresh UID in the target mailbox; subsequent EXPUNGE
+/// in the source must not affect the target's UID. Pre-fix any
+/// mutation reshuffled enumeration in BOTH mailboxes.
+#[tokio::test]
+async fn uid_copy_then_source_expunge_keeps_target_uid_stable() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID COPY 1 \"Archive\"\r\n\
+        d UID STORE 1 +FLAGS (\\Deleted)\r\n\
+        e UID EXPUNGE 1\r\n\
+        f SELECT \"Archive\"\r\n\
+        g UID FETCH 1:* (UID)\r\n\
+        h STATUS \"Archive\" (UIDNEXT)\r\n\
+        i LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+    assert!(out.contains("c OK UID COPY completed"));
+    assert!(out.contains("e OK UID EXPUNGE completed"));
+
+    // Archive sees the copied email at UID 1 (its first allocation
+    // in that mailbox), and that UID survives the source-side
+    // expunge.
+    let post_g = out.split("g OK").next().expect("transcript before g OK");
+    assert!(
+        post_g.contains("* 1 FETCH (UID 1)"),
+        "Archive UID changed after source expunge: {post_g:?}"
+    );
+
+    // Archive's UIDNEXT = 2 (one message ever assigned a UID in
+    // Archive). Pre-fix it would have stayed flat across
+    // source-mailbox mutations or reflected source-mailbox state.
+    assert!(
+        out.contains("Archive\" (UIDNEXT 2)"),
+        "Archive UIDNEXT off: {out:?}"
+    );
 }
 
 /// `UID EXPUNGE` is a no-op when no message in range carries

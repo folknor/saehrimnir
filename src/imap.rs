@@ -14,6 +14,7 @@
 //! `notes/ratatoskr-imap-surface.md` for what the client expects on
 //! the wire.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::io::{
@@ -712,15 +713,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // guard drops before we start writing - the writes await on
         // socket I/O and we must never hold a fixture lock across
         // `.await`.
+        //
+        // Sequence number is the message's position in the live
+        // mailbox view (1-based), not the UID. UIDs can have gaps
+        // after EXPUNGE / mailboxIds-removal; sequence numbers
+        // never do.
         let lines: Vec<String> = if changedsince_matches(changedsince) {
             let fix = self.fix_read();
             mailbox_messages(&fix, &selected_id)
                 .into_iter()
-                .filter(|(uid, _)| set.matches(*uid))
-                .map(|(uid, email)| {
-                    // In v0 nothing is ever expunged, so a message's
-                    // sequence number equals its UID.
-                    fetch_response_line(uid, uid, email, &attrs)
+                .enumerate()
+                .filter(|(_, (uid, _))| set.matches(*uid))
+                .map(|(live_idx, (uid, email))| {
+                    let seq = u32::try_from(live_idx + 1).expect("seq fits in u32");
+                    fetch_response_line(seq, uid, email, &attrs)
                 })
                 .collect()
         } else {
@@ -882,25 +888,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 Some(target_id) => {
                     let _ = fix.mutate(|f| {
                         let mut diff = crate::fixture::MutationDiff::default();
-                        let mailbox_indices: Vec<usize> = f
-                            .emails
+                        // Walk uid_history for the source mailbox so
+                        // UIDs match the wire view (slot N -> uid
+                        // N+1, skipping retired slots).
+                        let source_uids: Vec<(u32, String)> = f
+                            .uid_history(&selected_id)
                             .iter()
                             .enumerate()
-                            .filter(|(_, e)| {
-                                e.mailbox_ids.iter().any(|id| id == &selected_id)
+                            .filter_map(|(i, slot)| {
+                                slot.as_ref().map(|id| {
+                                    let uid = u32::try_from(i + 1)
+                                        .expect("uid fits in u32");
+                                    (uid, id.clone())
+                                })
                             })
-                            .map(|(i, _)| i)
                             .collect();
-                        for (slot, idx) in mailbox_indices.iter().copied().enumerate() {
-                            let uid = u32::try_from(slot + 1)
-                                .expect("mailbox seq fits in u32");
+                        for (uid, email_id) in source_uids {
                             if !set.matches(uid) {
                                 continue;
                             }
+                            let Some(idx) =
+                                f.emails.iter().position(|e| e.id == email_id)
+                            else {
+                                continue;
+                            };
                             let email = &mut f.emails[idx];
                             if !email.mailbox_ids.iter().any(|id| id == &target_id) {
                                 email.mailbox_ids.push(target_id.clone());
                                 diff.email_updated.push(email.id.clone());
+                                // Allocate a fresh UID in the
+                                // target mailbox; never reused.
+                                f.assign_uid(&target_id, email_id.clone());
                             }
                         }
                         diff
@@ -953,56 +971,60 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             let mut seqs: Vec<u32> = Vec::new();
             let _ = fix.mutate(|f| {
                 let mut diff = crate::fixture::MutationDiff::default();
-                // Snapshot (seq, fixture_index) for the messages in
-                // this mailbox so we can mutate by `f.emails` index
-                // without losing the original sequence numbers.
-                let mailbox_view: Vec<(u32, usize)> = f
-                    .emails
+                // Walk uid_history for the source mailbox; emit
+                // sequence numbers from the live (non-None) slot
+                // positions per RFC 3501. Each slot's uid is the
+                // slot index + 1; the IMAP `* N EXPUNGE` sequence
+                // number is the live-slot ordinal at the time of
+                // emission (highest first to avoid renumbering
+                // arithmetic).
+                let live: Vec<(u32, u32, String)> = f
+                    .uid_history(&selected_id)
                     .iter()
                     .enumerate()
-                    .filter(|(_, e)| e.mailbox_ids.iter().any(|id| id == &selected_id))
+                    .filter_map(|(i, slot)| {
+                        slot.as_ref().map(|id| {
+                            let uid = u32::try_from(i + 1)
+                                .expect("uid fits in u32");
+                            (uid, id.clone())
+                        })
+                    })
                     .enumerate()
-                    .map(|(slot, (idx, _))| {
-                        let uid =
-                            u32::try_from(slot + 1).expect("mailbox seq fits in u32");
-                        (uid, idx)
+                    .map(|(seq, (uid, id))| {
+                        let seq = u32::try_from(seq + 1)
+                            .expect("seq fits in u32");
+                        (seq, uid, id)
                     })
                     .collect();
-                // Collect the indices we will delete (in fixture
-                // order, ascending) but emit EXPUNGE responses in
-                // descending sequence-number order. Two separate
-                // walks let us remove from `f.emails` in reverse
-                // index order without invalidating earlier indices.
-                let mut victims: Vec<(u32, usize)> = mailbox_view
+                let mut victims: Vec<(u32, String)> = live
                     .iter()
-                    .copied()
-                    .filter(|(uid, idx)| {
+                    .filter(|(_seq, uid, id)| {
                         if !set.matches(*uid) {
                             return false;
                         }
-                        f.emails[*idx]
-                            .keywords
+                        f.emails
                             .iter()
-                            .any(|k| k == "$deleted")
+                            .find(|e| &e.id == id)
+                            .is_some_and(|e| {
+                                e.keywords.iter().any(|k| k == "$deleted")
+                            })
                     })
+                    .map(|(seq, _, id)| (*seq, id.clone()))
                     .collect();
-                // Highest sequence first so the wire-side renumbering
-                // contract holds without us tracking shifts.
-                victims.sort_by_key(|(uid, _)| std::cmp::Reverse(*uid));
-                seqs = victims.iter().map(|(uid, _)| *uid).collect();
-                // Mutate in descending fixture-index order so earlier
-                // indices stay valid through the loop.
-                let mut fixture_indices: Vec<usize> =
-                    victims.iter().map(|(_, idx)| *idx).collect();
-                fixture_indices.sort_unstable_by_key(|i| std::cmp::Reverse(*i));
-                for idx in fixture_indices {
-                    let id = f.emails[idx].id.clone();
+                victims.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+                seqs = victims.iter().map(|(seq, _)| *seq).collect();
+                for (_seq, id) in &victims {
+                    let Some(idx) = f.emails.iter().position(|e| &e.id == id)
+                    else {
+                        continue;
+                    };
                     f.emails[idx].mailbox_ids.retain(|m| m != &selected_id);
+                    f.retire_uid(&selected_id, id);
                     if f.emails[idx].mailbox_ids.is_empty() {
                         f.emails.remove(idx);
-                        diff.email_destroyed.push(id);
+                        diff.email_destroyed.push(id.clone());
                     } else {
-                        diff.email_updated.push(id);
+                        diff.email_updated.push(id.clone());
                     }
                 }
                 diff
@@ -1073,7 +1095,7 @@ struct ListEntry {
 }
 
 fn list_mailboxes(fixture: &Fixture) -> Vec<ListEntry> {
-    let by_id: std::collections::HashMap<&str, &Mailbox> =
+    let by_id: HashMap<&str, &Mailbox> =
         fixture.mailboxes.iter().map(|m| (m.id.as_str(), m)).collect();
     fixture
         .mailboxes
@@ -1090,7 +1112,7 @@ fn list_mailboxes(fixture: &Fixture) -> Vec<ListEntry> {
         .collect()
 }
 
-fn mailbox_path(m: &Mailbox, by_id: &std::collections::HashMap<&str, &Mailbox>) -> String {
+fn mailbox_path(m: &Mailbox, by_id: &HashMap<&str, &Mailbox>) -> String {
     if m.role == Some(Role::Inbox) {
         return "INBOX".to_string();
     }
@@ -1127,40 +1149,57 @@ struct Counts {
     uidnext: u64,
 }
 
-/// Yield `(uid, email)` pairs for emails in `mailbox_id`, in fixture
-/// declaration order. UIDs are 1-based per the determinism contract:
-/// the first email declared in a fixture mailbox is UID 1, the second
-/// is UID 2, etc. Membership is by `mailbox_ids` containment, not by
-/// declaration position, so the order is stable across fixture edits
-/// that don't reorder existing emails.
+/// Yield `(uid, email)` pairs for emails in `mailbox_id`. UIDs come
+/// from `Fixture::mailbox_uid_history`: the slot index plus one is
+/// the IMAP UID, never reused. Slots holding `None` (the email was
+/// removed from this mailbox via delete / move / expunge) are
+/// skipped; their UIDs stay assigned but are no longer addressable.
+/// Live email lookups go through a one-shot `id -> &Email` map so a
+/// big mailbox doesn't go quadratic.
 fn mailbox_messages<'a>(fixture: &'a Fixture, mailbox_id: &str) -> Vec<(u32, &'a Email)> {
-    fixture
+    let by_id: HashMap<&str, &Email> = fixture
         .emails
         .iter()
-        .filter(|e| e.mailbox_ids.iter().any(|id| id == mailbox_id))
+        .map(|e| (e.id.as_str(), e))
+        .collect();
+    fixture
+        .uid_history(mailbox_id)
+        .iter()
         .enumerate()
-        .map(|(i, e)| {
-            let seq = u32::try_from(i + 1).expect("mailbox seq fits in u32");
-            (seq, e)
+        .filter_map(|(i, slot)| {
+            slot.as_deref().and_then(|id| {
+                by_id.get(id).map(|e| {
+                    let uid = u32::try_from(i + 1).expect("uid fits in u32");
+                    (uid, *e)
+                })
+            })
         })
         .collect()
 }
 
 fn mailbox_counts(fixture: &Fixture, mailbox_id: &str) -> Counts {
-    let in_box: Vec<_> = fixture
+    let by_id: HashMap<&str, &Email> = fixture
         .emails
         .iter()
-        .filter(|e| e.mailbox_ids.iter().any(|id| id == mailbox_id))
+        .map(|e| (e.id.as_str(), e))
         .collect();
-    let exists = in_box.len() as u64;
-    let unseen = in_box
-        .iter()
-        .filter(|e| !e.keywords.iter().any(|k| k == "$seen"))
-        .count() as u64;
+    let mut exists: u64 = 0;
+    let mut unseen: u64 = 0;
+    for slot in fixture.uid_history(mailbox_id) {
+        let Some(id) = slot.as_deref() else { continue };
+        let Some(email) = by_id.get(id) else { continue };
+        exists += 1;
+        if !email.keywords.iter().any(|k| k == "$seen") {
+            unseen += 1;
+        }
+    }
     Counts {
         exists,
         unseen,
-        uidnext: exists + 1,
+        // UIDNEXT is monotonically increasing across the fixture's
+        // lifetime: history.len() + 1 keeps growing even after a
+        // delete clears a slot.
+        uidnext: u64::from(fixture.uidnext(mailbox_id)),
     }
 }
 
@@ -2219,6 +2258,7 @@ mod tests {
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
+            mailbox_uid_history: HashMap::new(),
         })
     }
 
@@ -2248,7 +2288,7 @@ mod tests {
             attachments: vec![],
             raw_bytes: None,
         };
-        crate::shared::handle(Fixture {
+        let mut fix = Fixture {
             name: "f".into(),
             state: "s1".into(),
             account: Account {
@@ -2301,7 +2341,11 @@ mod tests {
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
-        })
+            mailbox_uid_history: HashMap::new(),
+        };
+        // Test fixture - rebuild as if loaded.
+        fix.rebuild_uid_history();
+        crate::shared::handle(fix)
     }
 
     #[test]

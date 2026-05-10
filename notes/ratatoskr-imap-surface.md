@@ -150,8 +150,25 @@ sync run:
   `imap_delta_janitor.rs:16-21`.
 
 These must remain stable across runs. v0 mock pins UIDVALIDITY to 1
-and HIGHESTMODSEQ to 1 (it never changes), so resync just sees the
-same values.
+and derives HIGHESTMODSEQ from `Fixture::state`, so each mutation
+that bumps state (JMAP `Email/set`, IMAP `UID STORE`/`COPY`/
+`EXPUNGE`, change-script `email_*` ops) advances HIGHESTMODSEQ.
+
+UID stability (RFC 3501 §2.3.1.1): once assigned, a UID never
+refers to a different message in the same `(UIDVALIDITY, mailbox)`
+pair. The mock honours this by tracking
+`Fixture::mailbox_uid_history`: an insertion-ordered list of email
+ids per mailbox. Each new addition (load-time email declaration,
+JMAP `Email/set` create, change-script `EmailCreate`, `UID COPY`,
+`Email/set` mailboxIds add, change-script `EmailMove`) gets the
+next UID; deletions / moves-out flip the slot to a tombstone but
+the slot is NEVER reclaimed. UIDNEXT (= history.len() + 1) is
+monotonically increasing across the fixture's lifetime. Pre-fix
+the mock derived UIDs from filter-then-enumerate over the live
+email list, so a delete / move would silently shift sibling UIDs
+- a real client treating the new message at the freed UID as a
+content update for the original would corrupt its cache. Reported
+by ratatoskr 2026-05-10.
 
 ## Wire format strictness
 
