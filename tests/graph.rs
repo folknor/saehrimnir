@@ -852,3 +852,178 @@ async fn graph_calendar_mutations_round_trip_through_delta() {
     let _ = initial_events; // documenting the pre-state was 2 too.
 }
 
+
+// ── Contact sync ─────────────────────────────────────────────────────
+
+fn router_contacts() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-contacts-small.toml")).unwrap();
+    graph::router(graph::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+#[tokio::test]
+async fn graph_contact_folders_list_emits_two_folders() {
+    let (status, v) = get_json_with(router_contacts(), "/v1.0/me/contactFolders").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v["@odata.context"],
+        "https://graph.microsoft.com/v1.0/$metadata#me/contactFolders"
+    );
+    let folders = v["value"].as_array().unwrap();
+    assert_eq!(folders.len(), 2);
+    assert_eq!(folders[0]["id"], "cf-default");
+    assert_eq!(folders[0]["displayName"], "Contacts");
+    assert_eq!(folders[1]["id"], "cf-vendors");
+    // No nextLink: the page fits in one shot.
+    assert!(v.get("@odata.nextLink").is_none());
+}
+
+#[tokio::test]
+async fn graph_contact_folder_by_id_returns_single_folder() {
+    let (status, v) = get_json_with(
+        router_contacts(),
+        "/v1.0/me/contactFolders/cf-default",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "cf-default");
+    assert_eq!(v["displayName"], "Contacts");
+}
+
+#[tokio::test]
+async fn graph_contact_folder_default_alias_resolves_to_is_default_folder() {
+    let (status, v) = get_json_with(
+        router_contacts(),
+        "/v1.0/me/contactFolders/default",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "cf-default");
+}
+
+#[tokio::test]
+async fn graph_contact_folder_unknown_id_returns_404() {
+    let (status, _) = get_json_with(
+        router_contacts(),
+        "/v1.0/me/contactFolders/cf-bogus",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_contacts_in_folder_emit_full_projection() {
+    let (status, v) = get_json_with(
+        router_contacts(),
+        "/v1.0/me/contactFolders/cf-default/contacts?$select=id,displayName,emailAddresses,parentFolderId&$top=999",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let contacts = v["value"].as_array().unwrap();
+    // Three contacts in cf-default: contact-001, contact-002, contact-003.
+    // contact-100 is in cf-vendors and must NOT appear here.
+    assert_eq!(contacts.len(), 3);
+    let ids: Vec<&str> = contacts
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["contact-001", "contact-002", "contact-003"]);
+
+    // Wire shape: id, parentFolderId, displayName, emailAddresses
+    // (the array ratatoskr's GraphContact deserialises).
+    let alice = &contacts[0];
+    assert_eq!(alice["parentFolderId"], "cf-default");
+    assert_eq!(alice["displayName"], "Alice Anderson");
+    let emails = alice["emailAddresses"].as_array().unwrap();
+    assert_eq!(emails.len(), 2);
+    assert_eq!(emails[0]["address"], "alice@example.com");
+    assert_eq!(emails[0]["name"], "Alice Anderson");
+    // Bare-string sugar gets folded into {address} with no name.
+    assert_eq!(emails[1]["address"], "alice.anderson@example.org");
+    assert!(emails[1].get("name").is_none());
+
+    // Empty-emails contact still serialises a (empty) emailAddresses
+    // array; ratatoskr's extract_emails will skip it cleanly.
+    let charlie = &contacts[2];
+    assert!(charlie["emailAddresses"].as_array().unwrap().is_empty());
+    assert!(charlie.get("displayName").is_none());
+}
+
+#[tokio::test]
+async fn graph_contacts_in_unknown_folder_returns_404() {
+    let (status, _) = get_json_with(
+        router_contacts(),
+        "/v1.0/me/contactFolders/cf-bogus/contacts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_single_contact_in_folder_returns_one_body() {
+    let (status, v) = get_json_with(
+        router_contacts(),
+        "/v1.0/me/contactFolders/cf-default/contacts/contact-002",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "contact-002");
+    assert_eq!(v["displayName"], "Bob Bell");
+
+    // Wrong folder for that id: 404.
+    let (status, _) = get_json_with(
+        router_contacts(),
+        "/v1.0/me/contactFolders/cf-vendors/contacts/contact-002",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_single_contact_folder_agnostic_resolves_by_id() {
+    let (status, v) = get_json_with(
+        router_contacts(),
+        "/v1.0/me/contacts/contact-100",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "contact-100");
+    assert_eq!(v["parentFolderId"], "cf-vendors");
+}
+
+#[tokio::test]
+async fn graph_contacts_delta_initial_dump_then_latest_shortcut() {
+    let app = router_contacts();
+
+    // Bootstrap: full dump + deltaLink (cf-default has 3 contacts,
+    // small enough to fit in one page).
+    let (status, v) = get_json_with(
+        app.clone(),
+        "/v1.0/me/contactFolders/cf-default/contacts/delta?$select=id",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = v["value"].as_array().unwrap();
+    assert_eq!(value.len(), 3);
+    let delta_link = v["@odata.deltaLink"].as_str().unwrap().to_string();
+
+    // Follow up with the deltaLink's path: empty value, fresh
+    // deltaLink. (Token pinned to current state; nothing changed.)
+    let path_with_token = delta_link
+        .split_once("/v1.0/")
+        .map(|(_, p)| format!("/v1.0/{p}"))
+        .unwrap();
+    let (_, v2) = get_json_with(app.clone(), &path_with_token).await;
+    assert_eq!(v2["value"].as_array().unwrap().len(), 0);
+    assert!(v2["@odata.deltaLink"].is_string());
+
+    // `?$deltatoken=latest` shortcut: empty page, fresh deltaLink,
+    // no contact dump regardless of what's in the fixture.
+    let (status, v3) = get_json_with(
+        app,
+        "/v1.0/me/contactFolders/cf-default/contacts/delta?$deltatoken=latest",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v3["value"].as_array().unwrap().len(), 0);
+    assert!(v3["@odata.deltaLink"].is_string());
+}
