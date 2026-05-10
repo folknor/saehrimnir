@@ -17,7 +17,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::jmap::{self, JmapRequest, JmapResponse};
 use crate::oauth::{self, BearerDecision};
@@ -482,6 +482,14 @@ async fn clear_requests(State(state): State<AppState>) -> StatusCode {
 /// `notes/orchestration.md` (the "Test / admin control plane"
 /// section) and tracked there as the source of truth: this
 /// handler is the implementation, not the spec.
+///
+/// In addition to clearing volatile state, this rewinds the fixture
+/// image itself to the post-load baseline (cloned once at startup
+/// and held on `SharedHandles`). That lets a harness re-run the
+/// same `change(...)` script in one process without restarting the
+/// binary - the cursor goes back to 0 and the next
+/// `POST /test/fixture/step` applies step-1 against a pristine
+/// image. The fixture's read lock is held only briefly.
 async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     state.submission_log.clear();
     state.shared.request_log.clear();
@@ -489,23 +497,492 @@ async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     if let Some(d) = &state.shared.dispatcher {
         d.reset_counts();
     }
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        *fix = (*state.shared.baseline).clone();
+    }
+    {
+        let mut cursor = state.shared.change_cursor.lock().expect("cursor lock poisoned");
+        *cursor = 0;
+    }
     StatusCode::NO_CONTENT
 }
 
-/// `POST /test/fixture/step` -> 501 today; full contract (200
-/// shapes for applied / no-more, 400 for malformed body) lives
-/// in `notes/orchestration.md`. Returns 501 until `[[change]]`
-/// scripts land so harness scripts can detect the gap rather
-/// than silently no-op.
-async fn step_fixture() -> Response {
+/// `POST /test/fixture/step` -> apply the cursor's current step.
+///
+/// Body: optional JSON object. `{}` is fine. `{"expect": "step-id"}`
+/// guards against an out-of-phase harness: the handler verifies that
+/// the cursor's current step has that id and returns 409 on mismatch.
+///
+/// Atomic apply: every op in the step accumulates into one
+/// `MutationDiff` routed through one `Fixture::mutate` call. The
+/// fixture's emails/mailboxes/events are snapshot before applying;
+/// any per-op error rewinds them so a failed step never leaves a
+/// half-mutated fixture (the cursor stays put, too). On success the
+/// cursor advances by one.
+///
+/// Response shape (200) when a step ran:
+/// ```text
+/// { "ok": true, "fixture": "...", "step": "<id>", "applied": 1,
+///   "changes": {
+///       "emails":    { "created": [], "updated": [], "destroyed": [], "moved": [] },
+///       "mailboxes": { "created": [], "updated": [], "destroyed": [] },
+///       "events":    { "created": [], "updated": [], "destroyed": [] }
+///   },
+///   "state": "<post-step JMAP state token>" }
+/// ```
+///
+/// At end of script: 200 with `{"ok": true, "fixture": "...",
+/// "step": null, "applied": false}` so the harness knows the
+/// script is exhausted.
+///
+/// Errors:
+/// - 400 + `{"error": "...", "detail": "..."}` on malformed body.
+/// - 409 + `{"error": "expect mismatch", ...}` when the body's
+///   `expect` does not match the cursor's current step.
+/// - 422 + apply error envelope when an op fails (unknown id,
+///   invalid patch shape, ...). The fixture is not mutated; the
+///   cursor does not advance.
+async fn step_fixture(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body_obj: Map<String, Value> = match body {
+        None => Map::new(),
+        Some(Json(Value::Null)) => Map::new(),
+        Some(Json(Value::Object(m))) => m,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "malformed body",
+                    "detail": "expected an object or empty body",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let expect = match body_obj.get("expect") {
+        None => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "malformed body",
+                    "detail": "`expect` must be a string when present",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut cursor = state.shared.change_cursor.lock().expect("cursor lock poisoned");
+    let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+
+    // Cursor past the script end: nothing to apply.
+    if *cursor >= fix.change_script.len() {
+        return Json(json!({
+            "ok": true,
+            "fixture": fix.name,
+            "step": Value::Null,
+            "applied": false,
+        }))
+        .into_response();
+    }
+
+    let step = fix.change_script[*cursor].clone();
+    if let Some(want) = expect.as_deref()
+        && want != step.id
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "expect mismatch",
+                "detail": format!("cursor is at {:?}; got expect={want:?}", step.id),
+                "cursor_step": step.id,
+                "expect": want,
+            })),
+        )
+            .into_response();
+    }
+
+    // Atomic apply: snapshot the mutable fixture sections so we can
+    // rewind on per-op error. Collect the per-op effect lists so the
+    // response can split moves out from regular updates.
+    let saved_emails = fix.emails.clone();
+    let saved_mailboxes = fix.mailboxes.clone();
+    let saved_events = fix.events.clone();
+
+    let mut diff = crate::fixture::MutationDiff::default();
+    let mut moved: Vec<String> = Vec::new();
+    let apply_result: Result<(), (StatusCode, Value)> =
+        apply_change_step(&mut fix, &step, &mut diff, &mut moved);
+
+    if let Err((code, payload)) = apply_result {
+        // Rewind. The mutation never happened; the cursor stays put.
+        fix.emails = saved_emails;
+        fix.mailboxes = saved_mailboxes;
+        fix.events = saved_events;
+        return (code, Json(payload)).into_response();
+    }
+
+    // Commit: a single mutate call records exactly one transition for
+    // the entire step. The closure does no further mutation - the
+    // fixture already holds the post-step image; we just need to
+    // surface the diff to the change_log.
+    let trans = fix.mutate(|_f| diff);
+
+    *cursor += 1;
+    let cursor_after = *cursor;
+    drop(cursor);
+
+    let new_state = fix.state.clone();
+    let fixture_name = fix.name.clone();
+    drop(fix);
+
+    Json(json!({
+        "ok": true,
+        "fixture": fixture_name,
+        "step": step.id,
+        "applied": 1,
+        "cursor": cursor_after,
+        "changes": {
+            "emails": {
+                "created": trans.email_created,
+                "updated": trans.email_updated,
+                "destroyed": trans.email_destroyed,
+                "moved": moved,
+            },
+            "mailboxes": {
+                "created": trans.mailbox_created,
+                "updated": trans.mailbox_updated,
+                "destroyed": trans.mailbox_destroyed,
+            },
+            "events": {
+                "created": trans.event_created,
+                "updated": trans.event_updated,
+                "destroyed": trans.event_destroyed,
+            },
+        },
+        "state": new_state,
+    }))
+    .into_response()
+}
+
+/// Apply a `ChangeStep` to `fix` in place. Accumulates per-resource id
+/// touches into `diff` for the eventual `Fixture::mutate` commit; the
+/// move-only ids land in `moved` so the step response can surface them
+/// distinctly from regular `email_updated` updates.
+///
+/// Errors are returned as `(StatusCode, JSON envelope)` ready to reply
+/// directly. The caller is expected to rewind any partial mutation
+/// (this function freely mutates as it goes; it does not snapshot).
+#[allow(clippy::too_many_lines)]
+fn apply_change_step(
+    fix: &mut crate::fixture::Fixture,
+    step: &crate::fixture::ChangeStep,
+    diff: &mut crate::fixture::MutationDiff,
+    moved: &mut Vec<String>,
+) -> Result<(), (StatusCode, Value)> {
+    use crate::fixture::ChangeOp;
+    for (i, op) in step.ops.iter().enumerate() {
+        match op {
+            ChangeOp::EmailCreate(email) => {
+                let email = (**email).clone();
+                // Cross-ref guard: every mailbox the email points at
+                // must exist in the *current* fixture. Earlier ops in
+                // this step might have created the mailboxes, so we
+                // check at apply time, not at script load.
+                for mid in &email.mailbox_ids {
+                    if !fix.mailboxes.iter().any(|m| &m.id == mid) {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "unknownMailbox",
+                            &format!("email_create email {:?}: mailbox {mid:?} not in fixture", email.id),
+                        ));
+                    }
+                }
+                if fix.emails.iter().any(|e| e.id == email.id) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "duplicate",
+                        &format!("email_create email {:?}: id already exists", email.id),
+                    ));
+                }
+                let id = email.id.clone();
+                fix.emails.push(email);
+                diff.email_created.push(id);
+            }
+            ChangeOp::EmailUpdate { id, patch } => {
+                let idx = match fix.emails.iter().position(|e| &e.id == id) {
+                    Some(i) => i,
+                    None => {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "notFound",
+                            &format!("email_update {id:?}: no such email"),
+                        ));
+                    }
+                };
+                let mut clone = fix.emails[idx].clone();
+                if let Err(err) = crate::jmap::apply_email_patch(&mut clone, patch) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "invalidPatch",
+                        &format!("email_update {id:?}: {err}"),
+                    ));
+                }
+                fix.emails[idx] = clone;
+                diff.email_updated.push(id.clone());
+            }
+            ChangeOp::EmailMove { id, mailbox_ids } => {
+                for mid in mailbox_ids {
+                    if !fix.mailboxes.iter().any(|m| &m.id == mid) {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "unknownMailbox",
+                            &format!("email_move {id:?}: mailbox {mid:?} not in fixture"),
+                        ));
+                    }
+                }
+                let idx = match fix.emails.iter().position(|e| &e.id == id) {
+                    Some(i) => i,
+                    None => {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "notFound",
+                            &format!("email_move {id:?}: no such email"),
+                        ));
+                    }
+                };
+                fix.emails[idx].mailbox_ids = mailbox_ids.clone();
+                diff.email_updated.push(id.clone());
+                moved.push(id.clone());
+            }
+            ChangeOp::EmailDestroy { id } => {
+                let len_before = fix.emails.len();
+                fix.emails.retain(|e| &e.id != id);
+                if fix.emails.len() == len_before {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "notFound",
+                        &format!("email_destroy {id:?}: no such email"),
+                    ));
+                }
+                diff.email_destroyed.push(id.clone());
+            }
+            ChangeOp::MailboxCreate(mailbox) => {
+                let mailbox = (**mailbox).clone();
+                if fix.mailboxes.iter().any(|m| m.id == mailbox.id) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "duplicate",
+                        &format!("mailbox_create {:?}: id already exists", mailbox.id),
+                    ));
+                }
+                if let Some(parent) = &mailbox.parent_id
+                    && !fix.mailboxes.iter().any(|m| &m.id == parent)
+                {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "unknownParent",
+                        &format!(
+                            "mailbox_create {:?}: parent {parent:?} not in fixture",
+                            mailbox.id
+                        ),
+                    ));
+                }
+                let id = mailbox.id.clone();
+                fix.mailboxes.push(mailbox);
+                diff.mailbox_created.push(id);
+            }
+            ChangeOp::MailboxUpdate { id, patch } => {
+                let idx = match fix.mailboxes.iter().position(|m| &m.id == id) {
+                    Some(i) => i,
+                    None => {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "notFound",
+                            &format!("mailbox_update {id:?}: no such mailbox"),
+                        ));
+                    }
+                };
+                let mut clone = fix.mailboxes[idx].clone();
+                if let Err(err) = crate::jmap::apply_mailbox_patch(&mut clone, patch) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "invalidPatch",
+                        &format!("mailbox_update {id:?}: {err}"),
+                    ));
+                }
+                fix.mailboxes[idx] = clone;
+                diff.mailbox_updated.push(id.clone());
+            }
+            ChangeOp::MailboxDestroy { id } => {
+                let still_referenced = fix
+                    .emails
+                    .iter()
+                    .any(|e| e.mailbox_ids.iter().any(|m| m == id));
+                if still_referenced {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "mailboxHasEmail",
+                        &format!("mailbox_destroy {id:?}: mailbox is referenced by an email"),
+                    ));
+                }
+                let len_before = fix.mailboxes.len();
+                fix.mailboxes.retain(|m| &m.id != id);
+                if fix.mailboxes.len() == len_before {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "notFound",
+                        &format!("mailbox_destroy {id:?}: no such mailbox"),
+                    ));
+                }
+                diff.mailbox_destroyed.push(id.clone());
+            }
+            ChangeOp::EventCreate(event) => {
+                let event = (**event).clone();
+                if !fix.calendars.iter().any(|c| c.id == event.calendar_id) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "unknownCalendar",
+                        &format!(
+                            "event_create {:?}: calendar {:?} not in fixture",
+                            event.id, event.calendar_id
+                        ),
+                    ));
+                }
+                if fix.events.iter().any(|e| e.id == event.id) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "duplicate",
+                        &format!("event_create {:?}: id already exists", event.id),
+                    ));
+                }
+                let id = event.id.clone();
+                fix.events.push(event);
+                diff.event_created.push(id);
+            }
+            ChangeOp::EventUpdate { id, patch } => {
+                let idx = match fix.events.iter().position(|e| &e.id == id) {
+                    Some(i) => i,
+                    None => {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "notFound",
+                            &format!("event_update {id:?}: no such event"),
+                        ));
+                    }
+                };
+                if let Err(err) = apply_change_event_patch(&mut fix.events[idx], patch) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "invalidPatch",
+                        &format!("event_update {id:?}: {err}"),
+                    ));
+                }
+                diff.event_updated.push(id.clone());
+            }
+            ChangeOp::EventDestroy { id } => {
+                let len_before = fix.events.len();
+                fix.events.retain(|e| &e.id != id);
+                if fix.events.len() == len_before {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "notFound",
+                        &format!("event_destroy {id:?}: no such event"),
+                    ));
+                }
+                diff.event_destroyed.push(id.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Plain-shape event patch used by change-script `event_update` ops.
+/// Mirrors the keys the Lua builder emits (`subject`, `start`, `end`,
+/// `location`, `body_text`); RFC3339 strings only. Distinct from
+/// `graph::calendar::apply_event_patch` which decodes Graph's nested
+/// `start.dateTime` shape.
+fn apply_change_event_patch(
+    event: &mut crate::fixture::Event,
+    patch: &Value,
+) -> Result<(), String> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| "patch must be an object".to_string())?;
+    for (k, v) in obj {
+        match k.as_str() {
+            "subject" => {
+                event.subject = v
+                    .as_str()
+                    .ok_or_else(|| "subject must be a string".to_string())?
+                    .to_string();
+            }
+            "start" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| "start must be an RFC3339 string".to_string())?;
+                event.start = crate::fixture::parse_ts(s)?;
+            }
+            "end" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| "end must be an RFC3339 string".to_string())?;
+                event.end = crate::fixture::parse_ts(s)?;
+            }
+            "location" => {
+                event.location = match v {
+                    Value::Null => None,
+                    Value::String(s) => Some(s.clone()),
+                    _ => return Err("location must be a string or null".to_string()),
+                };
+            }
+            "body_text" => {
+                event.body_text = match v {
+                    Value::Null => None,
+                    Value::String(s) => Some(s.clone()),
+                    _ => return Err("body_text must be a string or null".to_string()),
+                };
+            }
+            other => return Err(format!("unknown patch field {other:?}")),
+        }
+    }
+    Ok(())
+}
+
+fn step_apply_error(step_id: &str, op_index: usize, kind: &str, detail: &str) -> (StatusCode, Value) {
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "fixture step not implemented",
-            "detail": "no [[change]] scripts in v0; see TODO.md \"Fixture format growth\""
-        })),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({
+            "error": "step apply failed",
+            "step": step_id,
+            "op_index": op_index,
+            "kind": kind,
+            "detail": detail,
+        }),
     )
-        .into_response()
 }
 
 /// Percent-encode `s` for use as the value of an RFC 5987

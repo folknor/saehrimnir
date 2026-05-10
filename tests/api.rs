@@ -1012,7 +1012,7 @@ async fn test_fixture_reset_clears_both_logs() {
 }
 
 #[tokio::test]
-async fn test_fixture_step_returns_501_until_change_scripts_land() {
+async fn test_fixture_step_with_no_change_script_reports_end_of_script() {
     let app = router_with_logs(
         saehrimnir::smtp::SubmissionLog::default(),
         saehrimnir::request_log::RequestLog::default(),
@@ -1027,10 +1027,13 @@ async fn test_fixture_step_returns_501_until_change_scripts_land() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    // Fixture has no change_script; cursor is past the (empty) end,
+    // so the response is the boring end-of-script shape.
+    assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
-    assert_eq!(v["error"], "fixture step not implemented");
-    assert!(v["detail"].as_str().unwrap().contains("[[change]]"));
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["applied"], false);
+    assert!(v["step"].is_null());
 }
 
 // ── /oauth/* + /test/oauth/invalidate ───────────────────────────────
