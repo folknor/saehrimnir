@@ -157,18 +157,22 @@ correct invariants and accepted trade-offs are omitted.
   twice` follow-up - now it's exactly one clone of the live
   deque per call. The handler-side `?stable=true` rebuild of
   `Value` per row remains as a separate item below.
-- **[bugs] CalDAV `xml::body_requests_prop` is a substring
-  match.** `src/caldav/xml.rs:32-46` matches
-  `calendar-multiget` against any element containing the
-  substring (e.g. a hypothetical `calendar-multiget-set` or a
-  comment). v0 fixtures don't collide; tighten if a future
-  fixture grows mixed-element bodies.
-- **[bugs] CalDAV path parsing accepts duplicated slashes /
-  doesn't percent-decode.** `src/caldav/mod.rs:183-217`
-  collapses `///` so request_log entries don't uniquely
-  identify the path; calendar / event ids that round-trip
-  through real clients carrying `%`-encoded characters won't
-  match. Reject `//` and percent-decode each segment.
+- ~~**[bugs] CalDAV `xml::body_requests_prop` is a substring
+  match.**~~ Landed. New `xml::requested_props(body)` parses
+  the propfind body once into a `HashSet<String>`, skipping
+  comments, CDATA sections, processing instructions, and
+  `<!DOCTYPE>` declarations. Every PROPFIND handler computes
+  the set at entry and consults it via `contains`; folds in
+  the matching `[perf] CalDAV PROPFIND `body_requests_prop`
+  runs per event per property` item below. `body_requests_prop`
+  remains as a thin wrapper for one-shot tests.
+- ~~**[bugs] CalDAV path parsing accepts duplicated slashes /
+  doesn't percent-decode.**~~ Landed. `parse_path` rejects any
+  trimmed-path segment that's empty (`/calendars//u/cal/` →
+  `Unknown`) and percent-decodes each segment via the new
+  `percent_decode` helper, so calendar / event ids that
+  round-trip through clients carrying `%XX`-encoded chars
+  match. Tests in `tests/caldav.rs`.
 - **[perf] `Fixture::delta_since` cancel set is O(c·d).**
   `src/fixture.rs:355-360` does `destroyed.contains(id)`
   (linear `Vec` scan) per created id. With a 256-transition
@@ -223,13 +227,11 @@ correct invariants and accepted trade-offs are omitted.
   `(U + D) · N` per envelope. Build an `id → idx` map at the
   top of the handler; rewrite `retain` as a single pass
   consulting a `HashSet<&str>` of destroy ids.
-- **[perf] CalDAV PROPFIND `body_requests_prop` runs per event
-  per property.** `src/caldav/mod.rs:333-338` calls 3× per
-  event in `event_resource_props`, each call up to 4
-  substring searches. For a calendar with 100k events and a
-  1KB request body: ~1.2GB of byte scans. Parse the prop set
-  once at the PROPFIND entry point into a `HashSet<&str>` and
-  pass down.
+- ~~**[perf] CalDAV PROPFIND `body_requests_prop` runs per event
+  per property.**~~ Landed via the `xml::requested_props`
+  refactor above; the prop set is parsed once at PROPFIND
+  entry and threaded through `home_collection_props`,
+  `calendar_props`, `event_resource_props`.
 - **[arch] `apply_contact_patch` / `apply_contact_folder_patch`
   / `apply_change_event_patch` live in `src/routes.rs`.**
   Routes is the HTTP transport seam; canonical-type apply

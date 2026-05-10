@@ -23,26 +23,86 @@ pub(crate) fn escape(s: &str) -> String {
     out
 }
 
+/// Walk the propfind body and return every requested property's
+/// local name (namespace prefix stripped). PROPFIND handlers call
+/// this once at entry and check membership on the resulting set;
+/// parsing the body once per request is O(body) instead of
+/// O(body * props) for the per-prop substring matcher.
+///
+/// Comments (`<!-- -->`), CDATA sections, processing instructions,
+/// and `<!DOCTYPE>` declarations are skipped, which closes the
+/// substring-match false-positive where a comment containing
+/// `<some-prop>` would have been treated as a request for that
+/// prop. Non-prop wrapper elements (`propfind`, `prop`) are
+/// included in the set too; that's harmless because PROPFIND
+/// handlers only look up specific known names.
+pub(crate) fn requested_props(body: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"<!--") {
+            match body[i..].find("-->") {
+                Some(end) => i += end + 3,
+                None => return out,
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"<![CDATA[") {
+            match body[i..].find("]]>") {
+                Some(end) => i += end + 3,
+                None => return out,
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"<?") {
+            match body[i..].find("?>") {
+                Some(end) => i += end + 2,
+                None => return out,
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"<!") {
+            match body[i..].find('>') {
+                Some(end) => i += end + 1,
+                None => return out,
+            }
+            continue;
+        }
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let after = &body[i + 1..];
+        // Closing tags: skip.
+        if after.starts_with('/') {
+            i += 1;
+            continue;
+        }
+        // Read the tag name (until the first whitespace, `/`, or `>`).
+        let name_end = after
+            .find([' ', '>', '/', '\t', '\n', '\r'])
+            .unwrap_or(after.len());
+        let raw_name = &after[..name_end];
+        let local = match raw_name.find(':') {
+            Some(j) => &raw_name[j + 1..],
+            None => raw_name,
+        };
+        if !local.is_empty() {
+            out.insert(local.to_string());
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Returns true if the propfind body contains a request for the
-/// named property, regardless of XML namespace prefix. v0's
-/// matcher is a simple substring search on the local name surrounded
-/// by element-shape characters (`<` / `>` / whitespace / `:`); good
-/// enough since the bodies are small and the property names are
-/// distinctive.
+/// named property, regardless of XML namespace prefix. Wrapper
+/// around [`requested_props`] for callers that only need to
+/// check one prop; PROPFIND handlers that check several should
+/// build the set once and consult it directly.
 pub(crate) fn body_requests_prop(body: &str, local_name: &str) -> bool {
-    // Match on `:<local-name>/`, `:<local-name>>`, `<local-name>/`,
-    // or `<local-name>>`. Covers `<D:current-user-principal/>`
-    // (self-closing with namespace prefix), `<current-user-principal/>`
-    // (default namespace), and the open/close form
-    // `<C:calendar-home-set></C:calendar-home-set>`.
-    let needle_prefixed_close = format!(":{local_name}/");
-    let needle_prefixed_open = format!(":{local_name}>");
-    let needle_bare_close = format!("<{local_name}/");
-    let needle_bare_open = format!("<{local_name}>");
-    body.contains(&needle_prefixed_close)
-        || body.contains(&needle_prefixed_open)
-        || body.contains(&needle_bare_close)
-        || body.contains(&needle_bare_open)
+    requested_props(body).contains(local_name)
 }
 
 /// Extract every `<href>` element value from an XML body, regardless
@@ -176,5 +236,41 @@ mod tests {
     fn escape_handles_ampersand_and_tags() {
         assert_eq!(escape("a & b"), "a &amp; b");
         assert_eq!(escape("<b>"), "&lt;b&gt;");
+    }
+
+    #[test]
+    fn requested_props_skips_xml_comments() {
+        // Substring-only matchers used to false-positive when a
+        // prop name appeared inside a comment.
+        let body = r#"<D:propfind xmlns:D="DAV:">
+            <!-- earlier draft asked for <D:current-user-principal/> -->
+            <D:prop><D:displayname/></D:prop>
+        </D:propfind>"#;
+        let props = requested_props(body);
+        assert!(props.contains("displayname"));
+        assert!(
+            !props.contains("current-user-principal"),
+            "comment-resident prop name leaked into the requested set: {props:?}"
+        );
+    }
+
+    #[test]
+    fn requested_props_skips_processing_instructions_and_doctype() {
+        let body = r#"<?xml version="1.0"?>
+            <!DOCTYPE propfind PUBLIC "ignored" "ignored">
+            <D:propfind xmlns:D="DAV:"><D:prop><D:displayname/></D:prop></D:propfind>"#;
+        let props = requested_props(body);
+        assert!(props.contains("displayname"));
+    }
+
+    #[test]
+    fn requested_props_handles_namespace_prefixes_and_no_prefix() {
+        let body = r#"<propfind xmlns="DAV:"><prop>
+            <displayname/>
+            <D:getctag xmlns:D="DAV:"/>
+        </prop></propfind>"#;
+        let props = requested_props(body);
+        assert!(props.contains("displayname"));
+        assert!(props.contains("getctag"));
     }
 }

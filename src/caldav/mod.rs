@@ -226,13 +226,29 @@ fn parse_path(fixture: &crate::fixture::Fixture, path: &str) -> ResourcePath {
     if path == "/.well-known/caldav" || path == "/.well-known/caldav/" {
         return ResourcePath::WellKnown;
     }
+    // Reject paths with empty segments (`//`, `/calendars//cal/`).
+    // Pre-fix the segment-filter swallowed them, so the request log
+    // and per-resource caches couldn't tell `/calendars/u/cal/`
+    // apart from `/calendars//u///cal//`. This is also defence-in-
+    // depth against any future filesystem-touching code path.
     let trimmed = path.trim_end_matches('/');
-    let segments: Vec<&str> = trimmed
+    if trimmed.split('/').skip(1).any(str::is_empty) {
+        return ResourcePath::Unknown;
+    }
+    // Percent-decode each segment so calendar / event ids that
+    // round-trip through real clients carrying `%`-encoded
+    // characters (Apple Calendar happily emits them) match the
+    // fixture-declared id. Decode failures fall back to the raw
+    // bytes so a deliberately-malformed segment still routes to
+    // Unknown without panicking.
+    let segments: Vec<String> = trimmed
         .split('/')
         .filter(|s| !s.is_empty())
+        .map(percent_decode)
         .collect();
     let user = &fixture.account.id;
-    match segments.as_slice() {
+    let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    match segs.as_slice() {
         ["principals", u] if u == user => ResourcePath::Principal {
             user: (*u).to_string(),
         },
@@ -255,22 +271,57 @@ fn parse_path(fixture: &crate::fixture::Fixture, path: &str) -> ResourcePath {
     }
 }
 
+/// Decode percent-escapes (`%XX`) in a single URL path segment.
+/// Slashes inside encoded form (`%2F`) decode to literal `/`,
+/// which is the right answer for a single segment - the slash
+/// split that produced this segment already happened. Malformed
+/// escapes (`%X`, `%`, non-hex) pass through verbatim so a
+/// deliberately-broken path still routes deterministically.
+fn percent_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            // hi/lo are <= 0xF; the OR fits in u8.
+            out.push(u8::try_from((hi << 4) | lo).expect("hex pair fits in u8"));
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| {
+        // Non-UTF-8 percent-decoded bytes: fall back to the raw
+        // input. A real client wouldn't send these for an
+        // ASCII-id fixture; defensive only.
+        String::from_utf8_lossy(e.as_bytes()).into_owned()
+    })
+}
+
 /// PROPFIND on `/` (or `/.well-known/caldav`): return the
 /// `current-user-principal` URL. Some clients ask for additional
 /// properties on the root resource; we honour
 /// `current-user-principal` and silently drop anything else (a
 /// truly conformant server would emit them under a 404 propstat).
 fn propfind_root(fixture: &crate::fixture::Fixture, body: &str) -> Response {
+    let requested = xml::requested_props(body);
     let user = &fixture.account.id;
     let principal_url = format!("/principals/{user}/");
     let mut props = String::new();
-    if xml::body_requests_prop(body, "current-user-principal") {
+    if requested.contains("current-user-principal") {
         props.push_str(&format!(
             "<D:current-user-principal><D:href>{}</D:href></D:current-user-principal>",
             xml::escape(&principal_url),
         ));
     }
-    if xml::body_requests_prop(body, "principal-URL") {
+    if requested.contains("principal-URL") {
         // Older clients ask for D:principal-URL alongside (or instead
         // of) current-user-principal. Same value.
         props.push_str(&format!(
@@ -287,21 +338,22 @@ fn propfind_root(fixture: &crate::fixture::Fixture, body: &str) -> Response {
 /// PROPFIND on `/principals/{user}/`: return the
 /// `calendar-home-set` URL.
 fn propfind_principal(fixture: &crate::fixture::Fixture, user: &str, body: &str) -> Response {
+    let requested = xml::requested_props(body);
     let home_url = format!("/calendars/{user}/");
     let mut props = String::new();
-    if xml::body_requests_prop(body, "calendar-home-set") {
+    if requested.contains("calendar-home-set") {
         props.push_str(&format!(
             "<C:calendar-home-set><D:href>{}</D:href></C:calendar-home-set>",
             xml::escape(&home_url),
         ));
     }
-    if xml::body_requests_prop(body, "current-user-principal") {
+    if requested.contains("current-user-principal") {
         props.push_str(&format!(
             "<D:current-user-principal><D:href>/principals/{}/</D:href></D:current-user-principal>",
             xml::escape(user),
         ));
     }
-    if xml::body_requests_prop(body, "displayname") {
+    if requested.contains("displayname") {
         props.push_str(&format!(
             "<D:displayname>{}</D:displayname>",
             xml::escape(&fixture.account.name),
@@ -321,8 +373,9 @@ fn propfind_calendar_home(
     body: &str,
     depth: u8,
 ) -> Response {
+    let requested = xml::requested_props(body);
     let home_href = format!("/calendars/{user}/");
-    let home_props = home_collection_props(body);
+    let home_props = home_collection_props(&requested);
 
     let mut entries = vec![Response207 {
         href: &home_href,
@@ -333,7 +386,7 @@ fn propfind_calendar_home(
     if depth >= 1 {
         for cal in &fixture.calendars {
             per_calendar_hrefs.push(format!("/calendars/{user}/{}/", cal.id));
-            per_calendar_props.push(calendar_props(fixture, cal, body));
+            per_calendar_props.push(calendar_props(fixture, cal, &requested));
         }
     }
     for (i, href) in per_calendar_hrefs.iter().enumerate() {
@@ -355,12 +408,13 @@ fn propfind_calendar(
     body: &str,
     depth: u8,
 ) -> Response {
+    let requested = xml::requested_props(body);
     let cal = match fixture.calendars.iter().find(|c| c.id == calendar_id) {
         Some(c) => c,
         None => return not_found(&format!("/calendars/{user}/{calendar_id}/")),
     };
     let cal_href = format!("/calendars/{user}/{calendar_id}/");
-    let cal_props = calendar_props(fixture, cal, body);
+    let cal_props = calendar_props(fixture, cal, &requested);
 
     let mut entries = vec![Response207 {
         href: &cal_href,
@@ -372,7 +426,7 @@ fn propfind_calendar(
     if depth >= 1 {
         for ev in fixture.events.iter().filter(|e| e.calendar_id == calendar_id) {
             event_hrefs.push(format!("/calendars/{user}/{calendar_id}/{}.ics", ev.id));
-            event_props.push(event_resource_props(fixture, ev, body));
+            event_props.push(event_resource_props(fixture, ev, &requested));
         }
     }
     for (i, href) in event_hrefs.iter().enumerate() {
@@ -393,6 +447,7 @@ fn propfind_event(
     event_id: &str,
     body: &str,
 ) -> Response {
+    let requested = xml::requested_props(body);
     let ev = match fixture
         .events
         .iter()
@@ -404,7 +459,7 @@ fn propfind_event(
         }
     };
     let href = format!("/calendars/{user}/{calendar_id}/{event_id}.ics");
-    let props = event_resource_props(fixture, ev, body);
+    let props = event_resource_props(fixture, ev, &requested);
     multistatus(wrap_responses(&[Response207 {
         href: &href,
         ok_props: &props,
@@ -414,12 +469,12 @@ fn propfind_event(
 // ── Property serialisation helpers ──────────────────────────────────
 
 /// Properties for the calendar-home collection itself.
-fn home_collection_props(body: &str) -> String {
+fn home_collection_props(requested: &std::collections::HashSet<String>) -> String {
     let mut props = String::new();
-    if xml::body_requests_prop(body, "resourcetype") {
+    if requested.contains("resourcetype") {
         props.push_str("<D:resourcetype><D:collection/></D:resourcetype>");
     }
-    if xml::body_requests_prop(body, "displayname") {
+    if requested.contains("displayname") {
         props.push_str("<D:displayname>Calendars</D:displayname>");
     }
     props
@@ -433,33 +488,33 @@ fn home_collection_props(body: &str) -> String {
 fn calendar_props(
     fixture: &crate::fixture::Fixture,
     cal: &crate::fixture::Calendar,
-    body: &str,
+    requested: &std::collections::HashSet<String>,
 ) -> String {
     let mut props = String::new();
-    if xml::body_requests_prop(body, "resourcetype") {
+    if requested.contains("resourcetype") {
         props.push_str("<D:resourcetype><D:collection/><C:calendar/></D:resourcetype>");
     }
-    if xml::body_requests_prop(body, "displayname") {
+    if requested.contains("displayname") {
         props.push_str(&format!(
             "<D:displayname>{}</D:displayname>",
             xml::escape(&cal.name),
         ));
     }
-    if xml::body_requests_prop(body, "getctag") {
+    if requested.contains("getctag") {
         props.push_str(&format!(
             "<CS:getctag>{}</CS:getctag>",
             xml::escape(&calendar_ctag(fixture, &cal.id)),
         ));
     }
     if let Some(color) = &cal.color
-        && xml::body_requests_prop(body, "calendar-color")
+        && requested.contains("calendar-color")
     {
         props.push_str(&format!(
             "<IC:calendar-color>{}</IC:calendar-color>",
             xml::escape(color),
         ));
     }
-    if xml::body_requests_prop(body, "current-user-privilege-set") {
+    if requested.contains("current-user-privilege-set") {
         props.push_str(
             "<D:current-user-privilege-set>\
                 <D:privilege><D:read/></D:privilege>\
@@ -470,7 +525,7 @@ fn calendar_props(
             </D:current-user-privilege-set>",
         );
     }
-    if xml::body_requests_prop(body, "supported-calendar-component-set") {
+    if requested.contains("supported-calendar-component-set") {
         props.push_str(
             "<C:supported-calendar-component-set>\
                 <C:comp name=\"VEVENT\"/>\
@@ -486,23 +541,23 @@ fn calendar_props(
 fn event_resource_props(
     fixture: &crate::fixture::Fixture,
     ev: &crate::fixture::Event,
-    body: &str,
+    requested: &std::collections::HashSet<String>,
 ) -> String {
     let mut props = String::new();
-    if xml::body_requests_prop(body, "resourcetype") {
+    if requested.contains("resourcetype") {
         // Resources (as opposed to collections) emit an empty
         // `<D:resourcetype/>`. Ratatoskr's parser distinguishes
         // collections from resources by the presence of children
         // here.
         props.push_str("<D:resourcetype/>");
     }
-    if xml::body_requests_prop(body, "getetag") {
+    if requested.contains("getetag") {
         props.push_str(&format!(
             "<D:getetag>{}</D:getetag>",
             xml::escape(&event_etag(fixture, &ev.id)),
         ));
     }
-    if xml::body_requests_prop(body, "getcontenttype") {
+    if requested.contains("getcontenttype") {
         props.push_str("<D:getcontenttype>text/calendar; component=vevent</D:getcontenttype>");
     }
     props

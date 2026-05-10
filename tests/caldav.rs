@@ -787,6 +787,42 @@ async fn caldav_put_visible_through_graph_calendar_view_delta() {
 }
 
 #[tokio::test]
+async fn propfind_path_with_duplicate_slashes_returns_404() {
+    // `/calendars//account-1/cal-work/` previously collapsed to
+    // `/calendars/account-1/cal-work/` because the segment filter
+    // dropped empty segments. That left request_log entries
+    // unable to distinguish the two paths and was a defence-in-
+    // depth concern. Reject upfront.
+    let (status, _) = send(
+        "PROPFIND",
+        "/calendars//account-1/cal-work/",
+        Some("0"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn propfind_path_percent_decodes_segments() {
+    // Real clients (Apple Calendar) round-trip ids through URL
+    // percent-encoding. Without per-segment decoding, a calendar
+    // id like `cal-work` requested as `cal%2Dwork` wouldn't match.
+    let (status, body) = send(
+        "PROPFIND",
+        "/calendars/account-1/cal%2Dwork/",
+        Some("0"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        body.contains("displayname"),
+        "percent-decoded path didn't reach the calendar handler: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn propfind_unknown_calendar_returns_404() {
     let (status, _) = send(
         "PROPFIND",
