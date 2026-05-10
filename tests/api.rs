@@ -1170,6 +1170,52 @@ async fn test_latency_rejects_malformed() {
 }
 
 #[tokio::test]
+async fn test_latency_rejects_values_above_cap() {
+    // Without the cap, `u64::MAX` would deadlock every dispatch path
+    // for ~584M years. The clamp is the documented defence; both
+    // global and per-protocol values are gated.
+    let app = router();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/latency")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "global_ms": u64::MAX })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp).await;
+    assert!(
+        v["detail"].as_str().unwrap().contains("exceeds cap"),
+        "wrong detail: {v:?}"
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/latency")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "per_protocol": { "graph": 999_999u64 }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_snapshot_state_projects_fixture_image() {
     let app = router();
     let resp = app

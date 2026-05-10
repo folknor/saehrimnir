@@ -1773,14 +1773,19 @@ fn render_rfc822(email: &Email) -> String {
 }
 
 /// For raw-bytes emails, slice the verbatim block at the first
-/// `\r\n\r\n` to recover header / body sub-fetches. If no terminator
-/// is present (a fixture deliberately authoring a malformed message
-/// with no header/body separator), the whole block is treated as
-/// headers and the text body comes back empty - lets a client that
-/// fetches `BODY[HEADER]` see what's really there.
+/// `\r\n\r\n` to recover header / body sub-fetches. The header slice
+/// stops at `i + 2` so it includes the last header field's
+/// terminating CRLF but not the blank-line CRLF (matches what the
+/// structured `render_rfc822_headers` returns - that function emits
+/// "Header: value\r\n" lines and the caller appends the blank-line
+/// CRLF separately). The body slice starts at `i + 4`, after the
+/// blank line. If no terminator is present (a fixture deliberately
+/// authoring a malformed message with no header/body separator), the
+/// whole block is treated as headers and the text body comes back
+/// empty.
 fn split_raw(raw: &str) -> (&str, &str) {
     match raw.find("\r\n\r\n") {
-        Some(i) => (&raw[..i + 4], &raw[i + 4..]),
+        Some(i) => (&raw[..i + 2], &raw[i + 4..]),
         None => (raw, ""),
     }
 }

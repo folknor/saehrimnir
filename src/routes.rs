@@ -546,6 +546,14 @@ async fn get_latency(State(state): State<AppState>) -> Json<Value> {
     Json(json!(snap))
 }
 
+/// Upper bound on a single latency knob. Anything above this is a
+/// harness mistake (or a hostile fixture); leaving the cap at
+/// `u64::MAX` would let `global_ms = u64::MAX` deadlock every
+/// dispatch path until SIGTERM. 60 seconds is well above the
+/// largest delay any test or simulated-slow-server scenario should
+/// want; raise if a fixture forces it.
+const LATENCY_MAX_MS: u64 = 60_000;
+
 /// `POST /test/latency` body:
 /// ```text
 /// { "global_ms": 50,                         // optional
@@ -553,8 +561,9 @@ async fn get_latency(State(state): State<AppState>) -> Json<Value> {
 /// ```
 /// Either field may be absent. Each call replaces (not merges) the
 /// affected keys; `"global_ms": 0` clears the global knob, and
-/// `"per_protocol": {"graph": 0}` clears the graph entry. Returns
-/// 200 + the post-update snapshot for round-trip verification.
+/// `"per_protocol": {"graph": 0}` clears the graph entry. Values
+/// above `LATENCY_MAX_MS` (60s) return 400. Returns 200 + the post-
+/// update snapshot for round-trip verification.
 async fn set_latency(
     State(state): State<AppState>,
     body: Option<Json<Value>>,
@@ -588,6 +597,18 @@ async fn set_latency(
                     .into_response();
             }
         };
+        if n > LATENCY_MAX_MS {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "malformed body",
+                    "detail": format!(
+                        "global_ms {n} exceeds cap of {LATENCY_MAX_MS}ms"
+                    ),
+                })),
+            )
+                .into_response();
+        }
         state.shared.latency.set("global", n);
     }
     if let Some(per) = body_obj.get("per_protocol") {
@@ -628,6 +649,18 @@ async fn set_latency(
                         .into_response();
                 }
             };
+            if n > LATENCY_MAX_MS {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "malformed body",
+                        "detail": format!(
+                            "per_protocol.{k} value {n} exceeds cap of {LATENCY_MAX_MS}ms"
+                        ),
+                    })),
+                )
+                    .into_response();
+            }
             state.shared.latency.set(k, n);
         }
     }

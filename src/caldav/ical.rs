@@ -84,8 +84,21 @@ fn write_address_line(out: &mut String, name: &str, addr: &Address) {
         out.push_str(&escape_text(n));
     }
     out.push_str(":mailto:");
-    out.push_str(&addr.email);
+    out.push_str(&sanitize_address(&addr.email));
     out.push_str("\r\n");
+}
+
+/// Strip CR/LF/control bytes from an address before it lands in an
+/// iCal property line. Real email addresses (per RFC 5321) cannot
+/// contain those characters, but a hostile fixture could embed
+/// `\r\nDESCRIPTION:injected` and inject a new property line into
+/// every CalDAV GET / REPORT. Defensive sanitisation here keeps the
+/// emit path infallible without forcing every caller to validate.
+fn sanitize_address(email: &str) -> String {
+    email
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\r' && *c != '\n')
+        .collect()
 }
 
 /// Escape RFC 5545 TEXT values: backslash, semicolon, comma, and
@@ -307,5 +320,52 @@ mod tests {
         assert!(ical.contains("Q1\\; budget review"));
         let parsed = parse_vevent(&ical).expect("parse");
         assert_eq!(parsed.summary.as_deref(), Some("Q1; budget review"));
+    }
+
+    #[test]
+    fn address_email_with_crlf_is_sanitised_no_property_injection() {
+        // A hostile email value containing \r\n followed by a fake
+        // iCal property would, without sanitisation, inject a new
+        // line into every CalDAV GET. Sanitisation strips CR/LF/
+        // control bytes; the result is the original email with the
+        // dangerous bytes removed (no escaping, since email
+        // addresses per RFC 5321 cannot contain those characters
+        // legitimately).
+        let event = Event {
+            id: "ev".into(),
+            calendar_id: "cal".into(),
+            subject: "x".into(),
+            body_preview: None,
+            body_text: None,
+            start: dt(2026, 2, 1, 14, 0, 0),
+            end: dt(2026, 2, 1, 15, 0, 0),
+            location: None,
+            organizer: Some(Address {
+                email: "evil@x\r\nDESCRIPTION:injected".into(),
+                name: None,
+            }),
+            attendees: vec![],
+            is_all_day: false,
+        };
+        let ical = event_to_ical(&event);
+        // The injected payload is concatenated into the ORGANIZER
+        // line as a single contiguous value (which a parser will
+        // reject as a malformed address) rather than appearing on
+        // its own line. The defence is "no new line emitted", not
+        // "the malformed address is hidden".
+        let line_starts_with_description = ical
+            .split("\r\n")
+            .any(|l| l.starts_with("DESCRIPTION:injected"));
+        assert!(
+            !line_starts_with_description,
+            "DESCRIPTION:injected appeared as its own property line: {ical}"
+        );
+        let organizer_line = ical
+            .split("\r\n")
+            .find(|l| l.starts_with("ORGANIZER"))
+            .expect("ORGANIZER line");
+        assert!(!organizer_line.contains('\r'));
+        assert!(!organizer_line.contains('\n'));
+        assert_eq!(organizer_line, "ORGANIZER:mailto:evil@xDESCRIPTION:injected");
     }
 }

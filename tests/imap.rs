@@ -662,8 +662,11 @@ async fn body_raw_bytes_emits_verbatim_through_imap_fetch() {
     );
     assert!(out.contains("c OK UID FETCH completed"));
 
-    // BODY[HEADER] = bytes up to and including the CRLFCRLF.
-    let head = &raw[..raw.find("\r\n\r\n").unwrap() + 4];
+    // BODY[HEADER] = headers terminated by the last field's CRLF
+    // (NOT the blank-line CRLF; that's the separator, not part of
+    // the header section per the BODY[HEADER] convention used by
+    // the structured render path).
+    let head = &raw[..raw.find("\r\n\r\n").unwrap() + 2];
     assert!(
         out.contains(&format!("BODY[HEADER] {{{}}}\r\n{head}", head.len())),
         "BODY[HEADER] slice wrong: {out:?}"

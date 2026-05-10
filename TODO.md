@@ -36,12 +36,12 @@ correct invariants and accepted trade-offs are omitted.
   destroyed-id walk (record `(id, parent_id)` on the destroyed
   list in `Transition`, or capture pre-destroy parent in
   `apply_change_step`).
-- **[bugs] IMAP `BODY[HEADER]` for raw-bytes emails includes one
-  extra `\r\n`.** `src/imap.rs:1781-1786`. RFC 3501 says HEADER
-  includes the headers terminated by the blank-line CRLF (one
-  trailing CRLF). Code uses `&raw[..i + 4]` (headers + blank
-  line + extra CRLF). Should be `&raw[..i + 2]` for HEADER and
-  keep `&raw[i + 4..]` for TEXT. Just-shipped code; trivial fix.
+- ~~**[bugs] IMAP `BODY[HEADER]` for raw-bytes emails includes
+  one extra `\r\n`.**~~ Landed. `src/imap.rs::split_raw` now
+  returns the header slice ending at `i + 2` (matching what the
+  structured `render_rfc822_headers` emits). Test in
+  `tests/imap.rs::body_raw_bytes_emits_verbatim_through_imap_fetch`
+  updated.
 - **[security] CalDAV listener never enforces
   `fixture.oauth.enforce`.** `src/caldav/mod.rs::router` /
   `dispatch` mounts no bearer middleware, so PUT / DELETE
@@ -53,20 +53,17 @@ correct invariants and accepted trade-offs are omitted.
   `graph/mod.rs::enforce_bearer_middleware`; update
   `notes/ratatoskr-oauth-surface.md` to extend coverage to
   CalDAV.
-- **[security] CalDAV iCal `ORGANIZER` / `ATTENDEE` email
-  addresses are emitted verbatim.** `src/caldav/ical.rs:80-89`
-  (`write_address_line`). A fixture-supplied (or, with the
-  enforcement gap above, PUT-supplied) address containing
-  `\r\n` injects a new iCal property line into every subsequent
-  GET / REPORT. Either route through `escape_text` or assert
-  no-CRLF at fixture-load and PUT time.
-- **[security] `/test/latency` accepts unbounded `u64` ms.**
-  `src/routes.rs:577-633`. A `POST /test/latency` with
-  `global_ms: u64::MAX` deadlocks every dispatch path for ~584M
-  years; recovery requires SIGTERM. Loopback-only and admin-
-  gated, but trivially DoS-able from a misbehaving harness.
-  Clamp to a sane ceiling (e.g. 60_000ms) or reject larger
-  values with 400.
+- ~~**[security] CalDAV iCal `ORGANIZER` / `ATTENDEE` email
+  addresses are emitted verbatim.**~~ Landed.
+  `src/caldav/ical.rs::sanitize_address` strips control bytes
+  and CR/LF before emit; `write_address_line` routes through
+  it. Real RFC-5321 addresses are unaffected. Test in
+  `src/caldav/ical.rs::tests`.
+- ~~**[security] `/test/latency` accepts unbounded `u64` ms.**~~
+  Landed. `src/routes.rs::set_latency` clamps both `global_ms`
+  and per-protocol values at 60_000ms (`LATENCY_MAX_MS`),
+  returning 400 above that. Test
+  `tests/api.rs::test_latency_rejects_values_above_cap`.
 - **[bugs] CalDAV ETag / CTag derive from global `fixture.state`,
   not per-resource.** `src/caldav/mod.rs:511-521`. Any mutation
   bumps `Fixture::state`, which changes every event's ETag and
