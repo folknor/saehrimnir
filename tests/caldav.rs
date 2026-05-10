@@ -667,6 +667,139 @@ async fn propfind_unknown_calendar_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// Regression: ETags must be per-resource, not derived from the
+/// fixture-wide state token. A mutation in calendar A used to bump
+/// every event's ETag in calendar B and B's CTag too, forcing
+/// real-client re-walks of every calendar after every unrelated
+/// mutation. Walks the change_log to find the last touch of each
+/// specific resource instead.
+#[tokio::test]
+async fn caldav_etag_and_ctag_are_per_resource_not_fixture_wide() {
+    let app = router();
+
+    // Capture baselines: ev-001 ETag (lives in cal-work) and the
+    // PROPFIND CTag for cal-personal (which has no events).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ev001_etag_before = resp
+        .headers()
+        .get("ETag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let (_, body_before) = send_with(
+        app.clone(),
+        "PROPFIND",
+        "/calendars/account-1/cal-personal/",
+        Some("0"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    let cal_personal_ctag_before = extract_ctag(&body_before);
+
+    // Mutate inside cal-work: PUT a brand-new event there. Pre-fix
+    // this would have bumped ev-001's ETag (sibling event, same
+    // calendar AND fixture state) and cal-personal's CTag (sibling
+    // calendar, same fixture state). Post-fix: ev-001 unchanged
+    // (its specific id wasn't touched), cal-personal CTag unchanged
+    // (no event in that calendar was touched).
+    let body = "BEGIN:VCALENDAR\r\n\
+                VERSION:2.0\r\n\
+                BEGIN:VEVENT\r\n\
+                UID:ev-fresh\r\n\
+                SUMMARY:Unrelated\r\n\
+                DTSTART:20260301T100000Z\r\n\
+                DTEND:20260301T110000Z\r\n\
+                END:VEVENT\r\n\
+                END:VCALENDAR\r\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-fresh.ics")
+                .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // ev-001 ETag must be unchanged.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let ev001_etag_after = resp.headers().get("ETag").unwrap().to_str().unwrap();
+    assert_eq!(
+        ev001_etag_after, ev001_etag_before,
+        "ev-001 ETag bumped by an unrelated PUT to ev-fresh"
+    );
+
+    // cal-personal CTag must be unchanged.
+    let (_, body_after) = send_with(
+        app.clone(),
+        "PROPFIND",
+        "/calendars/account-1/cal-personal/",
+        Some("0"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    let cal_personal_ctag_after = extract_ctag(&body_after);
+    assert_eq!(
+        cal_personal_ctag_after, cal_personal_ctag_before,
+        "cal-personal CTag bumped by an unrelated PUT in cal-work"
+    );
+
+    // Sanity: cal-work's CTag DID advance (the calendar this PUT
+    // landed in must report a fresh CTag so subscribed clients re-
+    // walk it).
+    let (_, body_work) = send_with(
+        app,
+        "PROPFIND",
+        "/calendars/account-1/cal-work/",
+        Some("0"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    let cal_work_ctag = extract_ctag(&body_work);
+    assert_ne!(
+        cal_work_ctag, cal_personal_ctag_before,
+        "cal-work CTag should differ from cal-personal's pristine CTag after a PUT"
+    );
+}
+
+fn extract_ctag(body: &str) -> String {
+    let open = body
+        .find("<CS:getctag>")
+        .or_else(|| body.find("<getctag>"))
+        .expect("CTag in body");
+    let after = &body[open..];
+    let val_start = after.find('>').unwrap() + 1;
+    let val_end = after[val_start..].find('<').unwrap();
+    after[val_start..val_start + val_end].to_string()
+}
+
 /// Bearer enforcement parity with the JMAP / Graph / Gmail
 /// listeners: when `fixture.oauth.enforce` is true, every CalDAV
 /// verb must reject requests without a valid bearer. Pre-fix CalDAV

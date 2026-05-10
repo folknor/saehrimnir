@@ -178,6 +178,25 @@ impl ChangeLog {
     }
 }
 
+impl Fixture {
+    /// Borrowing iterator over the retained transitions, oldest
+    /// first. CalDAV's per-resource ETag / CTag derivation walks
+    /// this in reverse to find the last transition that touched
+    /// a given event / calendar.
+    pub fn change_log_transitions(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &Transition> {
+        self.change_log.transitions.iter()
+    }
+
+    /// The change-log seed - the state token a fixture has after
+    /// load, before any mutation. Used as the fallback CalDAV
+    /// state value when no transition has touched a resource yet.
+    pub fn change_log_seed(&self) -> &str {
+        &self.change_log.seed
+    }
+}
+
 /// Fold the per-transition diffs over the half-open range
 /// `(from, to]` (i.e. every transition whose `from_state == from` or
 /// later, up to `to`). Applies RFC 8620 §5.2 dominance: an id that

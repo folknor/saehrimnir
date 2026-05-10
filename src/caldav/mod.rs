@@ -539,24 +539,77 @@ fn wrap_responses(entries: &[Response207<'_>]) -> String {
     out
 }
 
-/// Deterministic CTag for a calendar. Cycles when `fixture.state`
-/// advances (i.e. on any mutation through `Fixture::mutate`).
-/// Calendar id is folded in so two calendars in the same fixture
-/// don't appear synchronised when one of them mutates - real
-/// servers emit different CTags for sibling calendars and
-/// ratatoskr's per-calendar polling expects that. (Pre-state-advance
-/// the values stay byte-stable across runs since `fixture.state`
-/// is fixture-controlled.)
+/// Deterministic CTag for a calendar. Walks the change_log to find
+/// the most recent transition that touched any event in this
+/// calendar; the CTag advances only when something inside the
+/// calendar actually changed. Pre-fix the CTag tracked
+/// `fixture.state` directly, which advanced on every JMAP /
+/// IMAP / Graph mutation regardless - so a real CalDAV client
+/// would re-walk every calendar after every unrelated mailbox
+/// change. Falls back to the change-log seed when no transition
+/// has touched the calendar (the post-load baseline).
 fn calendar_ctag(fixture: &crate::fixture::Fixture, calendar_id: &str) -> String {
-    format!("{}/{calendar_id}", fixture.state)
+    let last = last_state_touching_calendar(fixture, calendar_id);
+    format!("{last}/{calendar_id}")
 }
 
-/// Deterministic ETag for an event. Same shape as the CTag (state +
-/// event id), and changes whenever the fixture state advances.
-/// Ratatoskr only checks for byte equality so the format is free to
-/// evolve.
+/// Deterministic ETag for an event. Walks the change_log to find
+/// the most recent transition that touched this specific event
+/// (created / updated / destroyed). Same scoping rationale as
+/// `calendar_ctag`. Ratatoskr only checks for byte equality so the
+/// format is free to evolve.
 fn event_etag(fixture: &crate::fixture::Fixture, event_id: &str) -> String {
-    format!("\"{}/{event_id}\"", fixture.state)
+    let last = last_state_touching_event(fixture, event_id);
+    format!("\"{last}/{event_id}\"")
+}
+
+/// Most recent `to_state` from any transition that listed
+/// `event_id` in its created / updated / destroyed sets. Returns
+/// the change-log seed when no transition has touched the event,
+/// which is the right answer for a freshly-loaded fixture.
+fn last_state_touching_event(fixture: &crate::fixture::Fixture, event_id: &str) -> String {
+    for t in fixture.change_log_transitions().rev() {
+        if t.event_created.iter().any(|id| id == event_id)
+            || t.event_updated.iter().any(|id| id == event_id)
+            || t.event_destroyed.iter().any(|id| id == event_id)
+        {
+            return t.to_state.clone();
+        }
+    }
+    fixture.change_log_seed().to_string()
+}
+
+/// Most recent `to_state` from any transition that touched any
+/// event in `calendar_id`. For created / updated, the event is
+/// still in the fixture so we look up the parent there. For
+/// destroyed, the parent comes from `event_destroyed_parents`
+/// (parallel to `event_destroyed`).
+fn last_state_touching_calendar(
+    fixture: &crate::fixture::Fixture,
+    calendar_id: &str,
+) -> String {
+    for t in fixture.change_log_transitions().rev() {
+        let touches_live = t
+            .event_created
+            .iter()
+            .chain(t.event_updated.iter())
+            .any(|id| {
+                fixture
+                    .events
+                    .iter()
+                    .any(|e| &e.id == id && e.calendar_id == calendar_id)
+            });
+        if touches_live {
+            return t.to_state.clone();
+        }
+        if t.event_destroyed_parents
+            .iter()
+            .any(|p| p == calendar_id)
+        {
+            return t.to_state.clone();
+        }
+    }
+    fixture.change_log_seed().to_string()
 }
 
 async fn handle_report(

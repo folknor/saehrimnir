@@ -61,14 +61,19 @@ correct invariants and accepted trade-offs are omitted.
   and per-protocol values at 60_000ms (`LATENCY_MAX_MS`),
   returning 400 above that. Test
   `tests/api.rs::test_latency_rejects_values_above_cap`.
-- **[bugs] CalDAV ETag / CTag derive from global `fixture.state`,
-  not per-resource.** `src/caldav/mod.rs:511-521`. Any mutation
-  bumps `Fixture::state`, which changes every event's ETag and
-  every calendar's CTag - so an unrelated JMAP `Email/set`
-  invalidates every CalDAV cache, forcing a real client to
-  re-walk every calendar. Mix a per-resource version into the
-  derivation, or cross-reference the change_log to find the
-  last touch of *that* resource.
+- ~~**[bugs] CalDAV ETag / CTag derive from global `fixture.state`,
+  not per-resource.**~~ Landed. `event_etag` walks the change_log
+  to find the last transition that listed `event_id` in its
+  created / updated / destroyed sets; `calendar_ctag` walks for
+  the last transition that touched any event in the named
+  calendar (using `event_destroyed_parents` for tombstones, the
+  live event's `calendar_id` for created / updated). Both fall
+  back to the change-log seed for resources no transition has
+  touched. New `Fixture::change_log_transitions` /
+  `Fixture::change_log_seed` accessors. Regression test
+  `tests/caldav.rs::caldav_etag_and_ctag_are_per_resource_not_fixture_wide`
+  asserts that an unrelated PUT in cal-work doesn't bump
+  cal-personal's CTag or ev-001's ETag.
 - **[arch] Two parallel `ChangeOp` producers with drift-prone
   patch construction.** `src/lua.rs::builder_change` (and
   per-op readers) and `src/fixture.rs::normalize_change_step`
