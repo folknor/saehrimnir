@@ -60,6 +60,19 @@ impl AppState {
     pub(crate) fn fixture(&self) -> std::sync::RwLockReadGuard<'_, crate::fixture::Fixture> {
         self.shared.fixture.read().expect("fixture lock poisoned")
     }
+
+    /// Replace the request log on the shared handle bag. Mirrors
+    /// `gmail::AppState::with_request_log` for parity.
+    pub fn with_request_log(mut self, log: crate::request_log::RequestLog) -> Self {
+        self.shared.request_log = log;
+        self
+    }
+
+    /// Attach a Lua dispatcher.
+    pub fn with_dispatcher(mut self, dispatcher: Arc<crate::lua::Dispatcher>) -> Self {
+        self.shared.dispatcher = Some(dispatcher);
+        self
+    }
 }
 
 pub fn maybe_override(
@@ -117,7 +130,9 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
 }
 
 /// Google Calendar error envelope. Matches the shape ratatoskr's
-/// `google_calendar_parse_json_response` reads back.
+/// `google_calendar_parse_json_response` reads back. Args are
+/// `(http_status, human_message, errors[0].reason)` - Google
+/// family convention. See `graph::error` for the OData reverse.
 pub fn error(status: StatusCode, message: &str, reason: &str) -> Response {
     let body = json!({
         "error": {

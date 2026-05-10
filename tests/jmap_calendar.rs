@@ -324,6 +324,84 @@ async fn calendar_event_set_creates_visible_in_changes_delta() {
 }
 
 #[tokio::test]
+async fn calendar_event_set_all_day_flip_recomputes_start_end() {
+    // Regression: pre-fix, a patch that set `showWithoutTime=true`
+    // alone (no start, no duration) flipped the flag but left
+    // start/end timed, so subsequent serialization emitted
+    // `2026-01-15T09:00:00` for an all-day event - inconsistent
+    // shape, parsers see the T-bearing form and treat it as
+    // timed.
+    let r = router();
+
+    // ev-001 is timed (09:00-09:15 on 2026-01-15) in the
+    // graph-calendar-small fixture.
+    let _ = jmap_call(
+        &r,
+        "CalendarEvent/set",
+        json!({
+            "accountId": "account-1",
+            "update": {
+                "ev-001": { "showWithoutTime": true }
+            }
+        }),
+    )
+    .await;
+    let resp = jmap_call(
+        &r,
+        "CalendarEvent/get",
+        json!({"accountId": "account-1", "ids": ["ev-001"]}),
+    )
+    .await;
+    let ev = &resp[1]["list"][0];
+    assert_eq!(ev["showWithoutTime"], true);
+    let start = ev["start"].as_str().unwrap();
+    assert!(
+        !start.contains('T'),
+        "all-day start must use date-only shape; got {start:?}"
+    );
+}
+
+#[tokio::test]
+async fn calendar_changes_returns_empty_for_known_seed_state() {
+    // Regression: pre-fix, Calendar/changes returned
+    // cannotCalculateChanges for any non-current state, even
+    // seed. Calendars are static in v0; an event mutation bumps
+    // fixture.state but doesn't touch the calendar resource type,
+    // so the right answer is an empty delta with the new state
+    // echoed back.
+    let r = router();
+    // Bump fixture.state via an unrelated event create.
+    let _ = jmap_call(
+        &r,
+        "CalendarEvent/set",
+        json!({
+            "accountId": "account-1",
+            "create": {"any": {
+                "calendarIds": {"cal-work": true},
+                "title": "x",
+                "start": "2026-04-01T10:00:00",
+                "duration": "PT15M"
+            }}
+        }),
+    )
+    .await;
+    // Calendar/changes from the seed state must NOT 410.
+    let resp = jmap_call(
+        &r,
+        "Calendar/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+    )
+    .await;
+    assert_eq!(resp[0], "Calendar/changes");
+    let body = &resp[1];
+    assert_eq!(body["oldState"], "fixture-state");
+    assert_ne!(body["newState"], "fixture-state");
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["updated"], json!([]));
+    assert_eq!(body["destroyed"], json!([]));
+}
+
+#[tokio::test]
 async fn mint_event_id_does_not_collide_after_unrelated_destroy() {
     // Regression: pre-fix every create site computed
     // `format!("mock-event-{}", events.len() + 1)`. After a

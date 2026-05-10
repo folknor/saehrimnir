@@ -411,7 +411,7 @@ async fn create_event(
     state.shared.request_log.record(
         "graph",
         format!("POST /v1.0/me/calendars/{calendar}/events"),
-        json!({ "body": parsed }),
+        crate::request_log::body_detail(&parsed),
     );
 
     // Mutate the fixture under a write guard. The closure resolves
@@ -475,7 +475,7 @@ async fn patch_event(
     state.shared.request_log.record(
         "graph",
         format!("PATCH /v1.0/me/events/{event}"),
-        json!({ "body": parsed }),
+        crate::request_log::body_detail(&parsed),
     );
 
     let result: Result<Value, Response> = {

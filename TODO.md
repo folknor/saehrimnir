@@ -22,51 +22,17 @@ tombstone gap, gcal stale-token tombstone gap, and the
 
 ### Fix soon
 
-- **[bugs] JMAP `apply_event_patch` flips `is_all_day` without
-  recomputing start/end.** `src/jmap_calendar.rs:514-516, 553-581`.
-  A patch that sets `showWithoutTime = true` alone (no start/
-  duration) leaves the event's all-day flag flipped but its
-  start/end timed; subsequent serialization emits an inconsistent
-  shape. Recompute when `is_all_day` changes too, not just when
-  start/duration are present in the patch.
-- **[bugs] JMAP `Calendar/changes` returns `cannotCalculateChanges`
-  on any non-current state, even seed.** `src/jmap_calendar.rs:117-126`.
-  Calendars are static in v0; an event-only mutation bumps
-  `fixture.state` but doesn't touch the calendar resource type.
-  RFC 8620 wants empty deltas for an unchanged resource type.
-  Fix: short-circuit on seed-or-known too, return empty.
-- **[bugs] gcal `apply_event_patch` ignores `organizer`.**
-  `src/gcal/events.rs:467-495`. JMAP's apply_event_patch parses
-  organizer; Graph's deliberately doesn't (Graph clients can't
-  repoint). Real Google clients can. Add the parse, document
-  Graph's omission inline.
-- **[arch] Google-family `error()` argument order is `(message,
-  reason)` while Graph's is `(code, message)`.** Drift is real
-  but underlying envelope shapes genuinely differ - the names
-  should track. Rename the param bindings in
-  `src/{gmail,gcal,people}/mod.rs::error` to `(message, reason)`
-  explicitly; add a one-line doc in each calling out which is
-  which.
-- **[arch] `gcal::AppState` and `people::AppState` lost the
-  `with_request_log` / `with_dispatcher` builders that
-  `gmail::AppState` and `routes::AppState` expose.** Tests
-  reach into `shared.dispatcher` directly. Either add the
-  builders to gcal/people for parity, or remove from
-  gmail/graph if nothing in the tree uses them. Pick one shape.
-- **[perf] People `projected_connections` materialises every
-  contact's JSON before paging.** `src/people/contacts.rs:114,
-  213-217`: collects refs, sorts, maps to `Vec<Value>`, then
-  `drain(offset..end)`. Pages are O(N) per request even when the
-  caller wants page_size = 100. Trivial fix: serialize after
-  slicing (`.iter().skip(offset).take(page_size).map(serialize_
-  person)`).
-- **[security] Request log records full parsed mutation bodies
-  unconditionally.** `src/gcal/events.rs:288-292, 334-338,
-  378-382` insert `{"body": parsed}` (up to 1 MiB JSON) on every
-  POST/PATCH/DELETE. With many calls + the 100k cap, request_log
-  memory grows large between `DELETE /test/requests` calls.
-  Loopback only, but other listeners deliberately keep the
-  body slice small. Either gate behind a knob or truncate.
+All seven Fix-soon items in this slice have landed. Two new
+helpers fell out and are reusable:
+
+- `Fixture::mint_event_id` / `Fixture::mint_email_id` for the
+  monotonic-id contract.
+- `request_log::body_detail` truncating wrapper, applied to gcal
+  and Graph mutation handlers (4 KiB cap per body).
+
+Regression tests added:
+`calendar_event_set_all_day_flip_recomputes_start_end`,
+`calendar_changes_returns_empty_for_known_seed_state`.
 
 ### Eventually (only when something forces it)
 

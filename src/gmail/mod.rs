@@ -134,6 +134,10 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
 
 /// Gmail error envelope as documented at
 /// https://developers.google.com/gmail/api/guides/handle-errors.
+/// Args are `(http_status, human_message, errors[0].reason)`.
+/// Reverse order from `graph::error(status, code, message)` -
+/// the second positional arg names the secondary error field,
+/// which is `code` in OData and `reason` in Google.
 pub fn error(status: StatusCode, message: &str, reason: &str) -> Response {
     let body = json!({
         "error": {

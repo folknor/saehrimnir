@@ -130,8 +130,13 @@ async fn list_connections(
         }));
     }
 
-    let mut all = projected_connections(&fixture);
-    let total = all.len();
+    // Sort once (refs only), then serialize the requested page
+    // slice. Pre-fix this materialised every contact's full JSON
+    // before paging, which made each page request O(N) regardless
+    // of page_size.
+    let mut sorted: Vec<&Contact> = fixture.contacts.iter().collect();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    let total = sorted.len();
     let page_size = clamp_page_size(params.page_size);
     let offset = parse_page_token(params.page_token.as_deref()).unwrap_or(0);
     if offset > total {
@@ -142,7 +147,7 @@ async fn list_connections(
         );
     }
     let end = (offset + page_size).min(total);
-    let slice: Vec<Value> = all.drain(offset..end).collect();
+    let slice: Vec<Value> = sorted[offset..end].iter().map(|c| serialize_person(c)).collect();
     let mut body = Map::new();
     body.insert("connections".into(), Value::Array(slice));
     body.insert(
@@ -227,12 +232,6 @@ fn encode_page_token(offset: usize) -> String {
 
 fn parse_page_token(t: Option<&str>) -> Option<usize> {
     t?.strip_prefix("p.")?.parse().ok()
-}
-
-fn projected_connections(fixture: &Fixture) -> Vec<Value> {
-    let mut contacts: Vec<&Contact> = fixture.contacts.iter().collect();
-    contacts.sort_by(|a, b| a.id.cmp(&b.id));
-    contacts.into_iter().map(serialize_person).collect()
 }
 
 /// People API tombstone shape: a Person whose `metadata.deleted`

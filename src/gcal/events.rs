@@ -333,7 +333,7 @@ async fn create_event(
     state.shared.request_log.record(
         "gcal",
         format!("POST /calendar/v3/calendars/{calendar}/events"),
-        json!({"body": parsed}),
+        crate::request_log::body_detail(&parsed),
     );
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
@@ -379,7 +379,7 @@ async fn patch_event(
     state.shared.request_log.record(
         "gcal",
         format!("PATCH /calendar/v3/calendars/{calendar}/events/{event_id}"),
-        json!({"body": parsed}),
+        crate::request_log::body_detail(&parsed),
     );
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
@@ -535,6 +535,16 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
     }
     if let Some(arr) = obj.get("attendees").and_then(Value::as_array) {
         event.attendees = arr.iter().filter_map(parse_address).collect();
+    }
+    // Real Google Calendar clients can repoint `organizer` on a
+    // PATCH (with appropriate ACLs); ratatoskr does not currently
+    // exercise this, but parsing it through keeps the gcal patch
+    // surface symmetric with create. Graph deliberately ignores
+    // `organizer` on patch (Microsoft Graph clients can't
+    // repoint), so the divergence between the two surfaces is
+    // intentional.
+    if let Some(v) = obj.get("organizer") {
+        event.organizer = parse_address(v);
     }
     Ok(())
 }

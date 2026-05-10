@@ -163,6 +163,11 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
 }
 
 /// Graph error envelope, RFC 7807 / Microsoft Graph error format.
+/// Args are `(http_status, odata_code, human_message)`. Reverse
+/// order from the Google-family `error(status, message, reason)`
+/// in `gmail/gcal/people` because the OData `code` field is named
+/// differently from Google's `errors[0].reason` and each signature
+/// orders its params to match the wire field it populates.
 pub fn error(status: StatusCode, code: &str, message: &str) -> Response {
     let body = json!({
         "error": {

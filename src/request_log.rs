@@ -131,3 +131,28 @@ impl RequestLog {
         self.len() == 0
     }
 }
+
+/// Inline mutation-body cap for request-log entries. Bodies whose
+/// serialized form exceeds this serialize to
+/// `{"truncated": true, "size": N}` instead of the full Value.
+/// Tests that assert on body content stay well under this;
+/// fixtures with large bodies (calendar invites with embedded
+/// VTIMEZONE, etc.) don't blow up the steady-state heap of the
+/// 100k-cap log between `DELETE /test/requests` calls.
+pub const REQUEST_LOG_BODY_MAX_BYTES: usize = 4096;
+
+/// Wrap `body` in `{"body": ...}` shape suitable for the
+/// `RequestEntry::detail` field, truncating when the serialized
+/// form exceeds [`REQUEST_LOG_BODY_MAX_BYTES`].
+pub fn body_detail(body: &Value) -> Value {
+    let serialized = body.to_string();
+    if serialized.len() > REQUEST_LOG_BODY_MAX_BYTES {
+        return serde_json::json!({
+            "body": {
+                "truncated": true,
+                "size": serialized.len(),
+            }
+        });
+    }
+    serde_json::json!({ "body": body })
+}
