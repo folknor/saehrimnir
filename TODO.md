@@ -118,10 +118,18 @@ from `gmail.googleapis.com`. Same listener pattern as gcal.
   delta sync via `syncToken`, otherContacts paging,
   sync-token recovery.
 
-### Deeper JMAP fixture families
+### Deeper JMAP fixture families - landed
 
-ratatoskr wants to write tests that exercise (a) slow paging
-under client timeouts, and (b) malformed MIME bodies.
+Slow-paging recipe documented in `notes/fixture-format.md`
+("Slow-paging recipe (Lua-only)"). Cross-protocol malformed-MIME
+injection wired: `Email::raw_bytes` now flows through JMAP
+`Email/get` `bodyValues` and Gmail `threads.get`
+`payload.body.data` in addition to the existing IMAP path; tests
+in `tests/malformed_mime.rs`. No `mime_mode` knob landed -
+`raw_bytes`'s presence is itself the opt-in, mirroring the IMAP
+contract.
+
+Original scope notes preserved below.
 
 - **Slow paging recipe.** Document in
   `notes/fixture-format.md` how to interleave `wait(ms)` in

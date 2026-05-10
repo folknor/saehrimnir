@@ -128,19 +128,38 @@ or require `.eml`? Lean toward adding `body_html` as a parallel field -
 many fixture cases will be "single text/html part" with no need for
 full MIME.
 
-### IMAP raw-bytes escape hatch
+### Cross-protocol raw-bytes escape hatch
 
 A third optional field, `body_raw_bytes`, lets a fixture override
-what the IMAP layer emits for `BODY[]` / `RFC822.SIZE` and the
-`BODY[HEADER]` / `BODY[TEXT]` / `BODY[1]` / `BODY[1.MIME]` slices.
-When set, the IMAP layer hands those bytes back verbatim instead of
-composing from the canonical headers + `body_text` + `attachments`;
-the bytes are split at the first `\r\n\r\n` to derive the header /
-text sub-fetches. Sub-parts (`BODY[N]` for N > 1) return NIL - the
-mock does not parse the raw block. `BODYSTRUCTURE` projects a
-single `text/plain` leaf reporting the raw octet count, which is a
-deliberate lie when the bytes claim multipart but is the best
-syntactically-valid answer the mock can give without parsing.
+what the wire layers emit for the body section. When set, the
+mock hands those bytes back verbatim instead of composing from
+the canonical `body_text` + `attachments`:
+
+- IMAP: `BODY[]` / `RFC822.SIZE` / `BODY[HEADER]` / `BODY[TEXT]` /
+  `BODY[1]` / `BODY[1.MIME]` all read from the raw block. The
+  bytes are split at the first `\r\n\r\n` to derive the header /
+  text sub-fetches. Sub-parts (`BODY[N]` for N > 1) return NIL -
+  the mock does not parse the raw block. `BODYSTRUCTURE` projects
+  a single `text/plain` leaf reporting the raw octet count, which
+  is a deliberate lie when the bytes claim multipart but is the
+  best syntactically-valid answer the mock can give without
+  parsing.
+- JMAP: `Email/get`'s `bodyValues[<text part>].value` carries the
+  raw bytes lossily decoded as UTF-8; ill-formed sequences
+  collapse to U+FFFD since JSON strings cannot carry arbitrary
+  bytes. `textBody[0].size` reflects raw byte length. Useful for
+  injecting anomalous body content (CRLF-only, bare-LF, weird
+  encoded-words) through ratatoskr's JMAP parser.
+- Gmail: `threads.get`'s `payload.body.data` carries the raw
+  bytes base64url-encoded, with no `parts[]` tree (the raw block
+  is the entire body, so a multipart wrapper is suppressed).
+  `payload.headers[]` keeps the structured headers so ratatoskr's
+  Gmail metadata path still finds From / To / Subject. `snippet`
+  and `sizeEstimate` read off the raw bytes too.
+- Graph: not yet wired (Graph projects a parsed metadata view,
+  which sidesteps the malformed-MIME testing surface that
+  ratatoskr's Graph mail parser exercises). Track in TODO.md if
+  a fixture needs Graph adversarial coverage.
 
 ```toml
 [[email]]
@@ -161,14 +180,19 @@ broken body\r
 """
 ```
 
-Coexists with `body_text`: structured-projection protocols (JMAP,
-Gmail, Graph) keep reading from `body_text` and ignore the raw
-block, so a fixture can give those clients a sane structured view
-while the IMAP wire shows hand-authored adversarial bytes. Mutually
-exclusive with `attachments` (the raw block IS the entire body, so
-authoring per-attachment metadata alongside is rejected at load
-time). For pure-IMAP adversarial fixtures, `body_text` can be a
-minimal placeholder.
+Coexists with `body_text`: when `body_raw_bytes` is unset, the
+canonical `body_text` is the source of truth on every wire and
+nothing changes. When it IS set, IMAP / JMAP / Gmail all switch to
+the raw block; structured headers (subject, from, to, ...) keep
+flowing from the canonical fields so the wire is still
+addressable. Mutually exclusive with `attachments` (the raw block
+IS the entire body, so authoring per-attachment metadata alongside
+is rejected at load time). For pure-IMAP adversarial fixtures,
+`body_text` can be a minimal placeholder.
+
+Worked tests in `tests/malformed_mime.rs` exercise the JMAP and
+Gmail cross-protocol surfaces; `tests/imap.rs::body_raw_bytes_
+emits_verbatim_through_imap_fetch` exercises IMAP.
 
 ### Threading
 
@@ -514,6 +538,56 @@ camelCase wire form directly; the fields are the friendly Lua names
 (`mailbox_ids`, `parent_id`, `sort_order`, `is_subscribed`) and the
 loader rewrites them into the JMAP-shape patch the apply layer
 expects.
+
+## Slow-paging recipe (Lua-only)
+
+Tests that need to assert client behaviour under a slow server -
+client-side timeouts, mid-page progress UI, retry policies - drive
+delay through a Lua `on()` callback that calls `wait(ms)` before
+returning `nil` (pass-through). The dispatcher holds a mutex while
+the callback runs, so `wait(ms)` is `std::thread::sleep` under the
+hood: other connections briefly queue on the lock, but unrelated
+protocol traffic continues on other tokio workers.
+
+Two worked examples ratatoskr-side scripts can lift verbatim:
+
+### Slow N-th JMAP `Email/query` page
+
+```lua
+fixture({ name = "slow-jmap" })
+account({ id = "account-1", name = "alice@example.com" })
+mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox" })
+bulk_emails({ count = 250, mailbox = "mb-inbox", seed = 1 })
+
+-- Pages 1 and 2 stream at full speed; page 3 (the call_index=3
+-- Email/query) holds the connection for 4s before passing
+-- through. ratatoskr's per-call timeout fires here.
+on("jmap", "Email/query", function(req)
+    if req.call_index == 3 then
+        wait(4000)
+    end
+    return nil
+end)
+```
+
+### Slow Graph `messages` `$skiptoken` page
+
+```lua
+on("graph", "list_messages", function(req)
+    -- req.skiptoken (when populated) is the s.<offset> token
+    -- ratatoskr uses to drive subsequent pages. Slow only the
+    -- second skiptoken page to mid-stream test partial-progress.
+    if req.skiptoken == "s.50" then
+        wait(2500)
+    end
+    return nil
+end)
+```
+
+For batched per-protocol slowdowns that don't depend on call shape,
+prefer `POST /test/latency` (per-protocol or `global` knob) over an
+`on()` hook - it skips the dispatcher mutex entirely. See
+`notes/orchestration.md` "Test / admin control plane".
 
 ## Reserved for v1+
 

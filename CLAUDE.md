@@ -191,6 +191,11 @@ checking whether the fact is already in `notes/`.
   `tower::ServiceExt::oneshot`.
 - `tests/gmail.rs` - Gmail integration tests via
   `tower::ServiceExt::oneshot`.
+- `tests/malformed_mime.rs` - asserts `Email::raw_bytes` flows
+  through the JMAP `Email/get` `bodyValues` and Gmail `threads.get`
+  `payload.body.data` paths in addition to the IMAP wire. Lets a
+  fixture inject anomalous body content for client-tolerance
+  testing on every parsed surface.
 - `tests/lua_fixture.rs` - asserts the Lua loader produces a
   `Fixture` byte-identical to the equivalent TOML fixture, plus
   error paths.

@@ -907,34 +907,41 @@ fn body_parts_and_values(
     fetch_html: bool,
     fetch_all: bool,
 ) -> (Value, Value, Option<Value>) {
-    match &e.body {
-        Body::Text(text) => {
-            let part_id = format!("{}:text", e.id);
-            let blob_id = format!("blob-{}-text", e.id);
-            let size = i64::try_from(text.len()).unwrap_or(i64::MAX);
-            let part = body_part_text(&part_id, &blob_id, size);
-            let text_body = Value::Array(vec![part]);
-            let html_body = Value::Array(vec![]);
-            let body_values = if fetch_text || fetch_all {
-                let mut bv = Map::new();
-                bv.insert(
-                    part_id,
-                    json!({
-                        "value": text,
-                        "isEncodingProblem": false,
-                        "isTruncated": false,
-                    }),
-                );
-                Some(Value::Object(bv))
-            } else if fetch_html {
-                // Empty bodyValues map (no html parts to fetch).
-                Some(Value::Object(Map::new()))
-            } else {
-                None
-            };
-            (text_body, html_body, body_values)
-        }
-    }
+    // Resolve the body string. When the fixture set `raw_bytes`, the
+    // wire body is whatever bytes the author wrote, lossy-decoded as
+    // UTF-8 - JMAP `bodyValues[*].value` is a JSON string, so any
+    // ill-formed sequence collapses to U+FFFD. Lets a fixture inject
+    // anomalous body content (CRLF-only, bare-LF, 8-bit, truncated
+    // shapes) through the JMAP projection in addition to the
+    // already-honoured IMAP path.
+    let body_str: std::borrow::Cow<'_, str> = match (e.raw_bytes.as_deref(), &e.body) {
+        (Some(raw), _) => std::borrow::Cow::Owned(raw.to_string()),
+        (None, Body::Text(text)) => std::borrow::Cow::Borrowed(text),
+    };
+
+    let part_id = format!("{}:text", e.id);
+    let blob_id = format!("blob-{}-text", e.id);
+    let size = i64::try_from(body_str.len()).unwrap_or(i64::MAX);
+    let part = body_part_text(&part_id, &blob_id, size);
+    let text_body = Value::Array(vec![part]);
+    let html_body = Value::Array(vec![]);
+    let body_values = if fetch_text || fetch_all {
+        let mut bv = Map::new();
+        bv.insert(
+            part_id,
+            json!({
+                "value": body_str.as_ref(),
+                "isEncodingProblem": false,
+                "isTruncated": false,
+            }),
+        );
+        Some(Value::Object(bv))
+    } else if fetch_html {
+        Some(Value::Object(Map::new()))
+    } else {
+        None
+    };
+    (text_body, html_body, body_values)
 }
 
 fn body_part_text(part_id: &str, blob_id: &str, size: i64) -> Value {

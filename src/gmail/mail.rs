@@ -365,16 +365,19 @@ async fn get_thread(
 fn message_value(e: &Email, fixture: &Fixture) -> Value {
     let label_ids = label_ids_for(e, fixture);
     let payload = build_payload(e);
-    let body_size: u64 = match &e.body {
-        Body::Text(t) => t.len() as u64,
+    let body_size: u64 = match (e.raw_bytes.as_deref(), &e.body) {
+        (Some(raw), _) => raw.len() as u64,
+        (None, Body::Text(t)) => t.len() as u64,
+    };
+    let snippet = match (e.raw_bytes.as_deref(), &e.body) {
+        (Some(raw), _) => raw.chars().take(100).collect::<String>(),
+        (None, Body::Text(t)) => t.chars().take(100).collect::<String>(),
     };
     json!({
         "id": e.id,
         "threadId": e.thread_id,
         "labelIds": label_ids,
-        "snippet": match &e.body {
-            Body::Text(t) => t.chars().take(100).collect::<String>(),
-        },
+        "snippet": snippet,
         "historyId": HISTORY_ID,
         "internalDate": e.received_at.timestamp_millis().to_string(),
         "sizeEstimate": body_size,
@@ -414,11 +417,21 @@ fn build_payload(e: &Email) -> Value {
     }
     headers.push(header("MIME-Version", "1.0"));
 
-    let body_str = match &e.body {
-        Body::Text(t) => t.clone(),
+    // When the fixture set `raw_bytes`, the body leaf carries those
+    // bytes verbatim (base64url) instead of the canonical body_text.
+    // attachments are dropped on the raw-bytes path because the bytes
+    // are the entire body, including any MIME structure the author
+    // wanted (mirrors the IMAP fetch contract documented on
+    // `Email::raw_bytes`). Lets fixtures inject anomalous body shapes
+    // through the Gmail projection: CRLF-only bodies, bare-LF, 8-bit
+    // sequences, oversized data, etc. The malformed-MIME tests in
+    // `tests/malformed_mime.rs` exercise the full path.
+    let body_str = match (e.raw_bytes.as_deref(), &e.body) {
+        (Some(raw), _) => raw.to_string(),
+        (None, Body::Text(t)) => t.clone(),
     };
 
-    if e.attachments.is_empty() {
+    if e.raw_bytes.is_some() || e.attachments.is_empty() {
         headers.push(header("Content-Type", "text/plain; charset=utf-8"));
         headers.push(header("Content-Transfer-Encoding", "8bit"));
         return text_leaf(String::new(), headers, &body_str);
