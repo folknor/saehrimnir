@@ -4,6 +4,315 @@ Running task list, ordered by what ratatoskr is actively waiting on.
 Per-protocol design notes live alongside in `notes/`; this file just
 tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
+## From the 2026-05-10 multi-agent review
+
+Findings from a four-agent (security / bugs / perf / arch) sweep of
+the work landed in commits `8f7798c..7602fdb` (RwLock + change_log,
+JMAP `Email/set` + `Mailbox/set`, IMAP `UID STORE`/`COPY`/`EXPUNGE`,
+Graph calendar mutations + delta, Graph contacts + delta, change-
+script pipeline + `/test/fixture/step` + `/test/fixture/reset`,
+latency knob, stable request log, OAuth-enforced fixture, CalDAV
+listener + module, TOML `[[change]]` projection, `body_raw_bytes`
+escape hatch). Only items that need work end up here; verified-
+correct invariants and accepted trade-offs are omitted.
+
+### Fix now
+
+- **[bugs] `apply_change_step` rewind drops `contacts` /
+  `contact_folders`.** `src/routes.rs:803-816` snapshots only
+  `emails` / `mailboxes` / `events`; a step that successfully
+  creates a contact and then errors on a later op leaves the
+  contact persisted and the cursor un-advanced, wedging the
+  script. One-line snapshot+restore fix; or restructure the apply
+  path around clone-then-swap so future resource additions don't
+  need a matching rewind line.
+- **[bugs] Graph `calendarView/delta` and `contacts/delta` emit
+  cross-collection tombstones.** `src/graph/calendar.rs:248-256`
+  and `src/graph/contacts.rs:329-336`. The `created` / `updated`
+  loops correctly filter by `calendar_id` / `folder_id`, but the
+  `destroyed` loop emits a tombstone for every id in the cross-
+  collection delta. Folder A's delta receives tombstones for
+  events destroyed in folder B. Thread parent-id into the
+  destroyed-id walk (record `(id, parent_id)` on the destroyed
+  list in `Transition`, or capture pre-destroy parent in
+  `apply_change_step`).
+- **[bugs] IMAP `BODY[HEADER]` for raw-bytes emails includes one
+  extra `\r\n`.** `src/imap.rs:1781-1786`. RFC 3501 says HEADER
+  includes the headers terminated by the blank-line CRLF (one
+  trailing CRLF). Code uses `&raw[..i + 4]` (headers + blank
+  line + extra CRLF). Should be `&raw[..i + 2]` for HEADER and
+  keep `&raw[i + 4..]` for TEXT. Just-shipped code; trivial fix.
+- **[security] CalDAV listener never enforces
+  `fixture.oauth.enforce`.** `src/caldav/mod.rs::router` /
+  `dispatch` mounts no bearer middleware, so PUT / DELETE
+  mutate fixture state with no `Authorization` header even when
+  every other HTTP listener (JMAP, Graph, Gmail) requires a
+  token. Loopback bind makes it unexploitable today, but the
+  enforcement asymmetry breaks the contract documented in
+  `notes/ratatoskr-oauth-surface.md`. Add a middleware mirror of
+  `graph/mod.rs::enforce_bearer_middleware`; update
+  `notes/ratatoskr-oauth-surface.md` to extend coverage to
+  CalDAV.
+- **[security] CalDAV iCal `ORGANIZER` / `ATTENDEE` email
+  addresses are emitted verbatim.** `src/caldav/ical.rs:80-89`
+  (`write_address_line`). A fixture-supplied (or, with the
+  enforcement gap above, PUT-supplied) address containing
+  `\r\n` injects a new iCal property line into every subsequent
+  GET / REPORT. Either route through `escape_text` or assert
+  no-CRLF at fixture-load and PUT time.
+- **[security] `/test/latency` accepts unbounded `u64` ms.**
+  `src/routes.rs:577-633`. A `POST /test/latency` with
+  `global_ms: u64::MAX` deadlocks every dispatch path for ~584M
+  years; recovery requires SIGTERM. Loopback-only and admin-
+  gated, but trivially DoS-able from a misbehaving harness.
+  Clamp to a sane ceiling (e.g. 60_000ms) or reject larger
+  values with 400.
+- **[bugs] CalDAV ETag / CTag derive from global `fixture.state`,
+  not per-resource.** `src/caldav/mod.rs:511-521`. Any mutation
+  bumps `Fixture::state`, which changes every event's ETag and
+  every calendar's CTag - so an unrelated JMAP `Email/set`
+  invalidates every CalDAV cache, forcing a real client to
+  re-walk every calendar. Mix a per-resource version into the
+  derivation, or cross-reference the change_log to find the
+  last touch of *that* resource.
+- **[arch] Two parallel `ChangeOp` producers with drift-prone
+  patch construction.** `src/lua.rs::builder_change` (and
+  per-op readers) and `src/fixture.rs::normalize_change_step`
+  build identical patch shapes (`keywords` / `mailboxIds`
+  camelCase, mailbox patch keys, contact `emails` array
+  projection, etc.). The byte-identity test in
+  `tests/lua_fixture.rs` catches divergence at the resulting
+  `ChangeStep` level but per-step error messages diverge
+  silently. Push the Lua readers further into building
+  `Raw*Update` structs and route both sides through one
+  shared `normalize_change_step`.
+- **[arch] `step_fixture` calls `mutate(|_f| diff)` after
+  already mutating the fixture in `apply_change_step`,
+  violating the closure-only-mutator contract.** `src/routes.rs`
+  step path mutates `fix.contacts` / `fix.events` etc. directly,
+  then calls `Fixture::mutate` solely to bump state and append
+  a transition. Anyone reading the `mutate` doc will assume the
+  closure is the only mutation site. Either widen the public
+  surface (`record_transition(diff) -> Transition`) so the step
+  path's intent is explicit, or restructure `apply_change_step`
+  to fill a closure-local working copy.
+- **[bugs] Lua `email_create` baseline-mailbox snapshot is taken
+  at the wrong moment.** `src/lua.rs:1267-1272` reads
+  `builder_mut(state)?.mailboxes` at `change(...)` invocation
+  time, so the snapshot is "set declared so far in script
+  order", not "load-time baseline" as the inline doc and
+  `CLAUDE.md` claim. A script that interleaves
+  `mailbox(...)` and `change(...)` calls behaves
+  unintuitively. Either capture the baseline once at script
+  finalize (or first `change(...)` call), or document the
+  ordering requirement loudly in `notes/fixture-format.md`.
+
+### Fix soon
+
+- **[security] CalDAV PUT can change a stored event's id behind
+  the URL.** `src/caldav/mod.rs:805` uses `parsed.uid` (from
+  the body) to choose the new event's id while
+  `existing_idx` was looked up by URL `event_id`. Body `UID:B`
+  against URL `.../A.ics` orphans the URL ↔ id mapping or
+  duplicates id `B`. Reject when `parsed.uid != Some(event_id)`.
+- **[security] CalDAV `If-Match` quote / weak-validator
+  handling.** `src/caldav/mod.rs:743-799, 884-889` does
+  byte-equality on a trimmed header value. Wildcard branch
+  matches only the literal three bytes `*`; a client sending
+  `"*"` (quoted) always 412s. `W/`-prefixed weak validators are
+  not stripped. Parse into a list of opaque tokens (split on
+  `,`, strip leading `W/`, strip surrounding quotes).
+- **[security] CalDAV `mailto:` strip is case-sensitive.**
+  `src/caldav/ical.rs:232`. Apple Calendar emits `MAILTO:`
+  uppercase; the parsed address ends up `email = "MAILTO:bob@x"`
+  and round-trips as `mailto:MAILTO:bob@x`. Case-insensitive
+  prefix-strip.
+- **[security] CalDAV multi-VEVENT body silently drops the
+  second event.** `src/caldav/ical.rs::parse_vevent` walks until
+  the first `END:VEVENT`. Combined with the URL/UID divergence
+  finding, an attacker-supplied body could have two VEVENTs
+  with different UIDs and we'd pick whichever the parser saw
+  first. Reject multi-VEVENT bodies (or accept all and
+  validate UID consistency).
+- **[bugs] Cross-folder contact moves disappear from source-
+  folder delta.** `src/graph/contacts.rs:329-336`. A
+  `contact_update` patch that changes `folder_id` from A to B
+  fires `contact_updated`; folder A's delta walk filters by
+  current `folder_id == A` and finds nothing. Folder A never
+  learns the contact moved away. Either reject `folder_id`
+  patches in `apply_contact_patch` (force destroy+create), or
+  expand the change_log to record per-move source/destination.
+  Same shape applies to event `calendar_id` moves once those
+  get patch support.
+- **[bugs] `step_fixture` and `reset_fixture` acquire locks in
+  opposite orders.** `src/routes.rs:770-771` (cursor →
+  fixture) vs `src/routes.rs:528-533` (fixture → cursor).
+  Axum's per-route handler serialization makes deadlock hard
+  to trip today, but the inversion is a real lock-ordering
+  bug. Pick one global order and apply it to both.
+- **[security] `RequestLog::snapshot` race window.**
+  `src/request_log.rs:113-131`. The `mem::take` → drop guard →
+  clone → reacquire dance allows entries that arrive during
+  the clone to be returned in the snapshot but evicted from
+  the live deque after the cap-reapplication, so a follow-up
+  `GET /test/requests` returns fewer rows than the previous
+  call. Either accept the contract as a single-shot drain
+  (return `out`, leave deque empty) or hold the lock for the
+  full clone+restore.
+- **[bugs] CalDAV `xml::body_requests_prop` is a substring
+  match.** `src/caldav/xml.rs:32-46` matches
+  `calendar-multiget` against any element containing the
+  substring (e.g. a hypothetical `calendar-multiget-set` or a
+  comment). v0 fixtures don't collide; tighten if a future
+  fixture grows mixed-element bodies.
+- **[bugs] CalDAV path parsing accepts duplicated slashes /
+  doesn't percent-decode.** `src/caldav/mod.rs:183-217`
+  collapses `///` so request_log entries don't uniquely
+  identify the path; calendar / event ids that round-trip
+  through real clients carrying `%`-encoded characters won't
+  match. Reject `//` and percent-decode each segment.
+- **[perf] `Fixture::delta_since` cancel set is O(c·d).**
+  `src/fixture.rs:355-360` does `destroyed.contains(id)`
+  (linear `Vec` scan) per created id. With a 256-transition
+  log over a 10k-event fixture, a stale-client follow-up
+  delta can pay ~600k comparisons. Build `destroyed` as
+  `HashSet<&str>` once. Same code path: `dedup_preserving_order`
+  clones every id into the HashSet - hash on `&str`.
+- **[perf] Graph delta walkers do nested `find` per delta id.**
+  `src/graph/calendar.rs:248-256`,
+  `src/graph/contacts.rs:329-336`. O(K · N) per delta call
+  where K = delta size, N = fixture-wide resources. Build an
+  `id → &Resource` HashMap once at the top of the handler.
+- **[perf] `step_fixture` clones full `emails` / `mailboxes` /
+  `events` vectors on every step under the write guard.**
+  `src/routes.rs:803-805`. Pure-defensive snapshot for
+  rewind-on-error; a 100-step script against a 10k-email
+  fixture re-pays the deep clone 100 times. Either pre-validate
+  cross-refs so the apply path is infallible (the validation
+  loops at lines 897-906, 944-953, 992-994 already exist), or
+  snapshot only the touched indices.
+- **[perf] `RequestLog::snapshot` deep-clones twice.**
+  `src/request_log.rs:113-131` plus `src/routes.rs:484-493`
+  rebuilds a fresh `Value` per row for `?stable=true`. With
+  cap = 100_000 and rich JSON details, steady-state per-call
+  working set is ~100MB. Take ownership in the handler;
+  serialize directly from `RequestEntry` borrows via a view
+  struct.
+- **[perf] IMAP `RFC822.SIZE` re-renders the entire body just
+  to take `.len()`.** `src/imap.rs:1699-1701`. Combined with
+  every other `BODY[*]` attribute on the same fetch line,
+  `render_rfc822` runs once per attribute - 5x re-encoding for
+  a typical Apple-Mail-shaped fetch list. Render once into a
+  small struct (`headers`, `text`, optional `multipart_full`)
+  and reuse slices.
+- **[perf] `split_raw` rerun per raw-bytes attribute.**
+  `src/imap.rs:1781-1786, 1790, 1848, 2057, 2082`. A FETCH
+  asking for `BODY[HEADER]` + `BODY[TEXT]` + `BODY[1.MIME]` +
+  `BODY[1]` runs the search 4× per message. Folds into the
+  render-once fix above.
+- **[perf] `cmd_uid_fetch` materializes all FETCH lines before
+  writing.** `src/imap.rs:715-728` builds `Vec<String>` of
+  every rendered message under the read guard. For a
+  10k-message FETCH peaks RAM at the entire mailbox; the lock-
+  drop motivation is correct but the obvious shape is to
+  clone the inputs and render+write per item. Lift the
+  existing `Streaming UID FETCH` future-work item from this
+  file's "IMAP follow-ups" section into here.
+- **[perf] `Email/set` updates and destroys each scan all
+  emails.** `src/jmap.rs:1060, 1080`,
+  `src/routes.rs::apply_change_step:920, 954, 971`.
+  `(U + D) · N` per envelope. Build an `id → idx` map at the
+  top of the handler; rewrite `retain` as a single pass
+  consulting a `HashSet<&str>` of destroy ids.
+- **[perf] CalDAV PROPFIND `body_requests_prop` runs per event
+  per property.** `src/caldav/mod.rs:333-338` calls 3× per
+  event in `event_resource_props`, each call up to 4
+  substring searches. For a calendar with 100k events and a
+  1KB request body: ~1.2GB of byte scans. Parse the prop set
+  once at the PROPFIND entry point into a `HashSet<&str>` and
+  pass down.
+- **[arch] `apply_contact_patch` / `apply_contact_folder_patch`
+  / `apply_change_event_patch` live in `src/routes.rs`.**
+  Routes is the HTTP transport seam; canonical-type apply
+  logic belongs alongside the types or in a dedicated patch
+  module. Plus there are now two distinct event-patch shapes
+  (`graph::calendar::apply_event_patch` for Graph wire,
+  `routes::apply_change_event_patch` for the change-script
+  flat-RFC3339 form). Move to `src/fixture/patches.rs` (or
+  onto canonical-type `impl` blocks); keep the JMAP / Graph
+  wire-shape patches in their respective protocol modules.
+- **[arch] Patch field-name conventions diverge.**
+  `apply_mailbox_patch` uses camelCase JMAP names (`parentId`,
+  `sortOrder`, `isSubscribed`); the contact / contact_folder /
+  change-script-event patches use snake_case. Pick a
+  convention per resource family and document it; lean
+  snake_case for change-script-only resources since there's no
+  protocol-wire forcing a name and the canonical types are
+  already snake_case.
+- **[arch] `src/routes.rs` has grown to ~1440 lines.** Hosts
+  JMAP HTTP, OAuth wiring, SMTP-submission test routes,
+  request-log routes, fixture reset, fixture step (with three
+  patch helpers and a 380-line `apply_change_step`), latency
+  GET/SET, snapshot-state, and an RFC 5987 utility. Split the
+  `/test/*` family into `src/routes/test_admin.rs` so the JMAP
+  HTTP / OAuth router glue stays scrollable.
+- **[docs] CalDAV is wired but undocumented in
+  `notes/orchestration.md`, `notes/request-log.md`, and
+  `notes/fixture-format.md`.** The sentinel content section
+  (`orchestration.md` line 79) lists the five original
+  protocols; `src/main.rs:94` writes `CALDAV` too. The
+  lifecycle diagram does not list `RATATOSKR_TEST_CALDAV_ENDPOINT`.
+  `request-log.md` enumerates five protocol tags; CalDAV
+  records under `"caldav"`. `fixture-format.md:233` reads
+  "the same canonical types will feed CalDAV when that
+  listener lands" - now stale. Update all three.
+- **[docs] `/test/snapshot-state` and `/test/fixture/step`
+  responses miss `contacts` / `contact_folders` in the
+  documented JSON shapes.** `notes/orchestration.md:222-232`
+  and `:287-296`. The actual handlers in `src/routes.rs:856-866`
+  emit them.
+
+### Eventually (only when something forces it)
+
+- **[security] CalDAV iCal / XML parsers are O(n·m) on
+  adversarial input.** `caldav/xml.rs::find_tag_open` /
+  `find_tag_close` advance one byte per `<` and re-scan the
+  suffix. Not exploitable for ReDoS (no backtracking) but a
+  single PROPFIND can pin one core for tens of ms on a 2MB
+  body. Acceptable for a loopback test mock.
+- **[perf] `RequestLog` retains rich `serde_json::Value` per
+  entry with cap = 100_000.** Multi-hundred-MB steady-state
+  heap even when no test reads it. Drop cap to 10_000 or let
+  fixtures override.
+- **[perf] `LatencyKnob::sleep_for` is `async` even on the
+  empty-knob path.** Saves the `tokio::time::sleep` call but
+  not the await-state-machine churn. Marginal.
+- **[perf] CalDAV `xml::escape` and `ical::escape_text` build
+  a fresh `String` char-by-char.** Fine for fixture-sized
+  bodies; swap to a byte-find fast path that pushes
+  unescaped runs in slices once 10MB CalDAV bodies show up.
+- **[perf] `caldav::dispatch` clones the path string at
+  entry.** `src/caldav/mod.rs:106`. One allocation per
+  request; trivial.
+- **[perf] `caldav::wrap_responses` builds parallel
+  `event_hrefs` / `event_props` / `entries` Vecs**
+  (`src/caldav/mod.rs:331-344`) where one streaming push into
+  the output buffer would suffice.
+- **[perf] `imap::mailbox_counts` builds a `Vec<&Email>`** to
+  count exists / unseen; could be two iterator counts.
+- **[arch] `LatencyKnob::lookup` is `pub` and used only by
+  internal callers.** Could be `pub(crate)`.
+- **[arch] `shared::SharedHandles::for_test` builds its own
+  `baseline` from a read of the live fixture.** Tests that
+  hit `/test/fixture/reset` would rewind to whatever the
+  fixture happened to look like at handle construction, not
+  the post-load image. No test trips this today; flag for
+  when one might.
+- **[arch] `body_raw_bytes` doc lives in three places**
+  (`notes/fixture-format.md`, the `Email::raw_bytes` field
+  doc, the IMAP render doc). Consolidate onto the field
+  doc-comment when next touched.
+
 ## From the 2026-05-09 multi-agent review
 
 Findings from a four-agent (security / bugs / perf / arch) review of
@@ -78,10 +387,8 @@ Remaining items are unblocked-but-unneeded.
 
 ## IMAP (lower-priority follow-ups)
 
-- Streaming `UID FETCH` to avoid materialising the full response
-  set before writing. Today's loop builds a `Vec<String>` first;
-  at huge N (think `bulk_emails(count=1_000_000)`) that's enough
-  memory to matter. Refactor when a fixture forces it.
+- Streaming `UID FETCH` is tracked under the 2026-05-10 perf
+  bucket above (`cmd_uid_fetch` materializes all FETCH lines).
 - 200-message FETCH batching boundary. The current handler emits
   all matched FETCH responses in one go. Ratatoskr's client
   batches client-side (`CHUNK_SIZE = 200`), so the wire boundary
