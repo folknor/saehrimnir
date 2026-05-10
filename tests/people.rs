@@ -274,6 +274,159 @@ async fn connections_emits_metadata_deleted_tombstone_after_destroy() {
     assert_ne!(new_token, token);
 }
 
+async fn request(
+    r: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Body,
+    content_type: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(ct) = content_type {
+        req = req.header("content-type", ct);
+    }
+    let resp = r.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn update_contact_records_transition_and_returns_person() {
+    let r = router();
+
+    // Bootstrap to grab the seed sync token.
+    let (_, bootstrap) = get(
+        &r,
+        "/v1/people/me/connections?personFields=names&pageSize=100&requestSyncToken=true",
+    )
+    .await;
+    let token = bootstrap["nextSyncToken"].as_str().unwrap().to_string();
+
+    // PATCH the first contact in the fixture (graph-contacts-small
+    // declares contact-001 ... contact-004).
+    let body = Body::from(
+        serde_json::to_vec(&serde_json::json!({
+            "etag": "*",
+            "phoneNumbers": [{ "value": "+1-555-0100" }],
+            "organizations": [{ "name": "Hammerworks" }],
+        }))
+        .unwrap(),
+    );
+    let (status, person) = request(
+        &r,
+        "PATCH",
+        "/v1/people/contact-001:updateContact?updatePersonFields=phoneNumbers,organizations",
+        body,
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(person["resourceName"], "people/contact-001");
+    assert_eq!(person["metadata"]["deleted"], false);
+
+    // Delta walk: contact-001 surfaces in the updated set.
+    let (status, follow) = get(
+        &r,
+        &format!("/v1/people/me/connections?personFields=names&pageSize=100&syncToken={token}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let conns = follow["connections"].as_array().unwrap();
+    let entry = conns
+        .iter()
+        .find(|p| p["resourceName"] == "people/contact-001")
+        .unwrap_or_else(|| panic!("expected contact-001 in delta; got {conns:?}"));
+    assert_eq!(entry["metadata"]["deleted"], false);
+    assert_ne!(follow["nextSyncToken"], Value::String(token));
+}
+
+#[tokio::test]
+async fn update_contact_unknown_id_returns_404() {
+    let r = router();
+    let body = Body::from(b"{\"etag\":\"*\"}".to_vec());
+    let (status, v) = request(
+        &r,
+        "PATCH",
+        "/v1/people/contact-999:updateContact?updatePersonFields=phoneNumbers",
+        body,
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
+}
+
+#[tokio::test]
+async fn delete_contact_removes_and_emits_tombstone_in_delta() {
+    let r = router();
+
+    let (_, bootstrap) = get(
+        &r,
+        "/v1/people/me/connections?personFields=names&pageSize=100&requestSyncToken=true",
+    )
+    .await;
+    let token = bootstrap["nextSyncToken"].as_str().unwrap().to_string();
+    let initial = bootstrap["connections"].as_array().unwrap().len();
+
+    let (status, _) = request(
+        &r,
+        "DELETE",
+        "/v1/people/contact-002:deleteContact",
+        Body::empty(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Bootstrap again (no token) to confirm contact-002 is gone.
+    let (_, fresh) = get(
+        &r,
+        "/v1/people/me/connections?personFields=names&pageSize=100&requestSyncToken=true",
+    )
+    .await;
+    assert_eq!(
+        fresh["connections"].as_array().unwrap().len(),
+        initial - 1,
+        "contact-002 should be removed from the live list"
+    );
+    assert!(
+        fresh["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["resourceName"] != "people/contact-002")
+    );
+
+    // Delta walk from the pre-delete token surfaces the tombstone.
+    let (_, follow) = get(
+        &r,
+        &format!("/v1/people/me/connections?personFields=names&pageSize=100&syncToken={token}"),
+    )
+    .await;
+    let tombstone = follow["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["resourceName"] == "people/contact-002")
+        .unwrap_or_else(|| panic!("expected tombstone for contact-002 in delta"));
+    assert_eq!(tombstone["metadata"]["deleted"], true);
+}
+
+#[tokio::test]
+async fn delete_contact_unknown_id_returns_404() {
+    let r = router();
+    let (status, _) = request(
+        &r,
+        "DELETE",
+        "/v1/people/contact-999:deleteContact",
+        Body::empty(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn unknown_path_falls_back_to_404_envelope() {
     let r = router();

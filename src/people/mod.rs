@@ -16,12 +16,16 @@
 //!   empty list since the fixture has no `other_contacts` field
 //!   yet - the route is here so ratatoskr's bootstrap path
 //!   doesn't 404).
-//!
-//! Mutations live elsewhere (POST / PATCH / DELETE on People API
-//! aren't wired by ratatoskr in v0). When they land, follow the
-//! Graph `contacts` pattern: write through `Fixture::mutate`,
-//! record `contact_*` transitions, and surface deltas via the
-//! `nextSyncToken` walk.
+//! - `PATCH /v1/people/{id}:updateContact?updatePersonFields=...`
+//!   (write-back from ratatoskr's contact editor; bumps state +
+//!   records `contact_updated` so the next delta surfaces the
+//!   contact). The fixture `Contact` only carries display name +
+//!   email list, so phone / organization / notes from the patch
+//!   body land in the request log but aren't durably stored.
+//! - `DELETE /v1/people/{id}:deleteContact` (write-back delete;
+//!   removes the contact and records a `contact_destroyed`
+//!   transition so the next delta emits a `metadata.deleted`
+//!   tombstone).
 
 pub mod contacts;
 

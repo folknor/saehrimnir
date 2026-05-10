@@ -115,9 +115,35 @@ fresh `nextSyncToken` on the final page. The mock honours this:
   delta path. ratatoskr's serde derives expect the field to be
   present (or `None`); a fully-empty body fails to parse.
 
+## Mutations (write-back)
+
+ratatoskr's contact editor pushes phone / company / notes back to
+Google through the People API custom verbs. The mock implements
+the request shape and bumps the change log; durable storage of
+the patched fields isn't there because the fixture `Contact`
+schema doesn't carry them.
+
+- `PATCH /v1/people/{id}:updateContact?updatePersonFields=...`.
+  Body is a partial `Person` (`{etag, phoneNumbers, organizations,
+  biographies}`). Mock validates the contact exists, records a
+  `contact_updated` transition, and echoes the (current) Person
+  back. The next `connections` delta surfaces the contact id in
+  the updated set.
+- `DELETE /v1/people/{id}:deleteContact`. Mock validates the
+  contact exists, removes it from `Fixture::contacts`, records a
+  `contact_destroyed` transition (with the contact's
+  `folder_id` as the destroyed parent), and returns `{}`. The
+  next `connections` delta surfaces the contact id as a
+  `metadata.deleted: true` tombstone.
+
+The custom verbs arrive on `/v1/people/{id}:updateContact` /
+`/v1/people/{id}:deleteContact` - the colon-prefixed verb is part
+of the path segment, not a query string.
+
 ## What v0 doesn't surface
 
-- Mutations (POST / PATCH / DELETE). ratatoskr only reads.
+- `POST /v1/people:createContact`. ratatoskr doesn't yet create
+  Google contacts (only existing-contact write-back).
 - `otherContacts` actual data; the mock always returns an empty
   list because the fixture format has no `[other_contact]` table
   yet. Wire when a fixture needs it.

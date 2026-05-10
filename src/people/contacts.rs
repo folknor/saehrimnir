@@ -17,7 +17,7 @@
 
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Response,
     routing::get,
@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
-use crate::fixture::{Contact, Fixture};
+use crate::fixture::{Contact, Fixture, MutationDiff};
 
 /// People-API page size cap from
 /// `<ratatoskr>/crates/gmail/src/contacts/mod.rs::PAGE_SIZE`.
@@ -38,6 +38,17 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/people/me/connections", get(list_connections))
         .route("/v1/otherContacts", get(list_other_contacts))
+        // Google's `:updateContact` / `:deleteContact` custom verbs
+        // arrive as a single segment (`{id}:updateContact`) on the
+        // `/v1/people/...` path. ratatoskr addresses contacts via
+        // their `people/{id}` resource name, so the wire URL is
+        // `/v1/people/{id}:updateContact`. We capture the whole
+        // segment as `spec` and pull off the `:verb` suffix in the
+        // handler.
+        .route(
+            "/v1/people/{spec}",
+            axum::routing::patch(update_contact).delete(delete_contact),
+        )
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -203,6 +214,158 @@ async fn list_other_contacts(
         "totalSize": 0,
         "nextSyncToken": fixture.state,
     }))
+}
+
+// ── Mutations ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct UpdateParams {
+    /// Comma-separated list of writable fields the client is touching
+    /// (`phoneNumbers`, `organizations`, `biographies`, ...). Echoed
+    /// into the request log; the mock doesn't durably store these
+    /// fields (the fixture `Contact` only carries display name + email
+    /// list) but treats any non-empty mask as a contact_updated
+    /// transition so the next delta surfaces the contact.
+    #[serde(default, rename = "updatePersonFields")]
+    update_person_fields: Option<String>,
+}
+
+async fn update_contact(
+    State(state): State<AppState>,
+    Path(spec): Path<String>,
+    Query(params): Query<UpdateParams>,
+    body: axum::body::Body,
+) -> Response {
+    let Some(id) = spec.strip_suffix(":updateContact") else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("v0 mock does not implement PATCH /v1/people/{spec}"),
+            "notFound",
+        );
+    };
+    let id = id.to_string();
+    let parsed = match parse_json_body(body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    state.shared.request_log.record(
+        "people",
+        format!("PATCH /v1/people/{id}:updateContact"),
+        json!({
+            "updatePersonFields": params.update_person_fields,
+            "body": crate::request_log::body_detail(&parsed),
+        }),
+    );
+
+    if let Some(o) = super::maybe_override(&state, "update_contact", |s| {
+        crate::lua::req_set_str(s, "contact_id", &id)?;
+        if let Some(m) = &params.update_person_fields {
+            crate::lua::req_set_str(s, "update_person_fields", m)?;
+        }
+        Ok(())
+    }) {
+        return o;
+    }
+
+    let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+    if !fix.contacts.iter().any(|c| c.id == id) {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("contact {id:?} not declared in fixture"),
+            "notFound",
+        );
+    }
+    let id_for_diff = id.clone();
+    let _ = fix.mutate(|_| MutationDiff {
+        contact_updated: vec![id_for_diff.clone()],
+        ..Default::default()
+    });
+    let view = fix.contacts.iter().find(|c| c.id == id).cloned();
+    drop(fix);
+    match view {
+        Some(c) => ok_json(serialize_person(&c)),
+        // Should never happen: we just checked above and hold the
+        // write guard. Defensive only.
+        None => error(StatusCode::NOT_FOUND, "contact vanished", "notFound"),
+    }
+}
+
+async fn delete_contact(
+    State(state): State<AppState>,
+    Path(spec): Path<String>,
+) -> Response {
+    let Some(id) = spec.strip_suffix(":deleteContact") else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("v0 mock does not implement DELETE /v1/people/{spec}"),
+            "notFound",
+        );
+    };
+    let id = id.to_string();
+    state.shared.request_log.record(
+        "people",
+        format!("DELETE /v1/people/{id}:deleteContact"),
+        json!({ "id": id }),
+    );
+
+    if let Some(o) = super::maybe_override(&state, "delete_contact", |s| {
+        crate::lua::req_set_str(s, "contact_id", &id)
+    }) {
+        return o;
+    }
+
+    let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+    let Some(parent) = fix
+        .contacts
+        .iter()
+        .find(|c| c.id == id)
+        .map(|c| c.folder_id.clone())
+    else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("contact {id:?} not declared in fixture"),
+            "notFound",
+        );
+    };
+    let id_for_diff = id.clone();
+    let _ = fix.mutate(|f| {
+        let len_before = f.contacts.len();
+        f.contacts.retain(|c| c.id != id_for_diff);
+        if f.contacts.len() < len_before {
+            MutationDiff {
+                contact_destroyed: vec![id_for_diff.clone()],
+                contact_destroyed_parents: vec![parent.clone()],
+                ..Default::default()
+            }
+        } else {
+            MutationDiff::default()
+        }
+    });
+    // Real People API returns an empty `{}` body on delete success.
+    ok_json(json!({}))
+}
+
+async fn parse_json_body(body: axum::body::Body) -> Result<Value, Response> {
+    let bytes = match axum::body::to_bytes(body, 1_048_576).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                &format!("failed to read body: {e}"),
+                "badRequest",
+            ));
+        }
+    };
+    if bytes.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(&bytes).map_err(|e| {
+        error(
+            StatusCode::BAD_REQUEST,
+            &format!("body is not JSON: {e}"),
+            "invalidRequest",
+        )
+    })
 }
 
 // ── Shape helpers ───────────────────────────────────────────────────
