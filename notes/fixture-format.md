@@ -278,6 +278,18 @@ The mock refuses to start (non-zero exit, stderr message) if:
 - A `body_path` does not exist or is not readable.
 - `received_at` cannot be parsed.
 
+Notable non-rules - things the validator deliberately accepts so
+that adversarial-shape fixtures can be authored:
+
+- Two or more emails sharing the same `Message-Id`. None of the
+  per-protocol projections key on `Message-Id`; it is emitted as a
+  header (IMAP, Gmail) or as the `messageId` array on each email
+  (JMAP), so duplicates are wire-safe and only differ from
+  unique-id fixtures in the header value clients see. Useful for
+  testing how ratatoskr's incremental sync handles the case where
+  two distinct messages happen to share a Message-Id (a real-world
+  edge case from broken senders).
+
 ## Determinism contract
 
 For any fixture, every response from the mock is byte-identical across

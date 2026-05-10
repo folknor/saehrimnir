@@ -92,6 +92,49 @@ fn lua_fixture_matches_equivalent_toml() {
 }
 
 #[test]
+fn duplicate_message_id_across_emails_is_accepted() {
+    // Adversarial-shape carve-out: two distinct emails sharing the
+    // same Message-Id load successfully. None of the per-protocol
+    // projections key on Message-Id (verified by grep at the time
+    // this test was written: it appears only in JMAP `messageId`,
+    // IMAP `Message-ID:` header, and Gmail `Message-ID:` header
+    // emission - never as a HashMap key or thread-grouping seed).
+    let fix = lua::load_source(
+        r#"
+        fixture({ name = "dup-msgid" })
+        account({ id = "a", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb"},
+            from = "alice@example.com",
+            to = {"test@example.com"},
+            received_at = "2026-01-15T10:00:00Z",
+            subject = "first",
+            body_text = "first body",
+            message_id = {"<shared@example.com>"},
+        })
+        email({
+            id = "e2",
+            mailbox_ids = {"mb"},
+            from = "bob@example.com",
+            to = {"test@example.com"},
+            received_at = "2026-01-15T11:00:00Z",
+            subject = "second",
+            body_text = "second body",
+            message_id = {"<shared@example.com>"},
+        })
+        "#,
+        "@dup-msgid",
+    )
+    .unwrap();
+    assert_eq!(fix.emails.len(), 2);
+    assert_eq!(fix.emails[0].message_id, fix.emails[1].message_id);
+    assert_eq!(fix.emails[0].id, "e1");
+    assert_eq!(fix.emails[1].id, "e2");
+}
+
+#[test]
 fn lua_incremental_fixture_matches_equivalent_toml() {
     let from_toml = fixture::load(Path::new("fixtures/jmap-incremental.toml")).unwrap();
     let from_lua = fixture::load(Path::new("fixtures/jmap-incremental.lua")).unwrap();
