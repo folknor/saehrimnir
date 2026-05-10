@@ -129,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dispatcher: dispatcher.clone(),
         request_log: request_log.clone(),
         token_store: token_store.clone(),
+        latency: saehrimnir::latency::LatencyKnob::new(),
     };
     let app = routes::router(routes::AppState {
         shared: shared.clone(),
@@ -159,8 +160,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let imap_fixture = Arc::clone(&fixture);
     let imap_dispatcher = dispatcher.clone();
     let imap_request_log = request_log.clone();
+    let imap_latency = shared.latency.clone();
     let imap_task = tokio::spawn(async move {
-        imap::serve(imap_listener, imap_fixture, imap_dispatcher, imap_request_log, imap_shutdown_rx).await
+        imap::serve(imap_listener, imap_fixture, imap_dispatcher, imap_request_log, imap_latency, imap_shutdown_rx).await
     });
 
     // SMTP server. The submission log is the same handle exposed to
@@ -177,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let smtp_request_log = request_log.clone();
+    let smtp_latency = shared.latency.clone();
     let smtp_task = tokio::spawn(async move {
         smtp::serve(
             smtp_listener,
@@ -184,6 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             smtp_dispatcher,
             smtp_tls,
             smtp_request_log,
+            smtp_latency,
             smtp_shutdown_rx,
         )
         .await

@@ -128,10 +128,19 @@ checking whether the fact is already in `notes/`.
   mail listeners is gated by `fixture.oauth.enforce`.
 - `src/routes.rs` - axum router, `AppState`, JMAP HTTP route handlers.
   Also serves the test/admin control plane: `/test/smtp/submissions`,
-  `/test/requests`, `/test/fixture/reset` (rewinds the fixture image
-  to the post-load baseline + clears volatile state),
+  `/test/requests` (with `?stable=true` to strip wall-clock
+  timestamps for byte-deterministic snapshots),
+  `/test/fixture/reset` (rewinds the fixture image to the post-load
+  baseline + clears volatile state + clears latency knob),
   `/test/fixture/step` (cursor-driven application of the Lua-authored
-  `change(...)` script; one Transition per step, atomic apply).
+  `change(...)` script; one Transition per step, atomic apply),
+  `/test/snapshot-state` (thin JSON projection of fixture state),
+  `/test/latency` (GET / POST per-protocol latency knob).
+- `src/latency.rs` - `LatencyKnob: Arc<Mutex<HashMap<String, u64>>>`.
+  Each protocol's dispatch entry calls `latency.sleep_for("<tag>")`
+  before doing real work; the sum of `"global"` plus the per-tag
+  value is the effective delay. Cleared by
+  `POST /test/fixture/reset`.
 - `src/jmap.rs` - JMAP request envelope, dispatcher, per-method
   handlers.
 - `src/imap.rs` - IMAP listener, connection state machine, command

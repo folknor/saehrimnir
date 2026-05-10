@@ -54,6 +54,7 @@ pub async fn serve(
     fixture: crate::shared::FixtureHandle,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     request_log: crate::request_log::RequestLog,
+    latency: crate::latency::LatencyKnob,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -70,9 +71,10 @@ pub async fn serve(
                         let fix = Arc::clone(&fixture);
                         let disp = dispatcher.clone();
                         let log = request_log.clone();
+                        let lat = latency.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, fix, disp, log, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, fix, disp, log, lat, &mut sd).await {
                                 eprintln!("saehrimnir: imap connection {peer}: {e}");
                             }
                         });
@@ -95,6 +97,7 @@ pub async fn serve_connection<S>(
     fixture: crate::shared::FixtureHandle,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     request_log: crate::request_log::RequestLog,
+    latency: crate::latency::LatencyKnob,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -108,6 +111,7 @@ where
         fixture,
         dispatcher,
         request_log,
+        latency,
         selected: None,
     };
 
@@ -122,6 +126,7 @@ where
                 return Ok(());
             }
         };
+        conn.latency.sleep_for("imap").await;
         conn.dispatch(&line).await?;
         if conn.state == State::Logout {
             return Ok(());
@@ -141,6 +146,9 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     /// `Arc<Mutex<...>>`); tests that don't care just pass
     /// `RequestLog::default()`.
     request_log: crate::request_log::RequestLog,
+    /// Per-protocol latency knob (test-only). Consulted before each
+    /// dispatched command so harness scripts can simulate slow links.
+    latency: crate::latency::LatencyKnob,
     /// Fixture id of the currently selected mailbox, if any. Set by
     /// SELECT/EXAMINE, cleared on CLOSE/UNSELECT (which we don't yet
     /// handle).
@@ -2276,7 +2284,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, crate::request_log::RequestLog::default(), &mut rx).await
+            serve_connection(server, fix, None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
         });
 
         client.write_all(script).await.unwrap();
@@ -2997,7 +3005,7 @@ mod tests {
         let fix = fixture();
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, crate::request_log::RequestLog::default(), &mut rx).await
+            serve_connection(server, fix, None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
         });
 
         // Read greeting first so the server is parked on the read.

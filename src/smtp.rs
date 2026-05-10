@@ -170,6 +170,7 @@ pub async fn serve(
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     request_log: crate::request_log::RequestLog,
+    latency: crate::latency::LatencyKnob,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -187,9 +188,10 @@ pub async fn serve(
                         let disp = dispatcher.clone();
                         let tls = tls_acceptor.clone();
                         let req_log = request_log.clone();
+                        let lat = latency.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, log, disp, tls, req_log, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, log, disp, tls, req_log, lat, &mut sd).await {
                                 eprintln!("saehrimnir: smtp connection {peer}: {e}");
                             }
                         });
@@ -216,6 +218,7 @@ pub async fn serve_connection<S>(
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     request_log: crate::request_log::RequestLog,
+    latency: crate::latency::LatencyKnob,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -230,6 +233,7 @@ where
         tls_acceptor,
         tls_active: false,
         request_log,
+        latency,
     };
     conn.write_str(GREETING).await?;
     loop {
@@ -241,6 +245,7 @@ where
                 return Ok(());
             }
         };
+        conn.latency.sleep_for("smtp").await;
         if conn.dispatch(&line).await? {
             // Handler signalled QUIT.
             return Ok(());
@@ -274,6 +279,7 @@ struct Conn {
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     tls_active: bool,
     request_log: crate::request_log::RequestLog,
+    latency: crate::latency::LatencyKnob,
 }
 
 enum ReadOutcome {
@@ -683,7 +689,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, None, crate::request_log::RequestLog::default(), &mut rx).await
+            serve_connection(server, log_clone, None, None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
         });
         client.write_all(script).await.unwrap();
         client.shutdown().await.unwrap();
@@ -874,7 +880,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, None, crate::request_log::RequestLog::default(), &mut rx).await
+            serve_connection(server, log_clone, None, None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
         });
         let mut greet = vec![0u8; GREETING.len()];
         client.read_exact(&mut greet).await.unwrap();

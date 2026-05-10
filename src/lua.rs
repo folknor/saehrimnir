@@ -305,16 +305,15 @@ fn builder_on(state: &mut State) -> dellingr::Result<u8> {
     // anchor_function_at validates that arg 3 is a function and
     // returns InvalidAnchor at registration time on mismatch.
     let anchor = state.anchor_function_at(3)?;
-    let builder = builder_mut(state)?;
-    if let Some(prev) = builder.handlers.insert((protocol, command), anchor) {
-        // Replacing an existing handler: release the old anchor so
-        // the GC can collect it. Idempotent and infallible per the
-        // dellingr API contract.
-        let _ = prev;
-        // We can't release here because we don't have &mut State
-        // (we hold &mut Builder). The old anchor leaks one slotmap
-        // entry until the State drops. Acceptable: scenarios
-        // typically register each callback once.
+    let prev = {
+        let builder = builder_mut(state)?;
+        builder.handlers.insert((protocol, command), anchor)
+    };
+    if let Some(prev) = prev {
+        // Replace: release the old anchor so its slotmap slot is
+        // free for reuse. Done via &mut State here because the
+        // builder borrow is already dropped.
+        state.release_anchor(prev);
     }
     Ok(0)
 }

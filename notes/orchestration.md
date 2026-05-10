@@ -215,6 +215,33 @@ feature gate guards these. All routes are scoped under `/test/`.
     (JMAP `call_id`, IMAP `tag` + `args`, SMTP `args`, HTTP
     `query`).
 - `DELETE /test/requests` -> 204; clears the request log.
+- `GET /test/requests?stable=true` -> same array, but each entry
+  drops `received_at` so the rendered JSON is byte-deterministic
+  across runs. Useful for snapshot-style assertions; without
+  `?stable=true` the response carries the wall-clock timestamp.
+- `GET /test/snapshot-state` -> JSON projection of the fixture's
+  current mailbox / email / event shape:
+  ```text
+  { "name": "...", "state": "<JMAP state token>",
+    "mailboxes": [{ "id", "name", "role", "parent_id",
+                    "sort_order", "is_subscribed" }],
+    "emails":    [{ "id", "thread_id", "mailbox_ids", "keywords",
+                    "subject", "received_at", "has_attachment" }],
+    "events":    [{ "id", "calendar_id", "subject",
+                    "start", "end", "location" }] }
+  ```
+  Body bytes and attachment data are deliberately excluded; tests
+  that need the wire body fetch from the protocol's GET surface.
+- `GET /test/latency` -> JSON object keyed by protocol tag (or
+  `"global"`); values are milliseconds. Empty `{}` when no knob
+  is set (the default).
+- `POST /test/latency` body: `{"global_ms": N, "per_protocol":
+  {"graph": M, ...}}`. Either field optional; setting a value to
+  `0` clears that key. Returns 200 + the post-update snapshot.
+  Each protocol's dispatch entry sleeps for
+  `global + per_protocol[<tag>]` ms before doing real work, so a
+  harness can simulate slow links for sync benchmarks. Cleared by
+  `POST /test/fixture/reset`.
 - `POST /test/fixture/reset` -> 204; reset in-process mutable
   state to the post-load baseline. The route is the source of
   truth on what "reset" means; the handler in
@@ -233,11 +260,11 @@ feature gate guards these. All routes are scoped under `/test/`.
 
   Reset additionally rewinds the fixture image itself to the
   post-load baseline (cloned once at startup into
-  `SharedHandles::baseline`) and zeros the
-  `change_cursor`. A harness can re-run the same `change(...)`
-  script in one process by hitting reset between runs; the
-  fixture is back to its pristine post-load shape and step-1
-  applies again.
+  `SharedHandles::baseline`), zeros the `change_cursor`, and
+  drops every entry from the latency knob. A harness can re-run
+  the same `change(...)` script in one process by hitting reset
+  between runs; the fixture is back to its pristine post-load
+  shape and step-1 applies again.
 - `POST /test/fixture/step` -> apply the cursor's current step
   from the Lua-authored change script. Body is JSON; both `{}`
   and an empty body are valid. An optional `{"expect": "step-id"}`

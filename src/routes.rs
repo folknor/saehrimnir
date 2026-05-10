@@ -145,6 +145,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/test/fixture/reset", post(reset_fixture))
         .route("/test/fixture/step", post(step_fixture))
+        .route("/test/snapshot-state", get(snapshot_state))
+        .route("/test/latency", get(get_latency).post(set_latency))
         .with_state(state)
         .merge(oauth_token_router)
         .merge(oauth_userinfo_router)
@@ -229,6 +231,7 @@ async fn api(
     Json(req): Json<JmapRequest>,
 ) -> Result<Json<JmapResponse>, Response> {
     enforce_bearer(&state, &headers).map_err(|b| *b)?;
+    state.shared.latency.sleep_for("jmap").await;
     // Record one request-log entry per method-call in the envelope so
     // `GET /test/requests` reflects the granularity ratatoskr cares
     // about (per-method asserts, not per-batch). Batched into a
@@ -467,8 +470,31 @@ async fn clear_smtp_submissions(State(state): State<AppState>) -> StatusCode {
 // `received_at` is wall-clock so byte-stable rendering is not a
 // goal.
 
-async fn list_requests(State(state): State<AppState>) -> Json<Vec<RequestEntry>> {
-    Json(state.shared.request_log.snapshot())
+/// `GET /test/requests` -> JSON array of every protocol-level
+/// dispatch event the binary has handled. With `?stable=true` the
+/// `received_at` wall-clock timestamp is stripped from each entry so
+/// the rendered JSON is byte-deterministic across runs (useful for
+/// snapshot-style assertions).
+async fn list_requests(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let snap = state.shared.request_log.snapshot();
+    if params.get("stable").map(String::as_str) == Some("true") {
+        let stripped: Vec<Value> = snap
+            .iter()
+            .map(|e| {
+                json!({
+                    "protocol": e.protocol,
+                    "command": e.command,
+                    "detail": e.detail,
+                })
+            })
+            .collect();
+        Json(stripped).into_response()
+    } else {
+        Json(snap).into_response()
+    }
 }
 
 async fn clear_requests(State(state): State<AppState>) -> StatusCode {
@@ -494,6 +520,7 @@ async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     state.submission_log.clear();
     state.shared.request_log.clear();
     state.shared.token_store.clear();
+    state.shared.latency.clear();
     if let Some(d) = &state.shared.dispatcher {
         d.reset_counts();
     }
@@ -506,6 +533,169 @@ async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
         *cursor = 0;
     }
     StatusCode::NO_CONTENT
+}
+
+// ── Test-only timing knob + state snapshot ──────────────────────────
+
+/// `GET /test/latency` -> 200 + JSON snapshot of the per-protocol
+/// latency map. Empty object when unset (the default). Keys are
+/// `"global"` plus the protocol tags (`"jmap"` / `"imap"` /
+/// `"smtp"` / `"graph"` / `"gmail"`); values are milliseconds.
+async fn get_latency(State(state): State<AppState>) -> Json<Value> {
+    let snap = state.shared.latency.snapshot();
+    Json(json!(snap))
+}
+
+/// `POST /test/latency` body:
+/// ```text
+/// { "global_ms": 50,                         // optional
+///   "per_protocol": { "graph": 200 } }       // optional
+/// ```
+/// Either field may be absent. Each call replaces (not merges) the
+/// affected keys; `"global_ms": 0` clears the global knob, and
+/// `"per_protocol": {"graph": 0}` clears the graph entry. Returns
+/// 200 + the post-update snapshot for round-trip verification.
+async fn set_latency(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body_obj: Map<String, Value> = match body {
+        None => Map::new(),
+        Some(Json(Value::Null)) => Map::new(),
+        Some(Json(Value::Object(m))) => m,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "malformed body",
+                    "detail": "expected an object or empty body",
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Some(g) = body_obj.get("global_ms") {
+        let n = match g.as_u64() {
+            Some(n) => n,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "malformed body",
+                        "detail": "global_ms must be a non-negative integer",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        state.shared.latency.set("global", n);
+    }
+    if let Some(per) = body_obj.get("per_protocol") {
+        let map = match per.as_object() {
+            Some(m) => m,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "malformed body",
+                        "detail": "per_protocol must be an object",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        for (k, v) in map {
+            if k == "global" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "malformed body",
+                        "detail": "use top-level `global_ms`, not per_protocol.global",
+                    })),
+                )
+                    .into_response();
+            }
+            let n = match v.as_u64() {
+                Some(n) => n,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "malformed body",
+                            "detail": format!("per_protocol.{k} must be a non-negative integer"),
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            state.shared.latency.set(k, n);
+        }
+    }
+    Json(json!(state.shared.latency.snapshot())).into_response()
+}
+
+/// `GET /test/snapshot-state` -> 200 + JSON dump of the fixture's
+/// current mailbox / email / event shape. Used by harness scripts
+/// that want to verify post-step state without re-walking every
+/// protocol.
+///
+/// The shape is deliberately a thin projection of the relevant
+/// `Fixture` fields; raw bodies and attachments are deliberately
+/// omitted (they bloat the response and aren't what assertions
+/// check). For per-protocol wire shape, hit the protocol's GET
+/// endpoints instead.
+async fn snapshot_state(State(state): State<AppState>) -> Json<Value> {
+    let fix = state.shared.fixture.read().expect("fixture lock poisoned");
+    let mailboxes: Vec<Value> = fix
+        .mailboxes
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "name": m.name,
+                "role": m.role.map(crate::fixture::Role::as_str),
+                "parent_id": m.parent_id,
+                "sort_order": m.sort_order,
+                "is_subscribed": m.is_subscribed,
+            })
+        })
+        .collect();
+    let emails: Vec<Value> = fix
+        .emails
+        .iter()
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "thread_id": e.thread_id,
+                "mailbox_ids": e.mailbox_ids,
+                "keywords": e.keywords,
+                "subject": e.subject,
+                "received_at": e.received_at.to_rfc3339(),
+                "has_attachment": e.has_attachment,
+            })
+        })
+        .collect();
+    let events: Vec<Value> = fix
+        .events
+        .iter()
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "calendar_id": e.calendar_id,
+                "subject": e.subject,
+                "start": e.start.to_rfc3339(),
+                "end": e.end.to_rfc3339(),
+                "location": e.location,
+            })
+        })
+        .collect();
+    Json(json!({
+        "name": fix.name,
+        "state": fix.state,
+        "mailboxes": mailboxes,
+        "emails": emails,
+        "events": events,
+    }))
 }
 
 /// `POST /test/fixture/step` -> apply the cursor's current step.

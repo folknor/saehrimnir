@@ -134,15 +134,26 @@ Both granularity items shipped together:
   `notes/fixture-format.md` and the contract in
   `notes/orchestration.md`.
 
-### M9 prerequisite (lower priority)
+### M9 prerequisite (landed)
 
-- **Deterministic timing knobs.** `POST /test/set-latency` per
-  route and `GET /test/snapshot-state` to dump current server-side
-  mailbox state. Neither route exists today
-  (`src/routes.rs` only has `smtp/submissions`, `requests`,
-  `fixture/reset`, `fixture/step`, `oauth/invalidate`). Per-route
-  latency can be hacked via `on()` + `wait(ms)`; the global knob
-  is what unblocks reproducible sync-bench numbers.
+- **Deterministic timing knobs.** Landed.
+  `POST /test/latency` accepts `{global_ms, per_protocol}`;
+  `GET /test/latency` returns the current snapshot. Each
+  protocol's dispatch entry (JMAP `api`, Graph + Gmail
+  middleware, IMAP per-command, SMTP per-command) sleeps for
+  `global + per_protocol[<tag>]` ms before doing real work.
+  `POST /test/fixture/reset` drops every entry. Wired across all
+  five protocols; integration coverage in `tests/api.rs`
+  (`test_latency_round_trips_through_post_and_get`,
+  `test_latency_actually_delays_jmap_dispatch`,
+  `test_latency_rejects_malformed`).
+- **Server-side state snapshot.** Landed.
+  `GET /test/snapshot-state` returns a thin JSON projection of
+  the fixture's current mailboxes / emails / events (id +
+  metadata only; no body bytes or attachment data). Lets a
+  harness verify post-step state without re-walking every
+  protocol. Surface documented in
+  `notes/orchestration.md`.
 
 ## From the 2026-05-09 multi-agent review
 
@@ -162,11 +173,12 @@ the "Fix soon" backlog below.
 
 ### Fix soon (cleanup, ergonomics, smaller bugs)
 
-- **[bugs] `received_at` makes `RequestEntry` JSON output
-  non-byte-stable.** Documented in `src/request_log.rs`. Fix
-  (when a test forces it): `#[serde(skip_serializing)]` behind
-  an opt-in flag, or expose a `snapshot_stable()` that strips
-  timestamps.
+- ~~**[bugs] `received_at` makes `RequestEntry` JSON output
+  non-byte-stable.**~~ Landed.
+  `GET /test/requests?stable=true` strips `received_at` from
+  every entry; without the flag the wall-clock timestamp is
+  retained. Implementation in `src/routes.rs::list_requests`,
+  test in `tests/api.rs::test_requests_stable_strips_received_at`.
 
 ### Eventually (only when something forces it)
 
@@ -311,13 +323,11 @@ Phase 2 callbacks (`on(protocol, command, fn)`) are wired across all
 five protocols, mapped via `Override::Tagged { status, message }`.
 What's left on the Lua side:
 
-- Anchor release on handler overwrite. `builder_on` only holds
-  `&mut Builder`, not `&mut State`, so re-registering the same
-  `(protocol, command)` orphans the previous Anchor. Fixable by
-  pulling state access into builder_on (refactor user_data shape)
-  or by tracking pending releases and applying them at load
-  finalization. Acceptable today since real scenarios register
-  once.
+- ~~Anchor release on handler overwrite.~~ Landed.
+  `builder_on` now drops the builder borrow before calling
+  `state.release_anchor` on the previous anchor, so re-registering
+  the same `(protocol, command)` no longer leaks the old slotmap
+  entry.
 - SMTP `cmd_auth` callback hook. Skipped from the initial fanout
   because AUTH-time fault injection isn't a common scenario; the
   helper exists, adding the hook is one line if a fixture wants

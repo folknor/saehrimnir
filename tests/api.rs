@@ -1036,6 +1036,227 @@ async fn test_fixture_step_with_no_change_script_reports_end_of_script() {
     assert!(v["step"].is_null());
 }
 
+// ── /test/latency + /test/snapshot-state + /test/requests?stable ────
+
+#[tokio::test]
+async fn test_latency_round_trips_through_post_and_get() {
+    let app = router();
+
+    // Default is empty.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/test/latency")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v, json!({}));
+
+    // Set both global and per-protocol.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/latency")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "global_ms": 5,
+                        "per_protocol": { "graph": 25, "imap": 10 }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["global"], 5);
+    assert_eq!(v["graph"], 25);
+    assert_eq!(v["imap"], 10);
+
+    // Setting a key to 0 clears it.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/latency")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "per_protocol": { "graph": 0 } })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert!(v.get("graph").is_none());
+    assert_eq!(v["global"], 5);
+    assert_eq!(v["imap"], 10);
+}
+
+#[tokio::test]
+async fn test_latency_actually_delays_jmap_dispatch() {
+    // Share the router so the latency we set above is the same
+    // SharedHandles the JMAP call consults. The `router()` helper
+    // builds a fresh AppState per call, so use a single instance.
+    let app = router();
+
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/latency")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "global_ms": 100 })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let req_body = json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [["Mailbox/get",
+                         { "accountId": "account-1", "ids": Value::Null },
+                         "c0"]],
+    });
+    let start = std::time::Instant::now();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/api")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(80),
+        "expected >=80ms, got {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_latency_rejects_malformed() {
+    let app = router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/latency")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "global_ms": "five" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_snapshot_state_projects_fixture_image() {
+    let app = router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/test/snapshot-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["name"], "jmap-small");
+    let mailboxes = v["mailboxes"].as_array().unwrap();
+    assert!(!mailboxes.is_empty());
+    assert!(mailboxes.iter().any(|m| m["role"] == "inbox"));
+    let emails = v["emails"].as_array().unwrap();
+    assert!(!emails.is_empty());
+    // Body bytes deliberately not in snapshot.
+    assert!(emails[0].get("body_text").is_none());
+    assert!(emails[0]["received_at"].is_string());
+}
+
+#[tokio::test]
+async fn test_requests_stable_strips_received_at() {
+    let app = router();
+    // Drive a JMAP call into the SAME router so the request log we
+    // read from below sees the entry. (`jmap_call` builds a fresh
+    // router with its own SharedHandles; not what we want here.)
+    let req_body = json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [["Mailbox/get",
+                         { "accountId": "account-1", "ids": Value::Null },
+                         "c0"]],
+    });
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/api")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Without ?stable: received_at present.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/test/requests")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    let arr = v.as_array().unwrap();
+    assert!(arr.iter().any(|e| e.get("received_at").is_some()));
+
+    // With ?stable=true: received_at gone.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/test/requests?stable=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    let arr = v.as_array().unwrap();
+    assert!(!arr.is_empty());
+    for e in arr {
+        assert!(
+            e.get("received_at").is_none(),
+            "stable mode must strip received_at; got {e:?}"
+        );
+        assert!(e["protocol"].is_string());
+        assert!(e["command"].is_string());
+    }
+}
+
 // ── /oauth/* + /test/oauth/invalidate ───────────────────────────────
 
 fn router_with_token_store(store: saehrimnir::oauth::TokenStore) -> axum::Router {

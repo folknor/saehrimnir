@@ -16,6 +16,7 @@ pub mod gmail;
 pub mod graph;
 pub mod imap;
 pub mod jmap;
+pub mod latency;
 pub mod lua;
 pub mod oauth;
 pub mod request_log;

@@ -156,6 +156,7 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
         format!("{method} {path}"),
         json!({ "query": query }),
     );
+    state.shared.latency.sleep_for("graph").await;
     next.run(req).await
 }
 

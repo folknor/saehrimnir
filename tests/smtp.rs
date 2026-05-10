@@ -16,7 +16,7 @@ async fn run_with_log(script: &[u8]) -> (String, SubmissionLog) {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, None, None, saehrimnir::request_log::RequestLog::default(), &mut rx).await
+        smtp::serve_connection(server, log_clone, None, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -135,7 +135,7 @@ async fn run_with_dispatcher(
     let (_tx, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, dispatcher, None, saehrimnir::request_log::RequestLog::default(), &mut rx).await
+        smtp::serve_connection(server, log_clone, dispatcher, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -242,7 +242,7 @@ async fn smtp_dispatch_records_request_log_entries() {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, None, None, req_log_clone, &mut rx).await
+        smtp::serve_connection(server, log_clone, None, None, req_log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     let script = b"\
@@ -344,7 +344,7 @@ mod starttls {
         let acceptor =
             Arc::new(saehrimnir::tls::make_acceptor().expect("acceptor"));
         let server_task = tokio::spawn(async move {
-            smtp::serve(listener, log_clone, None, Some(acceptor), saehrimnir::request_log::RequestLog::default(), rx).await
+            smtp::serve(listener, log_clone, None, Some(acceptor), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), rx).await
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();

@@ -17,6 +17,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::fixture::Fixture;
+use crate::latency::LatencyKnob;
 use crate::lua::Dispatcher;
 use crate::oauth::TokenStore;
 use crate::request_log::RequestLog;
@@ -58,6 +59,13 @@ pub struct SharedHandles {
     pub dispatcher: Option<Arc<Dispatcher>>,
     pub request_log: RequestLog,
     pub token_store: TokenStore,
+    /// Per-protocol latency knob. Each protocol's dispatch entry
+    /// calls `latency.sleep_for("<protocol>").await` once per
+    /// command before doing real work; the global knob applies on
+    /// top of any per-protocol setting. Defaults to all-zero so
+    /// fixtures that don't drive `POST /test/set-latency` see no
+    /// delay.
+    pub latency: LatencyKnob,
 }
 
 impl SharedHandles {
@@ -75,6 +83,7 @@ impl SharedHandles {
             dispatcher: None,
             request_log: RequestLog::default(),
             token_store: TokenStore::default(),
+            latency: LatencyKnob::default(),
         }
     }
 

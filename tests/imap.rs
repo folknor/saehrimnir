@@ -18,7 +18,7 @@ async fn run_with_fixture(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::request_log::RequestLog::default(), &mut rx).await
+        imap::serve_connection(server, fix, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -151,7 +151,7 @@ async fn run_with_attach_fixture(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::request_log::RequestLog::default(), &mut rx).await
+        imap::serve_connection(server, fix, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -222,7 +222,7 @@ async fn run_with_lua_scenario(scenario: &str, imap_script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, dispatcher, saehrimnir::request_log::RequestLog::default(), &mut rx).await
+        imap::serve_connection(server, fix, dispatcher, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
     client.write_all(imap_script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -372,7 +372,7 @@ async fn run_with_imap_small(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::request_log::RequestLog::default(), &mut rx).await
+        imap::serve_connection(server, fix, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -426,7 +426,7 @@ async fn imap_dispatch_records_request_log_entries() {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, log_clone, &mut rx).await
+        imap::serve_connection(server, fix, None, log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     let script = b"\
@@ -473,7 +473,7 @@ async fn imap_uid_fetch_log_distinguishes_body_from_metadata() {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, log_clone, &mut rx).await
+        imap::serve_connection(server, fix, None, log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     let script = b"\

@@ -299,6 +299,7 @@ async fn run_imap(handle: &saehrimnir::shared::FixtureHandle, script: &[u8]) -> 
             fix,
             None,
             saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
             &mut rx,
         )
         .await
