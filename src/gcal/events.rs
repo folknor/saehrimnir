@@ -135,21 +135,53 @@ async fn list_events(
         );
     }
 
-    if let Some(token) = params.sync_token.as_deref()
-        && !is_known_state(&fixture, token)
-    {
-        return error(
-            StatusCode::GONE,
-            "sync token expired or not recognised; full sync required",
-            "fullSyncRequired",
-        );
-    }
-
+    // Sync-token paths (mirrors People's connections handler):
+    // - current state: empty delta + same token echoed back.
+    // - known historical state: walk the change_log via
+    //   `event_delta_since` (already parent-filtered for this
+    //   calendar), emit live events for created/updated and
+    //   `{id, status: "cancelled"}` tombstones for destroyed.
+    //   ratatoskr's `:189-200` cancelled-routing branch reads
+    //   these to drop deleted events from local DB.
+    // - unknown / evicted token: HTTP 410 with reason
+    //   `fullSyncRequired`. ratatoskr's recovery path matches on
+    //   `"410"` or `"sync token"` substrings to drop the saved
+    //   token and retry without it.
     if params.sync_token.as_deref() == Some(fixture.state.as_str()) {
         return ok_json(json!({
             "kind": "calendar#events",
             "summary": calendar,
             "items": [],
+            "nextSyncToken": fixture.state,
+        }));
+    }
+    if let Some(token) = params.sync_token.as_deref() {
+        let Some(delta) = fixture.event_delta_since(token, &calendar) else {
+            return error(
+                StatusCode::GONE,
+                "sync token expired or not recognised; full sync required",
+                "fullSyncRequired",
+            );
+        };
+        let live_by_id: std::collections::HashMap<&str, &Event> = fixture
+            .events
+            .iter()
+            .filter(|e| e.calendar_id == calendar)
+            .map(|e| (e.id.as_str(), e))
+            .collect();
+        let mut items: Vec<Value> = Vec::new();
+        for id in delta.created.iter().chain(delta.updated.iter()) {
+            if let Some(e) = live_by_id.get(id.as_str()) {
+                items.push(serialize_event(e));
+            }
+        }
+        for id in &delta.destroyed {
+            items.push(cancelled_tombstone(id));
+        }
+        return ok_json(json!({
+            "kind": "calendar#events",
+            "summary": calendar,
+            "items": items,
             "nextSyncToken": fixture.state,
         }));
     }
@@ -192,6 +224,19 @@ async fn list_events(
         );
     }
     ok_json(Value::Object(body))
+}
+
+/// Google Calendar tombstone shape: a calendar#event with
+/// `status: "cancelled"` and only the id present. Per
+/// `<ratatoskr>/crates/calendar/src/google.rs:189-200`, the
+/// cancelled-status branch routes the id to deleted_remote_ids
+/// and drops the row.
+fn cancelled_tombstone(id: &str) -> Value {
+    json!({
+        "kind": "calendar#event",
+        "id": id,
+        "status": "cancelled",
+    })
 }
 
 fn serialize_event(e: &Event) -> Value {
@@ -556,18 +601,6 @@ async fn parse_json_body(body: axum::body::Body) -> Result<Value, Response> {
 }
 
 // ── shared helpers ──────────────────────────────────────────────────
-
-fn is_known_state(fixture: &Fixture, state: &str) -> bool {
-    if state == fixture.state {
-        return true;
-    }
-    if state == fixture.change_log_seed() {
-        return true;
-    }
-    fixture
-        .change_log_transitions()
-        .any(|t| t.from_state == state || t.to_state == state)
-}
 
 fn encode_page_token(offset: usize) -> String {
     format!("p.{offset}")

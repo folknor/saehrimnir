@@ -78,35 +78,54 @@ async fn list_connections(
 
     let fixture = state.fixture();
 
-    // Sync-token recovery: an unknown token (not the current
-    // state, not the seed) is a 410 Gone. Real People API replies
-    // with `EXPIRED_TOKEN` reason; ratatoskr only checks the
-    // status code + the substring "syncToken", so we surface a
-    // matching message.
-    if let Some(token) = params.sync_token.as_deref()
-        && !is_known_state(&fixture, token)
-    {
-        return error(
-            StatusCode::GONE,
-            "syncToken expired or not recognised",
-            "expired",
-        );
-    }
-
-    // When the client passes a current-state syncToken, return an
-    // empty delta page. Real People API would return only the
-    // resources changed since the token, but v0's fixture is
-    // effectively static through the People surface (mutations
-    // land via change-script ops on the `[contact]` family, and
-    // any of those bumps `Fixture::state`, which makes the
-    // previous syncToken unknown and forces a re-bootstrap -
-    // exactly the contract ratatoskr's recovery path is built
-    // for).
+    // Sync-token paths:
+    // - current state: empty delta + same token echoed back.
+    // - known historical state: walk the change_log, emit
+    //   created/updated contacts as full Persons and destroyed
+    //   contacts as `metadata.deleted: true` tombstones, then
+    //   emit the current state as `nextSyncToken`. ratatoskr's
+    //   recovery branch only fires on 410, so a known token
+    //   must produce an honest delta (or recovery breaks
+    //   silently: stale token returns full live list, missing
+    //   tombstones, contacts persist forever).
+    // - unknown / evicted token: HTTP 410 with the
+    //   `expired`-reason envelope. Real People API uses
+    //   `EXPIRED_TOKEN`; ratatoskr matches on the `syncToken`
+    //   substring + the 410 status, so this lands.
     if params.sync_token.as_deref() == Some(fixture.state.as_str()) {
         return ok_json(json!({
             "connections": [],
             "totalPeople": 0,
             "totalItems": 0,
+            "nextSyncToken": fixture.state,
+        }));
+    }
+    if let Some(token) = params.sync_token.as_deref() {
+        let Some(delta) = fixture.contact_delta_since_any(token) else {
+            return error(
+                StatusCode::GONE,
+                "syncToken expired or not recognised",
+                "expired",
+            );
+        };
+        let live_by_id: std::collections::HashMap<&str, &Contact> = fixture
+            .contacts
+            .iter()
+            .map(|c| (c.id.as_str(), c))
+            .collect();
+        let mut connections: Vec<Value> = Vec::new();
+        for id in delta.created.iter().chain(delta.updated.iter()) {
+            if let Some(c) = live_by_id.get(id.as_str()) {
+                connections.push(serialize_person(c));
+            }
+        }
+        for id in &delta.destroyed {
+            connections.push(tombstone_person(id));
+        }
+        return ok_json(json!({
+            "connections": connections,
+            "totalPeople": connections.len(),
+            "totalItems": connections.len(),
             "nextSyncToken": fixture.state,
         }));
     }
@@ -214,6 +233,22 @@ fn projected_connections(fixture: &Fixture) -> Vec<Value> {
     let mut contacts: Vec<&Contact> = fixture.contacts.iter().collect();
     contacts.sort_by(|a, b| a.id.cmp(&b.id));
     contacts.into_iter().map(serialize_person).collect()
+}
+
+/// People API tombstone shape: a Person whose `metadata.deleted`
+/// is true. ratatoskr's `PersonMetadata.deleted` (`crates/gmail/
+/// src/contacts/mod.rs:58-61`) routes these to delete-the-row.
+/// Other fields are minimised because the Person no longer
+/// exists - the resource name is the only addressable identity.
+fn tombstone_person(id: &str) -> Value {
+    json!({
+        "resourceName": format!("people/{id}"),
+        "etag": format!("etag-{id}"),
+        "metadata": {
+            "deleted": true,
+            "sources": [{ "type": "CONTACT", "id": id }],
+        }
+    })
 }
 
 fn serialize_person(c: &Contact) -> Value {

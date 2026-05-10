@@ -529,6 +529,20 @@ impl Fixture {
         )
     }
 
+    /// Cross-folder contact delta. Returns every contact change
+    /// since `since` regardless of folder. Drives the People API
+    /// listener, which has no folder concept (Google flattens
+    /// every account contact into one connections list).
+    pub fn contact_delta_since_any(&self, since: &str) -> Option<DeltaSet> {
+        self.delta_since(since, |t| {
+            (
+                &t.contact_created,
+                &t.contact_updated,
+                &t.contact_destroyed,
+            )
+        })
+    }
+
     /// Contact-folder-side analogue.
     pub fn contact_folder_delta_since(&self, since: &str) -> Option<DeltaSet> {
         self.delta_since(since, |t| {

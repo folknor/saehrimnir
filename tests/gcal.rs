@@ -240,6 +240,72 @@ async fn unknown_calendar_returns_404() {
 }
 
 #[tokio::test]
+async fn list_events_emits_cancelled_tombstone_after_destroy() {
+    // Regression: pre-fix, a known-but-stale syncToken returned a
+    // full live-events list with no cancelled tombstones, so a
+    // deleted event silently persisted in the client's local DB.
+    // Now the handler walks the change_log (via
+    // `event_delta_since`, which is already calendar-filtered)
+    // and emits `{id, status: "cancelled"}` per RFC contract.
+    let r = router();
+
+    // Bootstrap → save token; fixture has ev-001 + ev-002 in
+    // cal-work.
+    let (_, bootstrap) = http(
+        &r,
+        "GET",
+        "/calendar/v3/calendars/cal-work/events",
+        None,
+    )
+    .await;
+    let token = bootstrap["nextSyncToken"].as_str().unwrap().to_string();
+    assert_eq!(bootstrap["items"].as_array().unwrap().len(), 2);
+
+    // Delete ev-001 via the gcal mutate path.
+    let resp = r
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/calendar/v3/calendars/cal-work/events/ev-001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Replay with the saved token: ev-001 must surface as a
+    // cancelled tombstone, ev-002 stays live (and may or may not
+    // surface depending on whether it was touched - here it
+    // wasn't, so the delta is just the destroy).
+    let (status, follow) = http(
+        &r,
+        "GET",
+        &format!("/calendar/v3/calendars/cal-work/events?syncToken={token}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = follow["items"].as_array().unwrap();
+    let cancelled = items
+        .iter()
+        .find(|e| e["id"] == "ev-001")
+        .unwrap_or_else(|| panic!("expected tombstone for ev-001; got {items:?}"));
+    assert_eq!(
+        cancelled["status"], "cancelled",
+        "tombstone must carry status=cancelled"
+    );
+    // ev-002 wasn't modified, so it should NOT appear in the
+    // delta even though it's still live.
+    assert!(
+        !items.iter().any(|e| e["id"] == "ev-002"),
+        "untouched event must not surface in delta; got {items:?}"
+    );
+    assert_ne!(follow["nextSyncToken"].as_str().unwrap(), token);
+}
+
+#[tokio::test]
 async fn gcal_create_surfaces_in_graph_calendar_view_delta() {
     let (gcal_r, graph_r) = cross_protocol_routers();
 
