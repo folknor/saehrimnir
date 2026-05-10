@@ -28,4 +28,5 @@ pub mod shared;
 pub mod shutdown;
 pub mod smtp;
 pub mod templates;
+pub mod test_admin;
 pub mod tls;

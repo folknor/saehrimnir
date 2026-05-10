@@ -246,13 +246,15 @@ correct invariants and accepted trade-offs are omitted.
   canonical types are already snake_case). Graph wire-shape
   event patch keeps the Graph nested form. The split is
   intentional, not drift.
-- **[arch] `src/routes.rs` has grown to ~1440 lines.** Hosts
-  JMAP HTTP, OAuth wiring, SMTP-submission test routes,
-  request-log routes, fixture reset, fixture step (with three
-  patch helpers and a 380-line `apply_change_step`), latency
-  GET/SET, snapshot-state, and an RFC 5987 utility. Split the
-  `/test/*` family into `src/routes/test_admin.rs` so the JMAP
-  HTTP / OAuth router glue stays scrollable.
+- ~~**[arch] `src/routes.rs` has grown to ~1440 lines.**~~
+  Landed. New `src/test_admin.rs` (~1085 lines) hosts the
+  `/test/*` route family: SMTP-submission introspection,
+  request log, fixture reset / step (with `StepTouches`,
+  `apply_change_step`, `step_apply_error`), latency get/set,
+  snapshot-state. `routes.rs` shrank to ~402 lines and now
+  hosts only the JMAP HTTP handlers + OAuth router merge.
+  `crate::routes::router` calls
+  `.merge(crate::test_admin::router(state))`.
 - ~~**[docs] CalDAV is wired but undocumented in
   `notes/orchestration.md`, `notes/request-log.md`, and
   `notes/fixture-format.md`.**~~ Landed. Lifecycle diagram +
