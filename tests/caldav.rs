@@ -200,6 +200,188 @@ async fn propfind_calendar_depth_0_returns_ctag() {
 }
 
 #[tokio::test]
+async fn propfind_calendar_depth_1_lists_events_with_etag_and_content_type() {
+    let body_xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:">
+  <D:prop>
+    <D:getetag/>
+    <D:getcontenttype/>
+  </D:prop>
+</D:propfind>"#;
+    let (status, body) = send(
+        "PROPFIND",
+        "/calendars/account-1/cal-work/",
+        Some("1"),
+        body_xml,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+
+    // Both events show up by href.
+    assert!(body.contains("/calendars/account-1/cal-work/ev-001.ics"));
+    assert!(body.contains("/calendars/account-1/cal-work/ev-002.ics"));
+    // Each event resource has getetag and getcontenttype.
+    let etag_count = body.matches("<D:getetag>").count();
+    assert_eq!(etag_count, 2, "expected 2 getetag emissions, body: {body}");
+    assert!(body.contains("text/calendar; component=vevent"));
+    // Empty cal-personal returns just the calendar entry (no events).
+    let (_, personal_body) = send(
+        "PROPFIND",
+        "/calendars/account-1/cal-personal/",
+        Some("1"),
+        body_xml,
+    )
+    .await;
+    assert!(!personal_body.contains(".ics"));
+}
+
+#[tokio::test]
+async fn get_event_returns_icalendar_with_etag() {
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/calendar; charset=utf-8"
+    );
+    let etag = resp.headers().get("ETag").unwrap().to_str().unwrap();
+    // ETag is a quoted opaque string per RFC 7232.
+    assert!(etag.starts_with('"') && etag.ends_with('"'), "got: {etag}");
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    // Minimum VEVENT shape: BEGIN/END markers, UID, SUMMARY, DTSTART,
+    // DTEND, ORGANIZER. The fixture's ev-001 carries Standup.
+    assert!(body.contains("BEGIN:VCALENDAR"));
+    assert!(body.contains("BEGIN:VEVENT"));
+    assert!(body.contains("UID:ev-001"));
+    assert!(body.contains("SUMMARY:Standup"));
+    assert!(body.contains("DTSTART:20260115T090000Z"));
+    assert!(body.contains("DTEND:20260115T091500Z"));
+    assert!(body.contains("ORGANIZER"));
+    assert!(body.contains("mailto:alice@example.com"));
+}
+
+#[tokio::test]
+async fn get_unknown_event_returns_404() {
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-bogus.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn report_calendar_multiget_returns_ical_for_each_href() {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+  <D:href>/calendars/account-1/cal-work/ev-001.ics</D:href>
+  <D:href>/calendars/account-1/cal-work/ev-002.ics</D:href>
+  <D:href>/calendars/account-1/cal-work/ev-bogus.ics</D:href>
+</C:calendar-multiget>"#;
+    let (status, response) = send(
+        "REPORT",
+        "/calendars/account-1/cal-work/",
+        Some("1"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    // Each known event surfaces with a getetag and a calendar-data
+    // payload.
+    assert!(response.contains("ev-001.ics"));
+    assert!(response.contains("ev-002.ics"));
+    let etag_count = response.matches("<D:getetag>").count();
+    assert_eq!(etag_count, 2, "expected 2 etags, got {etag_count}");
+    let calendar_data_count = response.matches("<C:calendar-data>").count();
+    assert_eq!(calendar_data_count, 2);
+    // The bogus href gets a 404 entry so the client can prune.
+    assert!(response.contains("ev-bogus.ics"));
+    assert!(response.contains("HTTP/1.1 404 Not Found"));
+    // The iCalendar bodies survived XML escaping (BEGIN/END markers
+    // become &lt;-encoded inside calendar-data; ratatoskr's parser
+    // unescapes them on the way back out).
+    assert!(response.contains("BEGIN:VEVENT"));
+}
+
+#[tokio::test]
+async fn report_calendar_query_filters_by_time_range() {
+    // ev-001 is 2026-01-15, ev-002 is 2026-02-01. Query a window
+    // that covers only January.
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+  <C:filter>
+    <C:comp-filter name="VCALENDAR">
+      <C:comp-filter name="VEVENT">
+        <C:time-range start="20260101T000000Z" end="20260131T235959Z"/>
+      </C:comp-filter>
+    </C:comp-filter>
+  </C:filter>
+</C:calendar-query>"#;
+    let (status, response) = send(
+        "REPORT",
+        "/calendars/account-1/cal-work/",
+        Some("1"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(response.contains("ev-001.ics"));
+    assert!(!response.contains("ev-002.ics"), "out-of-range event leaked: {response}");
+}
+
+#[tokio::test]
+async fn report_calendar_query_with_no_range_returns_all_events() {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+  <C:filter>
+    <C:comp-filter name="VCALENDAR">
+      <C:comp-filter name="VEVENT"/>
+    </C:comp-filter>
+  </C:filter>
+</C:calendar-query>"#;
+    let (status, response) = send(
+        "REPORT",
+        "/calendars/account-1/cal-work/",
+        Some("1"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(response.contains("ev-001.ics"));
+    assert!(response.contains("ev-002.ics"));
+}
+
+#[tokio::test]
 async fn propfind_unknown_calendar_returns_404() {
     let (status, _) = send(
         "PROPFIND",

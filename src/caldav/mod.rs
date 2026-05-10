@@ -521,16 +521,213 @@ fn event_etag(fixture: &crate::fixture::Fixture, event_id: &str) -> String {
 }
 
 async fn handle_report(
-    _state: &AppState,
-    _path: &str,
+    state: &AppState,
+    path: &str,
     _headers: &HeaderMap,
-    _body: &[u8],
+    body: &[u8],
 ) -> Response {
-    not_implemented("REPORT")
+    let body_str = match body_to_str(body) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
+    let (user, calendar_id) = match parse_path(&fixture, path) {
+        ResourcePath::Calendar { user, calendar_id } => (user, calendar_id),
+        // REPORT can also target the home collection (rare, but
+        // some clients use this for cross-calendar queries). v0
+        // treats it as a 404 since we don't support cross-calendar
+        // filters.
+        _ => return not_found(path),
+    };
+    if !fixture.calendars.iter().any(|c| c.id == calendar_id) {
+        return not_found(path);
+    }
+
+    // Two report kinds: calendar-multiget (explicit href list) and
+    // calendar-query (server-side filter, optionally narrowing by
+    // time range). We tell them apart by which root element is
+    // present in the body.
+    if xml::body_requests_prop(body_str, "calendar-multiget") {
+        return report_multiget(&fixture, &user, &calendar_id, body_str);
+    }
+    if xml::body_requests_prop(body_str, "calendar-query") {
+        return report_calendar_query(&fixture, &user, &calendar_id, body_str);
+    }
+    bad_request("REPORT body must be calendar-multiget or calendar-query")
 }
 
-async fn handle_get(_state: &AppState, _path: &str, _headers: &HeaderMap) -> Response {
-    not_implemented("GET")
+/// `calendar-multiget`: client lists `<href>` elements naming the
+/// resources it wants. We return one `<response>` per href, each
+/// carrying `getetag` + `<C:calendar-data>` (the iCalendar body).
+/// Hrefs not present in the fixture get a 404 propstat so the
+/// client can prune stale entries.
+fn report_multiget(
+    fixture: &crate::fixture::Fixture,
+    user: &str,
+    calendar_id: &str,
+    body: &str,
+) -> Response {
+    let hrefs = xml::collect_hrefs(body);
+    let mut out = String::new();
+    out.push_str(r#"<?xml version="1.0" encoding="utf-8"?>"#);
+    out.push('\n');
+    out.push_str(r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">"#);
+
+    for href in hrefs {
+        let resolved = match parse_path(fixture, &href) {
+            ResourcePath::Event {
+                user: u,
+                calendar_id: c,
+                event_id,
+            } if u == user && c == calendar_id => Some(event_id),
+            _ => None,
+        };
+        let event = resolved
+            .as_deref()
+            .and_then(|id| fixture.events.iter().find(|e| e.id == id && e.calendar_id == calendar_id));
+        match event {
+            Some(ev) => {
+                let etag = event_etag(fixture, &ev.id);
+                let ical = ical::event_to_ical(ev);
+                out.push_str("<D:response>");
+                out.push_str(&format!("<D:href>{}</D:href>", xml::escape(&href)));
+                out.push_str("<D:propstat><D:prop>");
+                out.push_str(&format!("<D:getetag>{}</D:getetag>", xml::escape(&etag)));
+                out.push_str(&format!(
+                    "<C:calendar-data>{}</C:calendar-data>",
+                    xml::escape(&ical),
+                ));
+                out.push_str("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>");
+                out.push_str("</D:response>");
+            }
+            None => {
+                // Not in this calendar: emit 404 so the client knows
+                // to drop the local copy.
+                out.push_str("<D:response>");
+                out.push_str(&format!("<D:href>{}</D:href>", xml::escape(&href)));
+                out.push_str("<D:status>HTTP/1.1 404 Not Found</D:status>");
+                out.push_str("</D:response>");
+            }
+        }
+    }
+    out.push_str("</D:multistatus>");
+    multistatus(out)
+}
+
+/// `calendar-query`: server-side filter. v0 honours
+/// `<C:time-range start="..." end="..."/>` inside the nested
+/// `<C:comp-filter name="VEVENT">`. Events whose [start, end)
+/// overlaps the query range are returned with their ical body.
+/// Other filter shapes (text-match, prop-filter on a property) get
+/// the unfiltered list - ratatoskr only sends the time-range form.
+fn report_calendar_query(
+    fixture: &crate::fixture::Fixture,
+    user: &str,
+    calendar_id: &str,
+    body: &str,
+) -> Response {
+    let range = parse_time_range(body);
+    let mut out = String::new();
+    out.push_str(r#"<?xml version="1.0" encoding="utf-8"?>"#);
+    out.push('\n');
+    out.push_str(r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">"#);
+
+    for ev in fixture.events.iter().filter(|e| e.calendar_id == calendar_id) {
+        if let Some((start, end)) = range
+            && !overlaps(ev, start, end)
+        {
+            continue;
+        }
+        let href = format!("/calendars/{user}/{calendar_id}/{}.ics", ev.id);
+        let etag = event_etag(fixture, &ev.id);
+        let ical = ical::event_to_ical(ev);
+        out.push_str("<D:response>");
+        out.push_str(&format!("<D:href>{}</D:href>", xml::escape(&href)));
+        out.push_str("<D:propstat><D:prop>");
+        out.push_str(&format!("<D:getetag>{}</D:getetag>", xml::escape(&etag)));
+        out.push_str(&format!(
+            "<C:calendar-data>{}</C:calendar-data>",
+            xml::escape(&ical),
+        ));
+        out.push_str("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>");
+        out.push_str("</D:response>");
+    }
+    out.push_str("</D:multistatus>");
+    multistatus(out)
+}
+
+/// Parse a `<C:time-range start="..." end="..."/>` element from a
+/// REPORT body. Returns `(start, end)` as parsed UTC datetimes,
+/// or None if the element isn't present (or one of the attributes
+/// fails to parse).
+fn parse_time_range(body: &str) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let idx = body.find("time-range")?;
+    let tail = &body[idx..];
+    let start = extract_attr(tail, "start").and_then(|s| ical::parse_dt(&s))?;
+    let end = extract_attr(tail, "end").and_then(|s| ical::parse_dt(&s))?;
+    Some((start, end))
+}
+
+/// Pull a quoted attribute value out of a tag. Tolerant of either
+/// single or double quotes; CalDAV bodies use double quotes.
+fn extract_attr(s: &str, name: &str) -> Option<String> {
+    let key_eq = format!("{name}=\"");
+    if let Some(start) = s.find(&key_eq) {
+        let after = &s[start + key_eq.len()..];
+        if let Some(close) = after.find('"') {
+            return Some(after[..close].to_string());
+        }
+    }
+    let key_eq = format!("{name}='");
+    if let Some(start) = s.find(&key_eq) {
+        let after = &s[start + key_eq.len()..];
+        if let Some(close) = after.find('\'') {
+            return Some(after[..close].to_string());
+        }
+    }
+    None
+}
+
+/// Half-open time-range overlap test: an event with `[ev.start,
+/// ev.end)` overlaps `[range_start, range_end)` iff
+/// `ev.start < range_end && ev.end > range_start`.
+fn overlaps(
+    ev: &crate::fixture::Event,
+    range_start: chrono::DateTime<chrono::Utc>,
+    range_end: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    ev.start < range_end && ev.end > range_start
+}
+
+async fn handle_get(state: &AppState, path: &str, _headers: &HeaderMap) -> Response {
+    let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
+    match parse_path(&fixture, path) {
+        ResourcePath::Event {
+            user: _,
+            calendar_id,
+            event_id,
+        } => match fixture
+            .events
+            .iter()
+            .find(|e| e.id == event_id && e.calendar_id == calendar_id)
+        {
+            Some(ev) => {
+                let body = ical::event_to_ical(ev);
+                let etag = event_etag(&fixture, &ev.id);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/calendar; charset=utf-8"),
+                    )
+                    .header("ETag", etag)
+                    .body(Body::from(body))
+                    .expect("static GET response builds")
+            }
+            None => not_found(path),
+        },
+        _ => not_found(path),
+    }
 }
 
 async fn handle_put(
