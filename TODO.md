@@ -199,26 +199,24 @@ correct invariants and accepted trade-offs are omitted.
   `RequestEntry` borrows via a view struct rather than rebuilding
   the JSON tree. The internal-clone half of this item landed via
   the `RequestLog::snapshot` simplification above.
-- **[perf] IMAP `RFC822.SIZE` re-renders the entire body just
-  to take `.len()`.** `src/imap.rs:1699-1701`. Combined with
-  every other `BODY[*]` attribute on the same fetch line,
-  `render_rfc822` runs once per attribute - 5x re-encoding for
-  a typical Apple-Mail-shaped fetch list. Render once into a
-  small struct (`headers`, `text`, optional `multipart_full`)
-  and reuse slices.
-- **[perf] `split_raw` rerun per raw-bytes attribute.**
-  `src/imap.rs:1781-1786, 1790, 1848, 2057, 2082`. A FETCH
-  asking for `BODY[HEADER]` + `BODY[TEXT]` + `BODY[1.MIME]` +
-  `BODY[1]` runs the search 4× per message. Folds into the
-  render-once fix above.
-- **[perf] `cmd_uid_fetch` materializes all FETCH lines before
-  writing.** `src/imap.rs:715-728` builds `Vec<String>` of
-  every rendered message under the read guard. For a
-  10k-message FETCH peaks RAM at the entire mailbox; the lock-
-  drop motivation is correct but the obvious shape is to
-  clone the inputs and render+write per item. Lift the
-  existing `Streaming UID FETCH` future-work item from this
-  file's "IMAP follow-ups" section into here.
+- ~~**[perf] IMAP `RFC822.SIZE` re-renders the entire body just
+  to take `.len()`.**~~ Landed. New `RenderedRfc822` struct
+  pre-computes (headers, text, full) once per email and
+  `fetch_response_line` lazily populates it on the first body-
+  shaped attr; subsequent attrs read from the cache. Old
+  `render_rfc822` removed; the unit test that called it now
+  uses `RenderedRfc822::for_email(...).full`.
+- ~~**[perf] `split_raw` rerun per raw-bytes attribute.**~~
+  Landed via the `RenderedRfc822` cache: raw-bytes emails go
+  through `split_raw` once at cache-population time and the
+  resulting (headers, text) pair is reused.
+- ~~**[perf] `cmd_uid_fetch` materializes all FETCH lines
+  before writing.**~~ Landed. `cmd_uid_fetch` now snapshots
+  owned `Email` clones under one read guard, drops the guard,
+  and renders+writes one at a time - each entry's render
+  strings can be reclaimed between writes rather than
+  retained for the whole batch. Determinism contract holds
+  because all snapshots happen under the same guard.
 - ~~**[perf] `Email/set` updates and destroys each scan all
   emails.**~~ Landed for the JMAP path. Updates build an
   `id -> idx` HashMap once; destroys snapshot mailbox

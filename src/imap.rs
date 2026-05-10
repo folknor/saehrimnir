@@ -710,15 +710,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
 
         // Snapshot the rendered FETCH lines up front so the read
-        // guard drops before we start writing - the writes await on
-        // socket I/O and we must never hold a fixture lock across
-        // `.await`.
+        // Snapshot just the (seq, uid, Email) triples we'll
+        // render under one read guard. Holding owned Email clones
+        // (vs. holding the read guard across the writes) keeps the
+        // determinism contract: every FETCH response on this line
+        // sees the same fixture image. Pre-fix we materialised the
+        // fully-rendered FETCH lines upfront; for a 10k-message
+        // FETCH with bodies that peaked RAM at the entire mailbox
+        // of rendered text. Snapshotting Email clones then
+        // rendering+writing one at a time lets each entry's render
+        // strings get reclaimed before the next is built.
         //
         // Sequence number is the message's position in the live
         // mailbox view (1-based), not the UID. UIDs can have gaps
         // after EXPUNGE / mailboxIds-removal; sequence numbers
         // never do.
-        let lines: Vec<String> = if changedsince_matches(changedsince) {
+        let snapshot: Vec<(u32, u32, Email)> = if changedsince_matches(changedsince) {
             let fix = self.fix_read();
             mailbox_messages(&fix, &selected_id)
                 .into_iter()
@@ -726,14 +733,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 .filter(|(_, (uid, _))| set.matches(*uid))
                 .map(|(live_idx, (uid, email))| {
                     let seq = u32::try_from(live_idx + 1).expect("seq fits in u32");
-                    fetch_response_line(seq, uid, email, &attrs)
+                    (seq, uid, email.clone())
                 })
                 .collect()
         } else {
             Vec::new()
         };
 
-        for line in lines {
+        for (seq, uid, email) in snapshot {
+            let line = fetch_response_line(seq, uid, &email, &attrs);
             self.write_response(&line).await?;
         }
         self.write_line(&format!("{tag} OK UID FETCH completed"))
@@ -1712,11 +1720,49 @@ fn changedsince_matches(modseq: Option<u64>) -> bool {
 }
 
 /// Render a single `* <seq> FETCH (...)` response line. The returned
+/// Pre-computed RFC 822 projection of an email, lazily populated.
+/// Pre-fix `RFC822.SIZE` + `BODY[]` + `BODY[HEADER]` + `BODY[TEXT]`
+/// on one fetch line called `render_rfc822*` four times; `split_raw`
+/// re-scanned the raw block per attr. With this cache each fetch
+/// renders once even for raw-bytes emails (one `split_raw`) and
+/// even for huge multipart bodies.
+struct RenderedRfc822 {
+    headers: String,
+    text: String,
+    full: String,
+}
+
+impl RenderedRfc822 {
+    fn for_email(email: &Email) -> Self {
+        if let Some(raw) = &email.raw_bytes {
+            let (h, t) = split_raw(raw);
+            return Self {
+                headers: h.to_string(),
+                text: t.to_string(),
+                full: raw.clone(),
+            };
+        }
+        let headers = render_rfc822_headers(email);
+        let text = render_rfc822_text_body(email);
+        let mut full = String::with_capacity(headers.len() + 2 + text.len());
+        full.push_str(&headers);
+        full.push_str("\r\n");
+        full.push_str(&text);
+        Self {
+            headers,
+            text,
+            full,
+        }
+    }
+}
+
 /// string already terminates with `\r\n` and may contain CRLFs inside
 /// an IMAP literal block.
 fn fetch_response_line(seq: u32, uid: u32, email: &Email, attrs: &[FetchAttr]) -> String {
     let mut out = format!("* {seq} FETCH (");
     let mut first = true;
+    // Lazy: render only if a body-shaped attr asks for it.
+    let mut rendered: Option<RenderedRfc822> = None;
     for attr in attrs {
         if !first {
             out.push(' ');
@@ -1736,20 +1782,28 @@ fn fetch_response_line(seq: u32, uid: u32, email: &Email, attrs: &[FetchAttr]) -
                 ));
             }
             FetchAttr::Rfc822Size => {
-                let body = render_rfc822(email);
-                out.push_str(&format!("RFC822.SIZE {}", body.len()));
+                let r = rendered.get_or_insert_with(|| RenderedRfc822::for_email(email));
+                out.push_str(&format!("RFC822.SIZE {}", r.full.len()));
             }
             FetchAttr::BodyFull => {
-                let body = render_rfc822(email);
-                out.push_str(&format!("BODY[] {{{}}}\r\n{}", body.len(), body));
+                let r = rendered.get_or_insert_with(|| RenderedRfc822::for_email(email));
+                out.push_str(&format!("BODY[] {{{}}}\r\n{}", r.full.len(), r.full));
             }
             FetchAttr::BodyHeader => {
-                let head = render_rfc822_headers(email);
-                out.push_str(&format!("BODY[HEADER] {{{}}}\r\n{}", head.len(), head));
+                let r = rendered.get_or_insert_with(|| RenderedRfc822::for_email(email));
+                out.push_str(&format!(
+                    "BODY[HEADER] {{{}}}\r\n{}",
+                    r.headers.len(),
+                    r.headers
+                ));
             }
             FetchAttr::BodyText => {
-                let text = render_rfc822_text_body(email);
-                out.push_str(&format!("BODY[TEXT] {{{}}}\r\n{}", text.len(), text));
+                let r = rendered.get_or_insert_with(|| RenderedRfc822::for_email(email));
+                out.push_str(&format!(
+                    "BODY[TEXT] {{{}}}\r\n{}",
+                    r.text.len(),
+                    r.text
+                ));
             }
             FetchAttr::BodyStructure => {
                 out.push_str(&format!("BODYSTRUCTURE {}", render_bodystructure(email)));
@@ -1801,15 +1855,11 @@ fn flags_for(email: &Email) -> String {
 // header line folding. When fixtures grow non-ASCII subjects or
 // multipart bodies, this is the moment to swap in `mail-builder`.
 
-fn render_rfc822(email: &Email) -> String {
-    if let Some(raw) = &email.raw_bytes {
-        return raw.clone();
-    }
-    let mut out = render_rfc822_headers(email);
-    out.push_str("\r\n");
-    out.push_str(&render_rfc822_text_body(email));
-    out
-}
+// `render_rfc822` removed: callers now go through
+// `RenderedRfc822::for_email`, which composes headers + text once
+// and exposes both pieces alongside the full block. Unit tests
+// in this module that needed the legacy entry point were updated
+// to call `RenderedRfc822::for_email(email).full` instead.
 
 /// For raw-bytes emails, slice the verbatim block at the first
 /// `\r\n\r\n` to recover header / body sub-fetches. The header slice
@@ -3087,7 +3137,7 @@ mod tests {
             attachments: vec![],
             raw_bytes: None,
         };
-        let r = render_rfc822(&e);
+        let r = RenderedRfc822::for_email(&e).full;
         assert!(r.contains("From: Alice <alice@example.com>\r\n"));
         assert!(r.contains("To: <bob@example.com>\r\n"));
         assert!(r.contains("Subject: Hello\r\n"));
