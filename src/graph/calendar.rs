@@ -244,13 +244,18 @@ async fn delta_events(
     if let Some(token) = q.deltatoken.as_deref() {
         let raw = odata::decode_deltatoken(token).unwrap_or("");
         if let Some(delta) = fixture.event_delta_since(raw, &calendar) {
+            // Build an id -> &Event map once; the per-id lookup
+            // would otherwise scan `fixture.events` linearly per
+            // delta entry. O(K + N) instead of O(K · N).
+            let by_id: std::collections::HashMap<&str, &crate::fixture::Event> = fixture
+                .events
+                .iter()
+                .filter(|e| e.calendar_id == calendar)
+                .map(|e| (e.id.as_str(), e))
+                .collect();
             let mut value: Vec<Value> = Vec::new();
             for id in delta.created.iter().chain(delta.updated.iter()) {
-                if let Some(e) = fixture
-                    .events
-                    .iter()
-                    .find(|e| &e.id == id && e.calendar_id == calendar)
-                {
+                if let Some(e) = by_id.get(id.as_str()) {
                     value.push(serialize_event(&fixture, e));
                 }
             }

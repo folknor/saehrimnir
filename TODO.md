@@ -173,18 +173,16 @@ correct invariants and accepted trade-offs are omitted.
   `percent_decode` helper, so calendar / event ids that
   round-trip through clients carrying `%XX`-encoded chars
   match. Tests in `tests/caldav.rs`.
-- **[perf] `Fixture::delta_since` cancel set is O(c·d).**
-  `src/fixture.rs:355-360` does `destroyed.contains(id)`
-  (linear `Vec` scan) per created id. With a 256-transition
-  log over a 10k-event fixture, a stale-client follow-up
-  delta can pay ~600k comparisons. Build `destroyed` as
-  `HashSet<&str>` once. Same code path: `dedup_preserving_order`
-  clones every id into the HashSet - hash on `&str`.
-- **[perf] Graph delta walkers do nested `find` per delta id.**
-  `src/graph/calendar.rs:248-256`,
-  `src/graph/contacts.rs:329-336`. O(K · N) per delta call
-  where K = delta size, N = fixture-wide resources. Build an
-  `id → &Resource` HashMap once at the top of the handler.
+- ~~**[perf] `Fixture::delta_since` cancel set is O(c·d).**~~
+  Landed. Both `delta_since` and `delta_since_filtered_destroys`
+  delegate to a new `apply_dominance_and_dedup` helper that
+  builds `destroyed` membership as `HashSet<&str>` once.
+  `dedup_preserving_order` rewritten to use a `&str`-keyed
+  HashSet plus a keep-mask so it does zero clones per call.
+- ~~**[perf] Graph delta walkers do nested `find` per delta id.**~~
+  Landed. Both `calendarView/delta` and `contacts/delta`
+  build an `id -> &Resource` HashMap (filtered to the
+  requested calendar / folder) once at the top of the handler.
 - **[perf] `step_fixture` clones full `emails` / `mailboxes` /
   `events` vectors on every step under the write guard.**
   `src/routes.rs:803-805`. Pure-defensive snapshot for
@@ -221,12 +219,15 @@ correct invariants and accepted trade-offs are omitted.
   clone the inputs and render+write per item. Lift the
   existing `Streaming UID FETCH` future-work item from this
   file's "IMAP follow-ups" section into here.
-- **[perf] `Email/set` updates and destroys each scan all
-  emails.** `src/jmap.rs:1060, 1080`,
-  `src/routes.rs::apply_change_step:920, 954, 971`.
-  `(U + D) · N` per envelope. Build an `id → idx` map at the
-  top of the handler; rewrite `retain` as a single pass
-  consulting a `HashSet<&str>` of destroy ids.
+- ~~**[perf] `Email/set` updates and destroys each scan all
+  emails.**~~ Landed for the JMAP path. Updates build an
+  `id -> idx` HashMap once; destroys snapshot mailbox
+  memberships and retain in a single pass against a
+  `HashSet<&str>` of destroy ids. Response order is preserved
+  by walking the request `destroys` list afterwards. The
+  change-script apply path iterates ops rather than batching
+  by kind, so a precomputed map wouldn't help the same way
+  there; not the hot path the reviewer was concerned about.
 - ~~**[perf] CalDAV PROPFIND `body_requests_prop` runs per event
   per property.**~~ Landed via the `xml::requested_props`
   refactor above; the prop set is parsed once at PROPFIND

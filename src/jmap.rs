@@ -1058,10 +1058,16 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
         // Updates: locate by id, apply the patch, record. We mutate
         // a clone first so a partial failure on one property leaves
         // the original untouched; on success we swap the clone back
-        // in. The clone is cheap relative to the number of update
-        // calls we expect (single-digit per envelope).
+        // in. Build an id -> idx map once; per-update `position`
+        // would otherwise be O(U · N).
+        let id_to_idx: std::collections::HashMap<String, usize> = fix
+            .emails
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.id.clone(), i))
+            .collect();
         for (id, patch) in &updates {
-            let Some(idx) = fix.emails.iter().position(|e| &e.id == id) else {
+            let Some(&idx) = id_to_idx.get(id) else {
                 not_updated.insert(id.clone(), set_error("notFound", "no such email"));
                 continue;
             };
@@ -1081,19 +1087,33 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
             }
         }
 
-        // Destroys: drop in place, record id.
+        // Destroys: snapshot mailbox memberships for every id we're
+        // about to drop, then a single-pass retain. Pre-fix this was
+        // an O(D · N) loop of `position` + `remove`. Walking the
+        // request `destroys` afterwards preserves response order.
+        let destroy_set: std::collections::HashSet<&str> =
+            destroys.iter().map(String::as_str).collect();
+        let memberships: std::collections::HashMap<String, Vec<String>> = fix
+            .emails
+            .iter()
+            .filter(|e| destroy_set.contains(e.id.as_str()))
+            .map(|e| (e.id.clone(), e.mailbox_ids.clone()))
+            .collect();
+        fix.emails.retain(|e| !destroy_set.contains(e.id.as_str()));
         for id in &destroys {
-            let Some(idx) = fix.emails.iter().position(|e| &e.id == id) else {
-                not_destroyed.insert(id.clone(), set_error("notFound", "no such email"));
-                continue;
-            };
-            let mailboxes = fix.emails[idx].mailbox_ids.clone();
-            fix.emails.remove(idx);
-            for mb in &mailboxes {
-                fix.retire_uid(mb, id);
+            match memberships.get(id) {
+                Some(mailboxes) => {
+                    for mb in mailboxes {
+                        fix.retire_uid(mb, id);
+                    }
+                    diff.email_destroyed.push(id.clone());
+                    destroyed_out.push(id.clone());
+                }
+                None => {
+                    not_destroyed
+                        .insert(id.clone(), set_error("notFound", "no such email"));
+                }
             }
-            diff.email_destroyed.push(id.clone());
-            destroyed_out.push(id.clone());
         }
 
         diff

@@ -325,13 +325,17 @@ async fn delta_contacts(
     if let Some(token) = q.deltatoken.as_deref() {
         let raw = odata::decode_deltatoken(token).unwrap_or("");
         if let Some(delta) = fixture.contact_delta_since(raw, &folder_id) {
+            // Build an id -> &Contact map once; per-id `find` over
+            // `fixture.contacts` would otherwise be O(K · N).
+            let by_id: std::collections::HashMap<&str, &crate::fixture::Contact> = fixture
+                .contacts
+                .iter()
+                .filter(|c| c.folder_id == folder_id)
+                .map(|c| (c.id.as_str(), c))
+                .collect();
             let mut value: Vec<Value> = Vec::new();
             for id in delta.created.iter().chain(delta.updated.iter()) {
-                if let Some(c) = fixture
-                    .contacts
-                    .iter()
-                    .find(|c| &c.id == id && c.folder_id == folder_id)
-                {
+                if let Some(c) = by_id.get(id.as_str()) {
                     value.push(serialize_contact(c));
                 }
             }

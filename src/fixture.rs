@@ -563,19 +563,7 @@ impl Fixture {
                 }
             }
         }
-        let cancel: std::collections::HashSet<String> = created
-            .iter()
-            .filter(|id| destroyed.contains(id))
-            .cloned()
-            .collect();
-        created.retain(|id| !cancel.contains(id));
-        destroyed.retain(|id| !cancel.contains(id));
-        let in_created: std::collections::HashSet<String> = created.iter().cloned().collect();
-        let in_destroyed: std::collections::HashSet<String> = destroyed.iter().cloned().collect();
-        updated.retain(|id| !in_created.contains(id) && !in_destroyed.contains(id));
-        dedup_preserving_order(&mut created);
-        dedup_preserving_order(&mut updated);
-        dedup_preserving_order(&mut destroyed);
+        apply_dominance_and_dedup(&mut created, &mut updated, &mut destroyed);
         Some(DeltaSet {
             created,
             updated,
@@ -619,25 +607,7 @@ impl Fixture {
             updated.extend(u.iter().cloned());
             destroyed.extend(d.iter().cloned());
         }
-        // Apply RFC 8620 §5.2 dominance: created∩destroyed cancels;
-        // created+updated collapses to created; destroyed+updated
-        // collapses to destroyed. The order of these checks matters
-        // (cancel first, then collapse).
-        let cancel: std::collections::HashSet<String> = created
-            .iter()
-            .filter(|id| destroyed.contains(id))
-            .cloned()
-            .collect();
-        created.retain(|id| !cancel.contains(id));
-        destroyed.retain(|id| !cancel.contains(id));
-        let in_created: std::collections::HashSet<String> = created.iter().cloned().collect();
-        let in_destroyed: std::collections::HashSet<String> = destroyed.iter().cloned().collect();
-        updated.retain(|id| !in_created.contains(id) && !in_destroyed.contains(id));
-        // Dedup each list while preserving first-seen order (stable
-        // for byte-determinism).
-        dedup_preserving_order(&mut created);
-        dedup_preserving_order(&mut updated);
-        dedup_preserving_order(&mut destroyed);
+        apply_dominance_and_dedup(&mut created, &mut updated, &mut destroyed);
         Some(DeltaSet {
             created,
             updated,
@@ -646,10 +616,64 @@ impl Fixture {
     }
 }
 
+/// Apply RFC 8620 §5.2 dominance to a freshly-extended delta and
+/// dedup each list while preserving first-seen order (stable for
+/// byte-determinism). Shared by both delta walkers in `Fixture`.
+///
+/// Dominance rules (order matters):
+/// 1. `created ∩ destroyed` cancels (both removed).
+/// 2. `updated` is dropped where the id also appears in the
+///    surviving created or destroyed list.
+///
+/// Pre-fix the cancel filter scanned `destroyed` linearly per
+/// `created` id (`destroyed.contains(id)` over a `Vec`), going
+/// O(c·d) on a stale-client delta walk. Now the membership probes
+/// hash on `&str`.
+fn apply_dominance_and_dedup(
+    created: &mut Vec<String>,
+    updated: &mut Vec<String>,
+    destroyed: &mut Vec<String>,
+) {
+    use std::collections::HashSet;
+    // Cancel set: only need `&str` membership against destroyed,
+    // and the filtered ids land back in an owned `HashSet<String>`
+    // for the subsequent retain calls (which can't borrow from
+    // either vec while mutating).
+    let cancel: HashSet<String> = {
+        let destroyed_set: HashSet<&str> = destroyed.iter().map(String::as_str).collect();
+        created
+            .iter()
+            .filter(|id| destroyed_set.contains(id.as_str()))
+            .cloned()
+            .collect()
+    };
+    created.retain(|id| !cancel.contains(id));
+    destroyed.retain(|id| !cancel.contains(id));
+    // updated.retain reads `created` / `destroyed` immutably; safe
+    // to borrow them as `&str` here.
+    let in_created: HashSet<&str> = created.iter().map(String::as_str).collect();
+    let in_destroyed: HashSet<&str> = destroyed.iter().map(String::as_str).collect();
+    updated.retain(|id| !in_created.contains(id.as_str()) && !in_destroyed.contains(id.as_str()));
+    dedup_preserving_order(created);
+    dedup_preserving_order(updated);
+    dedup_preserving_order(destroyed);
+}
+
 fn dedup_preserving_order(v: &mut Vec<String>) {
-    let mut seen: std::collections::HashSet<String> =
+    if v.len() < 2 {
+        return;
+    }
+    // Two passes: first builds a keep-mask using `&str` membership
+    // (no clones); then `retain` drops dropped slots in O(n).
+    let mut seen: std::collections::HashSet<&str> =
         std::collections::HashSet::with_capacity(v.len());
-    v.retain(|id| seen.insert(id.clone()));
+    let keep: Vec<bool> = v.iter().map(|s| seen.insert(s.as_str())).collect();
+    let mut idx = 0;
+    v.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
 }
 
 /// One named entry in the incremental-sync script. Authored via
