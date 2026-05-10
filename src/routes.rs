@@ -481,14 +481,22 @@ async fn list_requests(
 ) -> Response {
     let snap = state.shared.request_log.snapshot();
     if params.get("stable").map(String::as_str) == Some("true") {
-        let stripped: Vec<Value> = snap
+        // Borrow-and-serialize via a view struct: serde walks each
+        // `detail` once at write time, no per-row JSON tree rebuild.
+        // Pre-fix this re-cloned every detail via `json!({...})`,
+        // doubling the per-call working set against the 100k cap.
+        #[derive(serde::Serialize)]
+        struct Stable<'a> {
+            protocol: &'a str,
+            command: &'a str,
+            detail: &'a Value,
+        }
+        let stripped: Vec<Stable<'_>> = snap
             .iter()
-            .map(|e| {
-                json!({
-                    "protocol": e.protocol,
-                    "command": e.command,
-                    "detail": e.detail,
-                })
+            .map(|e| Stable {
+                protocol: e.protocol,
+                command: &e.command,
+                detail: &e.detail,
             })
             .collect();
         Json(stripped).into_response()
@@ -862,17 +870,27 @@ async fn step_fixture(
             .into_response();
     }
 
-    // Atomic apply: snapshot every mutable fixture section so we can
-    // rewind on per-op error. The snapshot must cover every field
-    // `apply_change_step` is allowed to touch - missing one leaves a
-    // torn write on the failure path. Collect the per-op effect
-    // lists so the response can split moves out from regular updates.
-    let saved_emails = fix.emails.clone();
-    let saved_mailboxes = fix.mailboxes.clone();
-    let saved_events = fix.events.clone();
-    let saved_contacts = fix.contacts.clone();
-    let saved_contact_folders = fix.contact_folders.clone();
-    let saved_mailbox_uid_history = fix.mailbox_uid_history.clone();
+    // Atomic apply: snapshot every mutable fixture section the
+    // step might touch so we can rewind on per-op error. Pre-fix
+    // every step deep-cloned every section unconditionally;
+    // against a 10k-email fixture, a step that only touches
+    // contacts paid for cloning all 10k emails. Now we walk the
+    // ops once, classify which categories they touch, and only
+    // clone those vecs. The snapshot must cover every field
+    // `apply_change_step` is allowed to mutate - missing one
+    // leaves a torn write on the failure path. mailbox_uid_history
+    // is touched by every email-shaped op (assign_uid /
+    // retire_uid); snapshot it whenever any email op exists.
+    let touched = StepTouches::from_step(&step);
+    let saved_emails = touched.emails.then(|| fix.emails.clone());
+    let saved_mailboxes = touched.mailboxes.then(|| fix.mailboxes.clone());
+    let saved_events = touched.events.then(|| fix.events.clone());
+    let saved_contacts = touched.contacts.then(|| fix.contacts.clone());
+    let saved_contact_folders = touched
+        .contact_folders
+        .then(|| fix.contact_folders.clone());
+    let saved_mailbox_uid_history =
+        touched.emails.then(|| fix.mailbox_uid_history.clone());
 
     let mut diff = crate::fixture::MutationDiff::default();
     let mut moved: Vec<String> = Vec::new();
@@ -881,17 +899,24 @@ async fn step_fixture(
 
     if let Err((code, payload)) = apply_result {
         // Rewind. The mutation never happened; the cursor stays put.
-        // mailbox_uid_history is part of the rewindable surface
-        // because EmailCreate / EmailUpdate / EmailMove / EmailDestroy
-        // each call assign_uid / retire_uid as they mutate; without
-        // restoring it a half-applied step would leak phantom UID
-        // assignments past the rewind.
-        fix.emails = saved_emails;
-        fix.mailboxes = saved_mailboxes;
-        fix.events = saved_events;
-        fix.contacts = saved_contacts;
-        fix.contact_folders = saved_contact_folders;
-        fix.mailbox_uid_history = saved_mailbox_uid_history;
+        if let Some(v) = saved_emails {
+            fix.emails = v;
+        }
+        if let Some(v) = saved_mailboxes {
+            fix.mailboxes = v;
+        }
+        if let Some(v) = saved_events {
+            fix.events = v;
+        }
+        if let Some(v) = saved_contacts {
+            fix.contacts = v;
+        }
+        if let Some(v) = saved_contact_folders {
+            fix.contact_folders = v;
+        }
+        if let Some(v) = saved_mailbox_uid_history {
+            fix.mailbox_uid_history = v;
+        }
         return (code, Json(payload)).into_response();
     }
 
@@ -949,6 +974,46 @@ async fn step_fixture(
         "state": new_state,
     }))
     .into_response()
+}
+
+/// Which fixture sections a step's ops will touch. Lets
+/// `step_fixture` snapshot only the relevant sections for
+/// rewind-on-error rather than deep-cloning every mutable vec.
+#[derive(Default)]
+struct StepTouches {
+    emails: bool,
+    mailboxes: bool,
+    events: bool,
+    contacts: bool,
+    contact_folders: bool,
+}
+
+impl StepTouches {
+    fn from_step(step: &crate::fixture::ChangeStep) -> Self {
+        use crate::fixture::ChangeOp;
+        let mut t = Self::default();
+        for op in &step.ops {
+            match op {
+                ChangeOp::EmailCreate(_)
+                | ChangeOp::EmailUpdate { .. }
+                | ChangeOp::EmailMove { .. }
+                | ChangeOp::EmailDestroy { .. } => t.emails = true,
+                ChangeOp::MailboxCreate(_)
+                | ChangeOp::MailboxUpdate { .. }
+                | ChangeOp::MailboxDestroy { .. } => t.mailboxes = true,
+                ChangeOp::EventCreate(_)
+                | ChangeOp::EventUpdate { .. }
+                | ChangeOp::EventDestroy { .. } => t.events = true,
+                ChangeOp::ContactCreate(_)
+                | ChangeOp::ContactUpdate { .. }
+                | ChangeOp::ContactDestroy { .. } => t.contacts = true,
+                ChangeOp::ContactFolderCreate(_)
+                | ChangeOp::ContactFolderUpdate { .. }
+                | ChangeOp::ContactFolderDestroy { .. } => t.contact_folders = true,
+            }
+        }
+        t
+    }
 }
 
 /// Apply a `ChangeStep` to `fix` in place. Accumulates per-resource id

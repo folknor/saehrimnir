@@ -183,22 +183,19 @@ correct invariants and accepted trade-offs are omitted.
   Landed. Both `calendarView/delta` and `contacts/delta`
   build an `id -> &Resource` HashMap (filtered to the
   requested calendar / folder) once at the top of the handler.
-- **[perf] `step_fixture` clones full `emails` / `mailboxes` /
-  `events` vectors on every step under the write guard.**
-  `src/routes.rs:803-805`. Pure-defensive snapshot for
-  rewind-on-error; a 100-step script against a 10k-email
-  fixture re-pays the deep clone 100 times. Either pre-validate
-  cross-refs so the apply path is infallible (the validation
-  loops at lines 897-906, 944-953, 992-994 already exist), or
-  snapshot only the touched indices.
-- **[perf] `?stable=true` rebuilds a fresh `Value` per row.**
-  `src/routes.rs:484-493` walks the snapshot and clones every
-  `detail: Value` into a fresh `json!({...})` to strip
-  `received_at`. With cap = 100k and rich JSON details that's
-  the dominant per-call working set. Serialize directly from
-  `RequestEntry` borrows via a view struct rather than rebuilding
-  the JSON tree. The internal-clone half of this item landed via
-  the `RequestLog::snapshot` simplification above.
+- ~~**[perf] `step_fixture` clones full `emails` / `mailboxes` /
+  `events` vectors on every step under the write guard.**~~
+  Landed. New `StepTouches::from_step` walks the step's ops
+  once and classifies which categories will be mutated;
+  `step_fixture` only clones the affected vecs (and
+  `mailbox_uid_history` only when an email-shaped op exists).
+  A 10k-email fixture running a contacts-only step now clones
+  just `contacts` instead of every section.
+- ~~**[perf] `?stable=true` rebuilds a fresh `Value` per row.**~~
+  Landed. The handler now serializes through a borrowed
+  `Stable<'a> { protocol, command, detail }` view struct;
+  serde walks each `detail: Value` once at write time, no
+  per-row JSON tree rebuild.
 - ~~**[perf] IMAP `RFC822.SIZE` re-renders the entire body just
   to take `.len()`.**~~ Landed. New `RenderedRfc822` struct
   pre-computes (headers, text, full) once per email and
