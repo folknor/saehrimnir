@@ -563,6 +563,60 @@ fn event_etag(fixture: &crate::fixture::Fixture, event_id: &str) -> String {
     format!("\"{last}/{event_id}\"")
 }
 
+/// Outcome of an If-Match precondition check.
+#[derive(Debug, PartialEq, Eq)]
+enum IfMatchOutcome {
+    /// At least one tag in the header matched the current resource
+    /// (or a wildcard against an existing resource).
+    Match,
+    /// The header was a wildcard but the resource does not exist.
+    /// PUT distinguishes this case (it 412s); DELETE always has
+    /// the resource (it 404s before getting here) so the
+    /// distinction is mostly for the PUT path.
+    WildcardNoResource,
+    /// No tag matched.
+    NoMatch,
+}
+
+/// Evaluate an `If-Match` header value against the current ETag.
+/// RFC 7232 §3.1: the value is a comma-separated list of opaque
+/// tags, optionally prefixed with `W/` (weak validators), each
+/// surrounded by double quotes; or the wildcard `*`. Real clients
+/// vary on the exact framing - some quote the wildcard, some emit
+/// `W/"..."`, some emit a single bare token. This helper tolerates
+/// the lot. The bare-quote-strip on both sides keeps the
+/// comparison body-equality even when one side is quoted and the
+/// other isn't.
+fn if_match_matches(header_value: &str, current_etag: Option<&str>) -> IfMatchOutcome {
+    let cur_unquoted = current_etag.map(unquote_etag);
+    for tag in header_value.split(',') {
+        let trimmed = tag.trim();
+        let unweak = trimmed.strip_prefix("W/").unwrap_or(trimmed).trim();
+        let unquoted = unquote_etag(unweak);
+        if unquoted == "*" {
+            return if current_etag.is_some() {
+                IfMatchOutcome::Match
+            } else {
+                IfMatchOutcome::WildcardNoResource
+            };
+        }
+        if let Some(cur) = cur_unquoted
+            && unquoted == cur
+        {
+            return IfMatchOutcome::Match;
+        }
+    }
+    IfMatchOutcome::NoMatch
+}
+
+/// Strip surrounding double quotes from an ETag, leaving the
+/// opaque body. Idempotent: an unquoted input passes through.
+fn unquote_etag(s: &str) -> &str {
+    s.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(s)
+}
+
 /// Most recent `to_state` from any transition that listed
 /// `event_id` in its created / updated / destroyed sets. Returns
 /// the change-log seed when no transition has touched the event,
@@ -855,9 +909,22 @@ async fn handle_put(
             return not_found(path);
         }
         let parsed = match ical::parse_vevent(body_str) {
-            Some(p) => p,
-            None => return bad_request("PUT body must contain a VEVENT"),
+            Ok(p) => p,
+            Err(msg) => return bad_request(&format!("PUT body: {msg}")),
         };
+        // The URL identifies the resource; the body's UID must
+        // either be absent (caller expects us to use the URL id) or
+        // match the URL's id exactly. A mismatch would orphan the
+        // URL ↔ id mapping (we'd create / update an event whose id
+        // is the body's UID, leaving the URL pointing at nothing or
+        // at a different event entirely).
+        if let Some(body_uid) = parsed.uid.as_deref()
+            && body_uid != event_id
+        {
+            return bad_request(&format!(
+                "PUT body UID {body_uid:?} does not match URL event id {event_id:?}"
+            ));
+        }
         (cal, event_id, parsed)
     };
 
@@ -874,17 +941,13 @@ async fn handle_put(
         .iter()
         .position(|e| e.id == event_id && e.calendar_id == calendar_id);
     if let Some(im) = if_match {
-        // RFC 7232: `*` matches when the resource exists; fail
-        // when it doesn't. A specific ETag matches when the value
-        // equals (one of) the current resource's ETag.
-        if im == "*" {
-            if existing_idx.is_none() {
+        let current = existing_idx.map(|i| event_etag(&fixture, &fixture.events[i].id));
+        match if_match_matches(im, current.as_deref()) {
+            IfMatchOutcome::Match => {}
+            IfMatchOutcome::WildcardNoResource => {
                 return precondition_failed("If-Match: * but event does not exist");
             }
-        } else {
-            let current = existing_idx.map(|i| event_etag(&fixture, &fixture.events[i].id));
-            let matches = current.as_deref() == Some(im);
-            if !matches {
+            IfMatchOutcome::NoMatch => {
                 return precondition_failed("If-Match did not match the current ETag");
             }
         }
@@ -975,9 +1038,15 @@ async fn handle_delete(state: &AppState, path: &str, headers: &HeaderMap) -> Res
     };
     if let Some(im) = if_match {
         let current = event_etag(&fixture, &fixture.events[idx].id);
-        let matches = im == "*" || im == current;
-        if !matches {
-            return precondition_failed("If-Match did not match the current ETag");
+        match if_match_matches(im, Some(&current)) {
+            IfMatchOutcome::Match => {}
+            // DELETE only fires after `idx` resolved, so the
+            // wildcard branch can't take WildcardNoResource here -
+            // but we still funnel through the same helper to keep
+            // the parsing centralised.
+            IfMatchOutcome::WildcardNoResource | IfMatchOutcome::NoMatch => {
+                return precondition_failed("If-Match did not match the current ETag");
+            }
         }
     }
     let id = fixture.events[idx].id.clone();

@@ -159,20 +159,31 @@ pub(crate) struct ParsedEvent {
 }
 
 /// Parse a VCALENDAR body, returning the first VEVENT's fields.
-/// Returns None if no VEVENT is present.
-pub(crate) fn parse_vevent(body: &str) -> Option<ParsedEvent> {
+/// Returns `Err` if no VEVENT is present, or if more than one is
+/// present. v0 only models one event per body; silently dropping
+/// the second VEVENT would let a hostile / broken client supply
+/// two with different UIDs and we'd take whichever the parser saw
+/// first - particularly bad given the URL/UID divergence concern
+/// where the URL says one id but the body could ship another.
+pub(crate) fn parse_vevent(body: &str) -> Result<ParsedEvent, &'static str> {
     let mut in_event = false;
     let mut parsed = ParsedEvent::default();
-    let mut found = false;
+    let mut found = 0usize;
     for raw_line in unfold_lines(body) {
         let line = raw_line.trim_end_matches(['\r', '\n']);
         if line == "BEGIN:VEVENT" {
+            found += 1;
+            if found > 1 {
+                return Err("body contains multiple VEVENTs; v0 accepts at most one");
+            }
             in_event = true;
-            found = true;
             continue;
         }
         if line == "END:VEVENT" {
-            break;
+            in_event = false;
+            // Don't break: keep scanning so a second BEGIN:VEVENT
+            // later in the body trips the multi-VEVENT guard above.
+            continue;
         }
         if !in_event {
             continue;
@@ -200,7 +211,11 @@ pub(crate) fn parse_vevent(body: &str) -> Option<ParsedEvent> {
             _ => {}
         }
     }
-    if found { Some(parsed) } else { None }
+    if found == 0 {
+        Err("body must contain a VEVENT")
+    } else {
+        Ok(parsed)
+    }
 }
 
 /// Unfold RFC 5545 line continuations: a line starting with a
@@ -238,11 +253,15 @@ fn split_property(line: &str) -> Option<(String, &str)> {
 }
 
 /// Parse an `ORGANIZER` / `ATTENDEE` line: `NAME[;CN="..."]:mailto:address`.
+/// `mailto:` strip is case-insensitive: RFC 5545 examples and Apple
+/// Calendar emit `MAILTO:` uppercase, lowercase clients emit
+/// `mailto:`, both must round-trip without leaving the prefix
+/// embedded in `address.email`.
 fn parse_address(line: &str) -> Option<Address> {
     let colon = line.find(':')?;
     let params_segment = &line[..colon];
     let value = &line[colon + 1..];
-    let email = value.strip_prefix("mailto:").unwrap_or(value).to_string();
+    let email = strip_mailto_prefix(value).to_string();
     let mut name = None;
     for param in params_segment.split(';').skip(1) {
         if let Some(rest) = param.strip_prefix("CN=") {
@@ -254,6 +273,19 @@ fn parse_address(line: &str) -> Option<Address> {
         }
     }
     Some(Address { email, name })
+}
+
+/// Case-insensitive `mailto:` prefix strip. Apple Calendar emits
+/// `MAILTO:` uppercase per the RFC 5545 examples; lowercase clients
+/// emit `mailto:`. Both must produce the same `address.email` so a
+/// PUT round-trip doesn't surface `mailto:MAILTO:bob@x` (the
+/// re-emit unconditionally adds the lowercase prefix).
+fn strip_mailto_prefix(value: &str) -> &str {
+    if value.len() >= 7 && value[..7].eq_ignore_ascii_case("mailto:") {
+        &value[7..]
+    } else {
+        value
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +352,41 @@ mod tests {
         assert!(ical.contains("Q1\\; budget review"));
         let parsed = parse_vevent(&ical).expect("parse");
         assert_eq!(parsed.summary.as_deref(), Some("Q1; budget review"));
+    }
+
+    #[test]
+    fn organizer_mailto_prefix_strip_is_case_insensitive() {
+        // Apple Calendar emits MAILTO: uppercase; lowercase clients
+        // emit mailto:. Both must produce email = "alice@example.com"
+        // (without the prefix), so a round-trip doesn't surface
+        // mailto:MAILTO:alice@example.com.
+        for mailto in ["mailto:", "MAILTO:", "MailTo:"] {
+            let body = format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ev-1\r\nSUMMARY:X\r\nDTSTART:20260115T090000Z\r\nDTEND:20260115T091500Z\r\nORGANIZER:{mailto}alice@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            );
+            let parsed = parse_vevent(&body).expect("parse");
+            let org = parsed.organizer.expect("organizer");
+            assert_eq!(
+                org.email, "alice@example.com",
+                "{mailto} prefix not stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_vevent_rejects_multi_vevent_body() {
+        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                    BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:X\r\nDTSTART:20260115T090000Z\r\nDTEND:20260115T091500Z\r\nEND:VEVENT\r\n\
+                    BEGIN:VEVENT\r\nUID:b\r\nSUMMARY:Y\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\nEND:VEVENT\r\n\
+                    END:VCALENDAR\r\n";
+        let err = parse_vevent(body).unwrap_err();
+        assert!(err.contains("multiple VEVENT"), "wrong error: {err}");
+    }
+
+    #[test]
+    fn parse_vevent_rejects_empty_body() {
+        let err = parse_vevent("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").unwrap_err();
+        assert!(err.contains("must contain a VEVENT"), "wrong error: {err}");
     }
 
     #[test]

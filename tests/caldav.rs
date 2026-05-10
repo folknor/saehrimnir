@@ -567,6 +567,137 @@ async fn delete_removes_event() {
 }
 
 #[tokio::test]
+async fn put_with_body_uid_mismatch_returns_400() {
+    // Regression: PUT body's UID must match the URL's event id, or
+    // the resource ↔ id mapping breaks. URL says ev-mismatch but
+    // body's UID:ev-other - 400, and the URL's resource is not
+    // touched.
+    let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ev-other\r\nSUMMARY:X\r\nDTSTART:20260115T090000Z\r\nDTEND:20260115T091500Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-mismatch.ics")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn put_with_multi_vevent_body_returns_400() {
+    // Regression: a body with two VEVENTs is rejected. Pre-fix the
+    // first VEVENT was parsed and the second silently dropped,
+    // letting an attacker supply two with conflicting UIDs.
+    let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                BEGIN:VEVENT\r\nUID:ev-001\r\nSUMMARY:Real\r\nDTSTART:20260115T090000Z\r\nDTEND:20260115T091500Z\r\nEND:VEVENT\r\n\
+                BEGIN:VEVENT\r\nUID:ev-shadow\r\nSUMMARY:Smuggled\r\nDTSTART:20260115T100000Z\r\nDTEND:20260115T110000Z\r\nEND:VEVENT\r\n\
+                END:VCALENDAR\r\n";
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn put_if_match_accepts_quoted_wildcard_and_weak_validator() {
+    // Regression: pre-fix the wildcard branch only matched the
+    // literal three bytes `*`. Quoted `"*"`, weak `W/*`, and
+    // weak-quoted `W/"current-etag"` must all parse as RFC 7232
+    // intends.
+    let app = router();
+
+    // Get baseline ETag for ev-001.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let etag = resp
+        .headers()
+        .get("ETag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // PUT with quoted wildcard. ev-001 exists, so this matches.
+    let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ev-001\r\nSUMMARY:V1\r\nDTSTART:20260115T090000Z\r\nDTEND:20260115T091500Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .header("If-Match", "\"*\"")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "quoted wildcard should match an existing resource (PUT-update returns 204)"
+    );
+
+    // PUT with W/<current-etag> (weak validator wrapping the current
+    // etag). After the previous PUT the etag changed, so refetch.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let etag2 = resp
+        .headers()
+        .get("ETag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(etag2, etag);
+
+    let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ev-001\r\nSUMMARY:V2\r\nDTSTART:20260115T090000Z\r\nDTEND:20260115T091500Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .header("If-Match", format!("W/{etag2}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "W/<etag> should match when the unweak comparison equals current"
+    );
+}
+
+#[tokio::test]
 async fn delete_with_if_match_mismatch_returns_412() {
     let resp = router()
         .oneshot(

@@ -112,31 +112,26 @@ correct invariants and accepted trade-offs are omitted.
 
 ### Fix soon
 
-- **[security] CalDAV PUT can change a stored event's id behind
-  the URL.** `src/caldav/mod.rs:805` uses `parsed.uid` (from
-  the body) to choose the new event's id while
-  `existing_idx` was looked up by URL `event_id`. Body `UID:B`
-  against URL `.../A.ics` orphans the URL ↔ id mapping or
-  duplicates id `B`. Reject when `parsed.uid != Some(event_id)`.
-- **[security] CalDAV `If-Match` quote / weak-validator
-  handling.** `src/caldav/mod.rs:743-799, 884-889` does
-  byte-equality on a trimmed header value. Wildcard branch
-  matches only the literal three bytes `*`; a client sending
-  `"*"` (quoted) always 412s. `W/`-prefixed weak validators are
-  not stripped. Parse into a list of opaque tokens (split on
-  `,`, strip leading `W/`, strip surrounding quotes).
-- **[security] CalDAV `mailto:` strip is case-sensitive.**
-  `src/caldav/ical.rs:232`. Apple Calendar emits `MAILTO:`
-  uppercase; the parsed address ends up `email = "MAILTO:bob@x"`
-  and round-trips as `mailto:MAILTO:bob@x`. Case-insensitive
-  prefix-strip.
-- **[security] CalDAV multi-VEVENT body silently drops the
-  second event.** `src/caldav/ical.rs::parse_vevent` walks until
-  the first `END:VEVENT`. Combined with the URL/UID divergence
-  finding, an attacker-supplied body could have two VEVENTs
-  with different UIDs and we'd pick whichever the parser saw
-  first. Reject multi-VEVENT bodies (or accept all and
-  validate UID consistency).
+- ~~**[security] CalDAV PUT can change a stored event's id behind
+  the URL.**~~ Landed. `handle_put` now rejects with 400 when
+  the body's `UID` is present and disagrees with the URL's
+  event id; absent UID continues to fall back to the URL id.
+- ~~**[security] CalDAV `If-Match` quote / weak-validator
+  handling.**~~ Landed. New `if_match_matches` helper +
+  `IfMatchOutcome` enum tolerates comma-separated lists,
+  `W/`-prefixed weak validators, and quoted wildcards (`"*"`).
+  Both PUT and DELETE route through it. Tests exercise quoted
+  wildcard and `W/<etag>` against an existing resource.
+- ~~**[security] CalDAV `mailto:` strip is case-sensitive.**~~
+  Landed. `parse_address` calls a new `strip_mailto_prefix`
+  helper that does a case-insensitive 7-byte prefix check.
+  Test covers `mailto:` / `MAILTO:` / `MailTo:`.
+- ~~**[security] CalDAV multi-VEVENT body silently drops the
+  second event.**~~ Landed. `parse_vevent` returns
+  `Result<ParsedEvent, &'static str>`; a body with more than
+  one VEVENT is rejected ("multiple VEVENTs"), an empty body
+  is rejected ("must contain a VEVENT"). PUT path 400s on
+  either error.
 - **[bugs] Cross-folder contact moves disappear from source-
   folder delta.** `src/graph/contacts.rs:329-336`. A
   `contact_update` patch that changes `folder_id` from A to B
