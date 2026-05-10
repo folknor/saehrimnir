@@ -886,11 +886,14 @@ async fn step_fixture(
         return (code, Json(payload)).into_response();
     }
 
-    // Commit: a single mutate call records exactly one transition for
-    // the entire step. The closure does no further mutation - the
-    // fixture already holds the post-step image; we just need to
-    // surface the diff to the change_log.
-    let trans = fix.mutate(|_f| diff);
+    // Commit: the fixture already holds the post-step image
+    // (apply_change_step mutates in place), so we just need to
+    // record the cumulative transition. `record_transition` is
+    // the explicit entry for callers that have already mutated
+    // - going through `mutate(|_f| diff)` would still work but
+    // misrepresents the contract that mutate's closure is the
+    // sole mutation site.
+    let trans = fix.record_transition(diff);
 
     *cursor += 1;
     let cursor_after = *cursor;

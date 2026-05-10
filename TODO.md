@@ -85,16 +85,17 @@ correct invariants and accepted trade-offs are omitted.
   silently. Push the Lua readers further into building
   `Raw*Update` structs and route both sides through one
   shared `normalize_change_step`.
-- **[arch] `step_fixture` calls `mutate(|_f| diff)` after
+- ~~**[arch] `step_fixture` calls `mutate(|_f| diff)` after
   already mutating the fixture in `apply_change_step`,
-  violating the closure-only-mutator contract.** `src/routes.rs`
-  step path mutates `fix.contacts` / `fix.events` etc. directly,
-  then calls `Fixture::mutate` solely to bump state and append
-  a transition. Anyone reading the `mutate` doc will assume the
-  closure is the only mutation site. Either widen the public
-  surface (`record_transition(diff) -> Transition`) so the step
-  path's intent is explicit, or restructure `apply_change_step`
-  to fill a closure-local working copy.
+  violating the closure-only-mutator contract.**~~ Landed.
+  `Fixture` gained `pub fn record_transition(&mut self, diff)`
+  exposing the bump-state + append-transition path explicitly;
+  `mutate` is now a thin closure-wrapper that delegates to it.
+  `step_fixture` calls `record_transition` directly so the
+  read-the-doc-literal is preserved (mutate's closure is the
+  only mutation site for closure-style callers; the change-
+  script path's prior in-place mutation is now the documented
+  reason `record_transition` exists).
 - ~~**[bugs] Lua `email_create` baseline-mailbox snapshot is taken
   at the wrong moment.**~~ Documented. The early sanity check at
   `src/lua.rs::read_email_create` is duplicated by the

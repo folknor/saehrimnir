@@ -219,17 +219,34 @@ impl Fixture {
     /// transition recorded) so that idempotent set-calls (e.g. an
     /// `update` block that only patches keywords already present)
     /// stay observable as "nothing changed".
+    ///
+    /// Most callers want this shape. The change-script step path
+    /// in `routes.rs` already mutates the fixture in place across
+    /// many ops and only needs to record the cumulative transition
+    /// at the end; that path uses [`Self::record_transition`]
+    /// directly.
     pub fn mutate<F>(&mut self, f: F) -> Transition
     where
         F: FnOnce(&mut Fixture) -> MutationDiff,
     {
-        let from_state = self.state.clone();
         let diff = f(self);
+        self.record_transition(diff)
+    }
+
+    /// Record a `MutationDiff` against the current fixture state:
+    /// bump `state`, append a `Transition` to the change_log, and
+    /// return the recorded transition. Public so callers that have
+    /// already mutated the fixture in place (the change-script step
+    /// applier in particular) can capture the cumulative diff
+    /// without going through `mutate`'s closure dance.
+    ///
+    /// All-empty diff stays a no-op (no state bump, no transition
+    /// appended); the returned transition has `from == to` and
+    /// empty id sets so callers reporting `oldState` / `newState`
+    /// see "nothing changed".
+    pub fn record_transition(&mut self, diff: MutationDiff) -> Transition {
+        let from_state = self.state.clone();
         if diff.is_empty() {
-            // No-op: don't bump state, don't record a transition.
-            // Return a marker transition with `from == to` so the
-            // caller's `oldState == newState` response stays correct
-            // without us polluting the log.
             return Transition {
                 from_state: from_state.clone(),
                 to_state: from_state,
