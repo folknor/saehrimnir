@@ -10,6 +10,7 @@
 // idiomatic.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod caldav;
 pub mod cli;
 pub mod fixture;
 pub mod gmail;

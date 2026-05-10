@@ -6,7 +6,7 @@ use saehrimnir::lua::MockExit;
 use saehrimnir::oauth::TokenStore;
 use saehrimnir::request_log::RequestLog;
 use saehrimnir::sentinel::ProtocolPort;
-use saehrimnir::{cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp, tls};
+use saehrimnir::{caldav, cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp, tls};
 use tokio::sync::watch;
 
 /// Hard budget on graceful drain after SIGTERM. Plan-2 acceptance #6
@@ -61,6 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gmail_addr = gmail_listener.local_addr()?;
     eprintln!("saehrimnir: gmail listening on {gmail_addr}");
 
+    // CalDAV listener.
+    let caldav_listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.caldav_port)).await?;
+    let caldav_addr = caldav_listener.local_addr()?;
+    eprintln!("saehrimnir: caldav listening on {caldav_addr}");
+
     sentinel::write_ready(
         &args.readiness_file,
         &[
@@ -83,6 +89,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProtocolPort {
                 name: "GMAIL",
                 port: gmail_addr.port(),
+            },
+            ProtocolPort {
+                name: "CALDAV",
+                port: caldav_addr.port(),
             },
         ],
     )
@@ -212,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Gmail server.
     let gmail_app = gmail::router(gmail::AppState {
-        shared,
+        shared: shared.clone(),
     });
     let gmail_shutdown_rx = shutdown_rx.clone();
     let gmail_task = tokio::spawn(
@@ -227,6 +237,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .into_future(),
     );
+
+    // CalDAV server. Reuses the same `SharedHandles` so the
+    // request log, latency knob, and fixture image are the same
+    // ones the other listeners see.
+    let caldav_state = caldav::AppState { shared };
+    let caldav_shutdown_rx = shutdown_rx.clone();
+    let caldav_task =
+        tokio::spawn(async move { caldav::serve(caldav_listener, caldav_state, caldav_shutdown_rx).await });
 
     // Race the OS signal handler against any mock_done()/mock_fail()
     // signal raised by a Lua scenario. If the dispatcher is absent
@@ -266,6 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = smtp_task.await;
         let _ = graph_task.await;
         let _ = gmail_task.await;
+        let _ = caldav_task.await;
     };
     match tokio::time::timeout(SHUTDOWN_BUDGET, drain).await {
         Ok(()) => eprintln!("saehrimnir: clean shutdown"),
