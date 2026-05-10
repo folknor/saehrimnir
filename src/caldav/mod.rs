@@ -731,16 +731,179 @@ async fn handle_get(state: &AppState, path: &str, _headers: &HeaderMap) -> Respo
 }
 
 async fn handle_put(
-    _state: &AppState,
-    _path: &str,
-    _headers: &HeaderMap,
-    _body: &[u8],
+    state: &AppState,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
 ) -> Response {
-    not_implemented("PUT")
+    let body_str = match body_to_str(body) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let if_match = headers
+        .get("if-match")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+
+    // Read-only resolution first so we can early-return without
+    // taking the write guard. The fixture image stays read-locked
+    // for the duration of the parse + validate; we drop it before
+    // re-acquiring as a write.
+    let (calendar_id, event_id, parsed) = {
+        let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
+        let (cal, event_id) = match parse_path(&fixture, path) {
+            ResourcePath::Event {
+                user: _,
+                calendar_id,
+                event_id,
+            } => (calendar_id, event_id),
+            _ => return not_found(path),
+        };
+        if !fixture.calendars.iter().any(|c| c.id == cal) {
+            return not_found(path);
+        }
+        let parsed = match ical::parse_vevent(body_str) {
+            Some(p) => p,
+            None => return bad_request("PUT body must contain a VEVENT"),
+        };
+        (cal, event_id, parsed)
+    };
+
+    // Now acquire write. Re-validate the calendar (it might have
+    // been destroyed between the read and write guard) and
+    // honour If-Match against the current event ETag (or the
+    // wildcard `*` against existence).
+    let mut fixture = state.shared.fixture.write().expect("fixture lock poisoned");
+    if !fixture.calendars.iter().any(|c| c.id == calendar_id) {
+        return not_found(path);
+    }
+    let existing_idx = fixture
+        .events
+        .iter()
+        .position(|e| e.id == event_id && e.calendar_id == calendar_id);
+    if let Some(im) = if_match {
+        // RFC 7232: `*` matches when the resource exists; fail
+        // when it doesn't. A specific ETag matches when the value
+        // equals (one of) the current resource's ETag.
+        if im == "*" {
+            if existing_idx.is_none() {
+                return precondition_failed("If-Match: * but event does not exist");
+            }
+        } else {
+            let current = existing_idx.map(|i| event_etag(&fixture, &fixture.events[i].id));
+            let matches = current.as_deref() == Some(im);
+            if !matches {
+                return precondition_failed("If-Match did not match the current ETag");
+            }
+        }
+    }
+
+    // Build the new Event from the parsed VEVENT. Preserve any
+    // calendar-id-shaped value the client sent under UID, but fall
+    // back to the path's event_id so a malformed body still routes
+    // to the URL.
+    let id = parsed.uid.unwrap_or_else(|| event_id.clone());
+    let start = match parsed.start {
+        Some(s) => s,
+        None => return bad_request("VEVENT missing DTSTART"),
+    };
+    let end = match parsed.end {
+        Some(s) => s,
+        // Real CalDAV allows DTEND to be omitted (then DURATION
+        // applies, or it's an instantaneous event). v0 fixtures
+        // always carry both; default DTEND to `start + 1h` to
+        // match `synthesize_event_dto`'s behaviour in ratatoskr.
+        None => start + chrono::Duration::hours(1),
+    };
+    let new_event = crate::fixture::Event {
+        id: id.clone(),
+        calendar_id: calendar_id.clone(),
+        subject: parsed.summary.unwrap_or_default(),
+        body_preview: None,
+        body_text: parsed.description,
+        start,
+        end,
+        location: parsed.location,
+        organizer: parsed.organizer,
+        attendees: parsed.attendees,
+        is_all_day: parsed.is_all_day,
+    };
+    let was_create = existing_idx.is_none();
+    fixture.mutate(|f| {
+        match existing_idx {
+            Some(idx) => {
+                f.events[idx] = new_event.clone();
+                crate::fixture::MutationDiff {
+                    event_updated: vec![id.clone()],
+                    ..Default::default()
+                }
+            }
+            None => {
+                f.events.push(new_event.clone());
+                crate::fixture::MutationDiff {
+                    event_created: vec![id.clone()],
+                    ..Default::default()
+                }
+            }
+        }
+    });
+    let etag = event_etag(&fixture, &id);
+    let status = if was_create {
+        StatusCode::CREATED
+    } else {
+        StatusCode::NO_CONTENT
+    };
+    Response::builder()
+        .status(status)
+        .header("ETag", etag)
+        .body(Body::empty())
+        .expect("static PUT response builds")
 }
 
-async fn handle_delete(_state: &AppState, _path: &str, _headers: &HeaderMap) -> Response {
-    not_implemented("DELETE")
+async fn handle_delete(state: &AppState, path: &str, headers: &HeaderMap) -> Response {
+    let if_match = headers
+        .get("if-match")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    let mut fixture = state.shared.fixture.write().expect("fixture lock poisoned");
+    let (calendar_id, event_id) = match parse_path(&fixture, path) {
+        ResourcePath::Event {
+            user: _,
+            calendar_id,
+            event_id,
+        } => (calendar_id, event_id),
+        _ => return not_found(path),
+    };
+    let idx = fixture
+        .events
+        .iter()
+        .position(|e| e.id == event_id && e.calendar_id == calendar_id);
+    let Some(idx) = idx else {
+        return not_found(path);
+    };
+    if let Some(im) = if_match {
+        let current = event_etag(&fixture, &fixture.events[idx].id);
+        let matches = im == "*" || im == current;
+        if !matches {
+            return precondition_failed("If-Match did not match the current ETag");
+        }
+    }
+    let id = fixture.events[idx].id.clone();
+    fixture.mutate(|f| {
+        f.events.remove(idx);
+        crate::fixture::MutationDiff {
+            event_destroyed: vec![id.clone()],
+            ..Default::default()
+        }
+    });
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .expect("static DELETE response builds")
+}
+
+fn precondition_failed(msg: &str) -> Response {
+    (StatusCode::PRECONDITION_FAILED, msg.to_string()).into_response()
 }
 
 /// `OPTIONS *` and `OPTIONS /` advertise the verbs we support plus

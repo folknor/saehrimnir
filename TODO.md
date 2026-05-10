@@ -252,26 +252,46 @@ remain unblocked-but-unneeded.
   accounts (JMAP session resource, Graph `/users/{id}/...` paths,
   IMAP per-connection account context).
 
-## Next-protocol-surface ordering
+## CalDAV (landed)
 
-User-confirmed priority for the protocol surfaces below: **Graph
-contacts first, then CalDAV.** Graph contacts has landed (see
-"Microsoft Graph (other future work)" below); CalDAV is up next.
-
-## CalDAV (next)
-
-Net-new protocol surface ratatoskr will speak when its calendar
-client points at a non-Graph backend. New `src/caldav.rs` module
-+ new listener binding (separate `--caldav-port`) +
-`notes/ratatoskr-caldav-surface.md` scout doc. Reuses the existing
+The CalDAV surface ratatoskr's `CalDavClient` exercises is wired
+in v0. New listener (`--caldav-port`), new module
+(`src/caldav/{mod, xml, ical}.rs`), and a scout doc
+(`notes/ratatoskr-caldav-surface.md`). Reuses the existing
 `Calendar` / `Event` fixture types so the same `[[calendar]]` /
-`[[event]]` declarations drive both surfaces. Endpoints:
+`[[event]]` declarations drive both Graph and CalDAV. Implemented:
 
-- Principal discovery (`PROPFIND /.well-known/caldav`).
-- Calendar home set (`PROPFIND` on principal).
-- `REPORT` calendar-query and calendar-multiget.
-- `PUT` event with ETag generation.
-- `DELETE` event with If-Match handling.
+- `PROPFIND /` and `/.well-known/caldav` -> `current-user-principal`.
+- `PROPFIND /principals/{user}/` -> `calendar-home-set`.
+- `PROPFIND /calendars/{user}/` Depth=1 -> calendar listing with
+  displayname, ctag, color, privilege-set, supported-component-set.
+- `PROPFIND /calendars/{user}/{cal}/` Depth=0 -> ctag + props;
+  Depth=1 -> event listing (getetag + getcontenttype).
+- `REPORT calendar-multiget` -> per-href ical body + 404 propstat
+  for unknown hrefs.
+- `REPORT calendar-query` -> server-side `time-range` filter on
+  VEVENT with half-open [start, end) overlap semantics.
+- `GET /calendars/{user}/{cal}/{event}.ics` -> iCalendar body +
+  `ETag` header.
+- `PUT` -> parse VEVENT, mutate fixture (create or update) under
+  `Fixture::mutate`. `If-Match` honoured: stale ETag returns 412,
+  `If-Match: *` requires existing event.
+- `DELETE` -> remove event + record `event_destroyed`. `If-Match`
+  honoured.
+- `OPTIONS` -> `DAV: 1, calendar-access` + Allow list.
+
+Mutations route through the same `Fixture::mutate` seam Graph
+calendar uses, so `event_created` / `event_updated` /
+`event_destroyed` land on the change_log and a subsequent Graph
+`calendarView/delta` walk observes the CalDAV write through the
+same id sets. End-to-end coverage in `tests/caldav.rs` including
+a cross-protocol assertion that a CalDAV PUT surfaces in Graph
+delta.
+
+Out of scope for v0 (revisit when a fixture forces it): MKCALENDAR,
+PROPPATCH, ACLs, delegation, free-busy, scheduling (iTIP / iMIP),
+VEVENT recurrence (RRULE / EXDATE), VALARM, attachments, per-event
+VTIMEZONE.
 
 ## IMAP (lower-priority follow-ups)
 

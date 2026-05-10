@@ -155,6 +155,18 @@ checking whether the fact is already in `notes/`.
   `contacts.rs` (contact + contactFolder GETs + contacts/delta
   walker, mutations via change-script). Sibling files for drive /
   groups / EWS land here when those surfaces are scouted.
+- `src/caldav/` - CalDAV mock. `mod.rs` (single-handler dispatch
+  on PROPFIND / REPORT / GET / PUT / DELETE / OPTIONS for the
+  WebDAV verb surface ratatoskr's CalDavClient exercises), `xml.rs`
+  (light XML emission + body matching - escape, body_requests_prop,
+  collect_hrefs - hand-rolled rather than pulling quick-xml since
+  bodies are small and well-known), `ical.rs` (VCALENDAR/VEVENT
+  round-trip with the small subset of RFC 5545 v0 needs: UID /
+  SUMMARY / DESCRIPTION / LOCATION / DTSTART / DTEND / ORGANIZER /
+  ATTENDEE; line unfolding + TEXT escape). Reuses the existing
+  `Calendar` / `Event` fixture types; PUT/DELETE mutate through
+  `Fixture::mutate` so Graph `calendarView/delta` observes
+  CalDAV writes.
 - `src/gmail/` - Gmail REST mock. `mod.rs` (router, AppState,
   catchall 404), `mail.rs` (profile, labels, threads, history,
   attachments stub, MIME payload builder, hand-rolled base64url).
@@ -179,6 +191,13 @@ checking whether the fact is already in `notes/`.
   binary, polls for the readiness sentinel, hits a real network
   endpoint, sends SIGTERM, asserts a clean exit. Closes the
   coverage gap that `scripts/smoke.sh` covers manually.
+- `tests/caldav.rs` - CalDAV integration tests via
+  `tower::ServiceExt::oneshot`. Covers OPTIONS, the discovery
+  walk (root + well-known + principal + home + Depth 0/1),
+  PROPFIND on a calendar, GET event ical, REPORT
+  calendar-multiget + calendar-query (time-range filter),
+  PUT/DELETE with If-Match, and a cross-protocol assertion that
+  a CalDAV PUT surfaces in Graph `calendarView/delta`.
 - `fixtures/jmap-small.toml` and `fixtures/jmap-small.lua` - the
   canonical v0 scenario in both authoring formats. Asserted
   equivalent by `tests/lua_fixture.rs`.
@@ -301,6 +320,26 @@ projection of fixture emails into Gmail's nested mimePart shape) +
 (empty list). Catchall returns Gmail error envelope. Module
 structure leaves room for People-API contacts and Drive sibling
 files.
+
+CalDAV: complete for v0's calendar-sync path. Discovery
+(`PROPFIND /` -> principal -> calendar-home-set -> calendar
+listing) follows ratatoskr's RFC 6764 walk; calendar listing
+emits displayname / ctag / Apple calendar-color / privilege-set /
+supported-calendar-component-set. Event surface:
+`PROPFIND` Depth=1 lists VEVENT resources; `GET <event>.ics`
+returns the iCalendar body + ETag; `REPORT calendar-multiget`
+batch-fetches by href list (404 propstat for unknown hrefs);
+`REPORT calendar-query` honours `<C:time-range>` on VEVENT.
+Mutating verbs: `PUT` parses the VEVENT body and either creates
+or updates the matching fixture event under `Fixture::mutate`,
+honouring `If-Match` (`*` requires existence; specific ETag
+requires byte-equality; mismatches return 412). `DELETE` removes
+the event with the same If-Match semantics. Mutations land on
+the change_log so a subsequent Graph `calendarView/delta`
+observes the CalDAV write through the same `event_*` id sets.
+ETags and CTags derive deterministically from `Fixture::state`
+plus the resource id. v0 explicitly does not implement
+MKCALENDAR / PROPPATCH / ACLs / scheduling / recurrence.
 
 Lua fixture loader: wired via [dellingr](https://crates.io/crates/dellingr),
 a pure-Rust deterministic sandboxed Lua VM with cost-bounded

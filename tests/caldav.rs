@@ -382,6 +382,267 @@ async fn report_calendar_query_with_no_range_returns_all_events() {
 }
 
 #[tokio::test]
+async fn put_creates_new_event_and_returns_etag() {
+    let app = router();
+    let body = "BEGIN:VCALENDAR\r\n\
+                VERSION:2.0\r\n\
+                BEGIN:VEVENT\r\n\
+                UID:ev-new\r\n\
+                SUMMARY:Sprint planning\r\n\
+                DTSTART:20260301T100000Z\r\n\
+                DTEND:20260301T110000Z\r\n\
+                LOCATION:Online\r\n\
+                END:VEVENT\r\n\
+                END:VCALENDAR\r\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-new.ics")
+                .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let etag = resp.headers().get("ETag").unwrap().to_str().unwrap();
+    assert!(etag.starts_with('"'));
+
+    // GET round-trip sees the new event.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-new.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(body.contains("UID:ev-new"));
+    assert!(body.contains("SUMMARY:Sprint planning"));
+}
+
+#[tokio::test]
+async fn put_updates_existing_event_and_etag_changes() {
+    let app = router();
+    // Get the baseline ETag for ev-001.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let baseline_etag = resp.headers().get("ETag").unwrap().to_str().unwrap().to_string();
+
+    // Update via PUT.
+    let body = "BEGIN:VCALENDAR\r\n\
+                VERSION:2.0\r\n\
+                BEGIN:VEVENT\r\n\
+                UID:ev-001\r\n\
+                SUMMARY:Standup (rescheduled)\r\n\
+                DTSTART:20260115T100000Z\r\n\
+                DTEND:20260115T101500Z\r\n\
+                END:VEVENT\r\n\
+                END:VCALENDAR\r\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let new_etag = resp.headers().get("ETag").unwrap().to_str().unwrap();
+    assert_ne!(new_etag, baseline_etag, "ETag must cycle on update");
+
+    // Subsequent GET reflects the rescheduled time.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = String::from_utf8(
+        resp.into_body().collect().await.unwrap().to_bytes().to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("DTSTART:20260115T100000Z"));
+    assert!(body.contains("Standup (rescheduled)"));
+}
+
+#[tokio::test]
+async fn put_with_if_match_mismatch_returns_412() {
+    let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ev-001\r\nSUMMARY:X\r\nDTSTART:20260115T090000Z\r\nDTEND:20260115T091500Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .header("If-Match", "\"stale-etag\"")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn put_with_if_match_star_on_missing_event_returns_412() {
+    let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ev-new2\r\nSUMMARY:X\r\nDTSTART:20260115T090000Z\r\nDTEND:20260115T091500Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-new2.ics")
+                .header("If-Match", "*")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn delete_removes_event() {
+    let app = router();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/calendars/account-1/cal-work/ev-002.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Subsequent GET 404s.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-1/cal-work/ev-002.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_with_if_match_mismatch_returns_412() {
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/calendars/account-1/cal-work/ev-001.ics")
+                .header("If-Match", "\"wrong\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn caldav_put_visible_through_graph_calendar_view_delta() {
+    // Both surfaces share the same fixture handle, so a CalDAV PUT
+    // must surface in the next Graph calendarView/delta walk.
+    use saehrimnir::graph;
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let caldav_app = caldav::router(caldav::AppState {
+        shared: saehrimnir::shared::SharedHandles::for_test(std::sync::Arc::clone(&handle)),
+    });
+    let graph_state = graph::AppState {
+        shared: saehrimnir::shared::SharedHandles::for_test(std::sync::Arc::clone(&handle)),
+    };
+    let graph_app = graph::router(graph_state);
+
+    // Bootstrap delta token.
+    let resp = graph_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1.0/me/calendars/cal-work/calendarView/delta")
+                .header(header::HOST, "127.0.0.1:0")
+                .header(header::AUTHORIZATION, "Bearer x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let delta_link = v["@odata.deltaLink"].as_str().unwrap().to_string();
+    let delta_path = delta_link
+        .split_once("/v1.0/")
+        .map(|(_, p)| format!("/v1.0/{p}"))
+        .unwrap();
+
+    // CalDAV PUT a new event.
+    let put_body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ev-from-caldav\r\nSUMMARY:Cross-protocol\r\nDTSTART:20260601T120000Z\r\nDTEND:20260601T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let resp = caldav_app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-1/cal-work/ev-from-caldav.ics")
+                .body(Body::from(put_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Graph delta walk now sees the new event.
+    let resp = graph_app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&delta_path)
+                .header(header::HOST, "127.0.0.1:0")
+                .header(header::AUTHORIZATION, "Bearer x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let value = v["value"].as_array().unwrap();
+    assert!(
+        value.iter().any(|e| e["id"] == "ev-from-caldav"),
+        "Graph delta should observe the CalDAV PUT: {value:?}"
+    );
+}
+
+#[tokio::test]
 async fn propfind_unknown_calendar_returns_404() {
     let (status, _) = send(
         "PROPFIND",
