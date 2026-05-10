@@ -40,6 +40,10 @@ Capabilities the session MUST advertise:
 
 - `urn:ietf:params:jmap:core`
 - `urn:ietf:params:jmap:mail`
+- `urn:ietf:params:jmap:calendars` - advertised iff the fixture
+  carries any `[[calendar]]` entry. Pulls the client into the
+  calendar sync flow at `<ratatoskr>/crates/jmap/src/calendar_sync/
+  mod.rs:sync_calendars`.
 
 Capabilities to NOT advertise (each pulls the client into work the
 mock can't satisfy in v0):
@@ -83,8 +87,9 @@ right):
    capability. Won't fire.
 8. `jmap_contacts_initial_sync` - fails soft, just logs a warning.
    Plan 2 can ignore.
-9. Calendar sync flows through a separate `CalendarRuntime`, not via
-   this code path.
+9. Calendar sync flows through a separate `CalendarRuntime` (the
+   JMAP arm calls `<ratatoskr>/crates/jmap/src/calendar_sync/mod.rs::
+   sync_calendars`); see "Calendar surface" below.
 
 ## `Email/get` property list
 
@@ -301,6 +306,56 @@ fixture loads but advance monotonically within one process.
   re-queries with `position += 50` and the mock must terminate.
   Either return `< 50` on the last page, or return an empty page
   next.
+
+## Calendar surface
+
+ratatoskr's JMAP calendar arm
+(`<ratatoskr>/crates/jmap/src/calendar_sync/`) drives a small subset
+of the JMAP Calendars spec backed by JSCalendar (RFC 8984) event
+objects. The wire shape needs:
+
+- `Calendar/get` - no ids = list all. Reads `id`, `name`, `color`,
+  `isDefault` per entry; ignores `myRights` / `isVisible` /
+  `isSubscribed` / `sortOrder` but they must serialize cleanly.
+  `state` is read for the calendar-list state token; we reuse the
+  fixture-level `state` here.
+- `Calendar/changes` - v0 only handles `sinceState ==
+  fixture.state` (empty delta). Anything else returns
+  `cannotCalculateChanges`; the client tolerates that and falls
+  back to a fresh `Calendar/get`.
+- `CalendarEvent/get` - no ids = list all. Returns JSCalendar
+  objects with `id`, `uid`, `calendarIds`, `title`, `description`,
+  `start` (LocalDateTime "%Y-%m-%dT%H:%M:%S" or "%Y-%m-%d" all-day),
+  `duration` (ISO 8601), `timeZone` ("UTC"), `showWithoutTime` for
+  all-day, `status` ("confirmed"), `locations` (`{"loc1": {"@type":
+  "Location", "name": ...}}`), `participants` (`{"<id>": {"@type":
+  "Participant", "email", "sendTo": {"imip": "mailto:<addr>"},
+  "name", "roles": {"owner"|"attendee": true}}}`).
+  ratatoskr reads back via
+  `<ratatoskr>/crates/jmap/src/calendar_sync/payload.rs` -
+  `extract_location`, `resolve_calendar_id`,
+  `extract_organizer_email`, `extract_attendees_json`,
+  `parse_jscalendar_times`.
+- `CalendarEvent/changes` - walks the change_log via
+  `Fixture::event_delta_since` unioned across every declared
+  calendar, since JMAP carries no calendar-id filter on
+  `/changes`. Returns `cannotCalculateChanges` for unknown / evicted
+  states. Source: `<ratatoskr>/crates/jmap/src/calendar_sync/
+  mod.rs::sync_events_delta`.
+- `CalendarEvent/set` - create / update / destroy. Mutations bump
+  `Fixture::state` and record `event_*` transitions (same shape
+  Graph and CalDAV writes use), so a JMAP create surfaces in a
+  follow-up Graph `calendarView/delta`. Source:
+  `<ratatoskr>/crates/jmap/src/calendar_sync/protocol.rs`.
+
+Things that WILL break calendar sync if wrong:
+
+- `cannotCalculateChanges` must use that exact error type string;
+  ratatoskr checks for it in
+  `sync_events_delta`'s error mapper to decide on a full re-sync.
+- `start` must be a JSCalendar LocalDateTime (no Z suffix). RFC 3339
+  with offset is parsed as a fallback in ratatoskr but the
+  canonical wire form is local.
 
 ## Headers, transport, status codes
 

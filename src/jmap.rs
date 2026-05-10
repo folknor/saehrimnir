@@ -109,11 +109,12 @@ fn dispatch(
     // else takes a brief read guard. Each method-call in a batched
     // envelope gets its own acquisition; readers and a writer
     // mutually exclude per-call only.
-    if matches!(name, "Email/set" | "Mailbox/set") {
+    if matches!(name, "Email/set" | "Mailbox/set" | "CalendarEvent/set") {
         let mut fix = fixture.write().expect("fixture lock poisoned");
         let res = match name {
             "Email/set" => email_set(&mut fix, args),
             "Mailbox/set" => mailbox_set(&mut fix, args),
+            "CalendarEvent/set" => crate::jmap_calendar::calendar_event_set(&mut fix, args),
             _ => unreachable!(),
         };
         return match res {
@@ -143,6 +144,24 @@ fn dispatch(
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
+        "Calendar/get" => match crate::jmap_calendar::calendar_get(&fix, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
+        "Calendar/changes" => match crate::jmap_calendar::calendar_changes(&fix, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
+        "CalendarEvent/get" => match crate::jmap_calendar::calendar_event_get(&fix, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
+        "CalendarEvent/changes" => {
+            match crate::jmap_calendar::calendar_event_changes(&fix, args) {
+                Ok(v) => (name.to_string(), v),
+                Err(err) => ("error".to_string(), err),
+            }
+        }
         _ => (
             "error".to_string(),
             json!({

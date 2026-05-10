@@ -72,6 +72,9 @@ checking whether the fact is already in `notes/`.
 - The session must NOT advertise `urn:ietf:params:jmap:principals`.
   It would pull the client into `Principal/get` and
   `ShareNotification` paths the mock cannot satisfy.
+- The session advertises `urn:ietf:params:jmap:calendars` iff the
+  fixture carries any `[[calendar]]` entries; this gates the JMAP
+  `Calendar/*` and `CalendarEvent/*` surface.
 
 ## Layout
 
@@ -143,6 +146,14 @@ checking whether the fact is already in `notes/`.
   `POST /test/fixture/reset`.
 - `src/jmap.rs` - JMAP request envelope, dispatcher, per-method
   handlers.
+- `src/jmap_calendar.rs` - JMAP calendar surface (`Calendar/get`
+  + `Calendar/changes` + `CalendarEvent/get` + `CalendarEvent/
+  changes` + `CalendarEvent/set`). Projects fixture `Calendar` /
+  `Event` to JSCalendar (RFC 8984) objects; mutations land via
+  `Fixture::mutate` and append the same `event_*` transitions
+  Graph and CalDAV write. `CalendarEvent/changes` unions
+  `event_delta_since` across every fixture calendar since JMAP
+  carries no per-calendar filter on `/changes`.
 - `src/imap.rs` - IMAP listener, connection state machine, command
   dispatcher, RFC 822 emit.
 - `src/smtp.rs` - SMTP submission listener + in-memory submission
@@ -231,6 +242,27 @@ honouring the create / update / destroy maps and the patch shapes
 ratatoskr drives - `keywords` / `keywords/<flag>`, `mailboxIds` /
 `mailboxIds/<id>`, plus `name` / `parentId` / `sortOrder` / `role` /
 `isSubscribed` on mailboxes. Full integration test coverage).
+
+JMAP calendars: complete for v0. Session advertises
+`urn:ietf:params:jmap:calendars` whenever the fixture has any
+`[[calendar]]` entry. Surface: `Calendar/get` (no-ids list +
+filtered + notFound), `Calendar/changes` (seed-or-current),
+`CalendarEvent/get` projecting fixture `Event` to RFC 8984
+JSCalendar (`@type: Event`, `id` / `uid`, `calendarIds`,
+`title`, `description`, `start` LocalDateTime, `duration` ISO
+8601, `timeZone: UTC`, `showWithoutTime` for all-day,
+`locations` with `loc1` named entry, `participants` with owner
++ attendee roles + `sendTo: {imip: mailto:...}`),
+`CalendarEvent/changes` unioning `event_delta_since` across
+every declared calendar (JMAP carries no per-calendar filter
+on `/changes`), and `CalendarEvent/set` create / update /
+destroy through `Fixture::mutate`. Mutations record the same
+`event_*` transitions Graph and CalDAV write, so a JMAP
+create surfaces in a follow-up Graph `calendarView/delta`.
+Integration tests in `tests/jmap_calendar.rs` cover the
+read-path projection, the changes envelope, the create /
+update / destroy round trip, and the cross-protocol
+visibility assertion.
 
 IMAP: complete for v0's read path (greeting, `CAPABILITY`, `LOGIN`/
 `AUTHENTICATE`, `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT`/`EXAMINE`/

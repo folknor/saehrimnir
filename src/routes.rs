@@ -162,15 +162,25 @@ async fn session(
     let base = state.base_url.as_str();
 
     let mut accounts = serde_json::Map::new();
+    let advertise_calendars = !fixture.calendars.is_empty();
+    let mut account_caps = serde_json::Map::new();
+    account_caps.insert("urn:ietf:params:jmap:mail".to_string(), json!({}));
+    if advertise_calendars {
+        account_caps.insert("urn:ietf:params:jmap:calendars".to_string(), json!({
+            "minDateTime": "1970-01-01T00:00:00",
+            "maxDateTime": "2099-12-31T23:59:59",
+            "maxExpandedQueryDuration": "P1Y",
+            "maxParticipantsPerEvent": 256,
+            "mayCreateCalendar": true,
+        }));
+    }
     accounts.insert(
         acct_id.clone(),
         json!({
             "name": acct_name,
             "isPersonal": true,
             "isReadOnly": false,
-            "accountCapabilities": {
-                "urn:ietf:params:jmap:mail": {}
-            }
+            "accountCapabilities": Value::Object(account_caps),
         }),
     );
 
@@ -183,21 +193,37 @@ async fn session(
         "urn:ietf:params:jmap:mail".to_string(),
         Value::String(acct_id.clone()),
     );
+    if advertise_calendars {
+        primary.insert(
+            "urn:ietf:params:jmap:calendars".to_string(),
+            Value::String(acct_id.clone()),
+        );
+    }
+
+    let mut top_caps = serde_json::Map::new();
+    top_caps.insert(
+        "urn:ietf:params:jmap:core".to_string(),
+        json!({
+            "maxSizeUpload": 50_000_000_u64,
+            "maxConcurrentUpload": 4,
+            "maxSizeRequest": 10_000_000_u64,
+            "maxConcurrentRequests": 4,
+            "maxCallsInRequest": 16,
+            "maxObjectsInGet": 500,
+            "maxObjectsInSet": 500,
+            "collationAlgorithms": [],
+        }),
+    );
+    top_caps.insert("urn:ietf:params:jmap:mail".to_string(), json!({}));
+    if advertise_calendars {
+        top_caps.insert(
+            "urn:ietf:params:jmap:calendars".to_string(),
+            json!({}),
+        );
+    }
 
     Ok(Json(json!({
-        "capabilities": {
-            "urn:ietf:params:jmap:core": {
-                "maxSizeUpload": 50_000_000_u64,
-                "maxConcurrentUpload": 4,
-                "maxSizeRequest": 10_000_000_u64,
-                "maxConcurrentRequests": 4,
-                "maxCallsInRequest": 16,
-                "maxObjectsInGet": 500,
-                "maxObjectsInSet": 500,
-                "collationAlgorithms": []
-            },
-            "urn:ietf:params:jmap:mail": {}
-        },
+        "capabilities": Value::Object(top_caps),
         "accounts": accounts,
         "primaryAccounts": primary,
         "username": acct_name,

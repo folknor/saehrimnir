@@ -4,6 +4,169 @@ Running task list, ordered by what ratatoskr is actively waiting on.
 Per-protocol design notes live alongside in `notes/`; this file just
 tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
+## Today's slice (2026-05-10)
+
+ratatoskr is waiting on four sæhrimnir surfaces to keep its sync
+test coverage moving. All four land in this slice.
+
+### JMAP Calendar - landed
+
+Capability advertised conditionally on `[[calendar]]` presence;
+`Calendar/get` + `Calendar/changes` + `CalendarEvent/get` +
+`CalendarEvent/changes` + `CalendarEvent/set` wired in
+`src/jmap_calendar.rs`. Cross-protocol delta visibility
+asserted in `tests/jmap_calendar.rs`.
+
+Original scope notes preserved below for reference.
+
+- Advertise `urn:ietf:params:jmap:calendars` in
+  `src/routes.rs`'s session capabilities.
+- `Calendar/get`: no IDs => return all calendars from
+  `fixture.calendars` projected to JMAP shape (`id`, `name`,
+  `color`, `isDefault`, ...). Surfaces `state`.
+- `CalendarEvent/get`: no IDs => return all events. Project
+  fixture `Event` to JSCalendar (`calendarIds`, `title`,
+  `description`, `start` as `LocalDateTime`, `duration` as
+  ISO 8601, `showWithoutTime` for all-day, `locations` map).
+  Surfaces `state`.
+- `CalendarEvent/changes`: walk `change_log` between
+  `sinceState` and current, using the existing
+  `event_created` / `event_updated` / `event_destroyed`
+  transitions (already present from Graph + CalDAV writes).
+  Honour `maxChanges`, emit `hasMoreChanges`. Unknown / evicted
+  `sinceState` returns `cannotCalculateChanges` (ratatoskr
+  triggers a full re-sync on that string).
+- `CalendarEvent/set`: create / update / destroy through
+  `Fixture::mutate`, recording the same `event_*` transitions
+  Graph and CalDAV write today, so a JMAP create surfaces in a
+  subsequent Graph `calendarView/delta` and vice-versa.
+- Integration tests in `tests/jmap_calendar.rs` (or extend
+  `tests/api.rs`) covering the initial-list / get-all /
+  changes-walk / set-create-update-destroy flow plus a
+  cross-protocol assertion that a JMAP `CalendarEvent/set`
+  surfaces in Graph `calendarView/delta`.
+- `notes/ratatoskr-jmap-surface.md` extended with the calendar
+  surface; capability list and `urn:ietf:params:jmap:calendars`
+  exclusion line in `CLAUDE.md` updated.
+
+### Google Calendar
+
+ratatoskr at `crates/calendar/src/google.rs` hits
+`https://www.googleapis.com/calendar/v3` - a *different host*
+from Gmail's mail surface, so it cannot be mounted on the
+existing Gmail listener. Spawn a sibling `src/gcal/` module
+matching the Gmail layout.
+
+- New `src/gcal/mod.rs` (router, AppState, catchall 404,
+  bearer middleware) + `src/gcal/events.rs` (handlers).
+- New listener bound by `main.rs`; sentinel grows a
+  `gcal_url` field; brokkr orchestration env grows
+  `RTSK_GCAL_URL` (track in `notes/orchestration.md`).
+- Endpoints: `GET /users/me/calendarList`,
+  `GET /calendars/{id}/events` (with `syncToken` /
+  `pageToken` / `timeMin` / `timeMax` / `singleEvents` /
+  `maxResults`), `POST /calendars/{id}/events`,
+  `PATCH .../events/{id}`, `DELETE .../events/{id}`.
+- Event JSON shape: `start.dateTime`+`timeZone` or
+  `start.date` (all-day), `end.*`, `summary`,
+  `description`, `location`, `status`, `organizer`,
+  `attendees`, `htmlLink`, `iCalUID`, `etag`,
+  `recurrence[]`, `visibility`, `transparency`. Tombstones
+  carry `status: "cancelled"`.
+- Sync-token expiry: `syncToken` not present in the
+  log-or-evicted window returns HTTP 410 (ratatoskr's
+  recovery contract).
+- Mutations land via `Fixture::mutate`, recording the same
+  `event_*` transitions so Graph / CalDAV / JMAP all observe
+  Google-side writes.
+- `notes/ratatoskr-gcal-surface.md` (new) documents the
+  surface with `crates/calendar/src/google.rs:LL` citations.
+- Integration tests in `tests/gcal.rs` covering list /
+  events list with paging + sync-token / single-event GET /
+  POST/PATCH/DELETE / 410 recovery / cross-protocol delta
+  visibility.
+
+### Gmail People API contacts
+
+ratatoskr at `crates/gmail/src/contacts/` hits
+`https://people.googleapis.com/v1` - again a different host
+from `gmail.googleapis.com`. Same listener pattern as gcal.
+
+- New `src/people/mod.rs` (router, AppState, catchall 404,
+  bearer middleware) + `src/people/contacts.rs`.
+- New listener; sentinel grows `people_url`; brokkr env
+  grows `RTSK_PEOPLE_URL`.
+- `GET /people/me/connections` (`personFields`, `pageSize`,
+  `pageToken`, `syncToken`, `requestSyncToken`).
+- `GET /otherContacts` (`readMask`, `pageSize`, `pageToken`,
+  `syncToken`, `requestSyncToken`).
+- `Person` JSON shape: `resourceName`, `etag`,
+  `metadata.deleted`, `metadata.sources[]`, `names[]`,
+  `emailAddresses[]`, `phoneNumbers[]`, `organizations[]`,
+  `photos[]`. Tombstones: `metadata.deleted = true`.
+- Sync-token recovery: HTTP 410 on evicted token.
+- Project from existing `fixture.contacts` /
+  `fixture.contact_folders`. People API has no folder
+  concept, so the projection collapses folders into a flat
+  connections list (folder-scoped fixtures keep working for
+  Graph; flat-list semantics layered on top for People).
+  `otherContacts` projects from a parallel
+  `fixture.other_contacts` if a fixture provides one;
+  otherwise empty list.
+- `notes/ratatoskr-people-surface.md` (new) with citations.
+- Integration tests in `tests/people.rs`: connections paging,
+  delta sync via `syncToken`, otherContacts paging,
+  sync-token recovery.
+
+### Deeper JMAP fixture families
+
+ratatoskr wants to write tests that exercise (a) slow paging
+under client timeouts, and (b) malformed MIME bodies.
+
+- **Slow paging recipe.** Document in
+  `notes/fixture-format.md` how to interleave `wait(ms)` in
+  an `on(protocol, command, fn)` callback to delay specific
+  pages. Include a complete worked example for JMAP
+  `Email/query` with `position`-driven slowdown on the
+  N-th page, and one for Graph `messages` with
+  `$skiptoken`-keyed slowdown. No code change required;
+  `wait(ms)` and `on()` are already wired.
+- **Malformed-MIME injection on JMAP and Gmail.** Today
+  `Email::raw_bytes` only flows through IMAP `UID FETCH`;
+  JMAP `Email/get` synthesizes `bodyValues` from canonical
+  `body_text` (`src/jmap.rs`), and Gmail `threads.get`
+  builds the MIME payload from canonical fields
+  (`src/gmail/mail.rs`). Extend both to honour
+  `raw_bytes` when set:
+  - JMAP `Email/get`: when `raw_bytes` is present, parse
+    headers + bodies straight from the bytes (or surface
+    them via `blobId`-style attachment refs if the test
+    requires that path) so the wire `bodyValues` /
+    `bodyStructure` reflect what the fixture authored,
+    not what we synthesized. Tests assert ratatoskr's
+    JMAP parser tolerates / rejects the expected cases
+    (e.g. CRLF-only bodies, bare-LF, missing
+    boundary, truncated multipart, 8-bit in headers).
+  - Gmail `threads.get`: same - when `raw_bytes` is set,
+    project the parsed view from those bytes rather than
+    rebuilding from canonical fields. The base64url
+    `raw` field on a Gmail message already round-trips
+    bytes verbatim; the new path also feeds the parsed
+    `payload` MIME tree from the same bytes.
+- Reserve a `[email] mime_mode = "raw_only" | "raw_then_canonical"`
+  knob (default unchanged) so a fixture can opt into the
+  malformed path without breaking byte-determinism for
+  the canonical-path consumers (IMAP rendering already
+  prefers `raw_bytes` when present).
+- New fixture `fixtures/jmap-malformed-mime.lua` and
+  matching `tests/malformed_mime.rs` covering at least
+  three malformed shapes per protocol.
+- Update `notes/fixture-format.md` to document
+  `raw_bytes` cross-protocol semantics (was previously
+  IMAP-only).
+
+
+
 ## From the 2026-05-10 multi-agent review
 
 Findings from a four-agent (security / bugs / perf / arch) sweep of
@@ -363,9 +526,6 @@ Remaining items are unblocked-but-unneeded.
   state derives mechanically from `Fixture::state`, so a step's
   state advance already moves HIGHESTMODSEQ; bumping UIDVALIDITY
   would need a fixture-side knob).
-- Documented recipe in `notes/fixture-format.md` for slow paged
-  responses via `wait(ms)` inside an `on()` callback - already
-  achievable today, just needs the writeup.
 - `body_html` parallel to `body_text`. Reserved in
   `notes/fixture-format.md`; not implemented. Pressing once IMAP
   needs to render an HTML wire body or Graph wants HTML rendering.
@@ -414,17 +574,10 @@ need it:
 
 v0 mail-sync surface is complete. Future Gmail work:
 
-- People API contacts (`<ratatoskr>/crates/gmail/src/contacts/`).
-  Different base URL (`https://people.googleapis.com/v1/`); will
-  need either a `people.googleapis.com`-shaped listener or a
-  separate `--people-port`. Lean toward separate listener.
 - Google Drive resumable uploads
   (`<ratatoskr>/crates/gmail/src/gdrive.rs`). Needed once the
   submission paths grow attachments large enough to spill out of
   inline.
-- Calendar lives in a separate `CalendarRuntime` in ratatoskr; not
-  part of Gmail mail sync. Will land as its own surface scout when
-  needed.
 - SendAs / signatures bidirectional sync. v0 emits an empty
   `sendAs[]`; once a fixture grows `[account.signature]` we honour
   it both ways.
