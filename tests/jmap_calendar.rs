@@ -324,6 +324,113 @@ async fn calendar_event_set_creates_visible_in_changes_delta() {
 }
 
 #[tokio::test]
+async fn calendar_event_changes_does_not_leak_across_calendars() {
+    // Regression: pre-fix, `event_delta_since` filtered tombstones
+    // by parent calendar but left created/updated unfiltered, so a
+    // create in cal A surfaced in cal B's per-calendar walk and the
+    // JMAP cross-calendar union over-reported on multi-calendar
+    // fixtures. Post-fix, JMAP uses `event_delta_since_any` which
+    // deliberately skips per-calendar filtering, and Graph's
+    // per-calendar callers see only their own events because
+    // `event_delta_since` filters created/updated against the live
+    // event's `calendar_id` too.
+    let r = router();
+
+    // Create one event each in cal-work and cal-personal. Both
+    // bumps land in the change log between the seed state and
+    // current.
+    let _ = jmap_call(
+        &r,
+        "CalendarEvent/set",
+        json!({
+            "accountId": "account-1",
+            "create": {
+                "wA": {
+                    "calendarIds": {"cal-work": true},
+                    "title": "in work",
+                    "start": "2026-04-01T10:00:00",
+                    "duration": "PT30M"
+                }
+            }
+        }),
+    )
+    .await;
+    let _ = jmap_call(
+        &r,
+        "CalendarEvent/set",
+        json!({
+            "accountId": "account-1",
+            "create": {
+                "pA": {
+                    "calendarIds": {"cal-personal": true},
+                    "title": "in personal",
+                    "start": "2026-04-02T10:00:00",
+                    "duration": "PT30M"
+                }
+            }
+        }),
+    )
+    .await;
+
+    // Now destroy the cal-work event. With the create+destroy in
+    // the same delta window, dominance must cancel them entirely:
+    // a sync client should never see the transient event.
+    let work_id = {
+        let resp = jmap_call(
+            &r,
+            "CalendarEvent/get",
+            json!({"accountId": "account-1"}),
+        )
+        .await;
+        let list = resp[1]["list"].as_array().unwrap();
+        list.iter()
+            .find(|e| e["title"] == "in work")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let _ = jmap_call(
+        &r,
+        "CalendarEvent/set",
+        json!({"accountId": "account-1", "destroy": [&work_id]}),
+    )
+    .await;
+
+    // From seed: net delta is one created (cal-personal's pA),
+    // because the cal-work event was created and destroyed in
+    // the same window. Pre-fix the per-calendar union would have
+    // reported the cal-work event as created (cal-personal's
+    // walk had it in created over-broadly, cal-work's walk
+    // cancelled it under dominance, but the seen-set dedupe
+    // kept the cal-personal copy alive).
+    let delta = jmap_call(
+        &r,
+        "CalendarEvent/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+    )
+    .await;
+    let body = &delta[1];
+    let created = body["created"].as_array().unwrap();
+    let destroyed = body["destroyed"].as_array().unwrap();
+    assert!(
+        !created.iter().any(|v| v.as_str() == Some(work_id.as_str())),
+        "destroyed-in-same-window event must not surface as created; \
+         got created={created:?}"
+    );
+    assert!(
+        !destroyed.iter().any(|v| v.as_str() == Some(work_id.as_str())),
+        "destroyed-in-same-window event must cancel under dominance, \
+         not surface as destroyed either; got destroyed={destroyed:?}"
+    );
+    assert_eq!(
+        created.len(),
+        1,
+        "only the surviving cal-personal create should remain; got {created:?}"
+    );
+}
+
+#[tokio::test]
 async fn jmap_event_set_surfaces_in_graph_calendar_view_delta() {
     // Two routers, one shared fixture handle. JMAP mutates, Graph
     // reads back through `calendarView/delta`.

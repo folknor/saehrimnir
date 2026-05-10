@@ -20,8 +20,6 @@
 //! the union of every fixture calendar and merge the resulting
 //! delta sets.
 
-use std::collections::HashSet;
-
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde_json::{Map, Value, json};
 
@@ -267,50 +265,28 @@ pub(crate) fn calendar_event_changes(
     let account_id = require_account(fixture, args)?;
     let since_state = require_since_state(args)?;
 
-    // event_delta_since takes a calendar_id filter; JMAP carries no
-    // such filter, so union the deltas across every declared
-    // calendar. Created/updated ids merge by set semantics; tombstones
-    // appear in exactly one calendar's parent list, so concatenation
-    // is safe (the change_log invariant guarantees uniqueness).
-    let mut created: Vec<String> = Vec::new();
-    let mut updated: Vec<String> = Vec::new();
-    let mut destroyed: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for cal in &fixture.calendars {
-        let Some(delta) = fixture.event_delta_since(since_state, &cal.id) else {
-            return Err(json!({
-                "type": "cannotCalculateChanges",
-                "description": format!(
-                    "sinceState {since_state:?} is not a known fixture state \
-                     (older than the seed or evicted from the bounded change log)"
-                ),
-            }));
-        };
-        for id in delta.created {
-            if seen.insert(id.clone()) {
-                created.push(id);
-            }
-        }
-        for id in delta.updated {
-            if seen.insert(id.clone()) {
-                updated.push(id);
-            }
-        }
-        for id in delta.destroyed {
-            if seen.insert(id.clone()) {
-                destroyed.push(id);
-            }
-        }
-    }
+    // JMAP `CalendarEvent/changes` carries no per-calendar filter,
+    // so use the cross-calendar walker. Per-calendar dominance
+    // (created+destroyed cancels) already applied by
+    // `apply_dominance_and_dedup` inside `delta_since`.
+    let delta = fixture.event_delta_since_any(since_state).ok_or_else(|| {
+        json!({
+            "type": "cannotCalculateChanges",
+            "description": format!(
+                "sinceState {since_state:?} is not a known fixture state \
+                 (older than the seed or evicted from the bounded change log)"
+            ),
+        })
+    })?;
 
     Ok(json!({
         "accountId": account_id,
         "oldState": since_state,
         "newState": fixture.state,
         "hasMoreChanges": false,
-        "created": created,
-        "updated": updated,
-        "destroyed": destroyed,
+        "created": delta.created,
+        "updated": delta.updated,
+        "destroyed": delta.destroyed,
     }))
 }
 

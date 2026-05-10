@@ -456,18 +456,52 @@ impl Fixture {
     /// bounded ring) return `None`; the Graph layer converts that to
     /// a full re-bootstrap.
     ///
-    /// Created and updated ids are filtered to the named calendar by
-    /// the caller (it can read each event's current `calendar_id`).
-    /// Destroyed ids must be filtered here because the event is gone
-    /// from the fixture; that's what `event_destroyed_parents` is
-    /// for.
+    /// All three sets are scoped to the named calendar:
+    /// - Destroyed ids are filtered against `event_destroyed_parents`
+    ///   recorded at retire time (the event is gone from the live
+    ///   fixture by then).
+    /// - Created / updated ids are filtered against the live event's
+    ///   current `calendar_id`. An event whose every transition in
+    ///   the window was on a sibling calendar is dropped here so
+    ///   the wire delta does not over-report. (Pre-fix this filter
+    ///   was the caller's responsibility, but the JMAP `Calendar
+    ///   Event/changes` cross-calendar union has no good way to
+    ///   apply it; folding the filter here keeps every consumer
+    ///   honest.)
     pub fn event_delta_since(&self, since: &str, calendar_id: &str) -> Option<DeltaSet> {
-        self.delta_since_filtered_destroys(
+        let mut delta = self.delta_since_filtered_destroys(
             since,
             |t| (&t.event_created, &t.event_updated, &t.event_destroyed),
             |t| Some(&t.event_destroyed_parents),
             calendar_id,
-        )
+        )?;
+        let live: std::collections::HashMap<&str, &str> = self
+            .events
+            .iter()
+            .map(|e| (e.id.as_str(), e.calendar_id.as_str()))
+            .collect();
+        delta
+            .created
+            .retain(|id| live.get(id.as_str()).copied() == Some(calendar_id));
+        delta
+            .updated
+            .retain(|id| live.get(id.as_str()).copied() == Some(calendar_id));
+        Some(delta)
+    }
+
+    /// Cross-calendar event delta. Returns every event change since
+    /// `since` regardless of which calendar it lives in. Drives
+    /// JMAP `CalendarEvent/changes`, which carries no per-calendar
+    /// filter on the wire (the `calendarIds` map on each event in
+    /// the follow-up `CalendarEvent/get` is the per-resource scope).
+    pub fn event_delta_since_any(&self, since: &str) -> Option<DeltaSet> {
+        self.delta_since(since, |t| {
+            (
+                &t.event_created,
+                &t.event_updated,
+                &t.event_destroyed,
+            )
+        })
     }
 
     /// Contact-side analogue. Drives the Graph
