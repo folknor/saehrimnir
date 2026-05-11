@@ -105,6 +105,25 @@ The fixture format adds a flat `[[category]]` block (see
 `notes/fixture-format.md`); the Lua loader exposes the same
 shape via `category({...})`.
 
+## Multi-account routing
+
+Graph mail surfaces both `/v1.0/me/...` and
+`/v1.0/users/{userId}/...` for the same handler set. `me`
+scopes to the primary account; a `userId` matching a declared
+`[[account]]` scopes to that account; `me` is also accepted as
+the literal value of `{userId}`. An unknown `userId` returns
+HTTP 404 with the Graph `{"error": {"code":
+"ResourceNotFound"}}` envelope. Folder lookups (including
+well-known aliases like `inbox`, `drafts`) are scoped to the
+named account, so a `/v1.0/users/{secondary}/mailFolders/inbox`
+request resolves the secondary account's inbox - not the
+primary's.
+
+Stage 3 of the multi-account refactor (this surface) covers
+mail only. Graph calendar / contacts / categories still route
+through `/v1.0/me/...` and scope to primary; the parallel
+`/users/{userId}/...` routes land in a follow-up.
+
 ## Connection / transport
 
 - Base URL: `https://graph.microsoft.com/v1.0` (a few flows use

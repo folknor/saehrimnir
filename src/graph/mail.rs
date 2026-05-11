@@ -1,9 +1,18 @@
 //! Microsoft Graph mail-sync endpoints.
 //!
-//! Implements the subset of `/v1.0/me/mailFolders/...` and
-//! `/v1.0/me/mailFolders/{id}/messages/...` ratatoskr's Graph client
-//! exercises during initial and delta sync. See
-//! `notes/ratatoskr-graph-surface.md`.
+//! Implements the subset of `/v1.0/me/mailFolders/...` and the
+//! parallel `/v1.0/users/{userId}/mailFolders/...` paths
+//! ratatoskr's Graph client exercises during initial and delta
+//! sync. See `notes/ratatoskr-graph-surface.md`.
+//!
+//! Stage 3 of the multi-account refactor introduces per-account
+//! routing on the Graph mail surface: `/v1.0/me/...` continues to
+//! scope to the primary account (matching every v0 single-account
+//! fixture); `/v1.0/users/{userId}/...` scopes to the
+//! `userId`-named declared account (`me` is accepted as an alias
+//! for the primary). Unknown `userId` returns 404
+//! `ResourceNotFound`. The same set of inner `*_impl` handlers
+//! powers both paths.
 
 use axum::{
     Router,
@@ -31,40 +40,259 @@ const FOLDERS_MAX_TOP: u32 = 250;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/v1.0/me/mailFolders", get(list_folders))
-        .route("/v1.0/me/mailFolders/{folder}", get(get_folder))
+        // /v1.0/me/...
+        .route("/v1.0/me/mailFolders", get(list_folders_me))
+        .route("/v1.0/me/mailFolders/{folder}", get(get_folder_me))
         .route(
             "/v1.0/me/mailFolders/{folder}/childFolders",
-            get(list_child_folders),
+            get(list_child_folders_me),
         )
         .route(
             "/v1.0/me/mailFolders/{folder}/messages",
-            get(list_messages),
+            get(list_messages_me),
         )
         .route(
             "/v1.0/me/mailFolders/{folder}/messages/delta",
-            get(delta_messages),
+            get(delta_messages_me),
         )
         .route(
             "/v1.0/me/messages/{message_id}/attachments",
-            get(list_message_attachments),
+            get(list_message_attachments_me),
         )
         .route(
             "/v1.0/me/messages/{message_id}/attachments/{attachment_id}",
-            get(get_message_attachment),
+            get(get_message_attachment_me),
         )
         .route(
             "/v1.0/me/messages/{message_id}/attachments/{attachment_id}/$value",
-            get(get_message_attachment_value),
+            get(get_message_attachment_value_me),
+        )
+        // /v1.0/users/{userId}/...
+        .route("/v1.0/users/{user}/mailFolders", get(list_folders_user))
+        .route("/v1.0/users/{user}/mailFolders/{folder}", get(get_folder_user))
+        .route(
+            "/v1.0/users/{user}/mailFolders/{folder}/childFolders",
+            get(list_child_folders_user),
+        )
+        .route(
+            "/v1.0/users/{user}/mailFolders/{folder}/messages",
+            get(list_messages_user),
+        )
+        .route(
+            "/v1.0/users/{user}/mailFolders/{folder}/messages/delta",
+            get(delta_messages_user),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{message_id}/attachments",
+            get(list_message_attachments_user),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{message_id}/attachments/{attachment_id}",
+            get(get_message_attachment_user),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{message_id}/attachments/{attachment_id}/$value",
+            get(get_message_attachment_value_user),
         )
 }
 
-// ── Handlers ────────────────────────────────────────────────────────
+// ── Account-scope resolution ────────────────────────────────────────
 
-async fn list_folders(
+/// Resolve the `{user}` path segment against the declared accounts.
+/// `me` is accepted as an alias for the primary account.
+/// Returns `Err(Response)` (404 ResourceNotFound) for an unknown id
+/// so callers can early-return.
+#[allow(clippy::result_large_err)]
+fn resolve_user_account(fixture: &Fixture, user: &str) -> Result<String, Response> {
+    if user == "me" {
+        return Ok(fixture.primary_account().id.clone());
+    }
+    match fixture.account(user) {
+        Some(a) => Ok(a.id.clone()),
+        None => Err(error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("user {user:?} not found"),
+        )),
+    }
+}
+
+// ── /me/ route wrappers ─────────────────────────────────────────────
+
+async fn list_folders_me(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    list_folders_impl(state, &account_id, headers, raw, /*me_path=*/ true).await
+}
+
+async fn get_folder_me(State(state): State<AppState>, Path(folder): Path<String>) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_folder_impl(state, &account_id, &folder, /*me_path=*/ true).await
+}
+
+async fn list_child_folders_me(
+    State(state): State<AppState>,
+    Path(folder): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    list_child_folders_impl(state, &account_id, &folder, headers, raw, true).await
+}
+
+async fn list_messages_me(
+    State(state): State<AppState>,
+    Path(folder): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    list_messages_impl(state, &account_id, &folder, headers, raw, true).await
+}
+
+async fn delta_messages_me(
+    State(state): State<AppState>,
+    Path(folder): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    delta_messages_impl(state, &account_id, &folder, headers, raw, true).await
+}
+
+async fn list_message_attachments_me(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    list_message_attachments_impl(state, &account_id, &message_id).await
+}
+
+async fn get_message_attachment_me(
+    State(state): State<AppState>,
+    Path((message_id, attachment_id)): Path<(String, String)>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_message_attachment_impl(state, &account_id, &message_id, &attachment_id).await
+}
+
+async fn get_message_attachment_value_me(
+    State(state): State<AppState>,
+    Path((message_id, attachment_id)): Path<(String, String)>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_message_attachment_value_impl(state, &account_id, &message_id, &attachment_id).await
+}
+
+// ── /users/{user}/ route wrappers ───────────────────────────────────
+
+async fn list_folders_user(
+    State(state): State<AppState>,
+    Path(user): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = match resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    list_folders_impl(state, &account_id, headers, raw, false).await
+}
+
+async fn get_folder_user(
+    State(state): State<AppState>,
+    Path((user, folder)): Path<(String, String)>,
+) -> Response {
+    let account_id = match resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_folder_impl(state, &account_id, &folder, false).await
+}
+
+async fn list_child_folders_user(
+    State(state): State<AppState>,
+    Path((user, folder)): Path<(String, String)>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = match resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    list_child_folders_impl(state, &account_id, &folder, headers, raw, false).await
+}
+
+async fn list_messages_user(
+    State(state): State<AppState>,
+    Path((user, folder)): Path<(String, String)>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = match resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    list_messages_impl(state, &account_id, &folder, headers, raw, false).await
+}
+
+async fn delta_messages_user(
+    State(state): State<AppState>,
+    Path((user, folder)): Path<(String, String)>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = match resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    delta_messages_impl(state, &account_id, &folder, headers, raw, false).await
+}
+
+async fn list_message_attachments_user(
+    State(state): State<AppState>,
+    Path((user, message_id)): Path<(String, String)>,
+) -> Response {
+    let account_id = match resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    list_message_attachments_impl(state, &account_id, &message_id).await
+}
+
+async fn get_message_attachment_user(
+    State(state): State<AppState>,
+    Path((user, message_id, attachment_id)): Path<(String, String, String)>,
+) -> Response {
+    let account_id = match resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_message_attachment_impl(state, &account_id, &message_id, &attachment_id).await
+}
+
+async fn get_message_attachment_value_user(
+    State(state): State<AppState>,
+    Path((user, message_id, attachment_id)): Path<(String, String, String)>,
+) -> Response {
+    let account_id = match resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_message_attachment_value_impl(state, &account_id, &message_id, &attachment_id).await
+}
+
+// ── Inner handlers (account-scoped) ─────────────────────────────────
+
+async fn list_folders_impl(
+    state: AppState,
+    account_id: &str,
+    headers: HeaderMap,
+    raw: Option<String>,
+    me_path: bool,
 ) -> Response {
     if let Some(r) = super::maybe_override(&state, "list_folders", |_s| Ok(())) {
         return r;
@@ -73,10 +301,8 @@ async fn list_folders(
     let host = host_or_default(&headers);
 
     let fixture = state.fixture();
-    // Top-level folders only (no parent).
     let folders: Vec<&Mailbox> = fixture
-        .mailboxes
-        .iter()
+        .mailboxes_for(account_id)
         .filter(|m| m.parent_id.is_none())
         .collect();
 
@@ -99,9 +325,13 @@ async fn list_folders(
         .map(|m| folder_value(&fixture, m))
         .collect();
 
-    let next_link = next_offset(offset, top, total).map(|next| {
-        odata::build_next_link(&host, "/v1.0/me/mailFolders", raw.as_deref(), next)
-    });
+    let base_path = if me_path {
+        "/v1.0/me/mailFolders".to_string()
+    } else {
+        format!("/v1.0/users/{account_id}/mailFolders")
+    };
+    let next_link = next_offset(offset, top, total)
+        .map(|next| odata::build_next_link(&host, &base_path, raw.as_deref(), next));
     let count = q.count.unwrap_or(false).then_some(total);
 
     ok_json(odata::collection_envelope(
@@ -113,18 +343,20 @@ async fn list_folders(
     ))
 }
 
-async fn get_folder(
-    State(state): State<AppState>,
-    Path(folder): Path<String>,
+async fn get_folder_impl(
+    state: AppState,
+    account_id: &str,
+    folder: &str,
+    _me_path: bool,
 ) -> Response {
-    let folder_owned = folder.clone();
+    let folder_owned = folder.to_string();
     if let Some(r) = super::maybe_override(&state, "get_folder", move |s| {
         crate::lua::req_set_str(s, "folder", &folder_owned)
     }) {
         return r;
     }
     let fixture = state.fixture();
-    let Some(m) = resolve_folder(&fixture, &folder) else {
+    let Some(m) = resolve_folder(&fixture, folder, account_id) else {
         return error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
@@ -143,20 +375,22 @@ async fn get_folder(
     ok_json(v)
 }
 
-async fn list_child_folders(
-    State(state): State<AppState>,
-    Path(folder): Path<String>,
+async fn list_child_folders_impl(
+    state: AppState,
+    account_id: &str,
+    folder: &str,
     headers: HeaderMap,
-    RawQuery(raw): RawQuery,
+    raw: Option<String>,
+    me_path: bool,
 ) -> Response {
-    let folder_owned = folder.clone();
+    let folder_owned = folder.to_string();
     if let Some(r) = super::maybe_override(&state, "list_child_folders", move |s| {
         crate::lua::req_set_str(s, "folder", &folder_owned)
     }) {
         return r;
     }
     let fixture = state.fixture();
-    let Some(parent) = resolve_folder(&fixture, &folder) else {
+    let Some(parent) = resolve_folder(&fixture, folder, account_id) else {
         return error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
@@ -167,8 +401,7 @@ async fn list_child_folders(
     let host = host_or_default(&headers);
 
     let children: Vec<&Mailbox> = fixture
-        .mailboxes
-        .iter()
+        .mailboxes_for(account_id)
         .filter(|m| m.parent_id.as_deref() == Some(parent.id.as_str()))
         .collect();
     let total = children.len() as u64;
@@ -190,9 +423,16 @@ async fn list_child_folders(
         .map(|m| folder_value(&fixture, m))
         .collect();
 
-    let path = format!("/v1.0/me/mailFolders/{}/childFolders", parent.id);
-    let next_link =
-        next_offset(offset, top, total).map(|next| odata::build_next_link(&host, &path, raw.as_deref(), next));
+    let path = if me_path {
+        format!("/v1.0/me/mailFolders/{}/childFolders", parent.id)
+    } else {
+        format!(
+            "/v1.0/users/{account_id}/mailFolders/{}/childFolders",
+            parent.id
+        )
+    };
+    let next_link = next_offset(offset, top, total)
+        .map(|next| odata::build_next_link(&host, &path, raw.as_deref(), next));
 
     ok_json(odata::collection_envelope(
         "https://graph.microsoft.com/v1.0/$metadata#me/mailFolders('...')/childFolders",
@@ -203,20 +443,22 @@ async fn list_child_folders(
     ))
 }
 
-async fn list_messages(
-    State(state): State<AppState>,
-    Path(folder): Path<String>,
+async fn list_messages_impl(
+    state: AppState,
+    account_id: &str,
+    folder: &str,
     headers: HeaderMap,
-    RawQuery(raw): RawQuery,
+    raw: Option<String>,
+    me_path: bool,
 ) -> Response {
-    let folder_owned = folder.clone();
+    let folder_owned = folder.to_string();
     if let Some(r) = super::maybe_override(&state, "list_messages", move |s| {
         crate::lua::req_set_str(s, "folder", &folder_owned)
     }) {
         return r;
     }
     let fixture = state.fixture();
-    let Some(m) = resolve_folder(&fixture, &folder) else {
+    let Some(m) = resolve_folder(&fixture, folder, account_id) else {
         return error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
@@ -227,7 +469,7 @@ async fn list_messages(
     let host = host_or_default(&headers);
     let expand = expand_attachments(q.expand.as_deref());
 
-    let mut messages = sorted_messages_in(&fixture, &m.id);
+    let mut messages = sorted_messages_in(&fixture, account_id, &m.id);
     if let Some(filter) = &q.filter
         && let Some(after) = parse_received_ge_filter(filter)
     {
@@ -252,7 +494,11 @@ async fn list_messages(
         .map(|e| message_value(e, &m.id, expand))
         .collect();
 
-    let path = format!("/v1.0/me/mailFolders/{}/messages", m.id);
+    let path = if me_path {
+        format!("/v1.0/me/mailFolders/{}/messages", m.id)
+    } else {
+        format!("/v1.0/users/{account_id}/mailFolders/{}/messages", m.id)
+    };
     let next_link = next_offset(offset, top, total)
         .map(|next| odata::build_next_link(&host, &path, raw.as_deref(), next));
 
@@ -265,20 +511,22 @@ async fn list_messages(
     ))
 }
 
-async fn delta_messages(
-    State(state): State<AppState>,
-    Path(folder): Path<String>,
+async fn delta_messages_impl(
+    state: AppState,
+    account_id: &str,
+    folder: &str,
     headers: HeaderMap,
-    RawQuery(raw): RawQuery,
+    raw: Option<String>,
+    me_path: bool,
 ) -> Response {
-    let folder_owned = folder.clone();
+    let folder_owned = folder.to_string();
     if let Some(r) = super::maybe_override(&state, "delta_messages", move |s| {
         crate::lua::req_set_str(s, "folder", &folder_owned)
     }) {
         return r;
     }
     let fixture = state.fixture();
-    let Some(m) = resolve_folder(&fixture, &folder) else {
+    let Some(m) = resolve_folder(&fixture, folder, account_id) else {
         return error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
@@ -288,11 +536,15 @@ async fn delta_messages(
     let q = odata::OdataQuery::parse(raw.as_deref());
     let host = host_or_default(&headers);
     let expand = expand_attachments(q.expand.as_deref());
-    let path = format!("/v1.0/me/mailFolders/{}/messages/delta", m.id);
+    let path = if me_path {
+        format!("/v1.0/me/mailFolders/{}/messages/delta", m.id)
+    } else {
+        format!(
+            "/v1.0/users/{account_id}/mailFolders/{}/messages/delta",
+            m.id
+        )
+    };
 
-    // The deltatoken=latest variant: client wants just a fresh delta
-    // link with no message dump. Used when discovering a new folder
-    // mid-cycle (`sync/delta_tokens.rs:96-114`).
     if q.deltatoken.as_deref() == Some("latest") {
         return ok_json(odata::collection_envelope(
             "https://graph.microsoft.com/v1.0/$metadata#message",
@@ -303,9 +555,6 @@ async fn delta_messages(
         ));
     }
 
-    // Subsequent delta cycles: any deltatoken we previously issued
-    // means "tell me what's changed". v0 fixtures are read-only, so
-    // nothing has changed - return empty + the same delta link.
     if q.deltatoken.is_some() {
         return ok_json(odata::collection_envelope(
             "https://graph.microsoft.com/v1.0/$metadata#message",
@@ -316,9 +565,7 @@ async fn delta_messages(
         ));
     }
 
-    // Initial bootstrap: page through the full folder, ending with a
-    // deltaLink instead of a nextLink.
-    let messages = sorted_messages_in(&fixture, &m.id);
+    let messages = sorted_messages_in(&fixture, account_id, &m.id);
     let total = messages.len() as u64;
     let top = q.page_size(MESSAGES_DEFAULT_TOP, MESSAGES_MAX_TOP);
     let offset = match q.offset() {
@@ -358,16 +605,91 @@ async fn delta_messages(
     ))
 }
 
+async fn list_message_attachments_impl(
+    state: AppState,
+    account_id: &str,
+    message_id: &str,
+) -> Response {
+    let fixture = state.fixture();
+    let Some(email) = fixture.emails_for(account_id).find(|e| e.id == message_id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("message {message_id:?} not found"),
+        );
+    };
+    let value: Vec<Value> = email
+        .attachments
+        .iter()
+        .map(|a| graph_attachment_value(&email.id, a, true))
+        .collect();
+    ok_json(odata::collection_envelope(
+        &format!("$metadata#users('me')/messages('{message_id}')/attachments"),
+        value,
+        None,
+        None,
+        None,
+    ))
+}
+
+async fn get_message_attachment_impl(
+    state: AppState,
+    account_id: &str,
+    message_id: &str,
+    attachment_id: &str,
+) -> Response {
+    let fixture = state.fixture();
+    let Some((email, att)) = find_email_with_attachment(&fixture, account_id, message_id, attachment_id)
+    else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("attachment {attachment_id:?} on message {message_id:?} not found"),
+        );
+    };
+    ok_json(graph_attachment_value(&email.id, att, true))
+}
+
+async fn get_message_attachment_value_impl(
+    state: AppState,
+    account_id: &str,
+    message_id: &str,
+    attachment_id: &str,
+) -> Response {
+    let fixture = state.fixture();
+    let Some((_, att)) = find_email_with_attachment(&fixture, account_id, message_id, attachment_id)
+    else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("attachment {attachment_id:?} on message {message_id:?} not found"),
+        );
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, att.content_type.clone())],
+        AxumBody::from(att.data.clone()),
+    )
+        .into_response()
+}
+
 // ── Folder projection ───────────────────────────────────────────────
 
-/// Resolve `folder` against either the well-known alias table or the
-/// fixture's opaque ids.
-fn resolve_folder<'a>(fixture: &'a Fixture, folder: &str) -> Option<&'a Mailbox> {
-    if let Some(m) = fixture.mailboxes.iter().find(|m| m.id == folder) {
+/// Resolve `folder` against the named account's mailbox set. Accepts
+/// either the literal mailbox id or a well-known role alias
+/// (`inbox`, `drafts`, ...). Scoped to one account so that a
+/// shared-mailbox request that names "inbox" doesn't accidentally
+/// resolve to the primary account's inbox.
+fn resolve_folder<'a>(
+    fixture: &'a Fixture,
+    folder: &str,
+    account_id: &'a str,
+) -> Option<&'a Mailbox> {
+    if let Some(m) = fixture.mailboxes_for(account_id).find(|m| m.id == folder) {
         return Some(m);
     }
     let role = role_from_alias(folder)?;
-    fixture.mailboxes.iter().find(|m| m.role == Some(role))
+    fixture.mailboxes_for(account_id).find(|m| m.role == Some(role))
 }
 
 fn role_from_alias(alias: &str) -> Option<Role> {
@@ -396,8 +718,7 @@ fn well_known_name_for(role: Option<Role>) -> Option<&'static str> {
 
 fn folder_value(fixture: &Fixture, m: &Mailbox) -> Value {
     let messages_in = fixture
-        .emails
-        .iter()
+        .emails_for(&m.account_id)
         .filter(|e| e.mailbox_ids.iter().any(|id| id == &m.id))
         .collect::<Vec<_>>();
     let total = messages_in.len() as u64;
@@ -406,8 +727,7 @@ fn folder_value(fixture: &Fixture, m: &Mailbox) -> Value {
         .filter(|e| !e.keywords.iter().any(|k| k == "$seen"))
         .count() as u64;
     let child_count = fixture
-        .mailboxes
-        .iter()
+        .mailboxes_for(&m.account_id)
         .filter(|c| c.parent_id.as_deref() == Some(m.id.as_str()))
         .count() as u64;
 
@@ -436,10 +756,13 @@ fn folder_value(fixture: &Fixture, m: &Mailbox) -> Value {
 
 // ── Message projection ──────────────────────────────────────────────
 
-fn sorted_messages_in<'a>(fixture: &'a Fixture, mailbox_id: &str) -> Vec<&'a Email> {
+fn sorted_messages_in<'a>(
+    fixture: &'a Fixture,
+    account_id: &'a str,
+    mailbox_id: &str,
+) -> Vec<&'a Email> {
     let mut v: Vec<&Email> = fixture
-        .emails
-        .iter()
+        .emails_for(account_id)
         .filter(|e| e.mailbox_ids.iter().any(|id| id == mailbox_id))
         .collect();
     // Same determinism contract as JMAP's Email/query: receivedAt
@@ -673,77 +996,13 @@ fn graph_attachment_value(message_id: &str, a: &Attachment, include_bytes: bool)
 
 fn find_email_with_attachment<'a>(
     fixture: &'a Fixture,
+    account_id: &'a str,
     message_id: &str,
     attachment_id: &str,
 ) -> Option<(&'a Email, &'a Attachment)> {
-    let email = fixture.emails.iter().find(|e| e.id == message_id)?;
+    let email = fixture.emails_for(account_id).find(|e| e.id == message_id)?;
     let att = email.attachments.iter().find(|a| a.blob_id == attachment_id)?;
     Some((email, att))
-}
-
-async fn list_message_attachments(
-    State(state): State<AppState>,
-    Path(message_id): Path<String>,
-) -> Response {
-    let fixture = state.fixture();
-    let Some(email) = fixture.emails.iter().find(|e| e.id == message_id) else {
-        return error(
-            StatusCode::NOT_FOUND,
-            &format!("message {message_id:?} not found"),
-            "ResourceNotFound",
-        );
-    };
-    let value: Vec<Value> = email
-        .attachments
-        .iter()
-        .map(|a| graph_attachment_value(&email.id, a, true))
-        .collect();
-    ok_json(odata::collection_envelope(
-        &format!("$metadata#users('me')/messages('{message_id}')/attachments"),
-        value,
-        None,
-        None,
-        None,
-    ))
-}
-
-async fn get_message_attachment(
-    State(state): State<AppState>,
-    Path((message_id, attachment_id)): Path<(String, String)>,
-) -> Response {
-    let fixture = state.fixture();
-    let Some((email, att)) =
-        find_email_with_attachment(&fixture, &message_id, &attachment_id)
-    else {
-        return error(
-            StatusCode::NOT_FOUND,
-            &format!("attachment {attachment_id:?} on message {message_id:?} not found"),
-            "ResourceNotFound",
-        );
-    };
-    ok_json(graph_attachment_value(&email.id, att, true))
-}
-
-async fn get_message_attachment_value(
-    State(state): State<AppState>,
-    Path((message_id, attachment_id)): Path<(String, String)>,
-) -> Response {
-    let fixture = state.fixture();
-    let Some((_, att)) =
-        find_email_with_attachment(&fixture, &message_id, &attachment_id)
-    else {
-        return error(
-            StatusCode::NOT_FOUND,
-            &format!("attachment {attachment_id:?} on message {message_id:?} not found"),
-            "ResourceNotFound",
-        );
-    };
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, att.content_type.clone())],
-        AxumBody::from(att.data.clone()),
-    )
-        .into_response()
 }
 
 /// Standard (`+`/`/`) base64 with padding. Avoids pulling in the

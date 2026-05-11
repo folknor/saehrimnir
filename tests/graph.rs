@@ -1429,3 +1429,112 @@ async fn graph_single_instance_event_omits_recurrence() {
     );
 }
 
+// ── Multi-account mail routing (Stage 3) ────────────────────────────
+//
+// Stage 3 grows `/v1.0/users/{userId}/...` parallel routes for the
+// Graph mail surface. `me` is an alias for the primary account;
+// other userIds must match a declared `[[account]]`. The same
+// inner handlers power both path families, scoped to the resolved
+// account.
+
+fn multi_account_graph_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    graph::router(graph::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+#[tokio::test]
+async fn graph_me_mailfolders_scopes_to_primary() {
+    let (status, v) = get_json_with(multi_account_graph_router(), "/v1.0/me/mailFolders").await;
+    assert_eq!(status, StatusCode::OK);
+    let folders = v["value"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0]["id"], "mbx-primary-inbox");
+}
+
+#[tokio::test]
+async fn graph_users_named_account_lists_that_accounts_folders() {
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/mailFolders",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let folders = v["value"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0]["id"], "mbx-secondary-inbox");
+}
+
+#[tokio::test]
+async fn graph_users_me_alias_resolves_to_primary() {
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/me/mailFolders",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let folders = v["value"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0]["id"], "mbx-primary-inbox");
+}
+
+#[tokio::test]
+async fn graph_users_unknown_account_returns_404_resource_not_found() {
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-bogus/mailFolders",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn graph_users_messages_scope_by_account() {
+    // /me/...inbox/messages: primary's email only.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/me/mailFolders/mbx-primary-inbox/messages",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let msgs = v["value"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["id"], "email-primary-001");
+
+    // /users/{secondary}/...inbox/messages: secondary's email.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/mailFolders/mbx-secondary-inbox/messages",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let msgs = v["value"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["id"], "email-secondary-001");
+
+    // Cross-account access: primary cannot resolve secondary's
+    // mailbox id (folder lookup scoped to the named account).
+    let (status, _) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/me/mailFolders/mbx-secondary-inbox/messages",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_inbox_alias_resolves_within_named_account() {
+    // The well-known `inbox` alias resolves to the named account's
+    // inbox, not the primary's. Both accounts declare an inbox-role
+    // mailbox, so the aliased lookup picks the right one per path.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/mailFolders/inbox/messages",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let msgs = v["value"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["id"], "email-secondary-001");
+}
+

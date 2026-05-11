@@ -61,23 +61,22 @@ checking whether the fact is already in `notes/`.
   JMAP listener (`/oauth/token`). IMAP and SMTP keep their own
   always-accept auth surfaces. See
   `notes/ratatoskr-oauth-surface.md`.
-- Multi-account fixtures (Stage 2): every resource type
-  (Mailbox, Email, Calendar, Event, ContactFolder, Contact,
-  Category) carries an `account_id`, derived from its parent
-  (calendars' events inherit calendar account; folders'
-  contacts inherit folder account; emails inherit from their
-  first declared mailbox) and validated against the fixture's
-  declared accounts at load time. `Fixture::*_for(account_id)`
-  helpers expose filtered iterators. The JMAP session resource
-  advertises every declared account; method handlers
-  (`Mailbox/get`, `Email/get`, `Email/query`, `Calendar/get`,
-  `CalendarEvent/get`) honour the request's `accountId` arg
-  and scope reads to that account. Unknown accountIds return
-  `accountNotFound`. Stage 3 (Graph `/v1.0/users/{id}/...`
-  routes, IMAP/SMTP per-conn account binding, account-scoped
-  OAuth tokens) is what unblocks Graph groups / shared mailbox
-  sync; non-JMAP protocols currently still scope to the
-  primary account.
+- Multi-account fixtures: every resource type carries an
+  `account_id`, derived from its parent and validated against
+  the declared `[[account]]` set at load time.
+  `Fixture::*_for(account_id)` helpers expose filtered
+  iterators. JMAP advertises every declared account in its
+  session resource and method handlers (`Mailbox/get`,
+  `Email/get`, `Email/query`, `Calendar/get`,
+  `CalendarEvent/get`) honour the request's `accountId` arg.
+  Graph mail grows parallel `/v1.0/users/{userId}/...` routes
+  (`me` aliases the primary; unknown userIds return 404
+  `ResourceNotFound`); `/v1.0/me/...` continues to scope to
+  primary and now filters out non-primary accounts' mail so
+  multi-account fixtures don't leak. Graph calendar / contacts
+  / categories, gcal, Gmail, People, CalDAV, IMAP, SMTP, and
+  OAuth still scope to primary; the limitation is invisible in
+  current single-account fixtures.
 - One shared fixture per process, behind a single
   `Arc<RwLock<Fixture>>` (`shared::FixtureHandle`). Read paths take
   brief read guards; the JMAP `Email/set` / `Mailbox/set` mutators
