@@ -204,8 +204,11 @@ checking whether the fact is already in `notes/`.
   walker, mutations via change-script), `label_sync.rs` (Outlook
   master category list - GET/POST/PATCH/DELETE on
   `/v1.0/me/outlook/masterCategories`, mutations via
-  `Fixture::mutate`). Sibling files for drive / groups / EWS land
-  here when those surfaces are scouted.
+  `Fixture::mutate`), `group_sync.rs` (cross-account groups -
+  `/v1.0/groups`, `/v1.0/groups/{id}`,
+  `/v1.0/groups/{id}/members`, `/v1.0/me/memberOf`,
+  `/v1.0/users/{id}/memberOf`). Sibling files for drive / EWS
+  land here when those surfaces are scouted.
 - `src/caldav/` - CalDAV mock. `mod.rs` (single-handler dispatch
   on PROPFIND / REPORT / GET / PUT / DELETE / OPTIONS for the
   WebDAV verb surface ratatoskr's CalDavClient exercises), `xml.rs`
@@ -410,8 +413,8 @@ restarting the binary. Integration tests in `tests/smtp.rs`,
 including a TCP-level STARTTLS round-trip; the route shape is
 covered in `tests/api.rs`.
 
-Graph: mail-sync, calendar, contacts, and master categories are
-complete for v0. Mail:
+Graph: mail-sync, calendar, contacts, master categories, and
+groups are complete for v0. Mail:
 `/v1.0/me/mailFolders` (list, by-id, by-well-known-alias,
 childFolders), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
 `$skip` / `$skiptoken` / `$filter`), `/v1.0/me/mailFolders/{id}/
@@ -450,9 +453,20 @@ record `category_*` transitions; the change_log entries are
 observability for tests asserting state moved (real Graph has no
 `masterCategories/delta` endpoint, so v0 doesn't expose one
 either). Tests in `tests/graph.rs`.
+
+Groups: `/v1.0/groups` (list + single), `/v1.0/groups/{id}/members`
+projecting each member-account as a `#microsoft.graph.user` (id,
+displayName, mail, userPrincipalName populated from
+`account.name`), plus `/v1.0/me/memberOf` (bearer-resolved) and
+`/v1.0/users/{id}/memberOf` (path-resolved; `me` aliases the
+bearer's primary). Groups are cross-account by nature - each
+fixture `[[group]]` carries a `members = [...]` list of declared
+account ids. Read-only in v0 (no mutating verbs on the Graph
+group surface).
+
 Catchall returns the Graph error envelope so unimplemented
 resources are visibly out-of-scope. Sibling files for drive /
-groups / EWS drop in later.
+EWS drop in later.
 
 Google Calendar v3: complete for v0. Sibling listener to Gmail
 on `--gcal-port`. `GET /calendar/v3/users/me/calendarList` (id

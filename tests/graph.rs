@@ -1681,3 +1681,109 @@ async fn graph_users_unknown_for_each_resource_family_returns_404() {
     }
 }
 
+// ── Graph groups ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn graph_groups_lists_every_declared_group() {
+    let (status, v) = get_json_with(multi_account_graph_router(), "/v1.0/groups").await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = v["value"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    let by_id: std::collections::HashMap<&str, &Value> = groups
+        .iter()
+        .map(|g| (g["id"].as_str().unwrap(), g))
+        .collect();
+    let eng = by_id["grp-eng"];
+    assert_eq!(eng["displayName"], "Engineering");
+    assert_eq!(eng["mail"], "engineering@example.com");
+    assert_eq!(eng["mailEnabled"], true);
+    assert_eq!(eng["securityEnabled"], true);
+    // The members list is NOT inlined on `/groups` - clients call
+    // `/groups/{id}/members` to expand. Real Graph behaves the same.
+    assert!(eng.get("members").is_none());
+}
+
+#[tokio::test]
+async fn graph_groups_single_returns_resource_or_404() {
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/groups/grp-leads",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "grp-leads");
+
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/groups/grp-bogus",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn graph_group_members_projects_accounts_as_users() {
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/groups/grp-eng/members",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let members = v["value"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    let ids: Vec<&str> = members.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"account-primary"));
+    assert!(ids.contains(&"account-secondary"));
+    // Each member is projected as a #microsoft.graph.user with
+    // mail / userPrincipalName populated from account.name.
+    let primary = members
+        .iter()
+        .find(|m| m["id"] == "account-primary")
+        .unwrap();
+    assert_eq!(primary["@odata.type"], "#microsoft.graph.user");
+    assert_eq!(primary["mail"], "primary@example.com");
+    assert_eq!(primary["userPrincipalName"], "primary@example.com");
+}
+
+#[tokio::test]
+async fn graph_me_memberof_scopes_by_bearer_token() {
+    // No bearer -> primary; primary is in both groups.
+    let (_, v) = get_json_with(multi_account_graph_router(), "/v1.0/me/memberOf").await;
+    let groups = v["value"].as_array().unwrap();
+    let ids: Vec<&str> = groups.iter().map(|g| g["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"grp-eng"));
+    assert!(ids.contains(&"grp-leads"));
+    assert_eq!(groups.len(), 2);
+}
+
+#[tokio::test]
+async fn graph_users_memberof_scopes_by_account() {
+    // Secondary is only in grp-eng (Engineering), not Leadership.
+    let (_, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/memberOf",
+    )
+    .await;
+    let groups = v["value"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["id"], "grp-eng");
+
+    // Unknown user 404s.
+    let (status, _) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-bogus/memberOf",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // `me` resolves to primary on the users/{} path too.
+    let (_, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/me/memberOf",
+    )
+    .await;
+    let groups = v["value"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+}
+

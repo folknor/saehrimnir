@@ -394,6 +394,36 @@ CRUD set; mutations land via `Fixture::mutate` and bump
 `fixture.state`. The Lua loader exposes the same block via
 `category({...})`.
 
+## Groups (optional)
+
+Cross-account groups for the Microsoft Graph `/v1.0/groups/...`
+surface. Each group names a `members` list of declared
+`[[account]]` ids; the same account can belong to several groups.
+
+```toml
+[[group]]
+id = "grp-eng"
+display_name = "Engineering"
+description = "Engineering team"   # optional
+mail = "engineering@example.com"   # optional
+mail_enabled = true                # optional; defaults to false
+security_enabled = true            # optional; defaults to false
+members = ["account-primary", "account-secondary"]
+```
+
+Validation:
+
+- `group.id` is unique across groups.
+- Every entry in `members` must match a declared
+  `[[account]]` id.
+- Member ids must be unique within one group.
+
+Groups project over the Graph
+`/v1.0/groups`, `/v1.0/groups/{id}`,
+`/v1.0/groups/{id}/members`, `/v1.0/me/memberOf`, and
+`/v1.0/users/{id}/memberOf` surfaces. The Lua loader exposes the
+same shape via `group({...})`.
+
 ## OAuth (optional)
 
 ```toml

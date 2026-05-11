@@ -178,6 +178,8 @@ struct Builder {
     contacts: Vec<crate::fixture::RawContact>,
     /// Outlook master categories accumulated via `category({...})`.
     categories: Vec<crate::fixture::RawCategory>,
+    /// Microsoft Graph groups accumulated via `group({...})`.
+    groups: Vec<crate::fixture::RawGroup>,
 }
 
 impl Builder {
@@ -200,6 +202,7 @@ impl Builder {
             contact_folders: self.contact_folders,
             contacts: self.contacts,
             categories: self.categories,
+            groups: self.groups,
             // Lua change_script lives in `Builder::change_script`
             // (fully-typed `Vec<ChangeStep>`) and is grafted onto
             // the Fixture after `normalize_with_dir` returns; the
@@ -239,6 +242,8 @@ fn install_builders(state: &mut State) {
     state.set_global("contact");
     state.push_rust_fn(builder_category);
     state.set_global("category");
+    state.push_rust_fn(builder_group);
+    state.set_global("group");
     state.push_rust_fn(builder_wait);
     state.set_global("wait");
     state.push_rust_fn(builder_mock_done);
@@ -449,6 +454,26 @@ fn builder_category(state: &mut State) -> dellingr::Result<u8> {
         account_id: read_string_opt(state, 1, "account_id")?,
     };
     builder_mut(state)?.categories.push(cat);
+    Ok(0)
+}
+
+/// `group { id, display_name, description?, mail?, mail_enabled?,
+/// security_enabled?, members = { "account-1", "account-2", ... } }`
+/// Microsoft Graph group with cross-account membership. `members`
+/// is an array of account ids; the loader validates each against
+/// the declared `[[account]]` set.
+fn builder_group(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "group")?;
+    let grp = crate::fixture::RawGroup {
+        id: read_string(state, 1, "id")?,
+        display_name: read_string(state, 1, "display_name")?,
+        description: read_string_opt(state, 1, "description")?,
+        mail: read_string_opt(state, 1, "mail")?,
+        mail_enabled: read_bool_opt(state, 1, "mail_enabled")?,
+        security_enabled: read_bool_opt(state, 1, "security_enabled")?,
+        members: read_string_array_opt(state, 1, "members")?,
+    };
+    builder_mut(state)?.groups.push(grp);
     Ok(0)
 }
 

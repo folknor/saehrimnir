@@ -123,3 +123,25 @@ id = "cat-secondary-urgent"
 account_id = "account-secondary"
 display_name = "Secondary-Urgent"
 color = "preset5"
+
+# Groups span accounts. Engineering contains both; Leadership
+# contains only primary. Used by tests/graph.rs to assert
+# /v1.0/groups, /v1.0/groups/{id}/members, and /me/memberOf
+# scoping by bearer-token's account.
+
+[[group]]
+id = "grp-eng"
+display_name = "Engineering"
+description = "Engineering team"
+mail = "engineering@example.com"
+mail_enabled = true
+security_enabled = true
+members = ["account-primary", "account-secondary"]
+
+[[group]]
+id = "grp-leads"
+display_name = "Leadership"
+mail = "leads@example.com"
+mail_enabled = true
+security_enabled = false
+members = ["account-primary"]

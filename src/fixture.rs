@@ -48,6 +48,12 @@ pub struct Fixture {
     /// analogue of Gmail labels / JMAP keywords). Flat per-account
     /// in real Graph - no folder scope. Empty by default.
     pub categories: Vec<Category>,
+    /// Microsoft Graph groups. Cross-account by nature: each group
+    /// declares a `members` list naming declared `[[account]]` ids
+    /// who belong to it. Projects over the Graph `/v1.0/groups/...`
+    /// surface plus the `/v1.0/me/memberOf` /
+    /// `/v1.0/users/{userId}/memberOf` walkers. Empty by default.
+    pub groups: Vec<Group>,
     /// Per-mutation transition log. Empty at load time (the seed
     /// state is the only known state); each successful `Email/set`
     /// or `Mailbox/set` envelope appends a transition and bumps
@@ -1077,6 +1083,26 @@ pub struct Category {
     pub color: Option<String>,
 }
 
+/// Microsoft Graph group. Distinct from the account-scoped
+/// resources above: a group is a directory object whose `members`
+/// list points at one or more declared accounts. The Graph
+/// `Group` resource carries a lot of fields v0 doesn't model
+/// (groupTypes, classifications, ...); the projection emits a
+/// minimal `{ id, displayName, description, mail, mailEnabled,
+/// securityEnabled, members[] }` shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    pub id: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub mail: Option<String>,
+    pub mail_enabled: bool,
+    pub security_enabled: bool,
+    /// Account ids that belong to the group. Validated at load
+    /// time against the declared `[[account]]` set.
+    pub members: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub id: String,
@@ -1269,6 +1295,8 @@ pub(crate) struct RawFixture {
     pub(crate) contacts: Vec<RawContact>,
     #[serde(default, rename = "category")]
     pub(crate) categories: Vec<RawCategory>,
+    #[serde(default, rename = "group")]
+    pub(crate) groups: Vec<RawGroup>,
     #[serde(default, rename = "change")]
     pub(crate) change_script: Vec<RawChangeStep>,
 }
@@ -1424,6 +1452,22 @@ pub(crate) struct RawCategory {
     pub(crate) color: Option<String>,
     #[serde(default)]
     pub(crate) account_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawGroup {
+    pub(crate) id: String,
+    pub(crate) display_name: String,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
+    pub(crate) mail: Option<String>,
+    #[serde(default)]
+    pub(crate) mail_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) security_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) members: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1982,6 +2026,44 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    // Microsoft Graph groups. Cross-account: members reference
+    // declared `[[account]]` ids. Distinct id namespace from
+    // every other resource type.
+    let mut group_ids: HashMap<String, ()> = HashMap::new();
+    let mut groups = Vec::with_capacity(raw.groups.len());
+    for grp in raw.groups {
+        if group_ids.insert(grp.id.clone(), ()).is_some() {
+            return Err(format!("duplicate group id {:?}", grp.id));
+        }
+        // Member ids must each match a declared account; duplicates
+        // within one group are rejected so the wire projection of
+        // /groups/{id}/members stays a set.
+        let mut seen: HashMap<&str, ()> = HashMap::new();
+        for m in &grp.members {
+            if !account_ids.contains_key(m) {
+                return Err(format!(
+                    "group {:?}: member {m:?} does not match any declared account",
+                    grp.id
+                ));
+            }
+            if seen.insert(m.as_str(), ()).is_some() {
+                return Err(format!(
+                    "group {:?}: duplicate member {m:?}",
+                    grp.id
+                ));
+            }
+        }
+        groups.push(Group {
+            id: grp.id,
+            display_name: grp.display_name,
+            description: grp.description,
+            mail: grp.mail,
+            mail_enabled: grp.mail_enabled.unwrap_or(false),
+            security_enabled: grp.security_enabled.unwrap_or(false),
+            members: grp.members,
+        });
+    }
+
     // Master categories. Flat list per account, ids unique.
     let mut category_ids: HashMap<String, ()> = HashMap::new();
     let mut categories = Vec::with_capacity(raw.categories.len());
@@ -2060,6 +2142,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         contact_folders,
         contacts,
         categories,
+        groups,
         change_log,
         change_script,
         mailbox_uid_history,

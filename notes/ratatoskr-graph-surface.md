@@ -105,6 +105,22 @@ The fixture format adds a flat `[[category]]` block (see
 `notes/fixture-format.md`); the Lua loader exposes the same
 shape via `category({...})`.
 
+## Groups (`src/graph/group_sync.rs`)
+
+Cross-account groups: each `[[group]]` in the fixture names a
+`members` list of declared `[[account]]` ids. The wire surface
+ratatoskr's group-enumeration code path consumes:
+
+| Endpoint | Notes |
+|----------|-------|
+| `GET /v1.0/groups` | List all groups. No paging in v0 - the group set is small. Members are NOT inlined; clients call `/groups/{id}/members` to expand (matches real Graph). |
+| `GET /v1.0/groups/{id}` | Single group; 404 on unknown id. |
+| `GET /v1.0/groups/{id}/members` | Project each member-account as a `#microsoft.graph.user` with `id`, `displayName`, `mail`, `userPrincipalName` populated from `account.name`. Real Graph emits each entry typed (user / group / device); v0 only models user-typed members. |
+| `GET /v1.0/me/memberOf` | Groups containing the bearer-resolved account (`oauth::account_from_bearer`, same fallback-to-primary semantics as Gmail / gcal / People). |
+| `GET /v1.0/users/{userId}/memberOf` | Path-resolved: `me` aliases the bearer-resolved primary, otherwise the `userId` must match a declared account. Unknown id returns 404 `ResourceNotFound`. |
+
+Read-only in v0 - the Graph group surface has no mutating verbs.
+
 ## Multi-account routing
 
 Graph mail surfaces both `/v1.0/me/...` and
@@ -373,14 +389,15 @@ attachments, this is the moment to fill it in.
 
 ## Out of scope for v0 - resource categories to scaffold for later
 
+Calendar (`calendar.rs`), master categories (`label_sync.rs`),
+groups (`group_sync.rs`), and shared-mailbox / per-user mail
+routing (`mail.rs` + `/v1.0/users/{id}/...` paths) are landed.
+Remaining:
+
 | Module                       | What it syncs                              |
 |------------------------------|--------------------------------------------|
-| `calendar_sync.rs`           | Calendars, events, recurrence, attendees   |
-| `label_sync.rs`              | Master category list                       |
-| `group_sync.rs`              | M365 groups, mail-enabled distribution     |
 | `onedrive.rs`                | Resumable upload sessions for attachments  |
 | `public_folder_sync.rs`      | Pinned public folders via EWS              |
-| `shared_mailbox_sync.rs`     | Per-mailbox sync via `/users/{id}/...`     |
 | `webhooks.rs`                | Change subscriptions                       |
 | `autodiscover.rs`            | Shared-mailbox discovery via SOAP          |
 | `ews/`                       | Exchange Web Services SOAP                 |

@@ -8,12 +8,6 @@ tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
 Concrete next-up items lifted above the per-protocol backlogs.
 
-- **Graph group enumeration.** `/v1.0/groups` + `/v1.0/me/
-  memberOf`. Lands in `src/graph/group_sync.rs` (new). Fixture
-  format needs a `[[group]]` table with optional `[[member]]`
-  rows pointing at declared accounts (groups are
-  cross-account by nature; the multi-account refactor is
-  landed so this is unblocked).
 - **Multi-account refactor follow-ups.** Stages 1-5 landed the
   fixture model, JMAP multi-account scoping, Graph per-account
   routing across all four resource families, OAuth-scoped
