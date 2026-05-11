@@ -157,49 +157,63 @@ async fn session(
 ) -> Result<Json<Value>, Response> {
     enforce_bearer(&state, &headers).map_err(|b| *b)?;
     let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
-    let primary = fixture.primary_account();
-    let acct_id = &primary.id;
-    let acct_name = &primary.name;
+    let primary_account = fixture.primary_account();
+    let primary_id = primary_account.id.clone();
+    let primary_name = primary_account.name.clone();
     let base = state.base_url.as_str();
 
+    // Stage 2 of the multi-account refactor: enumerate every
+    // declared account, deriving per-account capabilities from
+    // that account's own resources. Calendar capabilities advertise
+    // only on accounts that actually carry calendars; mail
+    // capabilities always advertise (every fixture account has at
+    // least a notional inbox in v0, even when no mailbox rows are
+    // declared on it yet).
     let mut accounts = serde_json::Map::new();
-    let advertise_calendars = !fixture.calendars.is_empty();
-    let mut account_caps = serde_json::Map::new();
-    account_caps.insert("urn:ietf:params:jmap:mail".to_string(), json!({}));
-    if advertise_calendars {
-        account_caps.insert("urn:ietf:params:jmap:calendars".to_string(), json!({
-            "minDateTime": "1970-01-01T00:00:00",
-            "maxDateTime": "2099-12-31T23:59:59",
-            "maxExpandedQueryDuration": "P1Y",
-            "maxParticipantsPerEvent": 256,
-            "mayCreateCalendar": true,
-        }));
+    for acct in &fixture.accounts {
+        let mut caps = serde_json::Map::new();
+        caps.insert("urn:ietf:params:jmap:mail".to_string(), json!({}));
+        let has_calendars = fixture.calendars_for(&acct.id).next().is_some();
+        if has_calendars {
+            caps.insert("urn:ietf:params:jmap:calendars".to_string(), json!({
+                "minDateTime": "1970-01-01T00:00:00",
+                "maxDateTime": "2099-12-31T23:59:59",
+                "maxExpandedQueryDuration": "P1Y",
+                "maxParticipantsPerEvent": 256,
+                "mayCreateCalendar": true,
+            }));
+        }
+        accounts.insert(
+            acct.id.clone(),
+            json!({
+                "name": acct.name,
+                "isPersonal": true,
+                "isReadOnly": false,
+                "accountCapabilities": Value::Object(caps),
+            }),
+        );
     }
-    accounts.insert(
-        acct_id.clone(),
-        json!({
-            "name": acct_name,
-            "isPersonal": true,
-            "isReadOnly": false,
-            "accountCapabilities": Value::Object(account_caps),
-        }),
-    );
 
+    // The top-level capabilities advertisement and `primaryAccounts`
+    // mapping pin the primary account; per-method `accountId` args
+    // select the actual scope on follow-up calls.
+    let primary_has_calendars = fixture.calendars_for(&primary_id).next().is_some();
     let mut primary = serde_json::Map::new();
     primary.insert(
         "urn:ietf:params:jmap:core".to_string(),
-        Value::String(acct_id.clone()),
+        Value::String(primary_id.clone()),
     );
     primary.insert(
         "urn:ietf:params:jmap:mail".to_string(),
-        Value::String(acct_id.clone()),
+        Value::String(primary_id.clone()),
     );
-    if advertise_calendars {
+    if primary_has_calendars {
         primary.insert(
             "urn:ietf:params:jmap:calendars".to_string(),
-            Value::String(acct_id.clone()),
+            Value::String(primary_id.clone()),
         );
     }
+    let advertise_calendars = !fixture.calendars.is_empty();
 
     let mut top_caps = serde_json::Map::new();
     top_caps.insert(
@@ -227,7 +241,7 @@ async fn session(
         "capabilities": Value::Object(top_caps),
         "accounts": accounts,
         "primaryAccounts": primary,
-        "username": acct_name,
+        "username": primary_name,
         "apiUrl": format!("{base}/jmap/api"),
         "downloadUrl": format!("{base}/jmap/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}"),
         "uploadUrl": format!("{base}/jmap/upload/{{accountId}}"),

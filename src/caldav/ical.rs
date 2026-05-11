@@ -337,6 +337,7 @@ mod tests {
     fn round_trip_minimal_event() {
         let event = Event {
             id: "ev-1".into(),
+            account_id: "acct".into(),
             calendar_id: "cal".into(),
             subject: "Standup".into(),
             body_preview: None,
@@ -375,6 +376,7 @@ mod tests {
     fn semicolons_in_summary_are_escaped_and_round_trip() {
         let event = Event {
             id: "ev".into(),
+            account_id: "acct".into(),
             calendar_id: "cal".into(),
             subject: "Q1; budget review".into(),
             body_preview: None,
@@ -440,6 +442,7 @@ mod tests {
         // legitimately).
         let event = Event {
             id: "ev".into(),
+            account_id: "acct".into(),
             calendar_id: "cal".into(),
             subject: "x".into(),
             body_preview: None,

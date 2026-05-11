@@ -33,8 +33,7 @@ pub(crate) fn calendar_get(fixture: &Fixture, args: &Value) -> Result<Value, Val
     let (list, not_found) = match args.get("ids") {
         None | Some(Value::Null) => {
             let all = fixture
-                .calendars
-                .iter()
+                .calendars_for(account_id)
                 .map(serialize_calendar)
                 .collect::<Vec<_>>();
             (Value::Array(all), Value::Array(vec![]))
@@ -46,7 +45,7 @@ pub(crate) fn calendar_get(fixture: &Fixture, args: &Value) -> Result<Value, Val
                 let Some(id) = v.as_str() else {
                     return Err(invalid_args("ids must be an array of strings"));
                 };
-                match fixture.calendars.iter().find(|c| c.id == id) {
+                match fixture.calendars_for(account_id).find(|c| c.id == id) {
                     Some(c) => list.push(serialize_calendar(c)),
                     None => not_found.push(Value::String(id.to_string())),
                 }
@@ -157,8 +156,7 @@ pub(crate) fn calendar_event_get(fixture: &Fixture, args: &Value) -> Result<Valu
     let (list, not_found) = match args.get("ids") {
         None | Some(Value::Null) => {
             let all = fixture
-                .events
-                .iter()
+                .events_for(account_id)
                 .map(serialize_event)
                 .collect::<Vec<_>>();
             (Value::Array(all), Value::Array(vec![]))
@@ -170,7 +168,7 @@ pub(crate) fn calendar_event_get(fixture: &Fixture, args: &Value) -> Result<Valu
                 let Some(id) = v.as_str() else {
                     return Err(invalid_args("ids must be an array of strings"));
                 };
-                match fixture.events.iter().find(|e| e.id == id) {
+                match fixture.events_for(account_id).find(|e| e.id == id) {
                     Some(e) => list.push(serialize_event(e)),
                     None => not_found.push(Value::String(id.to_string())),
                 }
@@ -545,10 +543,17 @@ fn build_event_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
     let (organizer, attendees) = parse_participants(obj.get("participants"));
 
     let server_id = fix.mint_event_id();
+    let account_id = fix
+        .calendars
+        .iter()
+        .find(|c| c.id == calendar_id)
+        .map(|c| c.account_id.clone())
+        .unwrap_or_else(|| fix.primary_account().id.clone());
     Ok((
         server_id.clone(),
         Event {
             id: server_id,
+            account_id,
             calendar_id,
             subject: title,
             body_preview: None,
@@ -814,7 +819,7 @@ fn require_account<'a>(fixture: &'a Fixture, args: &'a Value) -> Result<&'a str,
         .get("accountId")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_args("missing accountId"))?;
-    if account_id != fixture.primary_account().id {
+    if fixture.account(account_id).is_none() {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),

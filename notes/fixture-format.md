@@ -30,11 +30,29 @@ is_personal = true   # Stage 1 requires this on every declared account
 
 Multi-account fixtures repeat the `[[account]]` block. Exactly one
 entry must be flagged `primary = true`; that account is the one
-every protocol surface scopes to in Stage 1. Resources (mailboxes,
-emails, calendars, contacts, categories) belong implicitly to the
-primary account today. Stage 2 of the multi-account refactor lands
-per-resource `account_id` plus per-protocol scoping when Graph
-groups / shared mailbox sync needs it.
+non-JMAP protocols (Graph `/me/...`, IMAP, SMTP, Gmail, gcal,
+People, CalDAV) scope to. JMAP advertises every declared account
+in the session resource and method handlers honour the request's
+`accountId` argument.
+
+Resources (mailboxes, emails, calendars, contacts, categories)
+accept an optional `account_id` field; the loader defaults to
+the primary account when absent. Validation rules:
+
+- A declared `account_id` must match one of the declared
+  `[[account]]` ids.
+- Children inherit from parents: events take their calendar's
+  account, contacts take their folder's account, emails take
+  their first mailbox's account (and reject straddling
+  mailboxes across accounts).
+- Mailbox / contact-folder hierarchies (parent / child) must
+  share an account.
+
+Stage 3 of the refactor adds the Graph `/v1.0/users/{id}/...`
+parallel routes plus the universal primary-filter rewrite for
+non-JMAP protocols; in the interim, fixtures should declare
+resources on non-primary accounts only when they're exercised
+through JMAP.
 
 `name` is a fixture identifier brokkr resolves against (typically
 `<fixtures_dir>/<name>.toml`); sæhrimnir just consumes whatever file

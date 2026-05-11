@@ -1918,14 +1918,14 @@ async fn email_set_if_in_state_mismatch_rejects_envelope() {
     assert_eq!(body["updated"], json!([]));
 }
 
-// ── Multi-account fixture (Stage 1) ─────────────────────────────────
+// ── Multi-account fixture (Stage 2) ─────────────────────────────────
 //
-// Stage 1 lifts `Fixture::account` to `accounts: Vec<Account>` but
-// keeps single-account wire behavior. Multi-account fixtures load
-// cleanly; every listener still scopes to the primary account. Stage
-// 2 (per-resource `account_id`, JMAP multi-account session, Graph
-// `/users/{id}/...`, IMAP per-conn) lands when Graph groups or
-// shared mailbox sync needs it.
+// Stage 2 lands per-resource `account_id` plus JMAP multi-account
+// scoping: the session resource now lists every declared account,
+// and JMAP method handlers honour the `accountId` argument by
+// reading only that account's resources. Non-JMAP protocols (Graph
+// `/me/...`, IMAP, SMTP, Gmail, gcal, People) still scope to the
+// primary - Stage 3 grows per-account routing for them.
 
 fn multi_account_router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
@@ -1933,7 +1933,7 @@ fn multi_account_router() -> axum::Router {
 }
 
 #[tokio::test]
-async fn multi_account_jmap_session_advertises_primary_only() {
+async fn multi_account_jmap_session_lists_every_declared_account() {
     let resp = multi_account_router()
         .oneshot(
             Request::builder()
@@ -1946,16 +1946,122 @@ async fn multi_account_jmap_session_advertises_primary_only() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
     let accounts = v.get("accounts").unwrap().as_object().unwrap();
-    // Stage 1 contract: the second declared account is loaded but
-    // invisible on the JMAP wire. Stage 2 lifts this.
-    assert_eq!(accounts.len(), 1);
+    // Stage 2 contract: every declared account is advertised. The
+    // primary appears in `primaryAccounts`; per-account capabilities
+    // are derived from that account's own resources.
+    assert_eq!(accounts.len(), 2);
     assert!(accounts.contains_key("account-primary"));
-    assert!(!accounts.contains_key("account-secondary"));
+    assert!(accounts.contains_key("account-secondary"));
     assert_eq!(
         v["primaryAccounts"]["urn:ietf:params:jmap:mail"],
         "account-primary"
     );
     assert_eq!(v["username"], "primary@example.com");
+}
+
+async fn multi_account_jmap_call(method: &str, args: Value) -> Value {
+    let req_body = json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [[method, args, "c0"]],
+    });
+    let resp = multi_account_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/api")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await["methodResponses"][0].clone()
+}
+
+#[tokio::test]
+async fn multi_account_mailbox_get_scopes_by_accountid() {
+    // accountId=primary returns primary's mailbox only.
+    let resp =
+        multi_account_jmap_call("Mailbox/get", json!({ "accountId": "account-primary" })).await;
+    assert_eq!(resp[0], "Mailbox/get");
+    let body = &resp[1];
+    assert_eq!(body["accountId"], "account-primary");
+    let list = body["list"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], "mbx-primary-inbox");
+
+    // accountId=secondary returns secondary's mailbox only.
+    let resp =
+        multi_account_jmap_call("Mailbox/get", json!({ "accountId": "account-secondary" })).await;
+    let body = &resp[1];
+    assert_eq!(body["accountId"], "account-secondary");
+    let list = body["list"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], "mbx-secondary-inbox");
+}
+
+#[tokio::test]
+async fn multi_account_email_get_scopes_by_accountid() {
+    // accountId=primary returns primary's email only.
+    let resp = multi_account_jmap_call(
+        "Email/get",
+        json!({
+            "accountId": "account-primary",
+            "ids": ["email-primary-001", "email-secondary-001"],
+        }),
+    )
+    .await;
+    let body = &resp[1];
+    let list = body["list"].as_array().unwrap();
+    let not_found = body["notFound"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], "email-primary-001");
+    // Secondary's email is invisible under accountId=primary.
+    assert_eq!(not_found, &vec![json!("email-secondary-001")]);
+
+    // Symmetric assertion for secondary.
+    let resp = multi_account_jmap_call(
+        "Email/get",
+        json!({
+            "accountId": "account-secondary",
+            "ids": ["email-primary-001", "email-secondary-001"],
+        }),
+    )
+    .await;
+    let body = &resp[1];
+    let list = body["list"].as_array().unwrap();
+    let not_found = body["notFound"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], "email-secondary-001");
+    assert_eq!(not_found, &vec![json!("email-primary-001")]);
+}
+
+#[tokio::test]
+async fn multi_account_unknown_accountid_returns_account_not_found() {
+    let resp = multi_account_jmap_call(
+        "Mailbox/get",
+        json!({ "accountId": "account-bogus" }),
+    )
+    .await;
+    assert_eq!(resp[0], "error");
+    assert_eq!(resp[1]["type"], "accountNotFound");
+}
+
+#[tokio::test]
+async fn multi_account_email_query_scopes_by_accountid() {
+    // The query path is Email/query with a filter; assert that
+    // primary's filter sees only primary's emails.
+    let resp = multi_account_jmap_call(
+        "Email/query",
+        json!({ "accountId": "account-secondary" }),
+    )
+    .await;
+    let body = &resp[1];
+    assert_eq!(body["accountId"], "account-secondary");
+    let ids = body["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids[0], "email-secondary-001");
 }
 
 #[tokio::test]

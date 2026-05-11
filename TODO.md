@@ -12,18 +12,30 @@ Concrete next-up items lifted above the per-protocol backlogs.
   memberOf`. Lands in `src/graph/group_sync.rs` (new). Fixture
   format needs a `[[group]]` table; design alongside the
   multi-account work since groups cross accounts.
-- **Multi-account fixture support (Stage 2).** Stage 1 has landed:
-  fixtures may declare `[[account]]` repeatedly, every protocol
-  scopes to the `primary` account via `Fixture::primary_account()`,
-  and the loader validates account ids / primary flag / personal
-  invariant. Resources (mailboxes, emails, calendars, contacts,
-  categories) still belong implicitly to the primary. Stage 2 grows
-  per-resource `account_id`, lets the JMAP session resource
-  advertise additional accounts, lets Graph serve
-  `/v1.0/users/{id}/...` paths parallel to `/v1.0/me/...`, and
-  lets IMAP / SMTP per-connection auth pick a non-primary account.
-  Stage 2 is what unblocks Graph shared-mailbox sync and Graph
-  group enumeration.
+- **Multi-account fixture support (Stage 3).** Stage 1 lifted
+  `Fixture::account` to `accounts: Vec<Account>`. Stage 2 added
+  per-resource `account_id` (every Mailbox/Email/Calendar/Event/
+  ContactFolder/Contact/Category derives or declares its
+  account), grew `Fixture::*_for(account_id)` helpers, made the
+  JMAP session resource advertise every declared account, and
+  taught JMAP method handlers to honour the request's
+  `accountId` arg (Mailbox/get, Email/get, Email/query,
+  Calendar/get, CalendarEvent/get scope correctly; an unknown
+  accountId returns `accountNotFound`). Stage 3 is what's left
+  to unblock Graph groups / shared mailbox sync:
+  - Graph `/v1.0/users/{userId}/...` parallel routes to the
+    existing `/v1.0/me/...` (mail, calendar, contacts).
+  - Universal primary-filter rewrite for the non-JMAP protocols
+    (Graph `/me/`, IMAP, SMTP, Gmail, gcal, People, CalDAV) so a
+    multi-account fixture's secondary-account resources don't
+    leak into primary's wire surface. v0 fixtures that exercise
+    non-JMAP listeners should still declare resources only on
+    the primary; the limitation is invisible in the current test
+    fixtures and only matters once Stage 3's routing lands.
+  - IMAP / SMTP per-connection account binding via AUTH
+    credentials.
+  - OAuth tokens grow an account-id claim so Gmail / gcal /
+    People can scope by token.
 - **Graph shared mailbox sync.** `/v1.0/users/{id}/...` paths
   parallel to `/v1.0/me/...`. Lands in
   `src/graph/shared_mailbox_sync.rs` (new). Blocked on multi-

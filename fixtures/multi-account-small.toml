@@ -1,11 +1,11 @@
 name = "multi-account-small"
 
-# Two declared accounts. The primary owns the (single) mailbox +
-# email below; the secondary is declared but carries no resources
-# in Stage 1 - the loader accepts it, the OAuth provider could
-# enumerate it later, but no listener serves anything for it yet.
-# Stage 2 (Graph groups / shared mailbox sync) grows per-resource
-# `account_id` and per-protocol scoping.
+# Two declared accounts, each with its own mailbox + email. Stage 2
+# of the multi-account refactor lets JMAP advertise both accounts
+# in the session resource and lets method handlers scope by
+# `accountId`. Non-JMAP protocols (Graph `/me/...`, IMAP, SMTP,
+# Gmail, gcal, People) still scope to the primary account; Stage 3
+# adds per-account routing for them.
 
 [[account]]
 id = "account-primary"
@@ -18,17 +18,41 @@ id = "account-secondary"
 name = "secondary@example.com"
 is_personal = true
 
+# Primary's resources. Mailboxes default to the primary account
+# (no `account_id` field needed) but we set it explicitly to
+# exercise the loader's account_id-validation path.
+
 [[mailbox]]
-id = "mbx-inbox"
+id = "mbx-primary-inbox"
+account_id = "account-primary"
 name = "Inbox"
 role = "inbox"
 sort_order = 0
 
 [[email]]
-id = "email-001"
-mailbox_ids = ["mbx-inbox"]
+id = "email-primary-001"
+mailbox_ids = ["mbx-primary-inbox"]
 received_at = "2026-01-15T10:00:00Z"
 from = "sender@example.com"
 to = ["primary@example.com"]
 subject = "Hello primary"
-body_text = "Stage 1 lands the foundation; Stage 2 will scope this email to a specific account."
+body_text = "Primary account inbox email."
+
+# Secondary's resources. JMAP scopes to these via accountId =
+# account-secondary; other listeners ignore them in Stage 2.
+
+[[mailbox]]
+id = "mbx-secondary-inbox"
+account_id = "account-secondary"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+[[email]]
+id = "email-secondary-001"
+mailbox_ids = ["mbx-secondary-inbox"]
+received_at = "2026-01-20T11:00:00Z"
+from = "elsewhere@example.com"
+to = ["secondary@example.com"]
+subject = "Hello secondary"
+body_text = "Secondary account inbox email."

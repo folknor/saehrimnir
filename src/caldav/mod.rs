@@ -1025,8 +1025,16 @@ async fn handle_put(
         // match `synthesize_event_dto`'s behaviour in ratatoskr.
         None => start + chrono::Duration::hours(1),
     };
+    // Derive the event's account from its calendar's account.
+    let calendar_account_id = fixture
+        .calendars
+        .iter()
+        .find(|c| c.id == calendar_id)
+        .map(|c| c.account_id.clone())
+        .unwrap_or_else(|| fixture.primary_account().id.clone());
     let new_event = crate::fixture::Event {
         id: id.clone(),
+        account_id: calendar_account_id,
         calendar_id: calendar_id.clone(),
         subject: parsed.summary.unwrap_or_default(),
         body_preview: None,

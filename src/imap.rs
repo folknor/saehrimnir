@@ -2322,6 +2322,7 @@ mod tests {
         let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let mk_email = |id: &str, mailbox: &str, seen: bool| Email {
             id: id.into(),
+            account_id: "a".into(),
             thread_id: format!("t-{id}"),
             mailbox_ids: vec![mailbox.into()],
             keywords: if seen { vec!["$seen".into()] } else { vec![] },
@@ -2354,6 +2355,7 @@ mod tests {
             mailboxes: vec![
                 Mailbox {
                     id: "mb-inbox".into(),
+                    account_id: "a".into(),
                     name: "Inbox".into(),
                     role: Some(Role::Inbox),
                     parent_id: None,
@@ -2362,6 +2364,7 @@ mod tests {
                 },
                 Mailbox {
                     id: "mb-archive".into(),
+                    account_id: "a".into(),
                     name: "Archive".into(),
                     role: Some(Role::Archive),
                     parent_id: None,
@@ -2370,6 +2373,7 @@ mod tests {
                 },
                 Mailbox {
                     id: "mb-projects".into(),
+                    account_id: "a".into(),
                     name: "Projects".into(),
                     role: None,
                     parent_id: None,
@@ -2378,6 +2382,7 @@ mod tests {
                 },
                 Mailbox {
                     id: "mb-rust".into(),
+                    account_id: "a".into(),
                     name: "Rust".into(),
                     role: None,
                     parent_id: Some("mb-projects".into()),
@@ -3120,6 +3125,7 @@ mod tests {
         let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let e = Email {
             id: "e1".into(),
+            account_id: "a".into(),
             thread_id: "t1".into(),
             mailbox_ids: vec!["mb".into()],
             keywords: vec![],

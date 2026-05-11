@@ -613,8 +613,15 @@ fn build_event_from_create(
         .map(|arr| arr.iter().filter_map(parse_graph_attendee).collect())
         .unwrap_or_default();
     let id = fix.mint_event_id();
+    let account_id = fix
+        .calendars
+        .iter()
+        .find(|c| c.id == calendar_id)
+        .map(|c| c.account_id.clone())
+        .unwrap_or_else(|| fix.primary_account().id.clone());
     Ok(Event {
         id,
+        account_id,
         calendar_id: calendar_id.to_string(),
         subject,
         body_preview: None,

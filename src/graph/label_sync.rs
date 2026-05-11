@@ -132,6 +132,7 @@ async fn create_category(State(state): State<AppState>, body: AxumBody) -> Respo
         };
         let cat = Category {
             id: id.clone(),
+            account_id: fix.primary_account().id.clone(),
             display_name,
             color,
         };

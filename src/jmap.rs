@@ -182,7 +182,7 @@ fn mailbox_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
             "description": "missing accountId",
         })
     })?;
-    if account_id != fixture.primary_account().id {
+    if fixture.account(account_id).is_none() {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),
@@ -192,8 +192,7 @@ fn mailbox_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let (list, not_found) = match args.get("ids") {
         None | Some(Value::Null) => {
             let all = fixture
-                .mailboxes
-                .iter()
+                .mailboxes_for(account_id)
                 .map(|m| serialize_mailbox(fixture, m))
                 .collect::<Vec<_>>();
             (Value::Array(all), Value::Array(vec![]))
@@ -208,7 +207,7 @@ fn mailbox_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
                         "description": "ids must be an array of strings",
                     }));
                 };
-                match fixture.mailboxes.iter().find(|m| m.id == id) {
+                match fixture.mailboxes_for(account_id).find(|m| m.id == id) {
                     Some(m) => list.push(serialize_mailbox(fixture, m)),
                     None => not_found.push(Value::String(id.to_string())),
                 }
@@ -226,7 +225,7 @@ fn mailbox_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let mut out = Map::new();
     out.insert(
         "accountId".to_string(),
-        Value::String(fixture.primary_account().id.clone()),
+        Value::String(account_id.to_string()),
     );
     out.insert("state".to_string(), Value::String(fixture.state.clone()));
     out.insert("list".to_string(), list);
@@ -417,7 +416,7 @@ fn require_account<'a>(fixture: &'a Fixture, args: &'a Value) -> Result<&'a str,
                 "description": "missing accountId",
             })
         })?;
-    if account_id != fixture.primary_account().id {
+    if fixture.account(account_id).is_none() {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),
@@ -487,7 +486,7 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
             "description": "missing accountId",
         })
     })?;
-    if account_id != fixture.primary_account().id {
+    if fixture.account(account_id).is_none() {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),
@@ -543,8 +542,7 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     // id-lexicographic tiebreak, matching the determinism contract in
     // notes/fixture-format.md.
     let mut matches: Vec<&crate::fixture::Email> = fixture
-        .emails
-        .iter()
+        .emails_for(account_id)
         .filter(|e| filter.matches(e))
         .collect();
     matches.sort_by(|a, b| {
@@ -566,7 +564,7 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let mut out = Map::new();
     out.insert(
         "accountId".to_string(),
-        Value::String(fixture.primary_account().id.clone()),
+        Value::String(account_id.to_string()),
     );
     out.insert(
         "queryState".to_string(),
@@ -698,7 +696,7 @@ fn email_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
             "description": "missing accountId",
         })
     })?;
-    if account_id != fixture.primary_account().id {
+    if fixture.account(account_id).is_none() {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),
@@ -732,7 +730,7 @@ fn email_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
                         "description": "ids must be an array of strings",
                     }));
                 };
-                match fixture.emails.iter().find(|e| e.id == id) {
+                match fixture.emails_for(account_id).find(|e| e.id == id) {
                     Some(e) => list.push(serialize_email(e, fetch_text, fetch_html, fetch_all)),
                     None => not_found.push(Value::String(id.to_string())),
                 }
@@ -744,8 +742,7 @@ fn email_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
             // our session capabilities). v0 fixtures stay well under
             // that, so no truncation logic.
             let all = fixture
-                .emails
-                .iter()
+                .emails_for(account_id)
                 .map(|e| serialize_email(e, fetch_text, fetch_html, fetch_all))
                 .collect::<Vec<_>>();
             (Value::Array(all), Value::Array(vec![]))
@@ -761,7 +758,7 @@ fn email_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let mut out = Map::new();
     out.insert(
         "accountId".to_string(),
-        Value::String(fixture.primary_account().id.clone()),
+        Value::String(account_id.to_string()),
     );
     out.insert("state".to_string(), Value::String(fixture.state.clone()));
     out.insert("list".to_string(), list);
@@ -1198,8 +1195,19 @@ fn build_email_from_create(
                 .expect("hardcoded RFC3339")
                 .with_timezone(&chrono::Utc)
         });
+    // Email/set create is scoped to the primary account in v0;
+    // mailboxIds in the body must belong to it. Stage 3 of the
+    // multi-account refactor lets JMAP route mutations into a
+    // non-primary account through the request's accountId.
+    let account_id = fix
+        .mailboxes
+        .iter()
+        .find(|m| mailbox_ids.iter().any(|id| id == &m.id))
+        .map(|m| m.account_id.clone())
+        .unwrap_or_else(|| fix.primary_account().id.clone());
     let email = Email {
         id: server_id.clone(),
+        account_id,
         thread_id: server_id.clone(),
         mailbox_ids,
         keywords,
@@ -1457,8 +1465,19 @@ fn build_mailbox_from_create(
         .transpose()
         .map_err(|e: String| set_error("invalidProperties", &e))?;
     let id = format!("mock-mailbox-{}", fix.mailboxes.len() + 1);
+    // Mailbox/set create is scoped to the primary account in v0.
+    let account_id = match &parent_id {
+        Some(pid) => fix
+            .mailboxes
+            .iter()
+            .find(|m| &m.id == pid)
+            .map(|m| m.account_id.clone())
+            .unwrap_or_else(|| fix.primary_account().id.clone()),
+        None => fix.primary_account().id.clone(),
+    };
     Ok(Mailbox {
         id,
+        account_id,
         name,
         role,
         parent_id,
@@ -1632,6 +1651,7 @@ mod tests {
             mailboxes: vec![
                 Mailbox {
                     id: "mb-inbox".into(),
+                    account_id: "acct".into(),
                     name: "Inbox".into(),
                     role: Some(Role::Inbox),
                     parent_id: None,
@@ -1640,6 +1660,7 @@ mod tests {
                 },
                 Mailbox {
                     id: "mb-archive".into(),
+                    account_id: "acct".into(),
                     name: "Archive".into(),
                     role: Some(Role::Archive),
                     parent_id: None,
@@ -1650,6 +1671,7 @@ mod tests {
             emails: vec![
                 Email {
                     id: "e1".into(),
+                    account_id: "acct".into(),
                     thread_id: "t1".into(),
                     mailbox_ids: vec!["mb-inbox".into()],
                     keywords: vec!["$seen".into()],
@@ -1673,6 +1695,7 @@ mod tests {
                 },
                 Email {
                     id: "e2".into(),
+                    account_id: "acct".into(),
                     thread_id: "t2".into(),
                     mailbox_ids: vec!["mb-inbox".into()],
                     keywords: vec![],
@@ -1817,6 +1840,7 @@ mod tests {
     fn email(id: &str, mailbox: &str, ts: chrono::DateTime<chrono::Utc>) -> Email {
         Email {
             id: id.into(),
+            account_id: "acct".into(),
             thread_id: format!("t-{id}"),
             mailbox_ids: vec![mailbox.into()],
             keywords: vec![],
@@ -1853,6 +1877,7 @@ mod tests {
             mailboxes: vec![
                 Mailbox {
                     id: "mb-inbox".into(),
+                    account_id: "acct".into(),
                     name: "Inbox".into(),
                     role: Some(Role::Inbox),
                     parent_id: None,
@@ -1861,6 +1886,7 @@ mod tests {
                 },
                 Mailbox {
                     id: "mb-archive".into(),
+                    account_id: "acct".into(),
                     name: "Archive".into(),
                     role: Some(Role::Archive),
                     parent_id: None,
@@ -2128,6 +2154,7 @@ mod tests {
             }],
             mailboxes: vec![Mailbox {
                 id: "mb-inbox".into(),
+                account_id: "acct".into(),
                 name: "Inbox".into(),
                 role: Some(Role::Inbox),
                 parent_id: None,
@@ -2136,6 +2163,7 @@ mod tests {
             }],
             emails: vec![Email {
                 id: "e1".into(),
+                account_id: "acct".into(),
                 thread_id: "t1".into(),
                 mailbox_ids: vec!["mb-inbox".into()],
                 keywords: vec!["$seen".into(), "$flagged".into()],

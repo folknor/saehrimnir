@@ -267,6 +267,74 @@ impl Fixture {
             .expect("normalize guarantees one primary account")
     }
 
+    /// Borrow the [`Account`] with `id`. Returns None for unknown
+    /// ids so callers can map that to the protocol-appropriate
+    /// "account not found" error.
+    pub fn account(&self, id: &str) -> Option<&Account> {
+        self.accounts.iter().find(|a| a.id == id)
+    }
+
+    /// Mailboxes scoped to one account. The full
+    /// `fixture.mailboxes` field stays public for the few sites
+    /// that need a cross-account view (loader, snapshot, lookup
+    /// by id); per-protocol handlers should go through this
+    /// helper so a future per-account route addition reads as a
+    /// one-line argument change rather than a rewrite.
+    pub fn mailboxes_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a Mailbox> + 'a {
+        self.mailboxes.iter().filter(move |m| m.account_id == account_id)
+    }
+
+    /// Emails scoped to one account.
+    pub fn emails_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a Email> + 'a {
+        self.emails.iter().filter(move |e| e.account_id == account_id)
+    }
+
+    /// Calendars scoped to one account.
+    pub fn calendars_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a Calendar> + 'a {
+        self.calendars.iter().filter(move |c| c.account_id == account_id)
+    }
+
+    /// Events scoped to one account.
+    pub fn events_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a Event> + 'a {
+        self.events.iter().filter(move |e| e.account_id == account_id)
+    }
+
+    /// Contact folders scoped to one account.
+    pub fn contact_folders_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a ContactFolder> + 'a {
+        self.contact_folders.iter().filter(move |c| c.account_id == account_id)
+    }
+
+    /// Contacts scoped to one account.
+    pub fn contacts_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a Contact> + 'a {
+        self.contacts.iter().filter(move |c| c.account_id == account_id)
+    }
+
+    /// Categories scoped to one account.
+    pub fn categories_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a Category> + 'a {
+        self.categories.iter().filter(move |c| c.account_id == account_id)
+    }
+
     /// Read-only view of the per-mailbox UID history. Returns the
     /// empty slice for an unknown mailbox (no email has ever lived
     /// there).
@@ -922,11 +990,18 @@ pub struct Calendar {
     /// `is_default = true`; the loader rejects fixtures with
     /// multiple defaults.
     pub is_default: bool,
+    /// Account this calendar belongs to. See `Mailbox::account_id`.
+    pub account_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub id: String,
+    /// Account this event belongs to. Derived from the parent
+    /// calendar's account at load time; an event whose declared
+    /// `account_id` (if any) disagrees with its calendar's
+    /// account is rejected.
+    pub account_id: String,
     pub calendar_id: String,
     pub subject: String,
     pub body_preview: Option<String>,
@@ -956,6 +1031,8 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContactFolder {
     pub id: String,
+    /// Account this folder belongs to. See `Mailbox::account_id`.
+    pub account_id: String,
     pub display_name: String,
     /// Optional parent for nested folders. Graph supports nesting via
     /// `/v1.0/me/contactFolders/{id}/childFolders`; v0 fixtures stay
@@ -972,6 +1049,9 @@ pub struct ContactFolder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contact {
     pub id: String,
+    /// Account this contact belongs to. Derived from the parent
+    /// folder's account at load time.
+    pub account_id: String,
     pub folder_id: String,
     pub display_name: Option<String>,
     pub emails: Vec<ContactEmail>,
@@ -991,6 +1071,8 @@ pub struct ContactEmail {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Category {
     pub id: String,
+    /// Account this category belongs to. See `Mailbox::account_id`.
+    pub account_id: String,
     pub display_name: String,
     pub color: Option<String>,
 }
@@ -1009,6 +1091,11 @@ pub struct Account {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mailbox {
     pub id: String,
+    /// Account this mailbox belongs to. Defaults to the primary
+    /// account when the fixture omits the field. Stage 2 of the
+    /// multi-account refactor introduces this field; per-protocol
+    /// scoping (Stage 3) lets handlers serve non-primary accounts.
+    pub account_id: String,
     pub name: String,
     pub role: Option<Role>,
     pub parent_id: Option<String>,
@@ -1057,6 +1144,8 @@ impl Role {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Email {
     pub id: String,
+    /// Account this email belongs to. See `Mailbox::account_id`.
+    pub account_id: String,
     pub thread_id: String,
     pub mailbox_ids: Vec<String>,
     pub keywords: Vec<String>,
@@ -1309,6 +1398,8 @@ pub(crate) struct RawContactFolder {
     pub(crate) parent_folder_id: Option<String>,
     #[serde(default)]
     pub(crate) is_default: bool,
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1319,6 +1410,10 @@ pub(crate) struct RawContact {
     pub(crate) display_name: Option<String>,
     #[serde(default)]
     pub(crate) emails: Vec<RawContactEmail>,
+    /// Optional override; defaults to the parent folder's
+    /// `account_id` and must match it when both are present.
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1327,6 +1422,8 @@ pub(crate) struct RawCategory {
     pub(crate) display_name: String,
     #[serde(default)]
     pub(crate) color: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1359,6 +1456,8 @@ pub(crate) struct RawCalendar {
     pub(crate) color: Option<String>,
     #[serde(default)]
     pub(crate) is_default: bool,
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1387,6 +1486,12 @@ pub(crate) struct RawEvent {
     /// timestamp; parsed via `parse_ts` at normalize time.
     #[serde(default)]
     pub(crate) recurrence_exdates: Vec<String>,
+    /// Optional override. If absent the event inherits its parent
+    /// calendar's `account_id`; if present it must match the
+    /// parent's account or the loader rejects the cross-account
+    /// pairing.
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1422,6 +1527,10 @@ pub(crate) struct RawMailbox {
     pub(crate) sort_order: Option<i64>,
     #[serde(default)]
     pub(crate) is_subscribed: Option<bool>,
+    /// Account this mailbox belongs to. Defaults to the primary
+    /// account at normalize time when absent.
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1466,6 +1575,12 @@ pub(crate) struct RawEmail {
     pub(crate) body_raw_bytes: Option<String>,
     #[serde(default, rename = "attachment")]
     pub(crate) attachments: Vec<RawAttachment>,
+    /// Account this email belongs to. Defaults to primary when
+    /// absent. Must agree with the account of every mailbox
+    /// listed in `mailbox_ids`; the loader rejects cross-account
+    /// references.
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1590,6 +1705,28 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    let primary_id = accounts
+        .iter()
+        .find(|a| a.primary)
+        .map(|a| a.id.clone())
+        .expect("primary guaranteed by primary_flags check above");
+    let account_ids: HashMap<String, ()> =
+        accounts.iter().map(|a| (a.id.clone(), ())).collect();
+    let resolve_account =
+        |raw: Option<&String>, resource: &str, id: &str| -> Result<String, String> {
+            match raw {
+                Some(a) => {
+                    if !account_ids.contains_key(a) {
+                        return Err(format!(
+                            "{resource} {id:?}: account_id {a:?} does not match any declared account"
+                        ));
+                    }
+                    Ok(a.clone())
+                }
+                None => Ok(primary_id.clone()),
+            }
+        };
+
     let mut mb_ids: HashMap<String, ()> = HashMap::new();
     for mb in &raw.mailboxes {
         if mb_ids.insert(mb.id.clone(), ()).is_some() {
@@ -1597,6 +1734,10 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         }
     }
 
+    // mailbox id -> account_id, used downstream to validate that
+    // every email's listed mailboxes share its account and to seed
+    // each Email's `account_id` from its primary mailbox.
+    let mut mb_accounts: HashMap<String, String> = HashMap::new();
     let mut mailboxes = Vec::with_capacity(raw.mailboxes.len());
     for mb in raw.mailboxes {
         let role = mb.role.as_deref().map(Role::parse).transpose()?;
@@ -1608,9 +1749,12 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
                 mb.id
             ));
         }
+        let acct = resolve_account(mb.account_id.as_ref(), "mailbox", &mb.id)?;
+        mb_accounts.insert(mb.id.clone(), acct.clone());
         mailboxes.push(Mailbox {
             is_subscribed: mb.is_subscribed.unwrap_or(true),
             id: mb.id,
+            account_id: acct,
             name: mb.name,
             role,
             parent_id: mb.parent_id,
@@ -1618,6 +1762,20 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
     detect_cycles(&mailboxes)?;
+    // A child mailbox must share an account with its parent;
+    // cross-account nesting has no real-world analogue and would
+    // confuse the UID history walk.
+    for mb in &mailboxes {
+        if let Some(parent) = &mb.parent_id
+            && let Some(parent_acct) = mb_accounts.get(parent)
+            && parent_acct != &mb.account_id
+        {
+            return Err(format!(
+                "mailbox {:?}: account_id {:?} disagrees with parent {parent:?} on account {parent_acct:?}",
+                mb.id, mb.account_id
+            ));
+        }
+    }
 
     let mut email_ids: HashMap<String, ()> = HashMap::new();
     for em in &raw.emails {
@@ -1628,7 +1786,13 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
 
     let mut emails = Vec::with_capacity(raw.emails.len());
     for em in raw.emails {
-        let email = normalize_email(em, &mb_ids, fixture_dir)?;
+        let email = normalize_email(
+            em,
+            &mb_ids,
+            Some(&mb_accounts),
+            Some(&account_ids),
+            fixture_dir,
+        )?;
         emails.push(email);
     }
 
@@ -1646,6 +1810,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     // Calendars and events. Validate that every event references a
     // declared calendar - same shape as the email -> mailbox check.
     let mut calendar_ids: HashMap<String, ()> = HashMap::new();
+    let mut calendar_accounts: HashMap<String, String> = HashMap::new();
     let mut calendars = Vec::with_capacity(raw.calendars.len());
     let mut default_seen: Option<String> = None;
     for cal in raw.calendars {
@@ -1661,8 +1826,11 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             }
             default_seen = Some(cal.id.clone());
         }
+        let acct = resolve_account(cal.account_id.as_ref(), "calendar", &cal.id)?;
+        calendar_accounts.insert(cal.id.clone(), acct.clone());
         calendars.push(Calendar {
             id: cal.id,
+            account_id: acct,
             name: cal.name,
             color: cal.color,
             is_default: cal.is_default,
@@ -1680,6 +1848,24 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
                 ev.id, ev.calendar_id
             ));
         }
+        let parent_acct = calendar_accounts
+            .get(&ev.calendar_id)
+            .expect("calendar existence checked above")
+            .clone();
+        if let Some(declared) = &ev.account_id {
+            if !account_ids.contains_key(declared) {
+                return Err(format!(
+                    "event {:?}: account_id {declared:?} does not match any declared account",
+                    ev.id
+                ));
+            }
+            if declared != &parent_acct {
+                return Err(format!(
+                    "event {:?}: declared account_id {declared:?} disagrees with calendar's account {parent_acct:?}",
+                    ev.id
+                ));
+            }
+        }
         let start =
             parse_ts(&ev.start).map_err(|e| format!("event {:?} start: {e}", ev.id))?;
         let end = parse_ts(&ev.end).map_err(|e| format!("event {:?} end: {e}", ev.id))?;
@@ -1692,6 +1878,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         }
         events.push(Event {
             id: ev.id,
+            account_id: parent_acct,
             calendar_id: ev.calendar_id,
             subject: ev.subject,
             body_preview: ev.body_preview,
@@ -1711,6 +1898,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     // every contact references a declared folder, ids are unique
     // within their kind.
     let mut contact_folder_ids: HashMap<String, ()> = HashMap::new();
+    let mut contact_folder_accounts: HashMap<String, String> = HashMap::new();
     let mut contact_folders = Vec::with_capacity(raw.contact_folders.len());
     let mut default_contact_folder_seen: Option<String> = None;
     for cf in raw.contact_folders {
@@ -1736,8 +1924,20 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
                 cf.id
             ));
         }
+        let acct = resolve_account(cf.account_id.as_ref(), "contact_folder", &cf.id)?;
+        if let Some(parent) = &cf.parent_folder_id
+            && let Some(parent_acct) = contact_folder_accounts.get(parent)
+            && parent_acct != &acct
+        {
+            return Err(format!(
+                "contact_folder {:?}: account {acct:?} disagrees with parent {parent:?} on account {parent_acct:?}",
+                cf.id
+            ));
+        }
+        contact_folder_accounts.insert(cf.id.clone(), acct.clone());
         contact_folders.push(ContactFolder {
             id: cf.id,
+            account_id: acct,
             display_name: cf.display_name,
             parent_folder_id: cf.parent_folder_id,
             is_default: cf.is_default,
@@ -1755,8 +1955,27 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
                 c.id, c.folder_id
             ));
         }
+        let parent_acct = contact_folder_accounts
+            .get(&c.folder_id)
+            .expect("folder existence checked above")
+            .clone();
+        if let Some(declared) = &c.account_id {
+            if !account_ids.contains_key(declared) {
+                return Err(format!(
+                    "contact {:?}: account_id {declared:?} does not match any declared account",
+                    c.id
+                ));
+            }
+            if declared != &parent_acct {
+                return Err(format!(
+                    "contact {:?}: declared account_id {declared:?} disagrees with folder's account {parent_acct:?}",
+                    c.id
+                ));
+            }
+        }
         contacts.push(Contact {
             id: c.id,
+            account_id: parent_acct,
             folder_id: c.folder_id,
             display_name: c.display_name,
             emails: c.emails.into_iter().map(ContactEmail::from).collect(),
@@ -1770,8 +1989,10 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         if category_ids.insert(cat.id.clone(), ()).is_some() {
             return Err(format!("duplicate category id {:?}", cat.id));
         }
+        let acct = resolve_account(cat.account_id.as_ref(), "category", &cat.id)?;
         categories.push(Category {
             id: cat.id,
+            account_id: acct,
             display_name: cat.display_name,
             color: cat.color,
         });
@@ -1784,7 +2005,13 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     // `src/lua.rs::read_email_create`).
     let mut change_script: Vec<ChangeStep> = Vec::with_capacity(raw.change_script.len());
     for raw_step in raw.change_script {
-        change_script.push(normalize_change_step(raw_step, &mb_ids, fixture_dir)?);
+        change_script.push(normalize_change_step(
+            raw_step,
+            &mb_ids,
+            &mb_accounts,
+            &account_ids,
+            fixture_dir,
+        )?);
     }
 
     // Load-time IMAP UID assignment: each declared email gets its
@@ -1898,6 +2125,12 @@ pub(crate) fn mailbox_create_op(raw: RawMailbox) -> Result<ChangeOp, String> {
     let role = raw.role.as_deref().map(Role::parse).transpose()?;
     Ok(ChangeOp::MailboxCreate(Box::new(Mailbox {
         id: raw.id,
+        // Empty string here signals "default to primary at apply
+        // time"; the applier in `test_admin.rs` substitutes the
+        // live fixture's primary account id. A fixture-authored
+        // `account_id` flows through verbatim; the applier
+        // validates the ref.
+        account_id: raw.account_id.unwrap_or_default(),
         name: raw.name,
         role,
         parent_id: raw.parent_id,
@@ -1960,6 +2193,8 @@ pub(crate) fn event_create_op(raw: RawEvent) -> Result<ChangeOp, String> {
     }
     Ok(ChangeOp::EventCreate(Box::new(Event {
         id: raw.id,
+        // See `mailbox_create_op` for the empty-string semantics.
+        account_id: raw.account_id.unwrap_or_default(),
         calendar_id: raw.calendar_id,
         subject: raw.subject,
         body_preview: raw.body_preview,
@@ -2015,6 +2250,7 @@ pub(crate) fn event_update_op(
 pub(crate) fn contact_folder_create_op(raw: RawContactFolder) -> ChangeOp {
     ChangeOp::ContactFolderCreate(Box::new(ContactFolder {
         id: raw.id,
+        account_id: raw.account_id.unwrap_or_default(),
         display_name: raw.display_name,
         parent_folder_id: raw.parent_folder_id,
         is_default: raw.is_default,
@@ -2051,6 +2287,7 @@ pub(crate) fn contact_folder_update_op(
 pub(crate) fn contact_create_op(raw: RawContact) -> ChangeOp {
     ChangeOp::ContactCreate(Box::new(Contact {
         id: raw.id,
+        account_id: raw.account_id.unwrap_or_default(),
         folder_id: raw.folder_id,
         display_name: raw.display_name,
         emails: raw.emails.into_iter().map(ContactEmail::from).collect(),
@@ -2279,6 +2516,8 @@ pub(crate) fn apply_change_event_patch(
 fn normalize_change_step(
     raw: RawChangeStep,
     mb_ids: &HashMap<String, ()>,
+    mb_accounts: &HashMap<String, String>,
+    account_ids: &HashMap<String, ()>,
     fixture_dir: &Path,
 ) -> Result<ChangeStep, String> {
     let id = raw.id;
@@ -2292,8 +2531,14 @@ fn normalize_change_step(
             ));
         }
         let email_id = em.id.clone();
-        let email = normalize_email(em, mb_ids, fixture_dir)
-            .map_err(|e| format!("change step {id:?}: email_create entry {email_id:?}: {e}"))?;
+        let email = normalize_email(
+            em,
+            mb_ids,
+            Some(mb_accounts),
+            Some(account_ids),
+            fixture_dir,
+        )
+        .map_err(|e| format!("change step {id:?}: email_create entry {email_id:?}: {e}"))?;
         ops.push(ChangeOp::EmailCreate(Box::new(email)));
     }
     for u in raw.email_update {
@@ -2411,9 +2656,16 @@ pub fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {
 /// `mb_ids` is the surrounding mailbox-id set keyed for `O(1)` lookup
 /// the same way the load-time validator builds it; the change-script
 /// path passes a freshly-built set from the live fixture's mailboxes.
+// `mb_accounts: None` skips account derivation entirely (the
+// resulting email gets `account_id = String::new()`, an apply-time
+// placeholder). The change-script Lua path uses None because it
+// doesn't yet have a resolved account context at load time; the
+// applier in `test_admin.rs` fills the placeholder in.
 pub(crate) fn normalize_email(
     em: RawEmail,
     mb_ids: &HashMap<String, ()>,
+    mb_accounts: Option<&HashMap<String, String>>,
+    account_ids: Option<&HashMap<String, ()>>,
     fixture_dir: &Path,
 ) -> Result<Email, String> {
     if em.mailbox_ids.is_empty() {
@@ -2423,6 +2675,53 @@ pub(crate) fn normalize_email(
         if !mb_ids.contains_key(mid) {
             return Err(format!(
                 "email {:?}: mailbox_ids contains unknown {mid:?}",
+                em.id
+            ));
+        }
+    }
+
+    // Derive the email's account from its mailboxes (which carry
+    // the authoritative account_id). All listed mailboxes must
+    // share one account: an email straddling accounts would have
+    // no meaningful Graph `/users/{id}/messages/{id}` parent and
+    // no JMAP single accountId to surface under. If the fixture
+    // sets `email.account_id` explicitly, validate it matches.
+    let derived_account: String = if let Some(mb_accounts) = mb_accounts {
+        let mut iter = em.mailbox_ids.iter();
+        let first_mb = iter
+            .next()
+            .expect("non-empty checked above");
+        let first_acct = mb_accounts
+            .get(first_mb)
+            .expect("mailbox existence checked above")
+            .clone();
+        for mid in iter {
+            let other = mb_accounts.get(mid).expect("checked");
+            if other != &first_acct {
+                return Err(format!(
+                    "email {:?}: mailboxes {first_mb:?} and {mid:?} live in different accounts ({first_acct:?} vs {other:?})",
+                    em.id
+                ));
+            }
+        }
+        first_acct
+    } else {
+        // Apply-time placeholder; the change-script applier in
+        // `test_admin.rs` resolves it against the live fixture.
+        String::new()
+    };
+    if let Some(declared) = &em.account_id
+        && let Some(account_ids) = account_ids
+    {
+        if !account_ids.contains_key(declared) {
+            return Err(format!(
+                "email {:?}: account_id {declared:?} does not match any declared account",
+                em.id
+            ));
+        }
+        if !derived_account.is_empty() && declared != &derived_account {
+            return Err(format!(
+                "email {:?}: declared account_id {declared:?} disagrees with mailbox-derived account {derived_account:?}",
                 em.id
             ));
         }
@@ -2508,6 +2807,7 @@ pub(crate) fn normalize_email(
     Ok(Email {
         thread_id: em.thread_id.unwrap_or_else(|| em.id.clone()),
         id: em.id,
+        account_id: derived_account,
         mailbox_ids: em.mailbox_ids,
         keywords: em.keywords,
         size,

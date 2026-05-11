@@ -512,8 +512,15 @@ fn build_event_from_create(
         .unwrap_or_default();
 
     let id = fix.mint_event_id();
+    let account_id = fix
+        .calendars
+        .iter()
+        .find(|c| c.id == calendar)
+        .map(|c| c.account_id.clone())
+        .unwrap_or_else(|| fix.primary_account().id.clone());
     Ok(Event {
         id,
+        account_id,
         calendar_id: calendar.to_string(),
         subject: summary,
         body_preview: None,

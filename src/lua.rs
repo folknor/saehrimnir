@@ -398,12 +398,13 @@ fn builder_mailbox(state: &mut State) -> dellingr::Result<u8> {
         parent_id: read_string_opt(state, 1, "parent_id")?,
         sort_order: read_int_opt(state, 1, "sort_order")?,
         is_subscribed: read_bool_opt(state, 1, "is_subscribed")?,
+        account_id: read_string_opt(state, 1, "account_id")?,
     };
     builder_mut(state)?.mailboxes.push(mb);
     Ok(0)
 }
 
-/// `contact_folder { id, display_name, parent_folder_id?, is_default? }`
+/// `contact_folder { id, display_name, parent_folder_id?, is_default?, account_id? }`
 fn builder_contact_folder(state: &mut State) -> dellingr::Result<u8> {
     require_one_table_arg(state, "contact_folder")?;
     let cf = crate::fixture::RawContactFolder {
@@ -411,6 +412,7 @@ fn builder_contact_folder(state: &mut State) -> dellingr::Result<u8> {
         display_name: read_string(state, 1, "display_name")?,
         parent_folder_id: read_string_opt(state, 1, "parent_folder_id")?,
         is_default: read_bool_opt(state, 1, "is_default")?.unwrap_or(false),
+        account_id: read_string_opt(state, 1, "account_id")?,
     };
     builder_mut(state)?.contact_folders.push(cf);
     Ok(0)
@@ -425,23 +427,26 @@ fn builder_contact(state: &mut State) -> dellingr::Result<u8> {
     let folder_id = read_string(state, 1, "folder_id")?;
     let display_name = read_string_opt(state, 1, "display_name")?;
     let emails = read_contact_email_array_opt(state, 1, "emails")?;
+    let account_id = read_string_opt(state, 1, "account_id")?;
     builder_mut(state)?.contacts.push(crate::fixture::RawContact {
         id,
         folder_id,
         display_name,
         emails,
+        account_id,
     });
     Ok(0)
 }
 
-/// `category { id, display_name, color? }`. The Graph master
-/// category list is flat per account, no folder scope.
+/// `category { id, display_name, color?, account_id? }`. The
+/// Graph master category list is flat per account, no folder scope.
 fn builder_category(state: &mut State) -> dellingr::Result<u8> {
     require_one_table_arg(state, "category")?;
     let cat = crate::fixture::RawCategory {
         id: read_string(state, 1, "id")?,
         display_name: read_string(state, 1, "display_name")?,
         color: read_string_opt(state, 1, "color")?,
+        account_id: read_string_opt(state, 1, "account_id")?,
     };
     builder_mut(state)?.categories.push(cat);
     Ok(0)
@@ -883,6 +888,7 @@ fn builder_bulk_mailboxes(state: &mut State) -> dellingr::Result<u8> {
             parent_id,
             sort_order: Some(i),
             is_subscribed: None,
+            account_id: None,
         });
     }
     Ok(0)
@@ -912,6 +918,7 @@ fn builder_email(state: &mut State) -> dellingr::Result<u8> {
         body_text: read_string_opt(state, 1, "body_text")?,
         body_raw_bytes: read_string_opt(state, 1, "body_raw_bytes")?,
         attachments: read_attachment_array_opt(state, 1, "attachments")?,
+        account_id: read_string_opt(state, 1, "account_id")?,
     };
     builder_mut(state)?.emails.push(em);
     Ok(0)
@@ -1095,6 +1102,7 @@ fn read_contact_folder_create(
             display_name: read_string(state, entry_idx, "display_name")?,
             parent_folder_id: read_string_opt(state, entry_idx, "parent_folder_id")?,
             is_default: read_bool_opt(state, entry_idx, "is_default")?.unwrap_or(false),
+            account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
         state.pop(1);
         ops.push(crate::fixture::contact_folder_create_op(raw));
@@ -1180,6 +1188,7 @@ fn read_contact_create(
             folder_id: read_string(state, entry_idx, "folder_id")?,
             display_name: read_string_opt(state, entry_idx, "display_name")?,
             emails: read_contact_email_array_opt(state, entry_idx, "emails")?,
+            account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
         state.pop(1);
         ops.push(crate::fixture::contact_create_op(raw));
@@ -1291,13 +1300,55 @@ fn read_email_create(
     // in one op and an email pointing at it in the next op of the
     // same step works fine even though the load-time check would
     // not have known about the mailbox.
-    let mb_ids: HashMap<String, ()> = builder_mut(state)?
+    // Build the same mb_ids + mb_accounts + account_ids context the
+    // TOML loader passes to `normalize_email`, so the Lua- and
+    // TOML-built `Email` values are byte-identical (asserted in
+    // `tests/lua_fixture.rs`). Mailboxes declared via
+    // `mailbox(...)` carry an optional `account_id`; default to
+    // the builder's primary account (the first declared with
+    // `primary = true`, or the lone account if exactly one).
+    let builder = builder_mut(state)?;
+    let primary_id: String = builder
+        .accounts
+        .iter()
+        .find(|a| a.primary)
+        .or_else(|| {
+            if builder.accounts.len() == 1 {
+                builder.accounts.first()
+            } else {
+                None
+            }
+        })
+        .map(|a| a.id.clone())
+        .unwrap_or_default();
+    let mb_ids: HashMap<String, ()> = builder
         .mailboxes
         .iter()
         .map(|m| (m.id.clone(), ()))
         .collect();
+    let mb_accounts: HashMap<String, String> = builder
+        .mailboxes
+        .iter()
+        .map(|m| {
+            (
+                m.id.clone(),
+                m.account_id.clone().unwrap_or_else(|| primary_id.clone()),
+            )
+        })
+        .collect();
+    let account_ids: HashMap<String, ()> = builder
+        .accounts
+        .iter()
+        .map(|a| (a.id.clone(), ()))
+        .collect();
     for (i, raw) in entries.into_iter().enumerate() {
-        let email = match crate::fixture::normalize_email(raw, &mb_ids, std::path::Path::new(".")) {
+        let email = match crate::fixture::normalize_email(
+            raw,
+            &mb_ids,
+            Some(&mb_accounts),
+            Some(&account_ids),
+            std::path::Path::new("."),
+        ) {
             Ok(e) => e,
             Err(e) => return fail(state, format!("email_create entry {}: {e}", i + 1)),
         };
@@ -1459,6 +1510,7 @@ fn read_mailbox_create(
             parent_id: read_string_opt(state, entry_idx, "parent_id")?,
             sort_order: read_int_opt(state, entry_idx, "sort_order")?,
             is_subscribed: read_bool_opt(state, entry_idx, "is_subscribed")?,
+            account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
         state.pop(1);
         raws.push(mb);
@@ -1572,6 +1624,7 @@ fn read_event_create(
             is_all_day: read_bool_opt(state, entry_idx, "is_all_day")?.unwrap_or(false),
             recurrence_rule: read_string_opt(state, entry_idx, "recurrence_rule")?,
             recurrence_exdates: read_string_array_opt(state, entry_idx, "recurrence_exdates")?,
+            account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
         state.pop(1);
         let op = crate::fixture::event_create_op(raw).map_err(|e| {
@@ -1658,6 +1711,7 @@ fn read_raw_email_at(state: &mut State, t: isize) -> dellingr::Result<RawEmail> 
         body_text: read_string_opt(state, t, "body_text")?,
         body_raw_bytes: read_string_opt(state, t, "body_raw_bytes")?,
         attachments: read_attachment_array_opt(state, t, "attachments")?,
+        account_id: read_string_opt(state, t, "account_id")?,
     })
 }
 
