@@ -14,7 +14,18 @@ use serde::Deserialize;
 pub struct Fixture {
     pub name: String,
     pub state: String,
-    pub account: Account,
+    /// Declared accounts. v0 ships at least one and at most one is
+    /// flagged `primary` (the v0 mail account every protocol surface
+    /// scopes to today). Multi-account fixtures are accepted by the
+    /// loader but until Stage 2 of the multi-account refactor lands,
+    /// every resource (mailbox, email, calendar, contact, category)
+    /// is implicitly scoped to the primary account: declaring an
+    /// extra account today simply means the OAuth provider knows
+    /// about it and the JMAP session resource could enumerate it
+    /// later, but no listener serves resources for it yet. The
+    /// follow-up that lands Graph groups / shared mailbox sync grows
+    /// per-resource `account_id` and per-protocol scoping.
+    pub accounts: Vec<Account>,
     pub mailboxes: Vec<Mailbox>,
     pub emails: Vec<Email>,
     pub oauth: OAuthConfig,
@@ -242,6 +253,18 @@ impl Fixture {
     /// state value when no transition has touched a resource yet.
     pub fn change_log_seed(&self) -> &str {
         &self.change_log.seed
+    }
+
+    /// The single account v0 protocol surfaces serve. Multi-account
+    /// fixtures still expose exactly one primary; Stage 2 of the
+    /// refactor will let listeners scope to a non-primary on a
+    /// per-account basis. Normalize guarantees exactly one primary
+    /// exists, so the unwrap is structural.
+    pub fn primary_account(&self) -> &Account {
+        self.accounts
+            .iter()
+            .find(|a| a.primary)
+            .expect("normalize guarantees one primary account")
     }
 
     /// Read-only view of the per-mailbox UID history. Returns the
@@ -962,6 +985,11 @@ pub struct Category {
 pub struct Account {
     pub id: String,
     pub name: String,
+    /// The v0 account every protocol surface scopes to today.
+    /// Exactly one declared account is the primary. Single-account
+    /// fixtures (the v0 majority) get their lone account flagged
+    /// primary automatically by the loader.
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1114,7 +1142,14 @@ pub(crate) struct RawFixture {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) state: Option<String>,
-    pub(crate) account: RawAccount,
+    /// `[[account]]` repeated. At least one entry; exactly one
+    /// flagged `primary = true` (or, when none is flagged, the
+    /// first entry is taken as primary so single-account fixtures
+    /// don't have to bother). All entries must have
+    /// `is_personal = true` for the duration of Stage 1; relaxes
+    /// once Graph shared mailbox sync lands.
+    #[serde(default, rename = "account")]
+    pub(crate) accounts: Vec<RawAccount>,
     #[serde(default, rename = "mailbox")]
     pub(crate) mailboxes: Vec<RawMailbox>,
     #[serde(default, rename = "email")]
@@ -1346,6 +1381,12 @@ pub(crate) struct RawAccount {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) is_personal: bool,
+    /// Marks this entry as the v0 protocol-scoped account when the
+    /// fixture declares more than one. Optional; for single-account
+    /// fixtures the loader flags the lone entry primary
+    /// automatically. Exactly one declared account may be primary.
+    #[serde(default)]
+    pub(crate) primary: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1471,23 +1512,61 @@ pub(crate) fn normalize(raw: RawFixture) -> Result<Fixture, String> {
 }
 
 pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<Fixture, String> {
-    if !raw.account.is_personal {
-        return Err("account.is_personal must be true (v0 supports one personal account)".into());
+    if raw.accounts.is_empty() {
+        return Err("fixture must declare at least one `[[account]]`".into());
     }
-    // OAuth's userinfo endpoint serves `account.name` verbatim as
-    // both the `email` and `name` claims. Reject non-email-shaped
-    // names at load time so a fixture can't ship a misleading
-    // `email` claim - cheaper to fail loud here than to chase
-    // down a downstream client confused by `email: "Display
-    // Name"`. The check is intentionally minimal (one `@`, non-
-    // empty local, dotted domain, no whitespace); fixtures that
-    // need richer mailbox-name semantics can grow a separate
-    // `account.email` field later.
-    if !is_email_shaped(&raw.account.name) {
+    // Reject duplicate account ids before any other validation so
+    // the error message is consistent regardless of which other
+    // invariants the fixture violates.
+    {
+        let mut seen: HashMap<&str, ()> = HashMap::new();
+        for a in &raw.accounts {
+            if seen.insert(a.id.as_str(), ()).is_some() {
+                return Err(format!("duplicate account id {:?}", a.id));
+            }
+        }
+    }
+    // Promote the lone account in single-account fixtures to primary
+    // automatically so authors don't have to write `primary = true`
+    // boilerplate. Multi-account fixtures must mark one explicitly;
+    // ambiguity gets a clear error rather than a silent first-wins.
+    let primary_flags = raw.accounts.iter().filter(|a| a.primary).count();
+    let mut accounts_raw = raw.accounts;
+    if primary_flags == 0 {
+        if accounts_raw.len() == 1 {
+            accounts_raw[0].primary = true;
+        } else {
+            return Err(
+                "fixture declares multiple accounts but none is `primary = true`".into(),
+            );
+        }
+    } else if primary_flags > 1 {
         return Err(format!(
-            "account.name must be email-shaped (got {:?}); the OAuth userinfo endpoint exposes it as the `email` claim",
-            raw.account.name
+            "fixture declares {primary_flags} primary accounts; exactly one may be primary"
         ));
+    }
+    // Stage 1 invariants: every account must be personal and have
+    // an email-shaped name (OAuth userinfo serves `account.name`
+    // as the `email` / `name` claims).
+    let mut accounts: Vec<Account> = Vec::with_capacity(accounts_raw.len());
+    for raw_acct in accounts_raw {
+        if !raw_acct.is_personal {
+            return Err(format!(
+                "account {:?}: is_personal must be true (Stage 1 of the multi-account refactor still requires every declared account to be personal)",
+                raw_acct.id
+            ));
+        }
+        if !is_email_shaped(&raw_acct.name) {
+            return Err(format!(
+                "account {:?}: name must be email-shaped (got {:?}); the OAuth userinfo endpoint exposes it as the `email` claim",
+                raw_acct.id, raw_acct.name
+            ));
+        }
+        accounts.push(Account {
+            id: raw_acct.id,
+            name: raw_acct.name,
+            primary: raw_acct.primary,
+        });
     }
 
     let mut mb_ids: HashMap<String, ()> = HashMap::new();
@@ -1715,10 +1794,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     Ok(Fixture {
         name: raw.name,
         state,
-        account: Account {
-            id: raw.account.id,
-            name: raw.account.name,
-        },
+        accounts,
         mailboxes,
         emails,
         oauth,
@@ -2469,7 +2545,7 @@ mod tests {
     const MINIMAL: &str = r#"
         name = "test"
 
-        [account]
+        [[account]]
         id = "a1"
         name = "alice@example.com"
         is_personal = true
@@ -2498,7 +2574,9 @@ mod tests {
     fn loads_minimal_fixture() {
         let fix = parse(MINIMAL).unwrap();
         assert_eq!(fix.name, "test");
-        assert_eq!(fix.account.id, "a1");
+        assert_eq!(fix.primary_account().id, "a1");
+        assert_eq!(fix.accounts.len(), 1);
+        assert!(fix.accounts[0].primary);
         assert_eq!(fix.mailboxes.len(), 1);
         assert_eq!(fix.mailboxes[0].role, Some(Role::Inbox));
         assert!(fix.mailboxes[0].is_subscribed);
@@ -2563,7 +2641,7 @@ mod tests {
     fn detects_parent_cycle() {
         let s = r#"
             name = "x"
-            [account]
+            [[account]]
             id = "a"
             name = "a@b"
             is_personal = true
@@ -2578,6 +2656,79 @@ mod tests {
         "#;
         let err = parse(s).unwrap_err();
         assert!(err.contains("cycle"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_account_promotes_explicit_primary() {
+        let s = r#"
+            name = "ma"
+            [[account]]
+            id = "a1"
+            name = "one@example.com"
+            is_personal = true
+            primary = true
+            [[account]]
+            id = "a2"
+            name = "two@example.com"
+            is_personal = true
+        "#;
+        let fix = parse(s).unwrap();
+        assert_eq!(fix.accounts.len(), 2);
+        assert_eq!(fix.primary_account().id, "a1");
+        assert!(!fix.accounts.iter().find(|a| a.id == "a2").unwrap().primary);
+    }
+
+    #[test]
+    fn multi_account_without_explicit_primary_is_rejected() {
+        let s = r#"
+            name = "ma"
+            [[account]]
+            id = "a1"
+            name = "one@example.com"
+            is_personal = true
+            [[account]]
+            id = "a2"
+            name = "two@example.com"
+            is_personal = true
+        "#;
+        let err = parse(s).unwrap_err();
+        assert!(err.contains("primary"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_account_with_two_primaries_is_rejected() {
+        let s = r#"
+            name = "ma"
+            [[account]]
+            id = "a1"
+            name = "one@example.com"
+            is_personal = true
+            primary = true
+            [[account]]
+            id = "a2"
+            name = "two@example.com"
+            is_personal = true
+            primary = true
+        "#;
+        let err = parse(s).unwrap_err();
+        assert!(err.contains("primary"), "got: {err}");
+    }
+
+    #[test]
+    fn duplicate_account_id_rejected() {
+        let s = r#"
+            name = "ma"
+            [[account]]
+            id = "a1"
+            name = "one@example.com"
+            is_personal = true
+            [[account]]
+            id = "a1"
+            name = "two@example.com"
+            is_personal = true
+        "#;
+        let err = parse(s).unwrap_err();
+        assert!(err.contains("duplicate account id"), "got: {err}");
     }
 
     #[test]

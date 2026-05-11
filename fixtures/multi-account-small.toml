@@ -1,0 +1,34 @@
+name = "multi-account-small"
+
+# Two declared accounts. The primary owns the (single) mailbox +
+# email below; the secondary is declared but carries no resources
+# in Stage 1 - the loader accepts it, the OAuth provider could
+# enumerate it later, but no listener serves anything for it yet.
+# Stage 2 (Graph groups / shared mailbox sync) grows per-resource
+# `account_id` and per-protocol scoping.
+
+[[account]]
+id = "account-primary"
+name = "primary@example.com"
+is_personal = true
+primary = true
+
+[[account]]
+id = "account-secondary"
+name = "secondary@example.com"
+is_personal = true
+
+[[mailbox]]
+id = "mbx-inbox"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+[[email]]
+id = "email-001"
+mailbox_ids = ["mbx-inbox"]
+received_at = "2026-01-15T10:00:00Z"
+from = "sender@example.com"
+to = ["primary@example.com"]
+subject = "Hello primary"
+body_text = "Stage 1 lands the foundation; Stage 2 will scope this email to a specific account."

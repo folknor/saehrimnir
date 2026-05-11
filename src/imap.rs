@@ -2295,10 +2295,11 @@ mod tests {
         crate::shared::handle(Fixture {
             name: "t".into(),
             state: "s1".into(),
-            account: Account {
+            accounts: vec![Account {
                 id: "a".into(),
                 name: "a@b".into(),
-            },
+                primary: true,
+            }],
             mailboxes: vec![],
             emails: vec![],
             oauth: crate::fixture::OAuthConfig::default(),
@@ -2345,10 +2346,11 @@ mod tests {
         let mut fix = Fixture {
             name: "f".into(),
             state: "s1".into(),
-            account: Account {
+            accounts: vec![Account {
                 id: "a".into(),
                 name: "a@b".into(),
-            },
+                primary: true,
+            }],
             mailboxes: vec![
                 Mailbox {
                     id: "mb-inbox".into(),

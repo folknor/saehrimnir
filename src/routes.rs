@@ -157,8 +157,9 @@ async fn session(
 ) -> Result<Json<Value>, Response> {
     enforce_bearer(&state, &headers).map_err(|b| *b)?;
     let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
-    let acct_id = &fixture.account.id;
-    let acct_name = &fixture.account.name;
+    let primary = fixture.primary_account();
+    let acct_id = &primary.id;
+    let acct_name = &primary.name;
     let base = state.base_url.as_str();
 
     let mut accounts = serde_json::Map::new();

@@ -246,7 +246,7 @@ fn parse_path(fixture: &crate::fixture::Fixture, path: &str) -> ResourcePath {
         .filter(|s| !s.is_empty())
         .map(percent_decode)
         .collect();
-    let user = &fixture.account.id;
+    let user = &fixture.primary_account().id;
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
     match segs.as_slice() {
         ["principals", u] if u == user => ResourcePath::Principal {
@@ -312,7 +312,7 @@ fn percent_decode(segment: &str) -> String {
 /// truly conformant server would emit them under a 404 propstat).
 fn propfind_root(fixture: &crate::fixture::Fixture, body: &str) -> Response {
     let requested = xml::requested_props(body);
-    let user = &fixture.account.id;
+    let user = &fixture.primary_account().id;
     let principal_url = format!("/principals/{user}/");
     let mut props = String::new();
     if requested.contains("current-user-principal") {
@@ -356,7 +356,7 @@ fn propfind_principal(fixture: &crate::fixture::Fixture, user: &str, body: &str)
     if requested.contains("displayname") {
         props.push_str(&format!(
             "<D:displayname>{}</D:displayname>",
-            xml::escape(&fixture.account.name),
+            xml::escape(&fixture.primary_account().name),
         ));
     }
     multistatus(wrap_responses(&[Response207 {

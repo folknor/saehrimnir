@@ -737,7 +737,7 @@ fn require_account<'a>(fixture: &'a Fixture, args: &'a Value) -> Result<&'a str,
         .get("accountId")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_args("missing accountId"))?;
-    if account_id != fixture.account.id {
+    if account_id != fixture.primary_account().id {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),

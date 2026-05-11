@@ -15,15 +15,26 @@ name = "jmap-small"
 # never advances state.
 state = "fixture-state"
 
-[account]
+[[account]]
 id = "account-1"
 # Used as both the JMAP account name and the address ratatoskr stores
 # in its accounts row. Should be an email-shaped string - the client
 # falls back to it when principals lookup fails (out of scope for v0,
 # but cheap to satisfy).
 name = "test@example.com"
-is_personal = true   # MUST be true for v0; false triggers shared-account paths
+is_personal = true   # Stage 1 requires this on every declared account
+# primary = true     # optional for single-account fixtures (the lone
+                     # entry is auto-promoted); required when more than
+                     # one account is declared
 ```
+
+Multi-account fixtures repeat the `[[account]]` block. Exactly one
+entry must be flagged `primary = true`; that account is the one
+every protocol surface scopes to in Stage 1. Resources (mailboxes,
+emails, calendars, contacts, categories) belong implicitly to the
+primary account today. Stage 2 of the multi-account refactor lands
+per-resource `account_id` plus per-protocol scoping when Graph
+groups / shared mailbox sync needs it.
 
 `name` is a fixture identifier brokkr resolves against (typically
 `<fixtures_dir>/<name>.toml`); sæhrimnir just consumes whatever file
@@ -373,7 +384,11 @@ The mock refuses to start (non-zero exit, stderr message) if:
 - A mailbox's role is set but not one of the seven recognized values.
 - Two mailboxes share an `id`.
 - Two emails share an `id`.
-- `account.is_personal` is `false`.
+- Any declared `account.is_personal` is `false`.
+- No `[[account]]` block is declared.
+- Two declared accounts share an `id`.
+- More than one account is declared and either none or more than
+  one is flagged `primary = true`.
 - An email has neither `body_text` nor `body_path` (nor `body_html`
   once added).
 - A `body_path` does not exist or is not readable.
@@ -618,8 +633,6 @@ prefer `POST /test/latency` (per-protocol or `global` knob) over an
 
 ## Reserved for v1+
 
-- Multiple accounts per fixture (the `[account]` shape is already
-  positioned to accept `[[account]]`).
 - Per-mailbox `rights` overrides.
 - Multipart MIME via `body_path` (multipart/alternative HTML+text).
 - Failure injection: `[fault]` blocks scoped to method calls (slow

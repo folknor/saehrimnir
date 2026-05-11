@@ -48,7 +48,7 @@ async fn profile(State(state): State<AppState>) -> Response {
     }
     let f = state.fixture();
     ok_json(json!({
-        "emailAddress": f.account.name,
+        "emailAddress": f.primary_account().name,
         "messagesTotal": f.emails.len(),
         "threadsTotal": unique_thread_count(&f),
         "historyId": HISTORY_ID,

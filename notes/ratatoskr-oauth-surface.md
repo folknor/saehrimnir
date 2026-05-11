@@ -108,6 +108,8 @@ store along with the request and submission logs.
   nothing to verify.
 - No PKCE, no state-parameter checking, no nonce echo. Add when a
   fixture forces it.
-- No multiple-account-per-token. The mock has exactly one
-  fixture-side `[account]` in v0, so userinfo always projects the
-  same identity.
+- No multiple-account-per-token. Multi-account fixtures (Stage 1
+  of the multi-account refactor) declare additional
+  `[[account]]` blocks, but userinfo always projects the primary
+  account's claims regardless of which token was minted. Stage 2
+  ties tokens to a chosen account.

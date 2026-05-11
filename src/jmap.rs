@@ -182,7 +182,7 @@ fn mailbox_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
             "description": "missing accountId",
         })
     })?;
-    if account_id != fixture.account.id {
+    if account_id != fixture.primary_account().id {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),
@@ -226,7 +226,7 @@ fn mailbox_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let mut out = Map::new();
     out.insert(
         "accountId".to_string(),
-        Value::String(fixture.account.id.clone()),
+        Value::String(fixture.primary_account().id.clone()),
     );
     out.insert("state".to_string(), Value::String(fixture.state.clone()));
     out.insert("list".to_string(), list);
@@ -417,7 +417,7 @@ fn require_account<'a>(fixture: &'a Fixture, args: &'a Value) -> Result<&'a str,
                 "description": "missing accountId",
             })
         })?;
-    if account_id != fixture.account.id {
+    if account_id != fixture.primary_account().id {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),
@@ -487,7 +487,7 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
             "description": "missing accountId",
         })
     })?;
-    if account_id != fixture.account.id {
+    if account_id != fixture.primary_account().id {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),
@@ -566,7 +566,7 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let mut out = Map::new();
     out.insert(
         "accountId".to_string(),
-        Value::String(fixture.account.id.clone()),
+        Value::String(fixture.primary_account().id.clone()),
     );
     out.insert(
         "queryState".to_string(),
@@ -698,7 +698,7 @@ fn email_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
             "description": "missing accountId",
         })
     })?;
-    if account_id != fixture.account.id {
+    if account_id != fixture.primary_account().id {
         return Err(json!({
             "type": "accountNotFound",
             "description": format!("account {account_id:?} not found"),
@@ -761,7 +761,7 @@ fn email_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let mut out = Map::new();
     out.insert(
         "accountId".to_string(),
-        Value::String(fixture.account.id.clone()),
+        Value::String(fixture.primary_account().id.clone()),
     );
     out.insert("state".to_string(), Value::String(fixture.state.clone()));
     out.insert("list".to_string(), list);
@@ -1624,10 +1624,11 @@ mod tests {
         Fixture {
             name: "t".into(),
             state: "s1".into(),
-            account: Account {
+            accounts: vec![Account {
                 id: "acct".into(),
                 name: "a@b".into(),
-            },
+                primary: true,
+            }],
             mailboxes: vec![
                 Mailbox {
                     id: "mb-inbox".into(),
@@ -1844,10 +1845,11 @@ mod tests {
         Fixture {
             name: "q".into(),
             state: "s1".into(),
-            account: Account {
+            accounts: vec![Account {
                 id: "acct".into(),
                 name: "a@b".into(),
-            },
+                primary: true,
+            }],
             mailboxes: vec![
                 Mailbox {
                     id: "mb-inbox".into(),
@@ -2119,10 +2121,11 @@ mod tests {
         Fixture {
             name: "g".into(),
             state: "s1".into(),
-            account: Account {
+            accounts: vec![Account {
                 id: "acct".into(),
                 name: "a@b".into(),
-            },
+                primary: true,
+            }],
             mailboxes: vec![Mailbox {
                 id: "mb-inbox".into(),
                 name: "Inbox".into(),

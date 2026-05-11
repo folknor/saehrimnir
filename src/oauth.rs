@@ -328,7 +328,7 @@ pub async fn userinfo_endpoint(
     // (`fixture::is_email_shaped`), so any fixture that survives
     // to here is safe to expose as the `email` claim.
     let fixture = state.fixture.read().expect("fixture lock poisoned");
-    let acct = &fixture.account;
+    let acct = fixture.primary_account();
     Json(json!({
         "sub": acct.id,
         "email": acct.name,

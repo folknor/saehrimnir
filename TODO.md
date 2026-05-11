@@ -12,13 +12,18 @@ Concrete next-up items lifted above the per-protocol backlogs.
   memberOf`. Lands in `src/graph/group_sync.rs` (new). Fixture
   format needs a `[[group]]` table; design alongside the
   multi-account work since groups cross accounts.
-- **Multi-account fixture support.** v0 enforces `is_personal =
-  true` and exactly one account. Lifting requires per-protocol
-  tweaks to surface multiple accounts: JMAP session resource
-  (advertise additional accountIds), Graph `/users/{id}/...`
-  paths, IMAP per-connection account context. Prerequisite for
-  Graph shared-mailbox sync and Graph group enumeration (groups
-  cross accounts).
+- **Multi-account fixture support (Stage 2).** Stage 1 has landed:
+  fixtures may declare `[[account]]` repeatedly, every protocol
+  scopes to the `primary` account via `Fixture::primary_account()`,
+  and the loader validates account ids / primary flag / personal
+  invariant. Resources (mailboxes, emails, calendars, contacts,
+  categories) still belong implicitly to the primary. Stage 2 grows
+  per-resource `account_id`, lets the JMAP session resource
+  advertise additional accounts, lets Graph serve
+  `/v1.0/users/{id}/...` paths parallel to `/v1.0/me/...`, and
+  lets IMAP / SMTP per-connection auth pick a non-primary account.
+  Stage 2 is what unblocks Graph shared-mailbox sync and Graph
+  group enumeration.
 - **Graph shared mailbox sync.** `/v1.0/users/{id}/...` paths
   parallel to `/v1.0/me/...`. Lands in
   `src/graph/shared_mailbox_sync.rs` (new). Blocked on multi-

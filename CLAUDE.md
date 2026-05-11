@@ -61,6 +61,18 @@ checking whether the fact is already in `notes/`.
   JMAP listener (`/oauth/token`). IMAP and SMTP keep their own
   always-accept auth surfaces. See
   `notes/ratatoskr-oauth-surface.md`.
+- Multi-account fixtures (Stage 1): the fixture grows
+  `accounts: Vec<Account>` and the TOML / Lua loader accepts
+  `[[account]]` repeated. Exactly one account is flagged
+  `primary` (the loader promotes the lone account when only
+  one is declared). Every protocol surface scopes to the
+  primary via `Fixture::primary_account()`; resources
+  (mailboxes, emails, calendars, contacts, categories) still
+  belong implicitly to the primary. Stage 2 (per-resource
+  `account_id`, multi-account JMAP session,
+  `/v1.0/users/{id}/...` Graph paths, per-conn IMAP/SMTP
+  account scoping) lands when Graph groups or shared mailbox
+  sync needs it.
 - One shared fixture per process, behind a single
   `Arc<RwLock<Fixture>>` (`shared::FixtureHandle`). Read paths take
   brief read guards; the JMAP `Email/set` / `Mailbox/set` mutators

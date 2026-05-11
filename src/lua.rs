@@ -157,7 +157,7 @@ struct LuaExtras {
 struct Builder {
     name: Option<String>,
     state_token: Option<String>,
-    account: Option<RawAccount>,
+    accounts: Vec<RawAccount>,
     mailboxes: Vec<RawMailbox>,
     emails: Vec<RawEmail>,
     oauth: Option<RawOAuth>,
@@ -185,13 +185,13 @@ impl Builder {
         let Some(name) = self.name else {
             return Err("scenario must call fixture { name = ... }".to_string());
         };
-        let Some(account) = self.account else {
-            return Err("scenario must call account { ... }".to_string());
-        };
+        if self.accounts.is_empty() {
+            return Err("scenario must call account { ... } at least once".to_string());
+        }
         let raw = RawFixture {
             name,
             state: self.state_token,
-            account,
+            accounts: self.accounts,
             mailboxes: self.mailboxes,
             emails: self.emails,
             oauth: self.oauth,
@@ -375,14 +375,16 @@ fn builder_account(state: &mut State) -> dellingr::Result<u8> {
     let id = read_string(state, 1, "id")?;
     let name = read_string(state, 1, "name")?;
     let is_personal = read_bool_opt(state, 1, "is_personal")?.unwrap_or(true);
+    let primary = read_bool_opt(state, 1, "primary")?.unwrap_or(false);
     let builder = builder_mut(state)?;
-    if builder.account.is_some() {
-        return fail(state, "account { ... } may only be called once");
+    if builder.accounts.iter().any(|a| a.id == id) {
+        return fail(state, "account { ... } called with a duplicate id");
     }
-    builder.account = Some(RawAccount {
+    builder.accounts.push(RawAccount {
         id,
         name,
         is_personal,
+        primary,
     });
     Ok(0)
 }

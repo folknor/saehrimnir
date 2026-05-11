@@ -1917,3 +1917,69 @@ async fn email_set_if_in_state_mismatch_rejects_envelope() {
     assert_eq!(body["newState"], "fixture-state");
     assert_eq!(body["updated"], json!([]));
 }
+
+// ── Multi-account fixture (Stage 1) ─────────────────────────────────
+//
+// Stage 1 lifts `Fixture::account` to `accounts: Vec<Account>` but
+// keeps single-account wire behavior. Multi-account fixtures load
+// cleanly; every listener still scopes to the primary account. Stage
+// 2 (per-resource `account_id`, JMAP multi-account session, Graph
+// `/users/{id}/...`, IMAP per-conn) lands when Graph groups or
+// shared mailbox sync needs it.
+
+fn multi_account_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+#[tokio::test]
+async fn multi_account_jmap_session_advertises_primary_only() {
+    let resp = multi_account_router()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let accounts = v.get("accounts").unwrap().as_object().unwrap();
+    // Stage 1 contract: the second declared account is loaded but
+    // invisible on the JMAP wire. Stage 2 lifts this.
+    assert_eq!(accounts.len(), 1);
+    assert!(accounts.contains_key("account-primary"));
+    assert!(!accounts.contains_key("account-secondary"));
+    assert_eq!(
+        v["primaryAccounts"]["urn:ietf:params:jmap:mail"],
+        "account-primary"
+    );
+    assert_eq!(v["username"], "primary@example.com");
+}
+
+#[tokio::test]
+async fn multi_account_oauth_userinfo_returns_primary_claims() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let token = store.mint("authorization_code", 0xdead_beef);
+    let fix =
+        fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let app = routes::router(
+        routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store),
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/userinfo")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["sub"], "account-primary");
+    assert_eq!(v["email"], "primary@example.com");
+}
