@@ -9,6 +9,47 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
+/// Build a minimal fixture handle the SMTP tests can pass to
+/// `serve_connection`. Uses the canonical `jmap-small.toml` so the
+/// primary account name (`test@example.com`) is the default
+/// binding for unauthenticated submissions.
+fn default_fixture() -> saehrimnir::shared::FixtureHandle {
+    let fix = saehrimnir::fixture::load(std::path::Path::new("fixtures/jmap-small.toml"))
+        .expect("default fixture loads");
+    saehrimnir::shared::handle(fix)
+}
+
+fn multi_account_fixture() -> saehrimnir::shared::FixtureHandle {
+    let fix = saehrimnir::fixture::load(std::path::Path::new("fixtures/multi-account-small.toml"))
+        .expect("multi-account fixture loads");
+    saehrimnir::shared::handle(fix)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() >= 2 {
+            out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() == 3 {
+            out.push(ALPHA[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 async fn run_with_log(script: &[u8]) -> (String, SubmissionLog) {
     let log = SubmissionLog::new();
     let log_clone = log.clone();
@@ -16,7 +57,7 @@ async fn run_with_log(script: &[u8]) -> (String, SubmissionLog) {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, None, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        smtp::serve_connection(server, log_clone, None, default_fixture(), saehrimnir::oauth::TokenStore::default(), None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -135,7 +176,7 @@ async fn run_with_dispatcher(
     let (_tx, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, dispatcher, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        smtp::serve_connection(server, log_clone, dispatcher, default_fixture(), saehrimnir::oauth::TokenStore::default(), None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -242,7 +283,7 @@ async fn smtp_dispatch_records_request_log_entries() {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, None, None, req_log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        smtp::serve_connection(server, log_clone, None, default_fixture(), saehrimnir::oauth::TokenStore::default(), None, req_log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     let script = b"\
@@ -344,7 +385,7 @@ mod starttls {
         let acceptor =
             Arc::new(saehrimnir::tls::make_acceptor().expect("acceptor"));
         let server_task = tokio::spawn(async move {
-            smtp::serve(listener, log_clone, None, Some(acceptor), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), rx).await
+            smtp::serve(listener, log_clone, None, default_fixture(), saehrimnir::oauth::TokenStore::default(), Some(acceptor), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), rx).await
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -408,4 +449,122 @@ mod starttls {
         server_task.abort();
         let _ = server_task.await;
     }
+}
+
+// ── Multi-account AUTH binding (Stage 4) ────────────────────────────
+
+async fn run_with_multi_account(
+    script: &[u8],
+    store: saehrimnir::oauth::TokenStore,
+) -> (String, SubmissionLog) {
+    let log = SubmissionLog::new();
+    let log_clone = log.clone();
+    let (server, mut client) = tokio::io::duplex(32 * 1024);
+    let (_tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        smtp::serve_connection(
+            server,
+            log_clone,
+            None,
+            multi_account_fixture(),
+            store,
+            None,
+            saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
+            &mut rx,
+        )
+        .await
+    });
+    client.write_all(script).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    task.await.unwrap().unwrap();
+    (String::from_utf8(buf).unwrap(), log)
+}
+
+#[tokio::test]
+async fn smtp_auth_plain_binds_submission_to_matching_account() {
+    // SASL PLAIN: `\0secondary@example.com\0password`.
+    let payload = b"\0secondary@example.com\0password";
+    let encoded = base64_encode(payload);
+    let script = format!(
+        "EHLO me\r\n\
+         AUTH PLAIN {encoded}\r\n\
+         MAIL FROM:<x@y>\r\n\
+         RCPT TO:<z@w>\r\n\
+         DATA\r\n\
+         x\r\n\
+         .\r\n\
+         QUIT\r\n"
+    );
+    let (_out, log) =
+        run_with_multi_account(script.as_bytes(), saehrimnir::oauth::TokenStore::default()).await;
+    let snap = log.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].account_id, "account-secondary");
+}
+
+#[tokio::test]
+async fn smtp_auth_unrecognised_user_stays_on_primary() {
+    let payload = b"\0nobody@example.com\0password";
+    let encoded = base64_encode(payload);
+    let script = format!(
+        "EHLO me\r\n\
+         AUTH PLAIN {encoded}\r\n\
+         MAIL FROM:<x@y>\r\n\
+         RCPT TO:<z@w>\r\n\
+         DATA\r\n\
+         x\r\n\
+         .\r\n\
+         QUIT\r\n"
+    );
+    let (_out, log) =
+        run_with_multi_account(script.as_bytes(), saehrimnir::oauth::TokenStore::default()).await;
+    let snap = log.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].account_id, "account-primary");
+}
+
+#[tokio::test]
+async fn smtp_auth_xoauth2_binds_via_token_store() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let token = store.mint("authorization_code", "account-secondary", 1);
+    let payload = format!(
+        "user=secondary@example.com\x01auth=Bearer {token}\x01\x01"
+    );
+    let encoded = base64_encode(payload.as_bytes());
+    let script = format!(
+        "EHLO me\r\n\
+         AUTH XOAUTH2 {encoded}\r\n\
+         MAIL FROM:<x@y>\r\n\
+         RCPT TO:<z@w>\r\n\
+         DATA\r\n\
+         x\r\n\
+         .\r\n\
+         QUIT\r\n"
+    );
+    let (_out, log) = run_with_multi_account(script.as_bytes(), store).await;
+    let snap = log.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].account_id, "account-secondary");
+}
+
+#[tokio::test]
+async fn smtp_no_auth_stays_on_primary() {
+    // Submissions without AUTH inherit the connection's default
+    // (primary). Matches the v0 no-auth baseline.
+    let script = b"EHLO me\r\n\
+         MAIL FROM:<x@y>\r\n\
+         RCPT TO:<z@w>\r\n\
+         DATA\r\n\
+         x\r\n\
+         .\r\n\
+         QUIT\r\n";
+    let (_out, log) =
+        run_with_multi_account(script, saehrimnir::oauth::TokenStore::default()).await;
+    let snap = log.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].account_id, "account-primary");
 }

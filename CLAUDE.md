@@ -80,9 +80,16 @@ checking whether the fact is already in `notes/`.
   optional form field on `/oauth/token`); the Google-family
   listeners (Gmail, gcal, People) scope reads to the bearer
   token's account via `oauth::account_from_bearer`, falling
-  back to primary for missing / unknown tokens. CalDAV, IMAP,
-  and SMTP still scope to primary; the limitation is invisible
-  in current single-account fixtures.
+  back to primary for missing / unknown tokens. IMAP `LOGIN`
+  and `AUTHENTICATE PLAIN` / `LOGIN` / `XOAUTH2` / `OAUTHBEARER`
+  parse the SASL response and rebind the connection's
+  `account_id` (case-insensitive match against `account.name`,
+  or token lookup via `TokenStore`); LIST / STATUS / SELECT /
+  FETCH then scope by that account. SMTP `AUTH` shares the same
+  SASL helpers; `Submission` records the resolved account
+  (exposed on `GET /test/smtp/submissions`). CalDAV still
+  scopes to primary; the limitation is invisible in current
+  single-account fixtures.
 - One shared fixture per process, behind a single
   `Arc<RwLock<Fixture>>` (`shared::FixtureHandle`). Read paths take
   brief read guards; the JMAP `Email/set` / `Mailbox/set` mutators

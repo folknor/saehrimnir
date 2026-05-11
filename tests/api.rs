@@ -759,6 +759,7 @@ fn sample_submission(from: &str, attachment_size: usize) -> saehrimnir::smtp::Su
         from_params: Default::default(),
         rcpt_params: vec![Default::default()],
         auth_mechanism: Some("PLAIN".to_string()),
+        account_id: "account-1".to_string(),
         data: body.into_bytes(),
         received_at: chrono::Utc::now(),
     }

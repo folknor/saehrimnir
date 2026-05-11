@@ -195,8 +195,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let imap_dispatcher = dispatcher.clone();
     let imap_request_log = request_log.clone();
     let imap_latency = shared.latency.clone();
+    let imap_token_store = shared.token_store.clone();
     let imap_task = tokio::spawn(async move {
-        imap::serve(imap_listener, imap_fixture, imap_dispatcher, imap_request_log, imap_latency, imap_shutdown_rx).await
+        imap::serve(
+            imap_listener,
+            imap_fixture,
+            imap_dispatcher,
+            imap_token_store,
+            imap_request_log,
+            imap_latency,
+            imap_shutdown_rx,
+        )
+        .await
     });
 
     // SMTP server. The submission log is the same handle exposed to
@@ -214,11 +224,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let smtp_request_log = request_log.clone();
     let smtp_latency = shared.latency.clone();
+    let smtp_fixture = Arc::clone(&fixture);
+    let smtp_token_store = shared.token_store.clone();
     let smtp_task = tokio::spawn(async move {
         smtp::serve(
             smtp_listener,
             smtp_log_clone,
             smtp_dispatcher,
+            smtp_fixture,
+            smtp_token_store,
             smtp_tls,
             smtp_request_log,
             smtp_latency,

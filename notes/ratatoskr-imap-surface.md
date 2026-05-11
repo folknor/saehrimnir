@@ -26,8 +26,27 @@ so the next person can re-verify after the client drifts.
 - Three auth methods supported: LOGIN (password), XOAUTH2,
   OAUTHBEARER. Determined by `config.auth_method`. Source:
   `connection.rs:344-390`.
-- v0 mock: accept any credentials, any method. Respond with `OK` and
-  forget the username/password. No validation required.
+- v0 mock: every credential and method succeeds (no validation).
+  Stage 5 of the multi-account refactor grew **per-connection
+  account binding** on top: the credential's identity is parsed
+  and matched against the fixture's declared `[[account]]`s. A
+  match rebinds the connection's `account_id`; subsequent LIST /
+  STATUS / SELECT / FETCH return only that account's mailboxes
+  and messages. An unrecognised user (or no AUTH at all) keeps
+  the connection on the fixture's primary account, matching the
+  v0 no-auth baseline.
+  - **LOGIN**: the (quoted) username arg is matched
+    case-insensitively against `account.name`.
+  - **AUTHENTICATE PLAIN**: base64 of `\0user\0pass`. `user` is
+    matched as above.
+  - **AUTHENTICATE LOGIN**: the single continuation line is
+    treated as the username (the second `Password:` round-trip
+    isn't modelled today; extend when a fixture forces it).
+  - **AUTHENTICATE XOAUTH2 / OAUTHBEARER**: the `\x01`-separated
+    SASL blob is scanned for `auth=Bearer <token>` (looked up in
+    the OAuth `TokenStore`, same store the Google-family
+    listeners use); if no bearer match, the `user=` field is
+    tried instead.
 - No STARTTLS check is needed for plaintext paths; the gate is on the
   security mode, not a capability probe.
 

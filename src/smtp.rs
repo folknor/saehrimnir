@@ -50,6 +50,13 @@ pub struct Submission {
     pub rcpt_params: Vec<BTreeMap<String, String>>,
     /// SASL mechanism the client authenticated with, if any.
     pub auth_mechanism: Option<String>,
+    /// Account this submission belongs to. Stage 4 of the multi-
+    /// account refactor wires AUTH-time account binding: PLAIN /
+    /// LOGIN's user, or XOAUTH2 / OAUTHBEARER's bearer-token's
+    /// account, picks the declared account when one matches. An
+    /// unrecognised credential (or no AUTH at all) leaves the
+    /// submission on the fixture's primary account.
+    pub account_id: String,
     /// Full RFC 822 message bytes with dot-stuffing reversed (a body
     /// line starting `..` is collapsed to a single leading `.`).
     pub data: Vec<u8>,
@@ -164,10 +171,13 @@ pub const GREETING: &str = "220 saehrimnir ESMTP ready\r\n";
 /// connection. Cancels accept on shutdown. When `tls_acceptor` is
 /// `Some`, EHLO advertises `STARTTLS` and the upgrade path is wired
 /// through the per-connection state machine.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: TcpListener,
     log: SubmissionLog,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    fixture: crate::shared::FixtureHandle,
+    token_store: crate::oauth::TokenStore,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     request_log: crate::request_log::RequestLog,
     latency: crate::latency::LatencyKnob,
@@ -186,12 +196,14 @@ pub async fn serve(
                     Ok((stream, peer)) => {
                         let log = log.clone();
                         let disp = dispatcher.clone();
+                        let fix = Arc::clone(&fixture);
+                        let store = token_store.clone();
                         let tls = tls_acceptor.clone();
                         let req_log = request_log.clone();
                         let lat = latency.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, log, disp, tls, req_log, lat, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, log, disp, fix, store, tls, req_log, lat, &mut sd).await {
                                 eprintln!("saehrimnir: smtp connection {peer}: {e}");
                             }
                         });
@@ -212,10 +224,13 @@ pub async fn serve(
 /// `<status> <message>`, where `status` is interpreted as the SMTP
 /// numeric code (e.g. `"452"`). When `tls_acceptor` is `Some`, EHLO
 /// advertises `STARTTLS` and the connection accepts a TLS upgrade.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_connection<S>(
     stream: S,
     log: SubmissionLog,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    fixture: crate::shared::FixtureHandle,
+    token_store: crate::oauth::TokenStore,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     request_log: crate::request_log::RequestLog,
     latency: crate::latency::LatencyKnob,
@@ -225,15 +240,24 @@ where
     S: AsyncStream + 'static,
 {
     let boxed: Box<dyn AsyncStream> = Box::new(stream);
+    let primary_account_id = fixture
+        .read()
+        .expect("fixture lock poisoned")
+        .primary_account()
+        .id
+        .clone();
     let mut conn = Conn {
         stream: Some(BufStream::new(boxed)),
         state: SmtpState::default(),
         log,
         dispatcher,
+        fixture,
+        token_store,
         tls_acceptor,
         tls_active: false,
         request_log,
         latency,
+        account_id: primary_account_id,
     };
     conn.write_str(GREETING).await?;
     loop {
@@ -276,10 +300,17 @@ struct Conn {
     state: SmtpState,
     log: SubmissionLog,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    fixture: crate::shared::FixtureHandle,
+    token_store: crate::oauth::TokenStore,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     tls_active: bool,
     request_log: crate::request_log::RequestLog,
     latency: crate::latency::LatencyKnob,
+    /// Account this connection's pending submission belongs to.
+    /// Initialised to the fixture's primary at connect; `AUTH`
+    /// rebinds when a SASL response names (PLAIN / LOGIN) or
+    /// authorizes (XOAUTH2 / OAUTHBEARER) a declared account.
+    account_id: String,
 }
 
 enum ReadOutcome {
@@ -465,27 +496,46 @@ impl Conn {
     async fn cmd_auth(&mut self, rest: &str) -> std::io::Result<()> {
         let mut parts = rest.splitn(2, ' ');
         let mech = parts.next().unwrap_or("").to_ascii_uppercase();
-        let initial_response = parts.next().map(str::trim);
+        let initial_response = parts.next().map(|s| s.trim().to_string());
         match mech.as_str() {
             "PLAIN" | "LOGIN" | "XOAUTH2" | "OAUTHBEARER" => {
-                if initial_response.is_none() {
-                    // Prompt with a 334 challenge and consume one
-                    // continuation line.
-                    self.stream_mut().write_all(b"334 \r\n").await?;
-                    self.stream_mut().flush().await?;
-                    let mut buf = String::new();
-                    let n = self.stream_mut().read_line(&mut buf).await?;
-                    if n == 0 {
-                        return Ok(());
+                let response_b64 = match initial_response {
+                    Some(s) => Some(s),
+                    None => {
+                        // Prompt with a 334 challenge and consume one
+                        // continuation line.
+                        self.stream_mut().write_all(b"334 \r\n").await?;
+                        self.stream_mut().flush().await?;
+                        let mut buf = String::new();
+                        let n = self.stream_mut().read_line(&mut buf).await?;
+                        if n == 0 {
+                            return Ok(());
+                        }
+                        let stripped = strip_crlf(&buf).to_string();
+                        if stripped == "*" {
+                            return self.write_line(501, "AUTH cancelled").await;
+                        }
+                        // For LOGIN the server normally sends a second
+                        // 334 prompt for the password. v0 simplifies by
+                        // accepting whatever the client sent and
+                        // skipping the second round-trip. lettre
+                        // tolerates this because we return 235 directly.
+                        Some(stripped)
                     }
-                    if strip_crlf(&buf) == "*" {
-                        return self.write_line(501, "AUTH cancelled").await;
+                };
+                if let Some(b64) = response_b64
+                    && let Some(decoded) = crate::imap::sasl_decode_b64(&b64)
+                {
+                    if let Some(token) = crate::imap::sasl_extract_bearer(&decoded)
+                        && let Some(id) = self.token_store.account_for_token(&token)
+                    {
+                        self.account_id = id;
+                    } else if let Some(user) =
+                        crate::imap::sasl_extract_username(mech.as_str(), &decoded)
+                        && let Some(id) = self.account_id_for_username(&user)
+                    {
+                        self.account_id = id;
                     }
-                    // For LOGIN, the server normally sends a second
-                    // 334 prompt for the password. v0 simplifies by
-                    // accepting whatever the client sent and skipping
-                    // the second round-trip. lettre tolerates this
-                    // because we return 235 directly.
                 }
                 self.state.auth = Some(mech.clone());
                 self.write_line(235, "authentication accepted").await
@@ -493,6 +543,16 @@ impl Conn {
             "" => self.write_line(501, "AUTH missing mechanism").await,
             _ => self.write_line(504, "unsupported SASL mechanism").await,
         }
+    }
+
+    fn account_id_for_username(&self, identity: &str) -> Option<String> {
+        let fixture = self.fixture.read().expect("fixture lock poisoned");
+        let trimmed = identity.trim();
+        fixture
+            .accounts
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(trimmed))
+            .map(|a| a.id.clone())
     }
 
     async fn cmd_mail(&mut self, rest: &str) -> std::io::Result<()> {
@@ -564,6 +624,7 @@ impl Conn {
             from_params: std::mem::take(&mut self.state.from_params),
             rcpt_params: std::mem::take(&mut self.state.rcpt_params),
             auth_mechanism: self.state.auth.clone(),
+            account_id: self.account_id.clone(),
             data,
             received_at: Utc::now(),
         };
@@ -682,6 +743,14 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Load the canonical small fixture for tests that don't care
+    /// about specific resources. Primary account is `account-1`.
+    fn test_fixture() -> crate::shared::FixtureHandle {
+        let fix = crate::fixture::load(std::path::Path::new("fixtures/jmap-small.toml"))
+            .expect("default fixture loads");
+        crate::shared::handle(fix)
+    }
+
     async fn run_script(script: &[u8]) -> (String, SubmissionLog) {
         let log = SubmissionLog::new();
         let (server, mut client) = tokio::io::duplex(32 * 1024);
@@ -689,7 +758,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
+            serve_connection(server, log_clone, None, test_fixture(), crate::oauth::TokenStore::default(), None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
         });
         client.write_all(script).await.unwrap();
         client.shutdown().await.unwrap();
@@ -880,7 +949,7 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
+            serve_connection(server, log_clone, None, test_fixture(), crate::oauth::TokenStore::default(), None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
         });
         let mut greet = vec![0u8; GREETING.len()];
         client.read_exact(&mut greet).await.unwrap();

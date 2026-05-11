@@ -12,19 +12,18 @@ Concrete next-up items lifted above the per-protocol backlogs.
   memberOf`. Lands in `src/graph/group_sync.rs` (new). Fixture
   format needs a `[[group]]` table; design alongside the
   multi-account work since groups cross accounts.
-- **Multi-account refactor follow-ups.** Stages 1-4 landed the
+- **Multi-account refactor follow-ups.** Stages 1-5 landed the
   fixture model, JMAP multi-account scoping, Graph per-account
-  routing across all four resource families, and OAuth-scoped
-  tokens (Gmail / gcal / People now scope reads by the bearer
-  token's account; an `account_id` form field on `/oauth/token`
-  binds the minted token). What's left:
+  routing across all four resource families, OAuth-scoped
+  tokens for Gmail / gcal / People, and IMAP / SMTP
+  per-connection AUTH binding (LOGIN / AUTHENTICATE PLAIN /
+  LOGIN / XOAUTH2 / OAUTHBEARER parse the credential and bind
+  the connection state to a matching declared account; SMTP
+  `Submission` records the resolved account). What's left:
   - CalDAV: primary-filter rewrite, plus per-principal account
     resolution. CalDAV's `/principals/{user}/` URL shape
     already names a user; today every request resolves to
     primary regardless.
-  - IMAP / SMTP per-connection account binding via AUTH
-    credentials (the AUTH user/password names a specific
-    account; the connection state thereafter scopes to it).
   - JMAP `Mailbox/changes` / `Email/changes` partition the
     change_log by account so a multi-account fixture's
     mutations on the secondary don't surface in the primary's

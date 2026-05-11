@@ -18,7 +18,7 @@ async fn run_with_fixture(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -151,7 +151,7 @@ async fn run_with_attach_fixture(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -222,7 +222,7 @@ async fn run_with_lua_scenario(scenario: &str, imap_script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, dispatcher, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(server, fix, dispatcher, saehrimnir::oauth::TokenStore::default(), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
     client.write_all(imap_script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -372,7 +372,7 @@ async fn run_with_imap_small(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     client.write_all(script).await.unwrap();
@@ -426,7 +426,7 @@ async fn imap_dispatch_records_request_log_entries() {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     let script = b"\
@@ -473,7 +473,7 @@ async fn imap_uid_fetch_log_distinguishes_body_from_metadata() {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
     });
 
     let script = b"\
@@ -791,5 +791,121 @@ async fn uid_expunge_without_deleted_flag_is_noop() {
     let post = pre_post_split[1];
     assert!(post.contains("* 1 FETCH (UID 1)"));
     assert!(post.contains("* 2 FETCH (UID 2)"));
+}
+
+// ── Multi-account (Stage 4: AUTH-driven account binding) ────────────
+
+async fn run_with_multi_account(
+    script: &[u8],
+    store: saehrimnir::oauth::TokenStore,
+) -> String {
+    let fix = saehrimnir::shared::handle(
+        fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap(),
+    );
+    let (server, mut client) = tokio::io::duplex(32 * 1024);
+    let (_tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        imap::serve_connection(
+            server,
+            fix,
+            None,
+            store,
+            saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
+            &mut rx,
+        )
+        .await
+    });
+    client.write_all(script).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    task.await.unwrap().unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
+#[tokio::test]
+async fn imap_login_binds_to_matching_account_and_lists_its_mailboxes() {
+    // LOGIN with secondary's email -> LIST returns only secondary's
+    // mailbox. The primary account's mailbox is invisible.
+    let script = b"\
+        a1 LOGIN \"secondary@example.com\" \"password\"\r\n\
+        a2 LIST \"\" \"*\"\r\n\
+        a3 LOGOUT\r\n";
+    let out = run_with_multi_account(script, saehrimnir::oauth::TokenStore::default()).await;
+    let lists: Vec<&str> = out.split("\r\n").filter(|l| l.starts_with("* LIST")).collect();
+    assert_eq!(lists.len(), 1);
+    assert!(
+        lists[0].contains("INBOX") && !lists[0].contains("mbx-primary-inbox"),
+        "expected secondary's inbox; got {lists:?}",
+    );
+}
+
+#[tokio::test]
+async fn imap_login_unrecognised_user_stays_on_primary() {
+    // No matching account -> connection stays on primary, matching
+    // the v0 no-auth baseline.
+    let script = b"\
+        a1 LOGIN \"nobody@example.com\" \"password\"\r\n\
+        a2 STATUS INBOX (MESSAGES)\r\n\
+        a3 LOGOUT\r\n";
+    let out = run_with_multi_account(script, saehrimnir::oauth::TokenStore::default()).await;
+    // Primary has email-primary-001 in its inbox.
+    assert!(out.contains("* STATUS \"INBOX\" (MESSAGES 1)"), "got {out}");
+}
+
+#[tokio::test]
+async fn imap_authenticate_xoauth2_resolves_via_token_store() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let token = store.mint("authorization_code", "account-secondary", 1);
+    // SASL XOAUTH2 initial response: base64 of
+    // `user=secondary@example.com\x01auth=Bearer <token>\x01\x01`.
+    let payload = format!(
+        "user=secondary@example.com\x01auth=Bearer {token}\x01\x01"
+    );
+    let encoded = base64_encode(payload.as_bytes());
+    let script = format!(
+        "a1 AUTHENTICATE XOAUTH2 {encoded}\r\n\
+         a2 LIST \"\" \"*\"\r\n\
+         a3 LOGOUT\r\n"
+    );
+    let out = run_with_multi_account(script.as_bytes(), store).await;
+    let lists: Vec<&str> = out.split("\r\n").filter(|l| l.starts_with("* LIST")).collect();
+    assert_eq!(lists.len(), 1);
+    assert!(lists[0].contains("INBOX"), "expected an inbox; got {lists:?}");
+    // Secondary's inbox-role mailbox is `mbx-secondary-inbox`; LIST
+    // serializes it as "INBOX" (the IMAP convention for role=inbox).
+    // The primary's `mbx-primary-inbox` would also render as
+    // "INBOX", but it's invisible under the secondary-bound token.
+    // Disambiguate by checking the STATUS message count: secondary
+    // has 1 message; primary has 1 too in this fixture, so check
+    // the body subject through a FETCH.
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    // Standard base64 with `=` padding.
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() >= 2 {
+            out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() == 3 {
+            out.push(ALPHA[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 

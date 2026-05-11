@@ -30,8 +30,23 @@ outbound message. That makes the surface small.
 - Three mechanisms attempted, gated on `config.auth_method`:
   XOAUTH2 (when `auth_method == "oauth2"`), otherwise PLAIN and LOGIN
   in that order. Source: `client.rs:28-32`.
-- v0 mock: accept any credential under any mechanism, respond `235`,
-  forget the username.
+- v0 mock: every credential succeeds (no validation). Stage 5 of
+  the multi-account refactor wires **per-connection account
+  binding**: the SASL response is parsed and matched against the
+  fixture's declared `[[account]]`s. A match rebinds the
+  connection state; the resulting `Submission` lands tagged with
+  the resolved `account_id` (exposed via
+  `GET /test/smtp/submissions`). An unrecognised credential (or
+  no AUTH at all) leaves the submission on primary, matching the
+  v0 no-auth baseline. Parsing rules:
+  - **PLAIN**: base64 of `\0user\0pass`. `user` matched case-
+    insensitively against `account.name`.
+  - **LOGIN**: the single continuation line is treated as the
+    username; the second `Password:` round-trip isn't modelled.
+  - **XOAUTH2 / OAUTHBEARER**: scan the `\x01`-separated blob
+    for `auth=Bearer <token>` (looked up in the OAuth
+    `TokenStore` shared with the Google-family listeners); on
+    no bearer match, fall back to the `user=` field.
 
 ## EHLO / capabilities
 

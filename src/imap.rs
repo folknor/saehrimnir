@@ -54,6 +54,7 @@ pub async fn serve(
     listener: TcpListener,
     fixture: crate::shared::FixtureHandle,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    token_store: crate::oauth::TokenStore,
     request_log: crate::request_log::RequestLog,
     latency: crate::latency::LatencyKnob,
     mut shutdown: watch::Receiver<bool>,
@@ -71,11 +72,12 @@ pub async fn serve(
                     Ok((stream, peer)) => {
                         let fix = Arc::clone(&fixture);
                         let disp = dispatcher.clone();
+                        let store = token_store.clone();
                         let log = request_log.clone();
                         let lat = latency.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, fix, disp, log, lat, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, fix, disp, store, log, lat, &mut sd).await {
                                 eprintln!("saehrimnir: imap connection {peer}: {e}");
                             }
                         });
@@ -97,6 +99,7 @@ pub async fn serve_connection<S>(
     stream: S,
     fixture: crate::shared::FixtureHandle,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    token_store: crate::oauth::TokenStore,
     request_log: crate::request_log::RequestLog,
     latency: crate::latency::LatencyKnob,
     shutdown: &mut watch::Receiver<bool>,
@@ -105,15 +108,23 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, writer) = tokio::io::split(stream);
+    let primary_account_id = fixture
+        .read()
+        .expect("fixture lock poisoned")
+        .primary_account()
+        .id
+        .clone();
     let mut conn = Conn {
         reader: BufReader::new(reader),
         writer,
         state: State::NotAuthenticated,
         fixture,
         dispatcher,
+        token_store,
         request_log,
         latency,
         selected: None,
+        account_id: primary_account_id,
     };
 
     conn.write_line(GREETING.trim_end_matches("\r\n")).await?;
@@ -143,6 +154,10 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     state: State,
     fixture: crate::shared::FixtureHandle,
     dispatcher: Option<Arc<crate::lua::Dispatcher>>,
+    /// Token store. Used to resolve `AUTHENTICATE XOAUTH2` /
+    /// `OAUTHBEARER` bearer tokens to the account they authorize,
+    /// matching the OAuth flow Gmail / gcal / People use.
+    token_store: crate::oauth::TokenStore,
     /// Cross-protocol request log handle. Cheap to clone (it's an
     /// `Arc<Mutex<...>>`); tests that don't care just pass
     /// `RequestLog::default()`.
@@ -154,6 +169,13 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     /// SELECT/EXAMINE, cleared on CLOSE/UNSELECT (which we don't yet
     /// handle).
     selected: Option<String>,
+    /// Account this connection is scoped to. Default = primary;
+    /// LOGIN and AUTHENTICATE parse the supplied credential and
+    /// rebind to a matching declared account if the username (or
+    /// the bearer token, for XOAUTH2 / OAUTHBEARER) resolves. A
+    /// credential that doesn't match any account leaves this on
+    /// primary, matching the v0 "no auth in v0" baseline.
+    account_id: String,
 }
 
 enum ReadOutcome {
@@ -356,19 +378,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         Ok(())
     }
 
-    async fn cmd_login(&mut self, tag: &str, _args: &str) -> std::io::Result<()> {
+    async fn cmd_login(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
         if self.state != State::NotAuthenticated {
             return self
                 .write_line(&format!("{tag} BAD LOGIN only valid pre-auth"))
                 .await;
         }
-        // v0 accepts any credential. Don't even bother parsing the
-        // user/pass quoted strings.
+        // v0 accepts any credential. Parse the user name only so the
+        // connection can bind to the matching `[[account]]`. An
+        // unrecognised user stays on primary (matches the v0
+        // "no auth in v0" baseline).
+        if let Some((user, _pass)) = parse_two_astrings(args)
+            && let Some(id) = self.account_id_for_username(&user)
+        {
+            self.account_id = id;
+        }
         self.state = State::Authenticated;
         self.write_line(&format!(
             "{tag} OK [CAPABILITY {CAPABILITIES}] LOGIN completed"
         ))
         .await
+    }
+
+    /// Look up the account a SASL identity binds the connection to.
+    /// `identity` is typically email-shaped (`alice@example.com`);
+    /// case-insensitive match against `account.name`. None when no
+    /// account matches; the caller leaves `self.account_id` at its
+    /// current value (primary by default).
+    fn account_id_for_username(&self, identity: &str) -> Option<String> {
+        let fixture = self.fix_read();
+        let trimmed = identity.trim();
+        fixture
+            .accounts
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(trimmed))
+            .map(|a| a.id.clone())
+    }
+
+    /// Resolve a bearer token (XOAUTH2 / OAUTHBEARER) to the account
+    /// it authorizes. Falls back to None for unknown tokens so the
+    /// caller can leave the connection on whichever account it was
+    /// already bound to.
+    fn account_id_for_bearer(&self, token: &str) -> Option<String> {
+        self.token_store.account_for_token(token)
     }
 
     async fn cmd_authenticate(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
@@ -379,26 +431,47 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
         let mut parts = args.splitn(2, ' ');
         let mech = parts.next().unwrap_or("").to_ascii_uppercase();
-        let initial_response = parts.next().map(str::trim);
+        let initial_response = parts.next().map(|s| s.trim().to_string());
         match mech.as_str() {
             "PLAIN" | "XOAUTH2" | "OAUTHBEARER" | "LOGIN" => {
                 // SASL-IR: if the client sent the response on the same
                 // line, no continuation needed. Otherwise prompt with
-                // `+\r\n` and read one continuation line that we
-                // discard.
-                if initial_response.is_none() {
-                    self.write_line("+").await?;
-                    let cont = self.read_line().await?;
-                    if cont.is_none() {
-                        // peer closed mid-handshake
-                        return Ok(());
+                // `+\r\n` and read one continuation line.
+                let response_b64 = match initial_response {
+                    Some(s) => Some(s),
+                    None => {
+                        self.write_line("+").await?;
+                        let cont = self.read_line().await?;
+                        if cont.is_none() {
+                            return Ok(()); // peer closed mid-handshake
+                        }
+                        let cont = cont.unwrap_or_default();
+                        if cont.trim() == "*" {
+                            return self
+                                .write_line(&format!("{tag} BAD AUTHENTICATE aborted"))
+                                .await;
+                        }
+                        Some(cont)
                     }
-                    // Per RFC 3501 sec 6.2.2, the client may abort by
-                    // sending `*`; if so, return BAD.
-                    if cont.as_deref() == Some("*") {
-                        return self
-                            .write_line(&format!("{tag} BAD AUTHENTICATE aborted"))
-                            .await;
+                };
+                // Parse the SASL response for an account-binding hint.
+                // PLAIN: base64(`\0user\0pass`).
+                // XOAUTH2 / OAUTHBEARER: base64 of a key-value blob
+                //   containing `user=<email>` and `auth=Bearer <tok>`.
+                // LOGIN: the first continuation carries `user` (we
+                //   don't model the second `+` round-trip; tests
+                //   that need it can extend later).
+                if let Some(b64) = response_b64
+                    && let Some(decoded) = sasl_decode_b64(&b64)
+                {
+                    if let Some(token) = sasl_extract_bearer(&decoded)
+                        && let Some(id) = self.account_id_for_bearer(&token)
+                    {
+                        self.account_id = id;
+                    } else if let Some(user) = sasl_extract_username(mech.as_str(), &decoded)
+                        && let Some(id) = self.account_id_for_username(&user)
+                    {
+                        self.account_id = id;
                     }
                 }
                 self.state = State::Authenticated;
@@ -470,7 +543,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // falls back to substring matching, which is enough for
         // ratatoskr (it only ever sends `*`).
         let _ = reference; // hierarchy reference is unused in v0.
-        let entries = list_mailboxes(&self.fix_read());
+        let entries = list_mailboxes(&self.fix_read(), &self.account_id);
         for e in &entries {
             if !pattern_matches(&pattern, &e.path) {
                 continue;
@@ -500,14 +573,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     .await;
             }
         };
-        let entries = list_mailboxes(&self.fix_read());
+        let entries = list_mailboxes(&self.fix_read(), &self.account_id);
         let entry = entries.iter().find(|e| e.path.eq_ignore_ascii_case(&parsed.name));
         let Some(entry) = entry else {
             return self
                 .write_line(&format!("{tag} NO STATUS unknown mailbox"))
                 .await;
         };
-        let counts = mailbox_counts(&self.fix_read(), &entry.fixture_id);
+        let counts = mailbox_counts(&self.fix_read(), &self.account_id, &entry.fixture_id);
         let mut items = Vec::with_capacity(parsed.items.len());
         for item in &parsed.items {
             let pair = match item.to_ascii_uppercase().as_str() {
@@ -553,7 +626,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     .await;
             }
         };
-        let entries = list_mailboxes(&self.fix_read());
+        let entries = list_mailboxes(&self.fix_read(), &self.account_id);
         let entry = entries.iter().find(|e| e.path.eq_ignore_ascii_case(&name));
         let Some(entry) = entry else {
             // Per RFC, on NO SELECT the connection drops back to
@@ -569,10 +642,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // into owned data; each helper borrows the fixture only for
         // its own call and the result owns no `&Fixture` references,
         // so the guard drops between calls.
-        let counts = mailbox_counts(&self.fix_read(), &entry.fixture_id);
+        let counts = mailbox_counts(&self.fix_read(), &self.account_id, &entry.fixture_id);
         let first_unseen_idx = {
             let fix = self.fix_read();
-            mailbox_messages(&fix, &entry.fixture_id)
+            mailbox_messages(&fix, &self.account_id, &entry.fixture_id)
                 .iter()
                 .position(|(_, e)| !e.keywords.iter().any(|k| k == "$seen"))
         };
@@ -727,7 +800,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // never do.
         let snapshot: Vec<(u32, u32, Email)> = if changedsince_matches(changedsince) {
             let fix = self.fix_read();
-            mailbox_messages(&fix, &selected_id)
+            mailbox_messages(&fix, &self.account_id, &selected_id)
                 .into_iter()
                 .enumerate()
                 .filter(|(_, (uid, _))| set.matches(*uid))
@@ -887,7 +960,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             // Resolve target mailbox name against the fixture-side
             // path projection (matches LIST output, case-insensitive
             // for INBOX as elsewhere).
-            let target_id = list_mailboxes(&fix)
+            let target_id = list_mailboxes(&fix, &self.account_id)
                 .iter()
                 .find(|e| e.path.eq_ignore_ascii_case(&target_name))
                 .map(|e| e.fixture_id.clone());
@@ -1062,7 +1135,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         };
         let mut hits: Vec<u32> = {
             let fix = self.fix_read();
-            mailbox_messages(&fix, &selected_id)
+            mailbox_messages(&fix, &self.account_id, &selected_id)
                 .iter()
                 .filter(|(uid, e)| matches.matches(*uid, e))
                 .map(|(uid, _)| *uid)
@@ -1102,12 +1175,18 @@ struct ListEntry {
     attributes: Vec<String>,
 }
 
-fn list_mailboxes(fixture: &Fixture) -> Vec<ListEntry> {
-    let by_id: HashMap<&str, &Mailbox> =
-        fixture.mailboxes.iter().map(|m| (m.id.as_str(), m)).collect();
+fn list_mailboxes(fixture: &Fixture, account_id: &str) -> Vec<ListEntry> {
+    // The path-building walk needs to follow `parent_id` chains, but
+    // parents must live in the same account (loader-enforced), so
+    // scoping the id->Mailbox map by account is correct and avoids
+    // a cross-account leak should a future loader relax cross-
+    // account parents.
+    let by_id: HashMap<&str, &Mailbox> = fixture
+        .mailboxes_for(account_id)
+        .map(|m| (m.id.as_str(), m))
+        .collect();
     fixture
-        .mailboxes
-        .iter()
+        .mailboxes_for(account_id)
         .map(|m| {
             let path = mailbox_path(m, &by_id);
             let attributes = role_attributes(m.role);
@@ -1164,10 +1243,13 @@ struct Counts {
 /// skipped; their UIDs stay assigned but are no longer addressable.
 /// Live email lookups go through a one-shot `id -> &Email` map so a
 /// big mailbox doesn't go quadratic.
-fn mailbox_messages<'a>(fixture: &'a Fixture, mailbox_id: &str) -> Vec<(u32, &'a Email)> {
+fn mailbox_messages<'a>(
+    fixture: &'a Fixture,
+    account_id: &'a str,
+    mailbox_id: &str,
+) -> Vec<(u32, &'a Email)> {
     let by_id: HashMap<&str, &Email> = fixture
-        .emails
-        .iter()
+        .emails_for(account_id)
         .map(|e| (e.id.as_str(), e))
         .collect();
     fixture
@@ -1185,10 +1267,9 @@ fn mailbox_messages<'a>(fixture: &'a Fixture, mailbox_id: &str) -> Vec<(u32, &'a
         .collect()
 }
 
-fn mailbox_counts(fixture: &Fixture, mailbox_id: &str) -> Counts {
+fn mailbox_counts(fixture: &Fixture, account_id: &str, mailbox_id: &str) -> Counts {
     let by_id: HashMap<&str, &Email> = fixture
-        .emails
-        .iter()
+        .emails_for(account_id)
         .map(|e| (e.id.as_str(), e))
         .collect();
     let mut exists: u64 = 0;
@@ -1263,6 +1344,116 @@ fn parse_status_args(args: &str) -> Option<StatusArgs> {
         }
     }
     Some(StatusArgs { name, items })
+}
+
+// ── SASL helpers (AUTHENTICATE / account binding) ────────────────────
+
+/// Decode a SASL response (base64-encoded, standard alphabet). The
+/// IMAP client always sends standard base64 with `=` padding here -
+/// not the URL-safe Gmail variant. Lenient: ignores stray padding
+/// and silently drops on unrecognised chars (the SASL spec allows
+/// either strict or lenient decoders).
+///
+/// Shared with `src/smtp.rs` (which uses the same SASL response
+/// shape for `AUTH PLAIN` / `LOGIN` / `XOAUTH2` / `OAUTHBEARER`).
+pub(crate) fn sasl_decode_b64(s: &str) -> Option<Vec<u8>> {
+    let alpha = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut val: [i8; 256] = [-1; 256];
+    for (i, &c) in alpha.iter().enumerate() {
+        // alpha has 64 entries; i fits in i8.
+        val[c as usize] = i8::try_from(i).expect("alpha index < 128");
+    }
+    let mut out: Vec<u8> = Vec::with_capacity((s.len() * 3) / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for c in s.bytes() {
+        if c == b'=' || c == b'\r' || c == b'\n' || c == b' ' {
+            continue;
+        }
+        let v = val[c as usize];
+        if v < 0 {
+            return None;
+        }
+        // v is in [0, 63] after the negativity check above.
+        let v_u: u8 = u8::try_from(v).expect("non-negative base64 nibble");
+        buf = (buf << 6) | u32::from(v_u);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Extract a bearer token from a SASL XOAUTH2 / OAUTHBEARER blob.
+/// Both shapes use `\x01`-separated key=value pairs; we look for the
+/// `auth=Bearer <token>` field. Returns None when the blob doesn't
+/// carry one (e.g. SASL PLAIN, or a malformed XOAUTH2 payload).
+pub(crate) fn sasl_extract_bearer(decoded: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(decoded).ok()?;
+    for field in s.split('\x01') {
+        if let Some(rest) = field.strip_prefix("auth=Bearer ")
+            .or_else(|| field.strip_prefix("auth=bearer "))
+        {
+            let token = rest.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the username from a SASL PLAIN / LOGIN / XOAUTH2 /
+/// OAUTHBEARER response. PLAIN uses `\0authzid\0user\0pass` (authzid
+/// is usually empty). XOAUTH2 / OAUTHBEARER prefix with `user=...`.
+/// LOGIN's first round-trip is literally the username (we don't yet
+/// support the second `+ Password:` round-trip; tests can extend).
+/// Returns None on malformed bytes; the caller leaves the binding
+/// unchanged.
+pub(crate) fn sasl_extract_username(mech: &str, decoded: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(decoded).ok()?;
+    match mech {
+        "PLAIN" => {
+            // `authzid\0user\0pass`. authzid may be empty.
+            let parts: Vec<&[u8]> = decoded.split(|b| *b == 0).collect();
+            if parts.len() >= 3 {
+                let user = std::str::from_utf8(parts[1]).ok()?;
+                if user.is_empty() { None } else { Some(user.to_string()) }
+            } else {
+                None
+            }
+        }
+        "XOAUTH2" | "OAUTHBEARER" => {
+            for field in s.split('\x01') {
+                if let Some(rest) = field.strip_prefix("user=") {
+                    let user = rest.trim();
+                    if !user.is_empty() {
+                        return Some(user.to_string());
+                    }
+                }
+                // OAUTHBEARER uses GS2 header `n,a=<user>,` for the
+                // optional authorization identity. Capture it.
+                if let Some(rest) = field.strip_prefix("n,a=")
+                    && let Some(end) = rest.find(',')
+                {
+                    let user = &rest[..end];
+                    if !user.is_empty() {
+                        return Some(user.to_string());
+                    }
+                }
+            }
+            None
+        }
+        "LOGIN" => {
+            // The (single) continuation in our implementation IS the
+            // base64-encoded username. Drop trailing whitespace.
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        }
+        _ => None,
+    }
 }
 
 struct AstringParser<'a> {
@@ -2448,7 +2639,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
+            serve_connection(server, fix, None, crate::oauth::TokenStore::default(), crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
         });
 
         client.write_all(script).await.unwrap();
@@ -3171,7 +3362,7 @@ mod tests {
         let fix = fixture();
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
+            serve_connection(server, fix, None, crate::oauth::TokenStore::default(), crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
         });
 
         // Read greeting first so the server is parked on the read.

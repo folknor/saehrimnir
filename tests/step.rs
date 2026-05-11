@@ -518,6 +518,7 @@ async fn run_imap(handle: &saehrimnir::shared::FixtureHandle, script: &[u8]) -> 
             server,
             fix,
             None,
+            saehrimnir::oauth::TokenStore::default(),
             saehrimnir::request_log::RequestLog::default(),
             saehrimnir::latency::LatencyKnob::default(),
             &mut rx,
