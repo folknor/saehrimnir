@@ -4,35 +4,58 @@ Running task list, ordered by what ratatoskr is actively waiting on.
 Per-protocol design notes live alongside in `notes/`; this file just
 tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
+## Priority (no particular order)
+
+Concrete next-up items lifted above the per-protocol backlogs.
+
+- **Graph group enumeration.** `/v1.0/groups` + `/v1.0/me/
+  memberOf`. Lands in `src/graph/group_sync.rs` (new). Fixture
+  format needs a `[[group]]` table; design alongside the
+  multi-account work since groups cross accounts.
+- **Multi-account fixture support.** v0 enforces `is_personal =
+  true` and exactly one account. Lifting requires per-protocol
+  tweaks to surface multiple accounts: JMAP session resource
+  (advertise additional accountIds), Graph `/users/{id}/...`
+  paths, IMAP per-connection account context. Prerequisite for
+  Graph shared-mailbox sync and Graph group enumeration (groups
+  cross accounts).
+- **Graph shared mailbox sync.** `/v1.0/users/{id}/...` paths
+  parallel to `/v1.0/me/...`. Lands in
+  `src/graph/shared_mailbox_sync.rs` (new). Blocked on multi-
+  account fixture support above.
+- **Gmail SendAs / signatures bidirectional sync.** Today
+  `/gmail/v1/users/me/settings/sendAs` returns an empty list.
+  Wire a `[[account.send_as]]` (or similar) fixture table, honour
+  it on GET, and accept PATCH to record signature changes via
+  `Fixture::mutate`. Lands in `src/gmail/mail.rs` plus a fixture
+  schema addition in `src/fixture.rs`.
+- **CalDAV MKCALENDAR.** Create-calendar verb. Should land an
+  `event_*`-parallel `calendar_created` transition so Graph
+  `/v1.0/me/calendars` and JMAP `Calendar/changes` observe the
+  new calendar. Lands in `src/caldav/mod.rs`.
+- **CalDAV recurrence (RRULE / EXDATE).** Round-trip recurrence
+  rules on VEVENT through the fixture `Event` type. Affects all
+  four calendar surfaces (CalDAV ical, Graph, gcal, JMAP
+  JSCalendar `recurrenceRules`). Fixture format needs an
+  `[[event.recurrence]]` shape; design before touching the
+  serializers.
+- **Lua Gmail attachment + sendAs hooks.** Wire `on("gmail",
+  "get_attachment", fn)` and `on("gmail", "send_as", fn)` through
+  the dispatcher so fault-injection works against those routes
+  the same way it does for `list_threads` etc. One-line additions
+  in `src/gmail/mail.rs` once the underlying handlers exist
+  (sendAs needs a real handler first; see Gmail SendAs item
+  above).
+- **Lua SMTP `cmd_auth` callback hook.** Wire `on("smtp",
+  "auth", fn)` so fixtures can inject AUTH-time failures. The
+  override helper exists; this is one call site in `src/smtp.rs`.
+
 ## From the 2026-05-10 multi-agent review (today's slice)
 
 Findings from a four-agent (bugs / security / perf / arch) sweep of
 the four commits in today's slice (`2aff7e6..bb2ecef`: JMAP
 calendar, cross-protocol raw_bytes + slow-paging, People API,
 Google Calendar). Only items that need work end up here.
-
-### Fix now
-
-All four Fix-now items in this slice have landed:
-`event_delta_since` parent-filter leak, People stale-token
-tombstone gap, gcal stale-token tombstone gap, and the
-`mock-event-{len+1}` id collision. See commits `467e5a7`,
-`a76c126`, and the id-collision commit. Regression tests in
-`tests/jmap_calendar.rs`, `tests/people.rs`, `tests/gcal.rs`.
-
-### Fix soon
-
-All seven Fix-soon items in this slice have landed. Two new
-helpers fell out and are reusable:
-
-- `Fixture::mint_event_id` / `Fixture::mint_email_id` for the
-  monotonic-id contract.
-- `request_log::body_detail` truncating wrapper, applied to gcal
-  and Graph mutation handlers (4 KiB cap per body).
-
-Regression tests added:
-`calendar_event_set_all_day_flip_recomputes_start_end`,
-`calendar_changes_returns_empty_for_known_seed_state`.
 
 ### Eventually (only when something forces it)
 
@@ -96,14 +119,6 @@ Regression tests added:
   fails in prod. Document in the People surface notes; reject
   unknown fields if a fixture cares.
 
-### Test coverage gaps closed in this slice
-
-All four gaps from the original review now have regression tests:
-`calendar_event_changes_does_not_leak_across_calendars`,
-`connections_emits_metadata_deleted_tombstone_after_destroy`,
-`list_events_emits_cancelled_tombstone_after_destroy`,
-`mint_event_id_does_not_collide_after_unrelated_destroy`.
-
 ## From the 2026-05-10 multi-agent review (earlier slice)
 
 Findings from a four-agent sweep of `8f7798c..7602fdb` (RwLock +
@@ -112,8 +127,7 @@ change_log, JMAP `Email/set` + `Mailbox/set`, IMAP `UID STORE` /
 contacts + delta, change-script pipeline + `/test/fixture/{step,
 reset}`, latency knob, stable request log, OAuth-enforced fixture,
 CalDAV listener, TOML `[[change]]` projection, `body_raw_bytes`
-escape hatch). Fix-now and Fix-soon items have all landed; only
-Eventually items remain.
+escape hatch).
 
 ### Eventually (only when something forces it)
 
@@ -215,10 +229,6 @@ Remaining items are unblocked-but-unneeded.
   the canonical fields. Attachments are already wired via
   `[[email.attachment]]`; this item is specifically about replacing
   the canonical body+attachments shape with a parsed `.eml`.
-- Multi-account. v0 enforces `is_personal = true` and exactly one
-  account. Lifting requires per-protocol tweaks to surface multiple
-  accounts (JMAP session resource, Graph `/users/{id}/...` paths,
-  IMAP per-connection account context).
 - Larger named fixtures beyond `fixtures/jmap-bulk.lua`. The
   `bulk_emails` / `bulk_threads` / `bulk_mailboxes` builders make
   medium (~1k), huge-thread, and many-folders fixtures one-liners.
@@ -240,52 +250,43 @@ Remaining items are unblocked-but-unneeded.
 
 ## Microsoft Graph (other future work)
 
-v0 mail-sync, calendar, and contacts are complete. Remaining future
-Graph work, in roughly the order the next fixture is likely to
-need it:
+v0 mail-sync, calendar, and contacts are complete. Label / group /
+shared-mailbox sync are tracked under "Priority" above. Remaining
+future Graph work:
 
-- Master category list (`label_sync.rs`).
-- Group enumeration (`group_sync.rs`).
 - OneDrive resumable upload sessions (`onedrive.rs`) - needed once
   the SMTP / Graph submit paths grow attachments.
 - Public-folder sync via EWS (`ews/`, `public_folder_sync.rs`).
   Different protocol (SOAP), separate `src/ews.rs` module.
-- Shared mailbox sync via `/users/{id}/...` paths
-  (`shared_mailbox_sync.rs`). Needs multi-account fixtures.
 - Webhooks / change notifications (`webhooks.rs`).
 - Autodiscover (`autodiscover.rs`).
 
 ## Gmail (future work)
 
-v0 mail-sync surface is complete. Future Gmail work:
+v0 mail-sync surface is complete. SendAs / signatures bidirectional
+sync is tracked under "Priority" above. Remaining future Gmail
+work:
 
 - Google Drive resumable uploads
   (`<ratatoskr>/crates/gmail/src/gdrive.rs`). Needed once the
   submission paths grow attachments large enough to spill out of
   inline.
-- SendAs / signatures bidirectional sync. v0 emits an empty
-  `sendAs[]`; once a fixture grows `[account.signature]` we honour
-  it both ways.
 
 ## CalDAV (future work)
 
-v0 surface is complete (see `CLAUDE.md` "Status"). Out of scope
-until a fixture forces it: MKCALENDAR, PROPPATCH, ACLs, delegation,
-free-busy, scheduling (iTIP / iMIP), VEVENT recurrence (RRULE /
-EXDATE), VALARM, attachments, per-event VTIMEZONE.
+v0 surface is complete (see `CLAUDE.md` "Status"). MKCALENDAR and
+recurrence (RRULE / EXDATE) are tracked under "Priority" above.
+Out of scope until a fixture forces it: PROPPATCH, ACLs, delegation,
+free-busy, scheduling (iTIP / iMIP), VALARM, attachments,
+per-event VTIMEZONE.
 
 ## Lua dynamic surface
 
 Phase 2 callbacks (`on(protocol, command, fn)`) are wired across all
 five protocols, mapped via `Override::Tagged { status, message }`.
-What's left on the Lua side:
+The SMTP `cmd_auth` hook and Gmail `get_attachment` / `send_as`
+hooks are tracked under "Priority" above. What's left:
 
-- SMTP `cmd_auth` callback hook. Skipped from the initial fanout
-  because AUTH-time fault injection isn't a common scenario; the
-  helper exists, adding the hook is one line if a fixture wants
-  it.
-- Gmail `get_attachment` and `send_as` callback hooks. Skipped
-  because both are stubs. Wire when a fixture needs them.
 - Per-protocol callbacks for the new gcal and People listeners
   (`list_events`, `calendar_list`, `list_connections`,
   `list_other_contacts` already accept overrides; mutating verbs

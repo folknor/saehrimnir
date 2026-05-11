@@ -1,0 +1,32 @@
+name = "graph-categories-small"
+
+[account]
+id = "account-1"
+name = "test@example.com"
+is_personal = true
+
+[[mailbox]]
+id = "mbx-inbox"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+# Three categories exercising:
+#  - bare displayName with no color (clients render as the default)
+#  - displayName + Graph-preset colour string
+#  - a synthesised `mock-category-N` id, used to verify
+#    `mint_category_id` seeds past the pre-declared max
+
+[[category]]
+id = "cat-work"
+display_name = "Work"
+color = "preset0"
+
+[[category]]
+id = "cat-personal"
+display_name = "Personal"
+color = "preset3"
+
+[[category]]
+id = "cat-no-color"
+display_name = "Untagged"

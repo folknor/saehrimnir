@@ -176,6 +176,8 @@ struct Builder {
     contact_folders: Vec<crate::fixture::RawContactFolder>,
     /// Contacts accumulated via `contact({...})`.
     contacts: Vec<crate::fixture::RawContact>,
+    /// Outlook master categories accumulated via `category({...})`.
+    categories: Vec<crate::fixture::RawCategory>,
 }
 
 impl Builder {
@@ -197,6 +199,7 @@ impl Builder {
             events: vec![],
             contact_folders: self.contact_folders,
             contacts: self.contacts,
+            categories: self.categories,
             // Lua change_script lives in `Builder::change_script`
             // (fully-typed `Vec<ChangeStep>`) and is grafted onto
             // the Fixture after `normalize_with_dir` returns; the
@@ -234,6 +237,8 @@ fn install_builders(state: &mut State) {
     state.set_global("contact_folder");
     state.push_rust_fn(builder_contact);
     state.set_global("contact");
+    state.push_rust_fn(builder_category);
+    state.set_global("category");
     state.push_rust_fn(builder_wait);
     state.set_global("wait");
     state.push_rust_fn(builder_mock_done);
@@ -424,6 +429,19 @@ fn builder_contact(state: &mut State) -> dellingr::Result<u8> {
         display_name,
         emails,
     });
+    Ok(0)
+}
+
+/// `category { id, display_name, color? }`. The Graph master
+/// category list is flat per account, no folder scope.
+fn builder_category(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "category")?;
+    let cat = crate::fixture::RawCategory {
+        id: read_string(state, 1, "id")?,
+        display_name: read_string(state, 1, "display_name")?,
+        color: read_string_opt(state, 1, "color")?,
+    };
+    builder_mut(state)?.categories.push(cat);
     Ok(0)
 }
 

@@ -1087,3 +1087,289 @@ async fn graph_contacts_delta_initial_dump_then_latest_shortcut() {
     assert_eq!(v3["value"].as_array().unwrap().len(), 0);
     assert!(v3["@odata.deltaLink"].is_string());
 }
+
+// ── Master categories ───────────────────────────────────────────────
+
+fn categories_router_with_log(
+    log: saehrimnir::request_log::RequestLog,
+) -> axum::Router {
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/graph-categories-small.toml",
+    ))
+    .unwrap();
+    graph::router(
+        graph::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(log),
+    )
+}
+
+fn categories_router() -> axum::Router {
+    categories_router_with_log(saehrimnir::request_log::RequestLog::default())
+}
+
+#[tokio::test]
+async fn graph_list_categories_projects_fixture_in_declaration_order() {
+    let (status, v) = get_json_with(
+        categories_router(),
+        "/v1.0/me/outlook/masterCategories",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v["@odata.context"],
+        "https://graph.microsoft.com/v1.0/$metadata#me/outlook/masterCategories"
+    );
+    let arr = v["value"].as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["id"], "cat-work");
+    assert_eq!(arr[0]["displayName"], "Work");
+    assert_eq!(arr[0]["color"], "preset0");
+    // No-color category omits the field entirely (matches real Graph
+    // behaviour for "color = none" categories, where the property is
+    // serialised as the string "none" - we leave it absent instead so
+    // a client that round-trips the object can distinguish "unset" from
+    // "explicit none").
+    assert_eq!(arr[2]["id"], "cat-no-color");
+    assert!(arr[2].get("color").is_none());
+}
+
+#[tokio::test]
+async fn graph_get_category_returns_single_resource() {
+    let (status, v) = get_json_with(
+        categories_router(),
+        "/v1.0/me/outlook/masterCategories/cat-personal",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "cat-personal");
+    assert_eq!(v["displayName"], "Personal");
+    assert_eq!(v["color"], "preset3");
+}
+
+#[tokio::test]
+async fn graph_get_category_404s_unknown_id() {
+    let (status, v) = get_json_with(
+        categories_router(),
+        "/v1.0/me/outlook/masterCategories/cat-missing",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn graph_create_category_mints_id_when_absent_and_bumps_state() {
+    let log = saehrimnir::request_log::RequestLog::default();
+    let app = categories_router_with_log(log.clone());
+
+    let body = serde_json::json!({
+        "displayName": "Urgent",
+        "color": "preset5",
+    });
+    let (status, v) =
+        json_request(app.clone(), "POST", "/v1.0/me/outlook/masterCategories", Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // The fixture seeds `synthetic_category_seq` to the highest of
+    // (a) the largest `mock-category-N` declared (0 here) and
+    // (b) the number of declared categories (3). First mint is 4.
+    assert_eq!(v["id"], "mock-category-4");
+    assert_eq!(v["displayName"], "Urgent");
+    assert_eq!(v["color"], "preset5");
+
+    // Body landed in the request log.
+    let snap = log.snapshot();
+    let entry = snap
+        .iter()
+        .find(|e| {
+            e.command == "POST /v1.0/me/outlook/masterCategories" && !e.detail["body"].is_null()
+        })
+        .expect("mutation entry recorded");
+    assert_eq!(entry.detail["body"]["displayName"], "Urgent");
+
+    // Follow-up list reflects the new category.
+    let (_, v) =
+        get_json_with(app, "/v1.0/me/outlook/masterCategories").await;
+    assert_eq!(v["value"].as_array().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn graph_create_category_honours_client_supplied_id() {
+    let app = categories_router();
+    let body = serde_json::json!({
+        "id": "cat-custom",
+        "displayName": "Custom",
+    });
+    let (status, v) = json_request(
+        app.clone(),
+        "POST",
+        "/v1.0/me/outlook/masterCategories",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(v["id"], "cat-custom");
+}
+
+#[tokio::test]
+async fn graph_create_category_409s_on_duplicate_id() {
+    let app = categories_router();
+    let body = serde_json::json!({
+        "id": "cat-work",
+        "displayName": "Work-2",
+    });
+    let (status, v) =
+        json_request(app, "POST", "/v1.0/me/outlook/masterCategories", Some(body)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(v["error"]["code"], "Conflict");
+}
+
+#[tokio::test]
+async fn graph_create_category_400s_without_display_name() {
+    let app = categories_router();
+    let body = serde_json::json!({ "color": "preset0" });
+    let (status, v) =
+        json_request(app, "POST", "/v1.0/me/outlook/masterCategories", Some(body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "BadRequest");
+}
+
+#[tokio::test]
+async fn graph_patch_category_updates_fields_and_echoes_view() {
+    let app = categories_router();
+    let body = serde_json::json!({
+        "displayName": "Work (renamed)",
+        "color": "preset12",
+    });
+    let (status, v) = json_request(
+        app.clone(),
+        "PATCH",
+        "/v1.0/me/outlook/masterCategories/cat-work",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "cat-work");
+    assert_eq!(v["displayName"], "Work (renamed)");
+    assert_eq!(v["color"], "preset12");
+
+    // Follow-up GET reflects the patch.
+    let (_, v) = get_json_with(app, "/v1.0/me/outlook/masterCategories/cat-work").await;
+    assert_eq!(v["displayName"], "Work (renamed)");
+}
+
+#[tokio::test]
+async fn graph_patch_category_404s_unknown_id() {
+    let app = categories_router();
+    let body = serde_json::json!({ "displayName": "x" });
+    let (status, _) = json_request(
+        app,
+        "PATCH",
+        "/v1.0/me/outlook/masterCategories/cat-missing",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_delete_category_returns_204_and_removes_resource() {
+    let log = saehrimnir::request_log::RequestLog::default();
+    let app = categories_router_with_log(log.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1.0/me/outlook/masterCategories/cat-work")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Follow-up GET 404s and follow-up list is short by one.
+    let (status, _) =
+        get_json_with(app.clone(), "/v1.0/me/outlook/masterCategories/cat-work").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, v) = get_json_with(app, "/v1.0/me/outlook/masterCategories").await;
+    assert_eq!(v["value"].as_array().unwrap().len(), 2);
+
+    let snap = log.snapshot();
+    assert!(snap.iter().any(|e| e.command
+        == "DELETE /v1.0/me/outlook/masterCategories/cat-work"
+        && e.detail["id"] == "cat-work"));
+}
+
+#[tokio::test]
+async fn graph_delete_category_404s_unknown_id() {
+    let app = categories_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1.0/me/outlook/masterCategories/cat-missing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_category_mutation_records_change_log_transition() {
+    // POST -> PATCH -> DELETE should bump fixture.state three times
+    // and append three transitions tagged with the right ids.
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/graph-categories-small.toml",
+    ))
+    .unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let initial_state = handle.read().unwrap().state.clone();
+    let app = graph::router(graph::AppState::for_test(Arc::clone(&handle)));
+
+    let body = serde_json::json!({ "id": "cat-new", "displayName": "New" });
+    let (s1, _) = json_request(
+        app.clone(),
+        "POST",
+        "/v1.0/me/outlook/masterCategories",
+        Some(body),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED);
+
+    let body = serde_json::json!({ "displayName": "Renamed" });
+    let (s2, _) = json_request(
+        app.clone(),
+        "PATCH",
+        "/v1.0/me/outlook/masterCategories/cat-new",
+        Some(body),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1.0/me/outlook/masterCategories/cat-new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let fix = handle.read().unwrap();
+    assert_ne!(fix.state, initial_state);
+    let trans: Vec<_> = fix.change_log_transitions().collect();
+    assert_eq!(trans.len(), 3);
+    assert_eq!(trans[0].category_created, vec!["cat-new".to_string()]);
+    assert_eq!(trans[1].category_updated, vec!["cat-new".to_string()]);
+    assert_eq!(trans[2].category_destroyed, vec!["cat-new".to_string()]);
+    // Sibling categories untouched.
+    assert!(fix.categories.iter().any(|c| c.id == "cat-work"));
+    assert!(!fix.categories.iter().any(|c| c.id == "cat-new"));
+}
+

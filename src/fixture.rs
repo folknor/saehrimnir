@@ -32,6 +32,11 @@ pub struct Fixture {
     /// Contacts scoped to a `ContactFolder` by `folder_id`. Empty by
     /// default.
     pub contacts: Vec<Contact>,
+    /// Outlook master category list. Projects over the Graph
+    /// `/v1.0/me/outlook/masterCategories` surface (the Graph
+    /// analogue of Gmail labels / JMAP keywords). Flat per-account
+    /// in real Graph - no folder scope. Empty by default.
+    pub categories: Vec<Category>,
     /// Per-mutation transition log. Empty at load time (the seed
     /// state is the only known state); each successful `Email/set`
     /// or `Mailbox/set` envelope appends a transition and bumps
@@ -76,6 +81,11 @@ pub struct Fixture {
     /// Monotonic counter for synthesized `mock-email-N` ids;
     /// same shape as `synthetic_event_seq`.
     pub synthetic_email_seq: u64,
+    /// Monotonic counter for synthesized `mock-category-N` ids
+    /// produced by `POST /v1.0/me/outlook/masterCategories` when
+    /// the client omits the id. Same shape as
+    /// `synthetic_event_seq`.
+    pub synthetic_category_seq: u64,
 }
 
 /// Bounded ring of recent state transitions.
@@ -138,6 +148,9 @@ pub struct Transition {
     pub contact_folder_created: Vec<String>,
     pub contact_folder_updated: Vec<String>,
     pub contact_folder_destroyed: Vec<String>,
+    pub category_created: Vec<String>,
+    pub category_updated: Vec<String>,
+    pub category_destroyed: Vec<String>,
 }
 
 /// Resource-id deltas a single mutator pass produced. Returned by the
@@ -168,6 +181,9 @@ pub struct MutationDiff {
     pub contact_folder_created: Vec<String>,
     pub contact_folder_updated: Vec<String>,
     pub contact_folder_destroyed: Vec<String>,
+    pub category_created: Vec<String>,
+    pub category_updated: Vec<String>,
+    pub category_destroyed: Vec<String>,
 }
 
 impl MutationDiff {
@@ -187,6 +203,9 @@ impl MutationDiff {
             && self.contact_folder_created.is_empty()
             && self.contact_folder_updated.is_empty()
             && self.contact_folder_destroyed.is_empty()
+            && self.category_created.is_empty()
+            && self.category_updated.is_empty()
+            && self.category_destroyed.is_empty()
     }
 }
 
@@ -348,6 +367,14 @@ impl Fixture {
         format!("mock-email-{}", self.synthetic_email_seq)
     }
 
+    /// Category-side analogue. Drives
+    /// `POST /v1.0/me/outlook/masterCategories` when the client
+    /// posts a body without an `id` field.
+    pub fn mint_category_id(&mut self) -> String {
+        self.synthetic_category_seq += 1;
+        format!("mock-category-{}", self.synthetic_category_seq)
+    }
+
     /// Apply a mutation, record its transition, and bump `state`.
     /// The closure is the only thing allowed to touch the fixture
     /// fields; it returns the resource-id diff so we can capture it
@@ -404,6 +431,9 @@ impl Fixture {
                 contact_folder_created: vec![],
                 contact_folder_updated: vec![],
                 contact_folder_destroyed: vec![],
+                category_created: vec![],
+                category_updated: vec![],
+                category_destroyed: vec![],
             };
         }
         self.change_log.counter += 1;
@@ -429,6 +459,9 @@ impl Fixture {
             contact_folder_created: diff.contact_folder_created,
             contact_folder_updated: diff.contact_folder_updated,
             contact_folder_destroyed: diff.contact_folder_destroyed,
+            category_created: diff.category_created,
+            category_updated: diff.category_updated,
+            category_destroyed: diff.category_destroyed,
         };
         debug_assert_eq!(
             trans.event_destroyed.len(),
@@ -913,6 +946,18 @@ pub struct ContactEmail {
     pub name: Option<String>,
 }
 
+/// Outlook master category. Real Graph stores these flat on the
+/// account; v0 mirrors that shape. `color` is a Graph preset
+/// string ("preset0".."preset24" or "none"); the mock does not
+/// validate the enum (real Graph accepts unknown presets too and
+/// renders them as the default colour).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Category {
+    pub id: String,
+    pub display_name: String,
+    pub color: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub id: String,
@@ -1084,6 +1129,8 @@ pub(crate) struct RawFixture {
     pub(crate) contact_folders: Vec<RawContactFolder>,
     #[serde(default, rename = "contact")]
     pub(crate) contacts: Vec<RawContact>,
+    #[serde(default, rename = "category")]
+    pub(crate) categories: Vec<RawCategory>,
     #[serde(default, rename = "change")]
     pub(crate) change_script: Vec<RawChangeStep>,
 }
@@ -1223,6 +1270,14 @@ pub(crate) struct RawContact {
     pub(crate) display_name: Option<String>,
     #[serde(default)]
     pub(crate) emails: Vec<RawContactEmail>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawCategory {
+    pub(crate) id: String,
+    pub(crate) display_name: String,
+    #[serde(default)]
+    pub(crate) color: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1599,6 +1654,20 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    // Master categories. Flat list per account, ids unique.
+    let mut category_ids: HashMap<String, ()> = HashMap::new();
+    let mut categories = Vec::with_capacity(raw.categories.len());
+    for cat in raw.categories {
+        if category_ids.insert(cat.id.clone(), ()).is_some() {
+            return Err(format!("duplicate category id {:?}", cat.id));
+        }
+        categories.push(Category {
+            id: cat.id,
+            display_name: cat.display_name,
+            color: cat.color,
+        });
+    }
+
     // Change-script projection. Normalised against the *baseline*
     // mailbox set declared in the same fixture; mailboxes that a
     // later step's `mailbox_create` op introduces are not visible
@@ -1640,6 +1709,9 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         .max(events.len() as u64);
     let synthetic_email_seq = max_mock_seq(emails.iter().map(|e| e.id.as_str()), "mock-email-")
         .max(emails.len() as u64);
+    let synthetic_category_seq =
+        max_mock_seq(categories.iter().map(|c| c.id.as_str()), "mock-category-")
+            .max(categories.len() as u64);
     Ok(Fixture {
         name: raw.name,
         state,
@@ -1654,11 +1726,13 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         events,
         contact_folders,
         contacts,
+        categories,
         change_log,
         change_script,
         mailbox_uid_history,
         synthetic_event_seq,
         synthetic_email_seq,
+        synthetic_category_seq,
     })
 }
 

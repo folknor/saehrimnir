@@ -172,8 +172,11 @@ checking whether the fact is already in `notes/`.
   `calendar.rs` (calendar + event handlers, including echo-mode
   POST/PATCH/DELETE that record bodies in the request log),
   `contacts.rs` (contact + contactFolder GETs + contacts/delta
-  walker, mutations via change-script). Sibling files for drive /
-  groups / EWS land here when those surfaces are scouted.
+  walker, mutations via change-script), `label_sync.rs` (Outlook
+  master category list - GET/POST/PATCH/DELETE on
+  `/v1.0/me/outlook/masterCategories`, mutations via
+  `Fixture::mutate`). Sibling files for drive / groups / EWS land
+  here when those surfaces are scouted.
 - `src/caldav/` - CalDAV mock. `mod.rs` (single-handler dispatch
   on PROPFIND / REPORT / GET / PUT / DELETE / OPTIONS for the
   WebDAV verb surface ratatoskr's CalDavClient exercises), `xml.rs`
@@ -370,7 +373,8 @@ restarting the binary. Integration tests in `tests/smtp.rs`,
 including a TCP-level STARTTLS round-trip; the route shape is
 covered in `tests/api.rs`.
 
-Graph: mail-sync, calendar, and contacts are complete for v0. Mail:
+Graph: mail-sync, calendar, contacts, and master categories are
+complete for v0. Mail:
 `/v1.0/me/mailFolders` (list, by-id, by-well-known-alias,
 childFolders), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
 `$skip` / `$skiptoken` / `$filter`), `/v1.0/me/mailFolders/{id}/
@@ -400,6 +404,15 @@ back to bootstrap). Mutations land via change-script ops
 (`contact_create` / `contact_update` / `contact_destroy` plus
 folder counterparts) routed through `Fixture::mutate`; tombstones
 use the Graph `{ id, "@removed": { reason: "deleted" } }` shape.
+Master categories: `/v1.0/me/outlook/masterCategories` GET (list +
+single) + POST / PATCH / DELETE. Flat per-account (no folder
+scope, mirroring real Graph). POST mints `mock-category-N` when
+the body omits `id`, or honours a client-supplied id when present
+(409 on collision). Mutations land via `Fixture::mutate` and
+record `category_*` transitions; the change_log entries are
+observability for tests asserting state moved (real Graph has no
+`masterCategories/delta` endpoint, so v0 doesn't expose one
+either). Tests in `tests/graph.rs`.
 Catchall returns the Graph error envelope so unimplemented
 resources are visibly out-of-scope. Sibling files for drive /
 groups / EWS drop in later.

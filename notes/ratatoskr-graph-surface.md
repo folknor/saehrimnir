@@ -77,6 +77,34 @@ Change-script ops (Lua `change({...})`):
 new/change/delete trio end-to-end through `contacts/delta`; see
 `tests/step.rs::fixture_step_mutations_visible_through_graph_contacts_delta`.
 
+## Master categories (`src/graph/label_sync.rs`)
+
+The Outlook master category list is the Graph analogue of Gmail
+labels / JMAP keywords. Flat per-account in real Graph - no
+folder scope - and exposed under
+`/v1.0/me/outlook/masterCategories`. Wire shape matches Graph's
+`OutlookCategory` resource: `id`, `displayName`, `color`
+(optional Graph preset enum string).
+
+| Endpoint | Notes |
+|----------|-------|
+| `GET /v1.0/me/outlook/masterCategories` | List. No paging - the master category list is small and real Graph returns it unpaginated. |
+| `GET /v1.0/me/outlook/masterCategories/{id}` | Single. |
+| `POST /v1.0/me/outlook/masterCategories` | Body `{ displayName, color?, id? }`. `id` is optional: if absent the mock mints `mock-category-N` via `Fixture::mint_category_id`; if present the mock honours it (real Graph rejects client-supplied ids with a 400, but v0 keeps this permissive so test fixtures can author predictable ids). Duplicate id returns 409 Conflict. Missing `displayName` returns 400. |
+| `PATCH /v1.0/me/outlook/masterCategories/{id}` | Body may patch `displayName` and `color`. Unknown fields are ignored. 404 on unknown id. |
+| `DELETE /v1.0/me/outlook/masterCategories/{id}` | 204 on success, 404 on unknown id. |
+
+Mutations land via `Fixture::mutate` and append
+`category_created` / `category_updated` / `category_destroyed`
+to the change log. Real Graph has no `masterCategories/delta`
+endpoint, so v0 doesn't expose one either - the change-log
+entries are purely observability for tests asserting state
+moved.
+
+The fixture format adds a flat `[[category]]` block (see
+`notes/fixture-format.md`); the Lua loader exposes the same
+shape via `category({...})`.
+
 ## Connection / transport
 
 - Base URL: `https://graph.microsoft.com/v1.0` (a few flows use

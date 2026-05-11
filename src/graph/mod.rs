@@ -11,6 +11,7 @@
 
 pub mod calendar;
 pub mod contacts;
+pub mod label_sync;
 pub mod mail;
 pub mod odata;
 
@@ -105,6 +106,7 @@ pub fn router(state: AppState) -> Router {
         .merge(mail::router())
         .merge(calendar::router())
         .merge(contacts::router())
+        .merge(label_sync::router())
         .fallback(any(not_implemented))
         .layer(middleware::from_fn_with_state(
             state.clone(),

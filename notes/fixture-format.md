@@ -302,6 +302,33 @@ The Lua loader exposes the same blocks via `contact_folder({...})`
 and `contact({...})` builders; the `emails` field accepts the same
 bare-string-or-table sugar as the TOML form.
 
+## Master categories (optional)
+
+```toml
+[[category]]
+id = "cat-work"
+display_name = "Work"
+color = "preset0"           # optional; Graph preset enum string
+
+[[category]]
+id = "cat-personal"
+display_name = "Personal"   # color absent -> field omitted on wire
+```
+
+Validation:
+
+- `category.id` is unique across categories.
+- `color` is not validated against the Graph preset enum
+  (`preset0`..`preset24` or `none`); real Graph accepts unknown
+  values too and renders them as the default colour.
+
+Categories project flat over the Graph
+`/v1.0/me/outlook/masterCategories` surface (no folder scope -
+they're per-account in real Graph). The mock supports the full
+CRUD set; mutations land via `Fixture::mutate` and bump
+`fixture.state`. The Lua loader exposes the same block via
+`category({...})`.
+
 ## OAuth (optional)
 
 ```toml

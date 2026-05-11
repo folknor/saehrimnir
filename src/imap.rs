@@ -2308,9 +2308,11 @@ mod tests {
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
+            categories: vec![],
             mailbox_uid_history: HashMap::new(),
             synthetic_event_seq: 0,
             synthetic_email_seq: 0,
+            synthetic_category_seq: 0,
         })
     }
 
@@ -2393,9 +2395,11 @@ mod tests {
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
+            categories: vec![],
             mailbox_uid_history: HashMap::new(),
             synthetic_event_seq: 0,
             synthetic_email_seq: 0,
+            synthetic_category_seq: 0,
         };
         // Test fixture - rebuild as if loaded.
         fix.rebuild_uid_history();
