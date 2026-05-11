@@ -47,6 +47,16 @@ outbound message. That makes the surface small.
     for `auth=Bearer <token>` (looked up in the OAuth
     `TokenStore` shared with the Google-family listeners); on
     no bearer match, fall back to the `user=` field.
+- Lua fixtures can inject AUTH-time failures via
+  `on("smtp", "AUTH", fn)`. The hook fires after the SASL
+  response is read but before the connection binds an account;
+  `req.payload` carries the mechanism name so the script can
+  reject selectively (e.g. fail XOAUTH2 while letting PLAIN
+  pass). Returning `{ status = "535", message = "..." }`
+  emits `535 ...\r\n` instead of `235 authentication accepted`
+  and leaves the connection unauthenticated. The decoded SASL
+  response itself is deliberately NOT exposed to callbacks
+  (credentials).
 
 ## EHLO / capabilities
 

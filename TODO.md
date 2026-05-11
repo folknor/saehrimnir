@@ -58,9 +58,6 @@ Concrete next-up items lifted above the per-protocol backlogs.
   in `src/gmail/mail.rs` once the underlying handlers exist
   (sendAs needs a real handler first; see Gmail SendAs item
   above).
-- **Lua SMTP `cmd_auth` callback hook.** Wire `on("smtp",
-  "auth", fn)` so fixtures can inject AUTH-time failures. The
-  override helper exists; this is one call site in `src/smtp.rs`.
 
 ## From the 2026-05-10 multi-agent review (today's slice)
 

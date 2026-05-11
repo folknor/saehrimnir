@@ -599,11 +599,19 @@ for `Override::Tagged { status, message }`:
 - **Gmail** (`profile`, `list_labels`, `list_threads`, `get_thread`,
   `history`): HTTP 400 with the Gmail error envelope (status maps to
   `errors[0].reason`, message to `error.message`).
-- **SMTP** (`MAIL`, `RCPT`, `DATA`): wire response `<code> <message>\r\n`
-  where `code` is parsed from the `status` field as a `u16` (e.g.
-  `"452"` for rate-limited rejection, `"552"` for body-too-large);
-  non-numeric status falls back to `550`. The DATA body is not
-  consumed when the override fires before `354`.
+- **SMTP** (`MAIL`, `RCPT`, `DATA`, `AUTH`): wire response
+  `<code> <message>\r\n` where `code` is parsed from the `status`
+  field as a `u16` (e.g. `"452"` for rate-limited rejection,
+  `"552"` for body-too-large, `"535"` for invalid credentials,
+  `"454"` for temporary AUTH failure); non-numeric status falls
+  back to `550`. The DATA body is not consumed when the override
+  fires before `354`. The `AUTH` hook fires after the SASL
+  response is read but before the connection binds an account;
+  `req.payload` carries the mechanism name (`PLAIN`, `LOGIN`,
+  `XOAUTH2`, `OAUTHBEARER`) so the script can fail selectively.
+  The decoded SASL response is deliberately NOT passed to the
+  callback - it carries credentials and the request log already
+  redacts them.
 
 Per-(protocol, command) `call_index` is a built-in `req` field;
 protocol-specific extras (`uid_set`, `attrs`, `mailbox`, `folder`,

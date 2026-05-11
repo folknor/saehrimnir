@@ -210,6 +210,58 @@ async fn rcpt_callback_can_inject_452() {
 }
 
 #[tokio::test]
+async fn auth_callback_can_inject_invalid_credentials() {
+    // The hook fires after the SASL response is read but before
+    // the connection binds account / writes 235. A `535` response
+    // suppresses both. Subsequent MAIL FROM is rejected with
+    // `503 send EHLO first`? No - state.auth stays None but
+    // state.ehlo is still set, so MAIL FROM proceeds; the
+    // submission gets recorded with auth_mechanism: None.
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "a", name = "a@b" })
+        on("smtp", "AUTH", function(req)
+            return { status = "535", message = "invalid credentials" }
+        end)
+    "#;
+    let (out, log) = run_with_dispatcher(
+        scenario,
+        b"EHLO me\r\nAUTH PLAIN AGFsaWNlAGh1bnRlcg==\r\nMAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\nx\r\n.\r\nQUIT\r\n",
+    )
+    .await;
+    assert!(out.contains("535 invalid credentials"), "got: {out:?}");
+    // 235 must NOT appear - the override skipped the success line.
+    assert!(!out.contains("235"), "AUTH 235 leaked through override: {out:?}");
+    // The submission still goes through (override only fails AUTH);
+    // auth_mechanism is None because state.auth was never set.
+    let snap = log.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert!(snap[0].auth_mechanism.is_none());
+}
+
+#[tokio::test]
+async fn auth_callback_can_inject_temporary_failure_by_mechanism() {
+    // `req.payload` carries the mechanism name so the script can
+    // selectively reject. Here we fail only XOAUTH2 while PLAIN
+    // would have passed.
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "a", name = "a@b" })
+        on("smtp", "AUTH", function(req)
+            if req.payload == "XOAUTH2" then
+                return { status = "454", message = "oauth temporarily unavailable" }
+            end
+        end)
+    "#;
+    let (out, _log) = run_with_dispatcher(
+        scenario,
+        b"EHLO me\r\nAUTH XOAUTH2 dXNlcj1hbGljZQ==\r\nQUIT\r\n",
+    )
+    .await;
+    assert!(out.contains("454 oauth temporarily unavailable"), "got: {out:?}");
+}
+
+#[tokio::test]
 async fn data_callback_can_reject_submission() {
     let scenario = r#"
         fixture({ name = "cb" })

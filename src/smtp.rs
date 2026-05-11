@@ -523,6 +523,21 @@ impl Conn {
                         Some(stripped)
                     }
                 };
+                // Consult the Lua dispatcher BEFORE binding the
+                // connection's account. The override payload is the
+                // mechanism name (e.g. "PLAIN"); the SASL response
+                // itself is deliberately omitted (it carries
+                // decoded credentials and the request log already
+                // redacts it - see `dispatch`'s logged_args
+                // handling). A fixture that wants to inject
+                // AUTH-time failures returns `{ status, message }`
+                // where `status` is the SMTP numeric code (e.g.
+                // `"535"` for invalid credentials, `"454"` for a
+                // temporary problem); the override skips both the
+                // account binding and the 235 success line.
+                if let Some((code, msg)) = self.maybe_override("AUTH", &mech) {
+                    return self.write_str(&format!("{code} {msg}\r\n")).await;
+                }
                 if let Some(b64) = response_b64
                     && let Some(decoded) = crate::imap::sasl_decode_b64(&b64)
                 {
