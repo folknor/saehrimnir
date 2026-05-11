@@ -1398,7 +1398,7 @@ async fn oauth_token_rejects_unsupported_grant_type() {
 #[tokio::test]
 async fn oauth_userinfo_returns_account_claims_with_active_token() {
     let store = saehrimnir::oauth::TokenStore::default();
-    let token = store.mint("authorization_code", 0xdead_beef);
+    let token = store.mint("authorization_code", "account-1", 0xdead_beef);
 
     let app = router_with_token_store(store);
     let resp = app
@@ -1441,7 +1441,7 @@ async fn oauth_userinfo_rejects_unknown_token() {
 #[tokio::test]
 async fn test_oauth_invalidate_drops_token_from_store() {
     let store = saehrimnir::oauth::TokenStore::default();
-    let token = store.mint("authorization_code", 1);
+    let token = store.mint("authorization_code", "account-1", 1);
     assert!(store.is_active(&token));
 
     let app = router_with_token_store(store.clone());
@@ -1480,7 +1480,7 @@ async fn test_oauth_invalidate_unknown_token_is_404() {
 #[tokio::test]
 async fn fixture_reset_clears_token_store_too() {
     let store = saehrimnir::oauth::TokenStore::default();
-    let _ = store.mint("authorization_code", 1);
+    let _ = store.mint("authorization_code", "account-1", 1);
     assert_eq!(store.active_count(), 1);
 
     let app = router_with_token_store(store.clone());
@@ -1532,7 +1532,7 @@ async fn jmap_session_enforces_bearer_when_fixture_oauth_enforce_is_true() {
     assert_eq!(v["type"], "urn:ietf:params:jmap:error:forbidden");
 
     // With a valid token.
-    let token = store.mint("authorization_code", 1);
+    let token = store.mint("authorization_code", "account-1", 1);
     let resp = app
         .oneshot(
             Request::builder()
@@ -2065,9 +2065,75 @@ async fn multi_account_email_query_scopes_by_accountid() {
 }
 
 #[tokio::test]
+async fn oauth_token_endpoint_accepts_account_id_form_field() {
+    // The mock honours an optional `account_id` on the token-form
+    // body so harness scripts can mint a token bound to a specific
+    // declared account. Real OAuth providers don't expose this knob;
+    // the wire shape is invisible to clients that don't set it.
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let app = routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "grant_type=authorization_code&account_id=account-secondary",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let token = v["access_token"].as_str().unwrap();
+
+    // Userinfo with the resulting token surfaces secondary's claims.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/userinfo")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["sub"], "account-secondary");
+    assert_eq!(v["email"], "secondary@example.com");
+}
+
+#[tokio::test]
+async fn oauth_token_endpoint_rejects_unknown_account_id() {
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let app = routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "grant_type=authorization_code&account_id=account-bogus",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp).await;
+    assert_eq!(v["error"], "invalid_request");
+}
+
+#[tokio::test]
 async fn multi_account_oauth_userinfo_returns_primary_claims() {
     let store = saehrimnir::oauth::TokenStore::default();
-    let token = store.mint("authorization_code", 0xdead_beef);
+    let token = store.mint("authorization_code", "account-primary", 0xdead_beef);
     let fix =
         fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
     let app = routes::router(

@@ -402,3 +402,86 @@ async fn gcal_recurring_event_emits_rrule_array() {
     let single = items.iter().find(|e| e["id"] == "ev-single").unwrap();
     assert!(single.get("recurrence").is_none(), "single instance leaked recurrence");
 }
+
+// ── Multi-account (Stage 4: OAuth-scoped tokens) ────────────────────
+
+fn multi_account_gcal_router(store: saehrimnir::oauth::TokenStore) -> axum::Router {
+    let fix = fixture::load(Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let shared = saehrimnir::shared::SharedHandles::for_test(saehrimnir::shared::handle(fix))
+        .with_token_store(store);
+    gcal::router(gcal::AppState { shared })
+}
+
+async fn get_with_bearer(router: axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_json(resp).await;
+    (status, v)
+}
+
+#[tokio::test]
+async fn gcal_calendar_list_scopes_by_bearer() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let primary_token = store.mint("authorization_code", "account-primary", 1);
+    let secondary_token = store.mint("authorization_code", "account-secondary", 2);
+
+    let (_, v) = get_with_bearer(
+        multi_account_gcal_router(store.clone()),
+        "/calendar/v3/users/me/calendarList",
+        &primary_token,
+    )
+    .await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "cal-primary");
+
+    let (_, v) = get_with_bearer(
+        multi_account_gcal_router(store),
+        "/calendar/v3/users/me/calendarList",
+        &secondary_token,
+    )
+    .await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "cal-secondary");
+}
+
+#[tokio::test]
+async fn gcal_events_scope_by_bearer() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let secondary_token = store.mint("authorization_code", "account-secondary", 1);
+
+    let (_, v) = get_with_bearer(
+        multi_account_gcal_router(store),
+        "/calendar/v3/calendars/cal-secondary/events",
+        &secondary_token,
+    )
+    .await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "ev-secondary-001");
+}
+
+#[tokio::test]
+async fn gcal_cross_account_calendar_returns_404() {
+    // A token bound to secondary can't see primary's calendar.
+    let store = saehrimnir::oauth::TokenStore::default();
+    let secondary_token = store.mint("authorization_code", "account-secondary", 1);
+    let (status, _) = get_with_bearer(
+        multi_account_gcal_router(store),
+        "/calendar/v3/calendars/cal-primary/events",
+        &secondary_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

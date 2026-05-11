@@ -435,3 +435,71 @@ async fn unknown_path_falls_back_to_404_envelope() {
     assert_eq!(v["error"]["code"], 404);
     assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
 }
+
+// ── Multi-account (Stage 4: OAuth-scoped tokens) ────────────────────
+
+fn multi_account_people_router(store: saehrimnir::oauth::TokenStore) -> axum::Router {
+    let fix = fixture::load(Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let shared = shared::SharedHandles::for_test(shared::handle(fix)).with_token_store(store);
+    people::router(people::AppState { shared })
+}
+
+async fn get_with_bearer(router: &axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = body_json(resp).await;
+    (status, v)
+}
+
+#[tokio::test]
+async fn people_connections_scope_by_bearer_token() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let primary_token = store.mint("authorization_code", "account-primary", 1);
+    let secondary_token = store.mint("authorization_code", "account-secondary", 2);
+
+    let r = multi_account_people_router(store.clone());
+    let (_, v) = get_with_bearer(&r, "/v1/people/me/connections", &primary_token).await;
+    let conns = v["connections"].as_array().unwrap();
+    assert_eq!(conns.len(), 1);
+    assert_eq!(conns[0]["resourceName"], "people/contact-primary-001");
+
+    let r = multi_account_people_router(store);
+    let (_, v) = get_with_bearer(&r, "/v1/people/me/connections", &secondary_token).await;
+    let conns = v["connections"].as_array().unwrap();
+    assert_eq!(conns.len(), 1);
+    assert_eq!(conns[0]["resourceName"], "people/contact-secondary-001");
+}
+
+#[tokio::test]
+async fn people_update_cross_account_returns_404() {
+    // A token bound to secondary cannot update primary's contact.
+    let store = saehrimnir::oauth::TokenStore::default();
+    let secondary_token = store.mint("authorization_code", "account-secondary", 1);
+    let r = multi_account_people_router(store);
+    let resp = r
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/v1/people/contact-primary-001:updateContact?updatePersonFields=displayName")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {secondary_token}"),
+                )
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

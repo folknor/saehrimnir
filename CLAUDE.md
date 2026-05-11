@@ -76,8 +76,12 @@ checking whether the fact is already in `notes/`.
   filters reads by the primary account so multi-account
   fixtures' secondary resources don't leak; folder + calendar +
   contact-folder aliases (`inbox`, `default`) resolve within
-  the named account. gcal, Gmail, People, CalDAV, IMAP, SMTP,
-  and OAuth still scope to primary; the limitation is invisible
+  the named account. OAuth tokens carry an `account_id` (via an
+  optional form field on `/oauth/token`); the Google-family
+  listeners (Gmail, gcal, People) scope reads to the bearer
+  token's account via `oauth::account_from_bearer`, falling
+  back to primary for missing / unknown tokens. CalDAV, IMAP,
+  and SMTP still scope to primary; the limitation is invisible
   in current single-account fixtures.
 - One shared fixture per process, behind a single
   `Arc<RwLock<Fixture>>` (`shared::FixtureHandle`). Read paths take

@@ -77,6 +77,12 @@ struct TokenStoreInner {
 #[derive(Debug, Clone)]
 pub struct TokenMetadata {
     pub grant_type: String,
+    /// Declared account id this token authorizes. The OAuth
+    /// userinfo endpoint serves this account's claims; the
+    /// Google-family listeners (Gmail, gcal, People) scope reads
+    /// to it. `/oauth/token` defaults to the fixture's primary
+    /// account when the client doesn't specify one.
+    pub account_id: String,
 }
 
 impl TokenStore {
@@ -84,8 +90,9 @@ impl TokenStore {
         Self::default()
     }
 
-    /// Mint a new access token. Returns the token string. The token
-    /// is registered as active before this returns.
+    /// Mint a new access token bound to `account_id`. Returns the
+    /// token string; the token is registered as active before this
+    /// returns.
     ///
     /// Note on the `mock-access-` prefix: refresh tokens issued by
     /// `token_endpoint` reuse this prefix, with collision-avoidance
@@ -93,7 +100,7 @@ impl TokenStore {
     /// always sees counter+1) rather than by the prefix or by
     /// `body_hash`. Future code that filters tokens by prefix should
     /// not assume this string distinguishes access from refresh.
-    pub fn mint(&self, grant_type: &str, body_hash: u64) -> String {
+    pub fn mint(&self, grant_type: &str, account_id: &str, body_hash: u64) -> String {
         let mut inner = self.0.lock().expect("oauth token store poisoned");
         inner.counter += 1;
         let token = format!("mock-access-{}-{:x}", inner.counter, body_hash);
@@ -101,6 +108,7 @@ impl TokenStore {
             token.clone(),
             TokenMetadata {
                 grant_type: grant_type.to_string(),
+                account_id: account_id.to_string(),
             },
         );
         token
@@ -112,6 +120,20 @@ impl TokenStore {
             .expect("oauth token store poisoned")
             .tokens
             .contains_key(token)
+    }
+
+    /// Look up the account a token authorizes. Returns None for
+    /// unknown / invalidated tokens; callers map that to the
+    /// protocol-appropriate fallback (Google-family listeners
+    /// fall back to the primary account when the bearer is
+    /// missing or unknown, matching today's no-auth baseline).
+    pub fn account_for_token(&self, token: &str) -> Option<String> {
+        self.0
+            .lock()
+            .expect("oauth token store poisoned")
+            .tokens
+            .get(token)
+            .map(|m| m.account_id.clone())
     }
 
     /// Remove a token. Returns `true` if it was present.
@@ -183,8 +205,14 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// `grant_type=authorization_code` and `grant_type=refresh_token`
 /// are recognised; v0 doesn't distinguish their behaviours beyond
 /// echoing the grant type into token metadata.
+#[derive(Clone)]
+pub struct TokenEndpointState {
+    pub fixture: crate::shared::FixtureHandle,
+    pub store: TokenStore,
+}
+
 pub async fn token_endpoint(
-    State(store): State<TokenStore>,
+    State(state): State<TokenEndpointState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -205,15 +233,46 @@ pub async fn token_endpoint(
             .into_response();
     }
 
+    // Resolve the account the token is for. Optional `account_id`
+    // (form or JSON) selects a non-primary account; absent means
+    // primary. Unknown account_id rejects with 400. Real OAuth
+    // providers don't expose an `account_id` knob on the token
+    // endpoint, but the wire shape is invisible to clients that
+    // don't set it - matching the no-arg flow ratatoskr uses
+    // today for single-account fixtures.
+    let fixture = state.fixture.read().expect("fixture lock poisoned");
+    let account_id = match form.get("account_id").map(String::as_str) {
+        None | Some("") => fixture.primary_account().id.clone(),
+        Some(id) => match fixture.account(id) {
+            Some(a) => a.id.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "invalid_request",
+                        "error_description": format!(
+                            "account_id {id:?} does not match any declared account"
+                        ),
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
+    drop(fixture);
+
     let body_hash = fnv1a64(&body);
-    let access_token = store.mint(grant_type, body_hash);
+    let access_token = state.store.mint(grant_type, &account_id, body_hash);
     // Refresh tokens are issued for both grant types so a client
     // that exchanges a code can immediately turn around and refresh
     // - mirrors real provider behaviour. The refresh token is
     // *also* registered in the same store; this is loose by real
     // OAuth standards but matches "any well-formed token works"
-    // mock semantics.
-    let refresh_token = store.mint("refresh", body_hash.rotate_left(1));
+    // mock semantics. The refresh token inherits the access
+    // token's account binding.
+    let refresh_token = state
+        .store
+        .mint("refresh", &account_id, body_hash.rotate_left(1));
 
     (
         StatusCode::OK,
@@ -319,16 +378,15 @@ pub async fn userinfo_endpoint(
     let Some(token) = bearer_token(&headers) else {
         return unauthorized("missing or malformed Authorization header");
     };
-    if !state.store.is_active(&token) {
+    let Some(account_id) = state.store.account_for_token(&token) else {
         return unauthorized("token is unknown or has been invalidated");
-    }
+    };
 
-    // `email` and `name` both source from `account.name`. The
-    // fixture loader rejects non-email-shaped names at load time
-    // (`fixture::is_email_shaped`), so any fixture that survives
-    // to here is safe to expose as the `email` claim.
+    // Serve the token's account claims, not the primary's.
+    // `email` and `name` source from `account.name` (loader
+    // rejects non-email-shaped names so the claim is safe).
     let fixture = state.fixture.read().expect("fixture lock poisoned");
-    let acct = fixture.primary_account();
+    let acct = fixture.account(&account_id).unwrap_or_else(|| fixture.primary_account());
     Json(json!({
         "sub": acct.id,
         "email": acct.name,
@@ -407,6 +465,32 @@ pub enum BearerDecision {
     Deny(String),
 }
 
+/// Resolve the account the request's bearer token authorizes,
+/// falling back to the fixture's primary account when no bearer
+/// is present, the token is unknown / invalidated, or the token
+/// points at an account the fixture no longer declares.
+///
+/// Used by the Google-family listeners (Gmail, gcal, People) to
+/// pick which account's resources to serve. Real Google's
+/// `users/me` placeholder means "the account this OAuth token
+/// was minted for"; the mock honours that by reading the bearer
+/// and looking the account up in the token store. Fixtures that
+/// don't bind a token (the no-auth baseline) keep getting
+/// primary, matching v0 behaviour.
+pub fn account_from_bearer(
+    fixture: &Fixture,
+    store: &TokenStore,
+    headers: &HeaderMap,
+) -> String {
+    if let Some(token) = bearer_token(headers)
+        && let Some(account_id) = store.account_for_token(&token)
+        && fixture.account(&account_id).is_some()
+    {
+        return account_id;
+    }
+    fixture.primary_account().id.clone()
+}
+
 pub fn check_bearer(
     fixture: &Fixture,
     store: &TokenStore,
@@ -432,6 +516,7 @@ pub fn check_bearer(
 pub struct TokenSnapshot {
     pub token: String,
     pub grant_type: String,
+    pub account_id: String,
 }
 
 impl TokenStore {
@@ -447,6 +532,7 @@ impl TokenStore {
             .map(|(k, v)| TokenSnapshot {
                 token: k.clone(),
                 grant_type: v.grant_type.clone(),
+                account_id: v.account_id.clone(),
             })
             .collect()
     }

@@ -26,6 +26,16 @@ Accepts both `application/x-www-form-urlencoded` and
 Any other `grant_type` -> 400 with
 `{"error": "unsupported_grant_type", ...}`.
 
+Optional `account_id` field (form or JSON) binds the minted token
+to a specific declared `[[account]]`. Absent / empty defaults to
+the primary account. An unknown id -> 400 with
+`{"error": "invalid_request", ...}`. The Google-family listeners
+(Gmail, gcal, People) use the token's account on every read, so
+this knob is what unlocks Gmail / gcal / People multi-account
+testing. Real OAuth providers don't expose this knob - clients
+that don't set it get the same single-account behaviour as
+before.
+
 Successful response (200):
 
 ```json
@@ -47,20 +57,22 @@ their own.
 ### `GET /oauth/userinfo`
 
 Reads `Authorization: Bearer <token>`. 401 if missing or unknown
-or invalidated. 200 returns:
+or invalidated. 200 returns the token's account claims:
 
 ```json
 {
-  "sub": "<fixture.account.id>",
-  "email": "<fixture.account.name>",
+  "sub": "<token-account.id>",
+  "email": "<token-account.name>",
   "email_verified": true,
-  "name": "<fixture.account.name>",
+  "name": "<token-account.name>",
   "iss": "<fixture.oauth.issuer>"
 }
 ```
 
-Email and name both default to `account.name` (which is itself
-email-shaped in v0, see `notes/fixture-format.md`).
+Email and name both source from the token's account `name` field
+(which is email-shaped, see `notes/fixture-format.md`). Tokens
+minted without an `account_id` form field default to the primary
+account, so single-account fixtures see no behaviour change.
 
 ### `POST /test/oauth/invalidate`
 
@@ -108,8 +120,6 @@ store along with the request and submission logs.
   nothing to verify.
 - No PKCE, no state-parameter checking, no nonce echo. Add when a
   fixture forces it.
-- No multiple-account-per-token. Multi-account fixtures (Stage 1
-  of the multi-account refactor) declare additional
-  `[[account]]` blocks, but userinfo always projects the primary
-  account's claims regardless of which token was minted. Stage 2
-  ties tokens to a chosen account.
+- No multiple-account-per-token. A minted token names one account
+  for its lifetime. Re-binding a token to a different account
+  isn't on the wire; mint a fresh token instead.

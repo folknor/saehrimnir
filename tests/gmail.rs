@@ -372,3 +372,96 @@ async fn gmail_middleware_records_request_log_entries() {
     assert_eq!(snap[1].command, "GET /gmail/v1/users/me/threads");
     assert_eq!(snap[1].detail["query"], "q=after:2026/1/1");
 }
+
+// ── Multi-account (Stage 4: OAuth-scoped tokens) ────────────────────
+//
+// Gmail's `users/me` placeholder means "the account this OAuth
+// token was minted for". Stage 4 of the multi-account refactor
+// makes the mock honour that: tokens carry an account_id, and the
+// Gmail handlers scope reads by the bearer-token-resolved account
+// (falling back to primary when the bearer is unknown).
+
+fn multi_account_gmail_router(
+    store: saehrimnir::oauth::TokenStore,
+) -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let shared = saehrimnir::shared::SharedHandles::for_test(saehrimnir::shared::handle(fix))
+        .with_token_store(store);
+    gmail::router(gmail::AppState { shared })
+}
+
+async fn get_with_bearer(
+    router: axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, Value) {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    (status, v)
+}
+
+#[tokio::test]
+async fn gmail_profile_uses_bearer_token_account() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let primary_token = store.mint("authorization_code", "account-primary", 1);
+    let secondary_token = store.mint("authorization_code", "account-secondary", 2);
+
+    let (_, v) = get_with_bearer(
+        multi_account_gmail_router(store.clone()),
+        "/gmail/v1/users/me/profile",
+        &primary_token,
+    )
+    .await;
+    assert_eq!(v["emailAddress"], "primary@example.com");
+
+    let (_, v) = get_with_bearer(
+        multi_account_gmail_router(store),
+        "/gmail/v1/users/me/profile",
+        &secondary_token,
+    )
+    .await;
+    assert_eq!(v["emailAddress"], "secondary@example.com");
+}
+
+#[tokio::test]
+async fn gmail_threads_scope_by_bearer_token_account() {
+    let store = saehrimnir::oauth::TokenStore::default();
+    let secondary_token = store.mint("authorization_code", "account-secondary", 1);
+
+    let (_, v) = get_with_bearer(
+        multi_account_gmail_router(store),
+        "/gmail/v1/users/me/threads",
+        &secondary_token,
+    )
+    .await;
+    let threads = v["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0]["id"], "email-secondary-001");
+}
+
+#[tokio::test]
+async fn gmail_unknown_bearer_falls_back_to_primary() {
+    // Tokens that aren't in the store (or no token at all) keep
+    // returning the primary account's resources - matches the v0
+    // no-auth baseline for single-account fixtures.
+    let store = saehrimnir::oauth::TokenStore::default();
+    let (_, v) = get_with_bearer(
+        multi_account_gmail_router(store),
+        "/gmail/v1/users/me/profile",
+        "doesnt-matter",
+    )
+    .await;
+    assert_eq!(v["emailAddress"], "primary@example.com");
+}

@@ -22,7 +22,7 @@
 use axum::{
     Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete as delete_route, get, patch},
 };
@@ -32,6 +32,13 @@ use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
 use crate::fixture::{Address, Calendar, Event, Fixture, MutationDiff};
+
+/// Resolve the request's bearer to the account it authorizes,
+/// falling back to primary. See `gmail::mail::bearer_account` for
+/// the shape rationale.
+fn bearer_account(state: &AppState, headers: &HeaderMap) -> String {
+    crate::oauth::account_from_bearer(&state.fixture(), &state.shared.token_store, headers)
+}
 
 const DEFAULT_PAGE_SIZE: usize = 250;
 const MAX_PAGE_SIZE: usize = 2500;
@@ -78,12 +85,16 @@ struct ListParams {
 
 // ── calendarList ────────────────────────────────────────────────────
 
-async fn calendar_list(State(state): State<AppState>) -> Response {
+async fn calendar_list(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(o) = super::maybe_override(&state, "calendar_list", |_| Ok(())) {
         return o;
     }
+    let account_id = bearer_account(&state, &headers);
     let fixture = state.fixture();
-    let items: Vec<Value> = fixture.calendars.iter().map(serialize_calendar).collect();
+    let items: Vec<Value> = fixture
+        .calendars_for(&account_id)
+        .map(serialize_calendar)
+        .collect();
     ok_json(json!({
         "kind": "calendar#calendarList",
         "etag": format!("etag-{}", fixture.state),
@@ -113,6 +124,7 @@ fn serialize_calendar(c: &Calendar) -> Value {
 
 async fn list_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(calendar): Path<String>,
     Query(params): Query<ListParams>,
 ) -> Response {
@@ -126,8 +138,9 @@ async fn list_events(
         return o;
     }
 
+    let account_id = bearer_account(&state, &headers);
     let fixture = state.fixture();
-    if !fixture.calendars.iter().any(|c| c.id == calendar) {
+    if !fixture.calendars_for(&account_id).any(|c| c.id == calendar) {
         return error(
             StatusCode::NOT_FOUND,
             &format!("calendar {calendar:?} not declared in fixture"),
@@ -164,8 +177,7 @@ async fn list_events(
             );
         };
         let live_by_id: std::collections::HashMap<&str, &Event> = fixture
-            .events
-            .iter()
+            .events_for(&account_id)
             .filter(|e| e.calendar_id == calendar)
             .map(|e| (e.id.as_str(), e))
             .collect();
@@ -187,8 +199,7 @@ async fn list_events(
     }
 
     let mut all: Vec<&Event> = fixture
-        .events
-        .iter()
+        .events_for(&account_id)
         .filter(|e| e.calendar_id == calendar)
         .collect();
     all.sort_by(|a, b| a.id.cmp(&b.id));
@@ -331,12 +342,17 @@ fn serialize_event_times(e: &Event) -> (Value, Value) {
 
 async fn create_event(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(calendar): Path<String>,
     body: axum::body::Body,
 ) -> Response {
+    let account_id = bearer_account(&state, &headers);
     {
         let fixture = state.fixture();
-        if !fixture.calendars.iter().any(|c| c.id == calendar) {
+        if !fixture
+            .calendars_for(&account_id)
+            .any(|c| c.id == calendar)
+        {
             return error(
                 StatusCode::NOT_FOUND,
                 &format!("calendar {calendar:?} not declared in fixture"),
@@ -373,14 +389,15 @@ async fn create_event(
 
 async fn patch_event(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((calendar, event_id)): Path<(String, String)>,
     body: axum::body::Body,
 ) -> Response {
+    let account_id = bearer_account(&state, &headers);
     {
         let fixture = state.fixture();
         if !fixture
-            .events
-            .iter()
+            .events_for(&account_id)
             .any(|e| e.id == event_id && e.calendar_id == calendar)
         {
             return error(
@@ -401,7 +418,11 @@ async fn patch_event(
     );
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-    let Some(idx) = fix.events.iter().position(|e| e.id == event_id) else {
+    let Some(idx) = fix
+        .events
+        .iter()
+        .position(|e| e.account_id == account_id && e.id == event_id)
+    else {
         return error(StatusCode::NOT_FOUND, "event vanished", "notFound");
     };
     let mut clone = fix.events[idx].clone();
@@ -422,13 +443,14 @@ async fn patch_event(
 
 async fn delete_event(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((calendar, event_id)): Path<(String, String)>,
 ) -> Response {
+    let account_id = bearer_account(&state, &headers);
     {
         let fixture = state.fixture();
         if !fixture
-            .events
-            .iter()
+            .events_for(&account_id)
             .any(|e| e.id == event_id && e.calendar_id == calendar)
         {
             return error(
@@ -446,14 +468,15 @@ async fn delete_event(
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
     let id_for_diff = event_id.clone();
+    let acct = account_id.clone();
     let parent = fix
         .events
         .iter()
-        .find(|e| e.id == id_for_diff)
+        .find(|e| e.account_id == acct && e.id == id_for_diff)
         .map(|e| e.calendar_id.clone());
     let _ = fix.mutate(|f| {
         let len_before = f.events.len();
-        f.events.retain(|e| e.id != id_for_diff);
+        f.events.retain(|e| !(e.account_id == acct && e.id == id_for_diff));
         if f.events.len() < len_before {
             MutationDiff {
                 event_destroyed: vec![id_for_diff.clone()],

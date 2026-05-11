@@ -18,7 +18,7 @@
 use axum::{
     Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Response,
     routing::get,
 };
@@ -27,6 +27,12 @@ use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
 use crate::fixture::{Contact, Fixture, MutationDiff};
+
+/// Resolve the request's bearer to the account it authorizes,
+/// falling back to primary.
+fn bearer_account(state: &AppState, headers: &HeaderMap) -> String {
+    crate::oauth::account_from_bearer(&state.fixture(), &state.shared.token_store, headers)
+}
 
 /// People-API page size cap from
 /// `<ratatoskr>/crates/gmail/src/contacts/mod.rs::PAGE_SIZE`.
@@ -73,6 +79,7 @@ struct ListParams {
 
 async fn list_connections(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> Response {
     if let Some(o) = super::maybe_override(&state, "list_connections", |s| {
@@ -87,6 +94,7 @@ async fn list_connections(
         return o;
     }
 
+    let account_id = bearer_account(&state, &headers);
     let fixture = state.fixture();
 
     // Sync-token paths:
@@ -120,8 +128,7 @@ async fn list_connections(
             );
         };
         let live_by_id: std::collections::HashMap<&str, &Contact> = fixture
-            .contacts
-            .iter()
+            .contacts_for(&account_id)
             .map(|c| (c.id.as_str(), c))
             .collect();
         let mut connections: Vec<Value> = Vec::new();
@@ -145,7 +152,7 @@ async fn list_connections(
     // slice. Pre-fix this materialised every contact's full JSON
     // before paging, which made each page request O(N) regardless
     // of page_size.
-    let mut sorted: Vec<&Contact> = fixture.contacts.iter().collect();
+    let mut sorted: Vec<&Contact> = fixture.contacts_for(&account_id).collect();
     sorted.sort_by(|a, b| a.id.cmp(&b.id));
     let total = sorted.len();
     let page_size = clamp_page_size(params.page_size);
@@ -232,10 +239,12 @@ struct UpdateParams {
 
 async fn update_contact(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(spec): Path<String>,
     Query(params): Query<UpdateParams>,
     body: axum::body::Body,
 ) -> Response {
+    let account_id = bearer_account(&state, &headers);
     let Some(id) = spec.strip_suffix(":updateContact") else {
         return error(
             StatusCode::NOT_FOUND,
@@ -268,7 +277,7 @@ async fn update_contact(
     }
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-    if !fix.contacts.iter().any(|c| c.id == id) {
+    if !fix.contacts.iter().any(|c| c.account_id == account_id && c.id == id) {
         return error(
             StatusCode::NOT_FOUND,
             &format!("contact {id:?} not declared in fixture"),
@@ -280,7 +289,11 @@ async fn update_contact(
         contact_updated: vec![id_for_diff.clone()],
         ..Default::default()
     });
-    let view = fix.contacts.iter().find(|c| c.id == id).cloned();
+    let view = fix
+        .contacts
+        .iter()
+        .find(|c| c.account_id == account_id && c.id == id)
+        .cloned();
     drop(fix);
     match view {
         Some(c) => ok_json(serialize_person(&c)),
@@ -292,8 +305,10 @@ async fn update_contact(
 
 async fn delete_contact(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(spec): Path<String>,
 ) -> Response {
+    let account_id = bearer_account(&state, &headers);
     let Some(id) = spec.strip_suffix(":deleteContact") else {
         return error(
             StatusCode::NOT_FOUND,
@@ -318,7 +333,7 @@ async fn delete_contact(
     let Some(parent) = fix
         .contacts
         .iter()
-        .find(|c| c.id == id)
+        .find(|c| c.account_id == account_id && c.id == id)
         .map(|c| c.folder_id.clone())
     else {
         return error(
@@ -328,9 +343,10 @@ async fn delete_contact(
         );
     };
     let id_for_diff = id.clone();
+    let acct = account_id.clone();
     let _ = fix.mutate(|f| {
         let len_before = f.contacts.len();
-        f.contacts.retain(|c| c.id != id_for_diff);
+        f.contacts.retain(|c| !(c.account_id == acct && c.id == id_for_diff));
         if f.contacts.len() < len_before {
             MutationDiff {
                 contact_destroyed: vec![id_for_diff.clone()],

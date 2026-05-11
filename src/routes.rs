@@ -114,7 +114,10 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let oauth_token_router: Router = Router::new()
         .route("/oauth/token", post(oauth::token_endpoint))
-        .with_state(state.shared.token_store.clone());
+        .with_state(oauth::TokenEndpointState {
+            fixture: Arc::clone(&state.shared.fixture),
+            store: state.shared.token_store.clone(),
+        });
     let oauth_invalidate_router: Router = Router::new()
         .route("/test/oauth/invalidate", post(oauth::invalidate_endpoint))
         .with_state(state.shared.token_store.clone());

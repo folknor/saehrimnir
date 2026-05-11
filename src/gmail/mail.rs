@@ -8,7 +8,7 @@
 use axum::{
     Router,
     extract::{Path, RawQuery, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Response,
     routing::get,
 };
@@ -16,6 +16,14 @@ use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
 use crate::fixture::{Address, Attachment, Body, Email, Fixture, Mailbox, Role};
+
+/// Resolve the request's bearer to the account it authorizes.
+/// Falls back to the fixture's primary account when no bearer is
+/// presented or the token is unknown - matches the v0 no-auth
+/// baseline so single-account fixtures stay one-listener-friendly.
+fn bearer_account(state: &AppState, headers: &HeaderMap) -> String {
+    crate::oauth::account_from_bearer(&state.fixture(), &state.shared.token_store, headers)
+}
 
 /// Pinned historyId for the lifetime of a fixture - matches the
 /// determinism contract (read-only fixtures, no real changes).
@@ -42,61 +50,64 @@ pub fn router() -> Router<AppState> {
 
 // ── Profile / Labels ────────────────────────────────────────────────
 
-async fn profile(State(state): State<AppState>) -> Response {
+async fn profile(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(r) = super::maybe_override(&state, "profile", |_s| Ok(())) {
         return r;
     }
+    let account_id = bearer_account(&state, &headers);
     let f = state.fixture();
+    let acct = f.account(&account_id).unwrap_or_else(|| f.primary_account());
+    let messages_total = f.emails_for(&account_id).count();
     ok_json(json!({
-        "emailAddress": f.primary_account().name,
-        "messagesTotal": f.emails.len(),
-        "threadsTotal": unique_thread_count(&f),
+        "emailAddress": acct.name,
+        "messagesTotal": messages_total,
+        "threadsTotal": unique_thread_count(&f, &account_id),
         "historyId": HISTORY_ID,
     }))
 }
 
-fn unique_thread_count(f: &Fixture) -> usize {
-    let mut seen: Vec<&str> = f.emails.iter().map(|e| e.thread_id.as_str()).collect();
+fn unique_thread_count(f: &Fixture, account_id: &str) -> usize {
+    let mut seen: Vec<&str> = f.emails_for(account_id).map(|e| e.thread_id.as_str()).collect();
     seen.sort_unstable();
     seen.dedup();
     seen.len()
 }
 
-async fn list_labels(State(state): State<AppState>) -> Response {
+async fn list_labels(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(r) = super::maybe_override(&state, "list_labels", |_s| Ok(())) {
         return r;
     }
+    let account_id = bearer_account(&state, &headers);
     let mut labels = Vec::new();
     let fixture = state.fixture();
 
     // System labels are always present, even if no fixture mailbox
     // carries the corresponding role - matches Gmail's behaviour.
     for sys in SYSTEM_LABELS {
-        labels.push(label_value(sys, sys, "system", &fixture));
+        labels.push(label_value(sys, sys, "system", &fixture, &account_id));
     }
 
     // User labels: fixture mailboxes without a role become user
     // labels.
-    for m in &fixture.mailboxes {
+    for m in fixture.mailboxes_for(&account_id) {
         if m.role.is_some() {
             continue;
         }
         let id = format!("Label_{}", m.id);
-        labels.push(label_value(&id, &m.name, "user", &fixture));
+        labels.push(label_value(&id, &m.name, "user", &fixture, &account_id));
     }
 
     // Custom keywords (non-`$` prefixed) on any email become user
     // labels too. Collect distinct ones.
     let mut custom: Vec<String> = fixture
-        .emails
-        .iter()
+        .emails_for(&account_id)
         .flat_map(|e| e.keywords.iter().filter(|k| !k.starts_with('$')).cloned())
         .collect();
     custom.sort();
     custom.dedup();
     for keyword in custom {
         let id = format!("Label_{keyword}");
-        labels.push(label_value(&id, &keyword, "user", &fixture));
+        labels.push(label_value(&id, &keyword, "user", &fixture, &account_id));
     }
 
     ok_json(json!({"labels": labels}))
@@ -106,9 +117,9 @@ const SYSTEM_LABELS: &[&str] = &[
     "INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "IMPORTANT", "STARRED", "UNREAD",
 ];
 
-fn label_value(id: &str, name: &str, kind: &str, fixture: &Fixture) -> Value {
+fn label_value(id: &str, name: &str, kind: &str, fixture: &Fixture, account_id: &str) -> Value {
     let (msg_total, msg_unread, thread_total, thread_unread) =
-        label_counts(fixture, id);
+        label_counts(fixture, id, account_id);
     json!({
         "id": id,
         "name": name,
@@ -122,10 +133,9 @@ fn label_value(id: &str, name: &str, kind: &str, fixture: &Fixture) -> Value {
     })
 }
 
-fn label_counts(fixture: &Fixture, label_id: &str) -> (u64, u64, u64, u64) {
+fn label_counts(fixture: &Fixture, label_id: &str, account_id: &str) -> (u64, u64, u64, u64) {
     let in_label: Vec<&Email> = fixture
-        .emails
-        .iter()
+        .emails_for(account_id)
         .filter(|e| email_carries_label(e, fixture, label_id))
         .collect();
     let total = in_label.len() as u64;
@@ -205,11 +215,13 @@ fn label_ids_for(email: &Email, fixture: &Fixture) -> Vec<String> {
 
 async fn list_threads(
     State(state): State<AppState>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
     if let Some(r) = super::maybe_override(&state, "list_threads", |_s| Ok(())) {
         return r;
     }
+    let account_id = bearer_account(&state, &headers);
     let q = parse_query(raw.as_deref());
     let max = q
         .max_results
@@ -217,7 +229,7 @@ async fn list_threads(
         .clamp(1, THREADS_HARD_MAX);
     let offset = q.offset();
 
-    let mut threads = thread_summaries(&state.fixture());
+    let mut threads = thread_summaries(&state.fixture(), &account_id);
     if let Some(after_q) = &q.q {
         // v0 only knows the `after:YYYY/M/D` shape ratatoskr's
         // initial-sync code emits. Anything else - typo, drift, or
@@ -275,9 +287,9 @@ struct ThreadSummary {
     received_at: chrono::DateTime<chrono::Utc>,
 }
 
-fn thread_summaries(fixture: &Fixture) -> Vec<ThreadSummary> {
+fn thread_summaries(fixture: &Fixture, account_id: &str) -> Vec<ThreadSummary> {
     let mut by_thread: std::collections::BTreeMap<String, Vec<&Email>> = Default::default();
-    for e in &fixture.emails {
+    for e in fixture.emails_for(account_id) {
         by_thread.entry(e.thread_id.clone()).or_default().push(e);
     }
     let mut out: Vec<ThreadSummary> = by_thread
@@ -319,6 +331,7 @@ fn thread_summaries(fixture: &Fixture) -> Vec<ThreadSummary> {
 
 async fn get_thread(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(thread_id): Path<String>,
 ) -> Response {
     let thread_id_owned = thread_id.clone();
@@ -327,10 +340,10 @@ async fn get_thread(
     }) {
         return r;
     }
+    let account_id = bearer_account(&state, &headers);
     let fixture = state.fixture();
     let mut messages: Vec<&Email> = fixture
-        .emails
-        .iter()
+        .emails_for(&account_id)
         .filter(|e| e.thread_id == thread_id)
         .collect();
     if messages.is_empty() {
@@ -558,10 +571,12 @@ async fn history(State(state): State<AppState>) -> Response {
 
 async fn get_attachment(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((message_id, attachment_id)): Path<(String, String)>,
 ) -> Response {
+    let account_id = bearer_account(&state, &headers);
     let fixture = state.fixture();
-    let Some(email) = fixture.emails.iter().find(|e| e.id == message_id) else {
+    let Some(email) = fixture.emails_for(&account_id).find(|e| e.id == message_id) else {
         return error(
             StatusCode::NOT_FOUND,
             &format!("message {message_id:?} not found"),

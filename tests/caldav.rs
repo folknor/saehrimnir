@@ -1001,7 +1001,7 @@ async fn caldav_enforces_bearer_when_oauth_enforce_is_true() {
     }
 
     // With a valid token, the same OPTIONS request succeeds.
-    let token = store.mint("authorization_code", 1);
+    let token = store.mint("authorization_code", "account-1", 1);
     let req = Request::builder()
         .method("OPTIONS")
         .uri("/calendars/account-1/cal-work/")
