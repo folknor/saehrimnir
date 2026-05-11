@@ -317,6 +317,86 @@ fn jscalendar_recurrence_rule(rule: &crate::recurrence::ParsedRule) -> Option<Va
     Some(Value::Object(obj))
 }
 
+/// Inverse of [`jscalendar_recurrence_rule`]. Read JSCalendar's
+/// `recurrenceRules: [{...}]` array, take the first rule (v0
+/// authors at most one), and synthesise an RRULE string. Returns
+/// None when the array is empty, the first rule lacks `frequency`,
+/// or `frequency` is outside the daily / weekly / monthly / yearly
+/// set v0 models.
+///
+/// JSCalendar `recurrenceOverrides` are out of scope on the write
+/// path (Stage 1 of recurrence read-side already documents the
+/// omission); EXDATEs the fixture wants to author go through the
+/// static `[[event]]` shape.
+fn parse_jscalendar_recurrence_rules(v: &Value) -> Option<String> {
+    use crate::recurrence::{ByDay, Frequency, ParsedRule, Weekday};
+    let arr = v.as_array()?;
+    let first = arr.first()?.as_object()?;
+    let freq = match first.get("frequency")?.as_str()? {
+        "daily" => Frequency::Daily,
+        "weekly" => Frequency::Weekly,
+        "monthly" => Frequency::Monthly,
+        "yearly" => Frequency::Yearly,
+        _ => return None,
+    };
+    let mut rule = ParsedRule {
+        freq: Some(freq),
+        ..Default::default()
+    };
+    if let Some(n) = first
+        .get("interval")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+    {
+        rule.interval = Some(n);
+    }
+    if let Some(by_day) = first.get("byDay").and_then(Value::as_array) {
+        rule.by_day = by_day
+            .iter()
+            .filter_map(|d| {
+                let o = d.as_object()?;
+                let weekday = Weekday::parse_short(o.get("day")?.as_str()?)?;
+                let ordinal = o
+                    .get("nthOfPeriod")
+                    .and_then(Value::as_i64)
+                    .and_then(|n| i32::try_from(n).ok());
+                Some(ByDay { ordinal, weekday })
+            })
+            .collect();
+    }
+    if let Some(by_md) = first.get("byMonthDay").and_then(Value::as_array) {
+        rule.by_month_day = by_md
+            .iter()
+            .filter_map(|v| v.as_i64().and_then(|n| i8::try_from(n).ok()))
+            .collect();
+    }
+    if let Some(by_m) = first.get("byMonth").and_then(Value::as_array) {
+        // RFC 8984 emits month strings (`"1"`, ..., `"12"`,
+        // optional `"L"` suffix). The L suffix is rare and v0
+        // doesn't model leap months; strip it and parse the
+        // numeric portion.
+        rule.by_month = by_m
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim_end_matches('L'))
+            .filter_map(|s| s.parse::<u8>().ok())
+            .collect();
+    }
+    if let Some(c) = first
+        .get("count")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+    {
+        rule.count = Some(c);
+    }
+    if let Some(u) = first.get("until").and_then(Value::as_str)
+        && let Ok(dt) = chrono::NaiveDateTime::parse_from_str(u, "%Y-%m-%dT%H:%M:%S")
+    {
+        rule.until = Some(dt.and_utc());
+    }
+    crate::recurrence::format_rrule(&rule)
+}
+
 fn serialize_participant(addr: &Address, is_owner: bool) -> Value {
     let mut p = Map::new();
     p.insert("@type".into(), Value::String("Participant".into()));
@@ -549,6 +629,9 @@ fn build_event_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
         .find(|c| c.id == calendar_id)
         .map(|c| c.account_id.clone())
         .unwrap_or_else(|| fix.primary_account().id.clone());
+    let recurrence_rule = obj
+        .get("recurrenceRules")
+        .and_then(parse_jscalendar_recurrence_rules);
     Ok((
         server_id.clone(),
         Event {
@@ -564,9 +647,11 @@ fn build_event_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
             organizer,
             attendees,
             is_all_day,
-            // JMAP mutations don't accept recurrence in v0; the
-            // wire body's `recurrenceRules` is ignored on create.
-            recurrence_rule: None,
+            recurrence_rule,
+            // JSCalendar models exceptions via `recurrenceOverrides`
+            // rather than EXDATE arrays. v0 doesn't model those on
+            // the write path; the fixture's static authoring shape
+            // keeps the field accessible if needed.
             recurrence_exdates: vec![],
         },
     ))
@@ -612,6 +697,19 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Value> {
                     })
                 {
                     event.calendar_id = new_cal;
+                }
+            }
+            "recurrenceRules" => {
+                // null / empty array clears recurrence; a
+                // non-empty array replaces it with the first
+                // rule's RRULE projection (v0 authors at most
+                // one rule per event).
+                if v.is_null() {
+                    event.recurrence_rule = None;
+                    event.recurrence_exdates.clear();
+                } else {
+                    event.recurrence_rule = parse_jscalendar_recurrence_rules(v);
+                    event.recurrence_exdates.clear();
                 }
             }
             _ => {

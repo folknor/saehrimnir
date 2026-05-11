@@ -677,3 +677,76 @@ async fn jmap_calendar_event_get_emits_recurrence_rules() {
         "single instance leaked recurrenceRules"
     );
 }
+
+#[tokio::test]
+async fn jmap_calendar_event_set_create_with_recurrence_rules_round_trips() {
+    let r = recurrence_router();
+    let body = json!({
+        "accountId": "account-1",
+        "create": {
+            "new-1": {
+                "@type": "Event",
+                "calendarIds": { "cal-work": true },
+                "title": "Weekly via JMAP",
+                "start": "2026-03-02T10:00:00",
+                "duration": "PT30M",
+                "timeZone": "UTC",
+                "recurrenceRules": [{
+                    "@type": "RecurrenceRule",
+                    "frequency": "weekly",
+                    "byDay": [{ "@type": "NDay", "day": "mo" }],
+                    "count": 8
+                }]
+            }
+        }
+    });
+    let resp = jmap_call(&r, "CalendarEvent/set", body).await;
+    assert_eq!(resp[0], "CalendarEvent/set");
+    let created = &resp[1]["created"]["new-1"];
+    let server_id = created["id"].as_str().unwrap().to_string();
+
+    // Read it back via CalendarEvent/get.
+    let resp = jmap_call(
+        &r,
+        "CalendarEvent/get",
+        json!({ "accountId": "account-1", "ids": [server_id] }),
+    )
+    .await;
+    let event = &resp[1]["list"][0];
+    let rules = event["recurrenceRules"].as_array().unwrap();
+    assert_eq!(rules.len(), 1);
+    let rule = &rules[0];
+    assert_eq!(rule["frequency"], "weekly");
+    let by_day = rule["byDay"].as_array().unwrap();
+    assert_eq!(by_day.len(), 1);
+    assert_eq!(by_day[0]["day"], "mo");
+    assert_eq!(rule["count"], 8);
+}
+
+#[tokio::test]
+async fn jmap_calendar_event_set_update_clears_recurrence() {
+    let r = recurrence_router();
+    let body = json!({
+        "accountId": "account-1",
+        "update": {
+            "ev-weekly": { "recurrenceRules": null }
+        }
+    });
+    let resp = jmap_call(&r, "CalendarEvent/set", body).await;
+    assert!(
+        resp[1]["updated"].as_object().unwrap().contains_key("ev-weekly"),
+        "expected updated key: {:?}",
+        resp[1]
+    );
+    let resp = jmap_call(
+        &r,
+        "CalendarEvent/get",
+        json!({ "accountId": "account-1", "ids": ["ev-weekly"] }),
+    )
+    .await;
+    let event = &resp[1]["list"][0];
+    assert!(
+        event.get("recurrenceRules").is_none(),
+        "expected recurrenceRules cleared: {event}"
+    );
+}

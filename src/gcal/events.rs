@@ -541,6 +541,10 @@ fn build_event_from_create(
         .find(|c| c.id == calendar)
         .map(|c| c.account_id.clone())
         .unwrap_or_else(|| fix.primary_account().id.clone());
+    let (recurrence_rule, recurrence_exdates) = obj
+        .get("recurrence")
+        .map(parse_gcal_recurrence)
+        .unwrap_or((None, Vec::new()));
     Ok(Event {
         id,
         account_id,
@@ -554,13 +558,53 @@ fn build_event_from_create(
         organizer,
         attendees,
         is_all_day,
-        // gcal POSTs don't honour `recurrence: [...]` in v0; reads
-        // surface fixture-authored recurrence verbatim, writes
-        // ignore it. Stage 2 of CalDAV recurrence covers gcal
-        // writes when a fixture forces it.
-        recurrence_rule: None,
-        recurrence_exdates: vec![],
+        recurrence_rule,
+        recurrence_exdates,
     })
+}
+
+/// Read Google Calendar's `recurrence: ["RRULE:...", "EXDATE:...",
+/// "RDATE:..."]` array. RRULE values are stored verbatim (CalDAV
+/// and the fixture both keep the canonical form); EXDATE entries
+/// can be comma-separated date lists per RFC 5545 §3.8.5.1, so
+/// each line splits and decodes individually. RDATE / unknown
+/// prefixes are silently dropped (real Google emits the array
+/// the client posts back verbatim including unknown shapes; the
+/// fixture only stores what the read path can re-emit).
+fn parse_gcal_recurrence(v: &Value) -> (Option<String>, Vec<chrono::DateTime<chrono::Utc>>) {
+    let mut rrule: Option<String> = None;
+    let mut exdates: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
+    let Some(arr) = v.as_array() else {
+        return (None, exdates);
+    };
+    for entry in arr {
+        let Some(s) = entry.as_str() else { continue };
+        if let Some(rest) = s.strip_prefix("RRULE:") {
+            rrule = Some(rest.trim().to_string());
+        } else if let Some(rest) = s.strip_prefix("EXDATE:") {
+            // EXDATE may carry a TZID parameter (`EXDATE;TZID=...:...`)
+            // - strip the param segment if present.
+            let value = rest
+                .rsplit_once(':')
+                .map_or(rest, |(_params, val)| val);
+            for part in value.split(',') {
+                if let Some(dt) = parse_ical_dt(part.trim()) {
+                    exdates.push(dt);
+                }
+            }
+        }
+    }
+    (rrule, exdates)
+}
+
+/// Parse an iCal UTC date-time (`YYYYMMDDTHHMMSSZ`). Tolerant of
+/// the trailing `Z` being missing (real clients sometimes drop it
+/// when the X-WR-TIMEZONE is UTC).
+fn parse_ical_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let stripped = s.trim_end_matches('Z');
+    chrono::NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S")
+        .ok()
+        .map(|dt| dt.and_utc())
 }
 
 fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response>> {
@@ -599,6 +643,20 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
     // intentional.
     if let Some(v) = obj.get("organizer") {
         event.organizer = parse_address(v);
+    }
+    // A PATCH carrying `recurrence: null` clears recurrence on the
+    // event; an array replaces it; any other shape silently leaves
+    // the existing fields alone (matches real gcal's PATCH semantics
+    // where absent / null clears).
+    if let Some(v) = obj.get("recurrence") {
+        if v.is_null() {
+            event.recurrence_rule = None;
+            event.recurrence_exdates.clear();
+        } else {
+            let (rrule, exdates) = parse_gcal_recurrence(v);
+            event.recurrence_rule = rrule;
+            event.recurrence_exdates = exdates;
+        }
     }
     Ok(())
 }

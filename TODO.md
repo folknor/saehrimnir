@@ -34,17 +34,6 @@ Concrete next-up items lifted above the per-protocol backlogs.
   `event_*`-parallel `calendar_created` transition so Graph
   `/v1.0/me/calendars` and JMAP `Calendar/changes` observe the
   new calendar. Lands in `src/caldav/mod.rs`.
-- **CalDAV recurrence write paths.** Read-side recurrence has
-  landed across all four calendar protocols (CalDAV RRULE/EXDATE
-  emit + parse, gcal `recurrence: [...]` array, Graph structured
-  `pattern`/`range`, JSCalendar `recurrenceRules`); fixtures
-  author recurrence on `Event` via `recurrence_rule` and
-  `recurrence_exdates`. What's still pending: gcal POST/PATCH,
-  Graph POST/PATCH, JMAP `CalendarEvent/set`, and the
-  change-script `event_create` / `event_update` ops accepting
-  recurrence fields. Stage 2 of recurrence covers them when a
-  fixture forces it. (CalDAV PUT already round-trips through the
-  existing parser.)
 - **Lua Gmail attachment + sendAs hooks.** Wire `on("gmail",
   "get_attachment", fn)` and `on("gmail", "send_as", fn)` through
   the dispatcher so fault-injection works against those routes
@@ -278,11 +267,12 @@ work:
 
 ## CalDAV (future work)
 
-v0 surface is complete (see `CLAUDE.md` "Status"). MKCALENDAR and
-recurrence (RRULE / EXDATE) are tracked under "Priority" above.
-Out of scope until a fixture forces it: PROPPATCH, ACLs, delegation,
-free-busy, scheduling (iTIP / iMIP), VALARM, attachments,
-per-event VTIMEZONE.
+v0 surface is complete (see `CLAUDE.md` "Status"). Recurrence
+read + write paths are landed across all four calendar protocols.
+MKCALENDAR is tracked under "Priority" above. Out of scope until
+a fixture forces it: PROPPATCH, ACLs, delegation, free-busy,
+scheduling (iTIP / iMIP), VALARM, attachments, per-event
+VTIMEZONE.
 
 ## Lua dynamic surface
 

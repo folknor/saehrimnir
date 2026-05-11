@@ -519,27 +519,36 @@ projection of fixture emails into Gmail's nested mimePart shape) +
 structure leaves room for People-API contacts and Drive sibling
 files.
 
-Calendar recurrence (read paths, all four protocols): events grow
-`recurrence_rule: Option<String>` (raw RFC 5545 RRULE value, no
-`RRULE:` prefix) and `recurrence_exdates: Vec<DateTime<Utc>>` on
-the canonical `Event`. Authoring uses `recurrence_rule` /
+Calendar recurrence (all four protocols, read + write): events
+grow `recurrence_rule: Option<String>` (raw RFC 5545 RRULE value,
+no `RRULE:` prefix) and `recurrence_exdates: Vec<DateTime<Utc>>`
+on the canonical `Event`. Authoring uses `recurrence_rule` /
 `recurrence_exdates` keys on TOML `[[event]]` and the Lua
-change-script `event_create` op. Per-protocol projections:
-CalDAV emits one `RRULE:` line plus one `EXDATE:` per excluded
-date (and parses them back on PUT for full round-trip);
-Google Calendar v3 emits a `recurrence: ["RRULE:...",
-"EXDATE:..."]` array; Microsoft Graph translates the parsed
-RRULE into a structured `recurrence: { pattern, range }` shape
-covering daily/weekly/absoluteMonthly/relativeMonthly/
-absoluteYearly patterns with `noEnd`/`endDate`/`numbered` range
-types; JMAP JSCalendar emits a `recurrenceRules` array of
-`RecurrenceRule` objects (`frequency`, `interval`, `byDay`,
-`byMonthDay`, `byMonth`, `count`, `until`). Mutation paths on
-the four protocols currently ignore inbound recurrence (writes
-zero `recurrence_rule` / `recurrence_exdates`); CalDAV PUT
-round-trips automatically through the iCal parser.
-`src/recurrence.rs` houses the shared RRULE parser used by Graph
-and JMAP.
+change-script `event_create` op. Per-protocol projections (read +
+write symmetric):
+- CalDAV: emit `RRULE:` line plus one `EXDATE:` per excluded
+  date; PUT parses the same back.
+- Google Calendar v3: emit / parse a `recurrence: ["RRULE:...",
+  "EXDATE:..."]` array on GET / POST / PATCH. `EXDATE;TZID=...`
+  parameters are stripped.
+- Microsoft Graph: translate between the parsed RRULE and a
+  structured `recurrence: { pattern, range }` shape covering
+  daily / weekly / absoluteMonthly / relativeMonthly /
+  absoluteYearly patterns with noEnd / endDate / numbered range
+  types. POST / PATCH parses the structured form back to an
+  RRULE via the inverse translator; `recurrence: null` on PATCH
+  clears the rule.
+- JMAP JSCalendar: emit / parse a `recurrenceRules` array of
+  `RecurrenceRule` objects (frequency, interval, byDay,
+  byMonthDay, byMonth, count, until). `CalendarEvent/set` create
+  + update accept the structured form; `recurrenceRules: null`
+  on update clears.
+`src/recurrence.rs` houses the shared `ParsedRule` plus
+`format_rrule` (the write-side inverse). Graph models exceptions
+as separate exception-event resources (not EXDATE arrays) and
+JSCalendar via `recurrenceOverrides`; v0 ignores both on write
+- the static `[[event]]` shape remains the way to author
+fixture-side EXDATEs.
 
 CalDAV: complete for v0's calendar-sync path. Discovery
 (`PROPFIND /` -> principal -> calendar-home-set -> calendar

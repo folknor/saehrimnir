@@ -742,6 +742,7 @@ fn build_event_from_create(
         .map(|arr| arr.iter().filter_map(parse_graph_attendee).collect())
         .unwrap_or_default();
     let id = fix.mint_event_id();
+    let recurrence_rule = obj.get("recurrence").and_then(parse_graph_recurrence);
     Ok(Event {
         id,
         account_id: account_id.to_string(),
@@ -755,9 +756,11 @@ fn build_event_from_create(
         organizer: None,
         attendees,
         is_all_day,
-        // Graph mutations don't accept recurrence in v0; the wire
-        // body's `recurrence` block is ignored here.
-        recurrence_rule: None,
+        recurrence_rule,
+        // Graph models exceptions as exception-event resources
+        // rather than EXDATE arrays, so the create body has no
+        // place to author EXDATEs. The fixture's static authoring
+        // shape keeps the field accessible if needed.
         recurrence_exdates: vec![],
     })
 }
@@ -813,6 +816,21 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
                     .as_array()
                     .map(|arr| arr.iter().filter_map(parse_graph_attendee).collect())
                     .unwrap_or_default();
+            }
+            "recurrence" => {
+                // A PATCH carrying `recurrence: null` clears
+                // recurrence; a structured pattern/range replaces
+                // it. An unparseable pattern (FREQ we don't model)
+                // also clears, on the theory that round-tripping
+                // a malformed Graph body to a half-translated
+                // RRULE would be worse than dropping it.
+                if v.is_null() {
+                    event.recurrence_rule = None;
+                    event.recurrence_exdates.clear();
+                } else {
+                    event.recurrence_rule = parse_graph_recurrence(v);
+                    event.recurrence_exdates.clear();
+                }
             }
             _ => {
                 // Quietly ignore properties v0 doesn't model.
@@ -1099,6 +1117,140 @@ fn graph_week_index(ordinal: i32) -> &'static str {
         -1 => "last",
         _ => "first",
     }
+}
+
+fn graph_index_to_ordinal(index: &str) -> i32 {
+    match index.to_ascii_lowercase().as_str() {
+        "first" => 1,
+        "second" => 2,
+        "third" => 3,
+        "fourth" => 4,
+        "last" => -1,
+        _ => 1,
+    }
+}
+
+/// Inverse of [`graph_recurrence`]. Read Graph's structured
+/// `recurrence: { pattern, range }` body and synthesise an RFC
+/// 5545 RRULE string the fixture can store. Returns None when the
+/// body is missing pattern/range or carries a `pattern.type`
+/// outside the daily / weekly / absoluteMonthly / relativeMonthly
+/// / absoluteYearly set v0 models. Graph's `range.endDate` lands
+/// in UNTIL at `T235959Z` (end-of-day UTC) since Graph dates are
+/// inclusive and the iCal UNTIL is a date-time the spec defines
+/// to include the last instance.
+///
+/// Graph models exceptions as a separate seriesMaster + exception
+/// event pair rather than EXDATE arrays, so this function only
+/// returns the RRULE string; recurrence_exdates stays empty on
+/// the write path (callers can still author EXDATEs via the
+/// fixture's static authoring shape).
+fn parse_graph_recurrence(v: &Value) -> Option<String> {
+    use crate::recurrence::{ByDay, Frequency, ParsedRule, Weekday};
+    let obj = v.as_object()?;
+    let pattern = obj.get("pattern")?.as_object()?;
+    let range = obj.get("range")?.as_object()?;
+    let ptype = pattern.get("type")?.as_str()?;
+    let interval = pattern
+        .get("interval")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok());
+    let mut rule = ParsedRule {
+        freq: None,
+        interval,
+        ..Default::default()
+    };
+    match ptype.to_ascii_lowercase().as_str() {
+        "daily" => rule.freq = Some(Frequency::Daily),
+        "weekly" => {
+            rule.freq = Some(Frequency::Weekly);
+            if let Some(days) = pattern.get("daysOfWeek").and_then(Value::as_array) {
+                rule.by_day = days
+                    .iter()
+                    .filter_map(|d| d.as_str().and_then(Weekday::parse_long))
+                    .map(|w| ByDay {
+                        ordinal: None,
+                        weekday: w,
+                    })
+                    .collect();
+            }
+        }
+        "absolutemonthly" => {
+            rule.freq = Some(Frequency::Monthly);
+            if let Some(d) = pattern
+                .get("dayOfMonth")
+                .and_then(Value::as_i64)
+                .and_then(|n| i8::try_from(n).ok())
+            {
+                rule.by_month_day = vec![d];
+            }
+        }
+        "relativemonthly" => {
+            rule.freq = Some(Frequency::Monthly);
+            let index_s = pattern
+                .get("index")
+                .and_then(Value::as_str)
+                .unwrap_or("first");
+            let ordinal = graph_index_to_ordinal(index_s);
+            if let Some(days) = pattern.get("daysOfWeek").and_then(Value::as_array)
+                && let Some(w) = days
+                    .iter()
+                    .filter_map(|d| d.as_str().and_then(Weekday::parse_long))
+                    .next()
+            {
+                rule.by_day = vec![ByDay {
+                    ordinal: Some(ordinal),
+                    weekday: w,
+                }];
+            }
+        }
+        "absoluteyearly" => {
+            rule.freq = Some(Frequency::Yearly);
+            if let Some(d) = pattern
+                .get("dayOfMonth")
+                .and_then(Value::as_i64)
+                .and_then(|n| i8::try_from(n).ok())
+            {
+                rule.by_month_day = vec![d];
+            }
+            if let Some(m) = pattern
+                .get("month")
+                .and_then(Value::as_u64)
+                .and_then(|n| u8::try_from(n).ok())
+            {
+                rule.by_month = vec![m];
+            }
+        }
+        _ => return None,
+    }
+
+    let rtype = range
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("noEnd");
+    match rtype.to_ascii_lowercase().as_str() {
+        "noend" => {}
+        "enddate" => {
+            if let Some(s) = range.get("endDate").and_then(Value::as_str)
+                && let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                && let Some(dt) = d.and_hms_opt(23, 59, 59)
+            {
+                rule.until = Some(dt.and_utc());
+            }
+        }
+        "numbered" => {
+            if let Some(n) = range
+                .get("numberOfOccurrences")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+            {
+                rule.count = Some(n);
+            }
+        }
+        _ => {}
+    }
+
+    crate::recurrence::format_rrule(&rule)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

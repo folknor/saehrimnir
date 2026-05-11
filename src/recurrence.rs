@@ -46,6 +46,17 @@ impl Frequency {
             Self::Yearly => "yearly",
         }
     }
+
+    /// RRULE token: uppercase ASCII, e.g. `"WEEKLY"`. Inverse of
+    /// [`Self::parse`], used by [`format_rrule`].
+    pub fn rrule_token(self) -> &'static str {
+        match self {
+            Self::Daily => "DAILY",
+            Self::Weekly => "WEEKLY",
+            Self::Monthly => "MONTHLY",
+            Self::Yearly => "YEARLY",
+        }
+    }
 }
 
 /// One BYDAY entry. RFC 5545 allows an optional ordinal prefix
@@ -108,6 +119,53 @@ impl Weekday {
             Self::Su => "su",
         }
     }
+
+    /// RRULE token: two-letter uppercase ASCII ("MO", ...).
+    pub fn rrule_token(self) -> &'static str {
+        match self {
+            Self::Mo => "MO",
+            Self::Tu => "TU",
+            Self::We => "WE",
+            Self::Th => "TH",
+            Self::Fr => "FR",
+            Self::Sa => "SA",
+            Self::Su => "SU",
+        }
+    }
+
+    /// Case-insensitive parse of the two-letter RRULE token.
+    /// Used by the write paths that synthesise an RRULE from a
+    /// protocol-specific structured form (Graph's `daysOfWeek`
+    /// in `"monday"` form goes through `from_long` first; the
+    /// short tokens land here).
+    pub fn parse_short(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "MO" => Some(Self::Mo),
+            "TU" => Some(Self::Tu),
+            "WE" => Some(Self::We),
+            "TH" => Some(Self::Th),
+            "FR" => Some(Self::Fr),
+            "SA" => Some(Self::Sa),
+            "SU" => Some(Self::Su),
+            _ => None,
+        }
+    }
+
+    /// Case-insensitive parse of Graph's full-word day token
+    /// (`"monday"`, `"tuesday"`, ...). Returns None for any
+    /// other string.
+    pub fn parse_long(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "monday" => Some(Self::Mo),
+            "tuesday" => Some(Self::Tu),
+            "wednesday" => Some(Self::We),
+            "thursday" => Some(Self::Th),
+            "friday" => Some(Self::Fr),
+            "saturday" => Some(Self::Sa),
+            "sunday" => Some(Self::Su),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -166,6 +224,53 @@ impl ParsedRule {
         }
         out
     }
+}
+
+/// Emit an RFC 5545 RRULE value (without the `RRULE:` prefix) from
+/// a parsed rule. Returns None when `freq` is unset - a recurrence
+/// with no FREQ isn't a valid wire form and the caller should leave
+/// the event single-instance instead of writing a malformed rule.
+///
+/// Used by the create / patch paths on gcal, Graph, and JMAP to
+/// turn their protocol-specific structured forms (parsed into
+/// `ParsedRule`) back into the canonical RRULE string the fixture
+/// stores. `INTERVAL` is omitted when 1 (the default) so the emitted
+/// rule round-trips through [`ParsedRule::parse`] with the same
+/// minimal field set the fixture loader produces.
+pub fn format_rrule(rule: &ParsedRule) -> Option<String> {
+    let freq = rule.freq?;
+    let mut parts: Vec<String> = vec![format!("FREQ={}", freq.rrule_token())];
+    if let Some(n) = rule.interval
+        && n > 1
+    {
+        parts.push(format!("INTERVAL={n}"));
+    }
+    if !rule.by_day.is_empty() {
+        let tokens: Vec<String> = rule
+            .by_day
+            .iter()
+            .map(|d| match d.ordinal {
+                Some(n) => format!("{n}{}", d.weekday.rrule_token()),
+                None => d.weekday.rrule_token().to_string(),
+            })
+            .collect();
+        parts.push(format!("BYDAY={}", tokens.join(",")));
+    }
+    if !rule.by_month_day.is_empty() {
+        let tokens: Vec<String> = rule.by_month_day.iter().map(i8::to_string).collect();
+        parts.push(format!("BYMONTHDAY={}", tokens.join(",")));
+    }
+    if !rule.by_month.is_empty() {
+        let tokens: Vec<String> = rule.by_month.iter().map(u8::to_string).collect();
+        parts.push(format!("BYMONTH={}", tokens.join(",")));
+    }
+    if let Some(c) = rule.count {
+        parts.push(format!("COUNT={c}"));
+    }
+    if let Some(u) = rule.until {
+        parts.push(format!("UNTIL={}", u.format("%Y%m%dT%H%M%SZ")));
+    }
+    Some(parts.join(";"))
 }
 
 fn parse_by_day(s: &str) -> Option<ByDay> {
@@ -262,5 +367,64 @@ mod tests {
         let r = ParsedRule::parse("FREQ=DAILY;COUNT=banana");
         assert_eq!(r.freq, Some(Frequency::Daily));
         assert_eq!(r.count, None);
+    }
+
+    #[test]
+    fn format_rrule_round_trips_weekly_byday_count() {
+        let r = ParsedRule::parse("FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=10");
+        let s = format_rrule(&r).unwrap();
+        assert_eq!(s, "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=10");
+        // Round-trip: parse the emitted string back; the parsed
+        // shape matches the original.
+        assert_eq!(ParsedRule::parse(&s), r);
+    }
+
+    #[test]
+    fn format_rrule_omits_default_interval() {
+        let r = ParsedRule {
+            freq: Some(Frequency::Daily),
+            interval: Some(1),
+            count: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(format_rrule(&r).unwrap(), "FREQ=DAILY;COUNT=5");
+    }
+
+    #[test]
+    fn format_rrule_emits_explicit_interval_when_greater_than_one() {
+        let r = ParsedRule {
+            freq: Some(Frequency::Monthly),
+            interval: Some(3),
+            by_month_day: vec![15],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_rrule(&r).unwrap(),
+            "FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=15"
+        );
+    }
+
+    #[test]
+    fn format_rrule_emits_until_in_utc_form() {
+        let r = ParsedRule::parse("FREQ=DAILY;UNTIL=20261215T170000Z");
+        let s = format_rrule(&r).unwrap();
+        assert!(s.ends_with("UNTIL=20261215T170000Z"), "got {s}");
+    }
+
+    #[test]
+    fn format_rrule_emits_ordinal_byday() {
+        let r = ParsedRule::parse("FREQ=MONTHLY;BYDAY=2MO,-1FR");
+        let s = format_rrule(&r).unwrap();
+        assert_eq!(s, "FREQ=MONTHLY;BYDAY=2MO,-1FR");
+    }
+
+    #[test]
+    fn format_rrule_returns_none_without_freq() {
+        let r = ParsedRule {
+            freq: None,
+            count: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(format_rrule(&r), None);
     }
 }

@@ -1787,3 +1787,94 @@ async fn graph_users_memberof_scopes_by_account() {
     assert_eq!(groups.len(), 2);
 }
 
+// ── Calendar recurrence writes ──────────────────────────────────────
+
+#[tokio::test]
+async fn graph_create_event_with_weekly_recurrence_round_trips() {
+    let app = recurrence_calendar_router();
+    let body = json!({
+        "subject": "Weekly graph sync",
+        "start": { "dateTime": "2026-03-02T10:00:00Z", "timeZone": "UTC" },
+        "end":   { "dateTime": "2026-03-02T10:30:00Z", "timeZone": "UTC" },
+        "recurrence": {
+            "pattern": {
+                "type": "weekly",
+                "interval": 1,
+                "daysOfWeek": ["monday", "wednesday"]
+            },
+            "range": {
+                "type": "numbered",
+                "startDate": "2026-03-02",
+                "numberOfOccurrences": 8
+            }
+        }
+    });
+    let (status, v) = json_request(
+        app.clone(),
+        "POST",
+        "/v1.0/me/calendars/cal-work/events",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = v["id"].as_str().unwrap().to_string();
+    // Follow-up GET: the server's read-side translator should
+    // reconstruct an equivalent pattern/range.
+    let (status, v) = get_json_with(app, &format!("/v1.0/me/events/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let rec = &v["recurrence"];
+    assert_eq!(rec["pattern"]["type"], "weekly");
+    assert_eq!(rec["pattern"]["daysOfWeek"], json!(["monday", "wednesday"]));
+    assert_eq!(rec["range"]["type"], "numbered");
+    assert_eq!(rec["range"]["numberOfOccurrences"], 8);
+}
+
+#[tokio::test]
+async fn graph_create_event_with_absolute_monthly_recurrence() {
+    let app = recurrence_calendar_router();
+    let body = json!({
+        "subject": "Monthly review",
+        "start": { "dateTime": "2026-03-15T17:00:00Z", "timeZone": "UTC" },
+        "end":   { "dateTime": "2026-03-15T18:00:00Z", "timeZone": "UTC" },
+        "recurrence": {
+            "pattern": { "type": "absoluteMonthly", "interval": 1, "dayOfMonth": 15 },
+            "range": { "type": "endDate", "startDate": "2026-03-15", "endDate": "2026-12-15" }
+        }
+    });
+    let (status, v) = json_request(
+        app.clone(),
+        "POST",
+        "/v1.0/me/calendars/cal-work/events",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = v["id"].as_str().unwrap().to_string();
+    let (_, v) = get_json_with(app, &format!("/v1.0/me/events/{id}")).await;
+    let rec = &v["recurrence"];
+    assert_eq!(rec["pattern"]["type"], "absoluteMonthly");
+    assert_eq!(rec["pattern"]["dayOfMonth"], 15);
+    assert_eq!(rec["range"]["type"], "endDate");
+    assert_eq!(rec["range"]["endDate"], "2026-12-15");
+}
+
+#[tokio::test]
+async fn graph_patch_recurrence_clears_with_null() {
+    let app = recurrence_calendar_router();
+    // ev-weekly already has recurrence; PATCH null clears it.
+    let body = json!({ "recurrence": null });
+    let (status, _) = json_request(
+        app.clone(),
+        "PATCH",
+        "/v1.0/me/events/ev-weekly",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, v) = get_json_with(app, "/v1.0/me/events/ev-weekly").await;
+    assert!(
+        v.get("recurrence").is_none(),
+        "expected recurrence cleared: {v}"
+    );
+}
+

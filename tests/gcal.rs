@@ -485,3 +485,75 @@ async fn gcal_cross_account_calendar_returns_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ── Recurrence write paths ──────────────────────────────────────────
+
+#[tokio::test]
+async fn gcal_create_event_with_recurrence_round_trips() {
+    let r = recurrence_router();
+    let body = json!({
+        "summary": "Weekly sync",
+        "start": { "dateTime": "2026-03-02T10:00:00Z", "timeZone": "UTC" },
+        "end":   { "dateTime": "2026-03-02T10:30:00Z", "timeZone": "UTC" },
+        "recurrence": [
+            "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=8",
+            "EXDATE:20260309T100000Z",
+        ],
+    });
+    let (status, v) = http(&r, "POST", "/calendar/v3/calendars/cal-work/events", Some(body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = v["id"].as_str().unwrap().to_string();
+    let rec = v["recurrence"].as_array().unwrap();
+    assert_eq!(rec[0], "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=8");
+    assert_eq!(rec[1], "EXDATE:20260309T100000Z");
+
+    // Follow-up list returns the same shape.
+    let (_, v) = http(&r, "GET", "/calendar/v3/calendars/cal-work/events", None).await;
+    let event = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == Value::String(id.clone()))
+        .unwrap();
+    let rec = event["recurrence"].as_array().unwrap();
+    assert_eq!(rec[0], "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=8");
+    assert_eq!(rec[1], "EXDATE:20260309T100000Z");
+}
+
+#[tokio::test]
+async fn gcal_patch_recurrence_replaces_and_clears() {
+    let r = recurrence_router();
+    // First create a non-recurring event to patch.
+    let body = json!({
+        "summary": "to recur",
+        "start": { "dateTime": "2026-04-01T10:00:00Z", "timeZone": "UTC" },
+        "end":   { "dateTime": "2026-04-01T10:30:00Z", "timeZone": "UTC" },
+    });
+    let (_, v) = http(&r, "POST", "/calendar/v3/calendars/cal-work/events", Some(body)).await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // PATCH to add recurrence.
+    let body = json!({
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    });
+    let (status, v) = http(
+        &r,
+        "PATCH",
+        &format!("/calendar/v3/calendars/cal-work/events/{id}"),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["recurrence"][0], "RRULE:FREQ=DAILY;COUNT=5");
+
+    // PATCH `recurrence: null` clears it.
+    let body = json!({ "recurrence": null });
+    let (_, v) = http(
+        &r,
+        "PATCH",
+        &format!("/calendar/v3/calendars/cal-work/events/{id}"),
+        Some(body),
+    )
+    .await;
+    assert!(v.get("recurrence").is_none(), "expected recurrence cleared: {v}");
+}
