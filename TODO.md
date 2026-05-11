@@ -10,8 +10,10 @@ Concrete next-up items lifted above the per-protocol backlogs.
 
 - **Graph group enumeration.** `/v1.0/groups` + `/v1.0/me/
   memberOf`. Lands in `src/graph/group_sync.rs` (new). Fixture
-  format needs a `[[group]]` table; design alongside the
-  multi-account work since groups cross accounts.
+  format needs a `[[group]]` table with optional `[[member]]`
+  rows pointing at declared accounts (groups are
+  cross-account by nature; the multi-account refactor is
+  landed so this is unblocked).
 - **Multi-account refactor follow-ups.** Stages 1-5 landed the
   fixture model, JMAP multi-account scoping, Graph per-account
   routing across all four resource families, OAuth-scoped
@@ -28,10 +30,6 @@ Concrete next-up items lifted above the per-protocol backlogs.
     change_log by account so a multi-account fixture's
     mutations on the secondary don't surface in the primary's
     delta walk.
-- **Graph shared mailbox sync.** `/v1.0/users/{id}/...` paths
-  parallel to `/v1.0/me/...`. Lands in
-  `src/graph/shared_mailbox_sync.rs` (new). Blocked on multi-
-  account fixture support above.
 - **Gmail SendAs / signatures bidirectional sync.** Today
   `/gmail/v1/users/me/settings/sendAs` returns an empty list.
   Wire a `[[account.send_as]]` (or similar) fixture table, honour
@@ -264,8 +262,9 @@ Remaining items are unblocked-but-unneeded.
 
 ## Microsoft Graph (other future work)
 
-v0 mail-sync, calendar, and contacts are complete. Label / group /
-shared-mailbox sync are tracked under "Priority" above. Remaining
+v0 mail, calendar, contacts, categories, and `/v1.0/users/{id}/...`
+per-account routing across all four resource families are complete.
+Group enumeration is tracked under "Priority" above. Remaining
 future Graph work:
 
 - OneDrive resumable upload sessions (`onedrive.rs`) - needed once
