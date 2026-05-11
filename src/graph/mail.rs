@@ -96,27 +96,6 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-// ── Account-scope resolution ────────────────────────────────────────
-
-/// Resolve the `{user}` path segment against the declared accounts.
-/// `me` is accepted as an alias for the primary account.
-/// Returns `Err(Response)` (404 ResourceNotFound) for an unknown id
-/// so callers can early-return.
-#[allow(clippy::result_large_err)]
-fn resolve_user_account(fixture: &Fixture, user: &str) -> Result<String, Response> {
-    if user == "me" {
-        return Ok(fixture.primary_account().id.clone());
-    }
-    match fixture.account(user) {
-        Some(a) => Ok(a.id.clone()),
-        None => Err(error(
-            StatusCode::NOT_FOUND,
-            "ResourceNotFound",
-            &format!("user {user:?} not found"),
-        )),
-    }
-}
-
 // ── /me/ route wrappers ─────────────────────────────────────────────
 
 async fn list_folders_me(
@@ -195,7 +174,7 @@ async fn list_folders_user(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let account_id = match resolve_user_account(&state.fixture(), &user) {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
@@ -206,7 +185,7 @@ async fn get_folder_user(
     State(state): State<AppState>,
     Path((user, folder)): Path<(String, String)>,
 ) -> Response {
-    let account_id = match resolve_user_account(&state.fixture(), &user) {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
@@ -219,7 +198,7 @@ async fn list_child_folders_user(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let account_id = match resolve_user_account(&state.fixture(), &user) {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
@@ -232,7 +211,7 @@ async fn list_messages_user(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let account_id = match resolve_user_account(&state.fixture(), &user) {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
@@ -245,7 +224,7 @@ async fn delta_messages_user(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    let account_id = match resolve_user_account(&state.fixture(), &user) {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
@@ -256,7 +235,7 @@ async fn list_message_attachments_user(
     State(state): State<AppState>,
     Path((user, message_id)): Path<(String, String)>,
 ) -> Response {
-    let account_id = match resolve_user_account(&state.fixture(), &user) {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
@@ -267,7 +246,7 @@ async fn get_message_attachment_user(
     State(state): State<AppState>,
     Path((user, message_id, attachment_id)): Path<(String, String, String)>,
 ) -> Response {
-    let account_id = match resolve_user_account(&state.fixture(), &user) {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
@@ -278,7 +257,7 @@ async fn get_message_attachment_value_user(
     State(state): State<AppState>,
     Path((user, message_id, attachment_id)): Path<(String, String, String)>,
 ) -> Response {
-    let account_id = match resolve_user_account(&state.fixture(), &user) {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };

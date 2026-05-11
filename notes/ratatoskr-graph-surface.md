@@ -119,10 +119,14 @@ named account, so a `/v1.0/users/{secondary}/mailFolders/inbox`
 request resolves the secondary account's inbox - not the
 primary's.
 
-Stage 3 of the multi-account refactor (this surface) covers
-mail only. Graph calendar / contacts / categories still route
-through `/v1.0/me/...` and scope to primary; the parallel
-`/users/{userId}/...` routes land in a follow-up.
+Coverage: every Graph resource family routes per-account -
+mail (`mailFolders`, `messages`, `messages/delta`,
+`messages/.../attachments`), calendar (`calendars`,
+`calendars/{id}/events`, `calendars/{id}/calendarView/delta`,
+`events/{id}`), contacts (`contactFolders`,
+`contactFolders/{id}/contacts`, `contacts/delta`,
+`contacts/{id}`), and master categories
+(`outlook/masterCategories`).
 
 ## Connection / transport
 

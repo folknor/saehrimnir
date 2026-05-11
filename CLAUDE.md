@@ -69,14 +69,16 @@ checking whether the fact is already in `notes/`.
   session resource and method handlers (`Mailbox/get`,
   `Email/get`, `Email/query`, `Calendar/get`,
   `CalendarEvent/get`) honour the request's `accountId` arg.
-  Graph mail grows parallel `/v1.0/users/{userId}/...` routes
-  (`me` aliases the primary; unknown userIds return 404
-  `ResourceNotFound`); `/v1.0/me/...` continues to scope to
-  primary and now filters out non-primary accounts' mail so
-  multi-account fixtures don't leak. Graph calendar / contacts
-  / categories, gcal, Gmail, People, CalDAV, IMAP, SMTP, and
-  OAuth still scope to primary; the limitation is invisible in
-  current single-account fixtures.
+  Every Graph resource family (mail, calendar, contacts,
+  categories) exposes parallel `/v1.0/users/{userId}/...`
+  routes alongside `/v1.0/me/...` (`me` aliases the primary;
+  unknown userIds return 404 `ResourceNotFound`). `/v1.0/me/...`
+  filters reads by the primary account so multi-account
+  fixtures' secondary resources don't leak; folder + calendar +
+  contact-folder aliases (`inbox`, `default`) resolve within
+  the named account. gcal, Gmail, People, CalDAV, IMAP, SMTP,
+  and OAuth still scope to primary; the limitation is invisible
+  in current single-account fixtures.
 - One shared fixture per process, behind a single
   `Arc<RwLock<Fixture>>` (`shared::FixtureHandle`). Read paths take
   brief read guards; the JMAP `Email/set` / `Mailbox/set` mutators

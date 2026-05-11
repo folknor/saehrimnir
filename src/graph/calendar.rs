@@ -1,38 +1,30 @@
 //! Microsoft Graph calendar endpoints.
 //!
 //! Implements the subset of `/v1.0/me/calendars/...` and
-//! `/v1.0/me/events/...` ratatoskr's Graph calendar client
-//! exercises. v0 covers:
+//! `/v1.0/me/events/...` (plus the parallel
+//! `/v1.0/users/{userId}/...` paths) ratatoskr's Graph calendar
+//! client exercises. v0 covers:
 //!
-//! - `GET /v1.0/me/calendars` (list).
-//! - `GET /v1.0/me/calendars/{id}` (single).
-//! - `GET /v1.0/me/calendars/{id}/events` (list events in a calendar).
-//! - `GET /v1.0/me/calendars/{id}/calendarView/delta`.
-//! - `GET /v1.0/me/events/{id}` (single).
-//! - `POST /v1.0/me/calendars/{id}/events` (create).
-//! - `PATCH /v1.0/me/events/{id}` (update).
-//! - `DELETE /v1.0/me/events/{id}` (drop).
+//! - `GET    /calendars` (list).
+//! - `GET    /calendars/{id}` (single).
+//! - `GET    /calendars/{id}/events` (list events).
+//! - `GET    /calendars/{id}/calendarView/delta`.
+//! - `GET    /events/{id}` (single).
+//! - `POST   /calendars/{id}/events` (create).
+//! - `PATCH  /events/{id}` (update).
+//! - `DELETE /events/{id}` (drop).
 //!
-//! GET endpoints project from the fixture. Mutating endpoints
-//! (POST / PATCH / DELETE) do *not* mutate the fixture - the
-//! fixture is read-only in v0 - they instead echo the request body
-//! back into the response so tests can assert on what the client
-//! tried to write. Real Graph echoes the created/updated event in
-//! the 201/200 response body, so this also matches reality.
-//! `DELETE` returns 204 with no body, again matching real Graph.
+//! Stage 3 of the multi-account refactor routes per-account on
+//! this surface: `/v1.0/me/...` scopes to the primary;
+//! `/v1.0/users/{userId}/...` scopes to the named declared
+//! account (`me` aliases primary; unknown user returns 404).
+//! Folder-agnostic `/events/{id}` looks up the event within the
+//! resolved account; mutations land on the calendar's account.
 //!
-//! The mutation echo is captured wherever it's useful via the
-//! existing cross-protocol `RequestLog` middleware in
-//! `super::log_request` - the path lands there already, and the
-//! handler additionally appends the parsed body to the matching
-//! entry's detail. (Graph itself doesn't expose a separate
-//! mutation log because the fixture stays read-only; tests that
-//! need the body inspect the response or the request log.)
-//!
-//! `calendarView/delta` returns the full event list on the first
-//! call (no `$deltatoken`) and an empty result with a fresh
-//! `@odata.deltaLink` on follow-ups, mirroring the messages/delta
-//! shape in `mail.rs`.
+//! Mutations land via `Fixture::mutate` and record
+//! `event_created` / `event_updated` / `event_destroyed`
+//! transitions so subsequent `calendarView/delta` calls walk
+//! them.
 
 use axum::{
     Router,
@@ -53,28 +45,216 @@ const EVENTS_MAX_TOP: u32 = 256;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/v1.0/me/calendars", get(list_calendars))
-        .route("/v1.0/me/calendars/{calendar}", get(get_calendar))
+        // /me/...
+        .route("/v1.0/me/calendars", get(list_calendars_me))
+        .route("/v1.0/me/calendars/{calendar}", get(get_calendar_me))
         .route(
             "/v1.0/me/calendars/{calendar}/events",
-            get(list_events).post(create_event),
+            get(list_events_me).post(create_event_me),
         )
         .route(
             "/v1.0/me/calendars/{calendar}/calendarView/delta",
-            get(delta_events),
+            get(delta_events_me),
         )
         .route(
             "/v1.0/me/events/{event}",
-            get(get_event).patch(patch_event).delete(delete_event),
+            get(get_event_me).patch(patch_event_me).delete(delete_event_me),
+        )
+        // /users/{user}/...
+        .route("/v1.0/users/{user}/calendars", get(list_calendars_user))
+        .route(
+            "/v1.0/users/{user}/calendars/{calendar}",
+            get(get_calendar_user),
+        )
+        .route(
+            "/v1.0/users/{user}/calendars/{calendar}/events",
+            get(list_events_user).post(create_event_user),
+        )
+        .route(
+            "/v1.0/users/{user}/calendars/{calendar}/calendarView/delta",
+            get(delta_events_user),
+        )
+        .route(
+            "/v1.0/users/{user}/events/{event}",
+            get(get_event_user)
+                .patch(patch_event_user)
+                .delete(delete_event_user),
         )
 }
 
-// ── Listing / single-resource projection ────────────────────────────
+// ── /me/ wrappers ───────────────────────────────────────────────────
 
-async fn list_calendars(
+async fn list_calendars_me(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RawQuery(_q): RawQuery,
+    RawQuery(q): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    list_calendars_impl(state, &account_id, headers, q).await
+}
+
+async fn get_calendar_me(
+    State(state): State<AppState>,
+    Path(calendar): Path<String>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_calendar_impl(state, &account_id, &calendar).await
+}
+
+async fn list_events_me(
+    State(state): State<AppState>,
+    Path(calendar): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    list_events_impl(state, &account_id, &calendar, raw_query, true).await
+}
+
+async fn delta_events_me(
+    State(state): State<AppState>,
+    Path(calendar): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    delta_events_impl(state, &account_id, &calendar, headers, raw_query, true).await
+}
+
+async fn get_event_me(State(state): State<AppState>, Path(event): Path<String>) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_event_impl(state, &account_id, &event).await
+}
+
+async fn create_event_me(
+    State(state): State<AppState>,
+    Path(calendar): Path<String>,
+    body: AxumBody,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    create_event_impl(state, &account_id, &calendar, body, true).await
+}
+
+async fn patch_event_me(
+    State(state): State<AppState>,
+    Path(event): Path<String>,
+    body: AxumBody,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    patch_event_impl(state, &account_id, &event, body, true).await
+}
+
+async fn delete_event_me(
+    State(state): State<AppState>,
+    Path(event): Path<String>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    delete_event_impl(state, &account_id, &event, true).await
+}
+
+// ── /users/{user}/ wrappers ─────────────────────────────────────────
+
+async fn list_calendars_user(
+    State(state): State<AppState>,
+    Path(user): Path<String>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    list_calendars_impl(state, &account_id, headers, q).await
+}
+
+async fn get_calendar_user(
+    State(state): State<AppState>,
+    Path((user, calendar)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_calendar_impl(state, &account_id, &calendar).await
+}
+
+async fn list_events_user(
+    State(state): State<AppState>,
+    Path((user, calendar)): Path<(String, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    list_events_impl(state, &account_id, &calendar, raw_query, false).await
+}
+
+async fn delta_events_user(
+    State(state): State<AppState>,
+    Path((user, calendar)): Path<(String, String)>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    delta_events_impl(state, &account_id, &calendar, headers, raw_query, false).await
+}
+
+async fn get_event_user(
+    State(state): State<AppState>,
+    Path((user, event)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_event_impl(state, &account_id, &event).await
+}
+
+async fn create_event_user(
+    State(state): State<AppState>,
+    Path((user, calendar)): Path<(String, String)>,
+    body: AxumBody,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    create_event_impl(state, &account_id, &calendar, body, false).await
+}
+
+async fn patch_event_user(
+    State(state): State<AppState>,
+    Path((user, event)): Path<(String, String)>,
+    body: AxumBody,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    patch_event_impl(state, &account_id, &event, body, false).await
+}
+
+async fn delete_event_user(
+    State(state): State<AppState>,
+    Path((user, event)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    delete_event_impl(state, &account_id, &event, false).await
+}
+
+// ── Inner handlers ──────────────────────────────────────────────────
+
+async fn list_calendars_impl(
+    state: AppState,
+    account_id: &str,
+    headers: HeaderMap,
+    _q: Option<String>,
 ) -> Response {
     if let Some(o) = super::maybe_override(&state, "list_calendars", |_| Ok(())) {
         return o;
@@ -82,8 +262,7 @@ async fn list_calendars(
     let _ = headers;
     let fixture = state.fixture();
     let value: Vec<Value> = fixture
-        .calendars
-        .iter()
+        .calendars_for(account_id)
         .map(|c| serialize_calendar(&fixture, c))
         .collect();
     ok_json(json!({
@@ -92,17 +271,15 @@ async fn list_calendars(
     }))
 }
 
-async fn get_calendar(
-    State(state): State<AppState>,
-    Path(calendar): Path<String>,
-) -> Response {
-    if let Some(o) = super::maybe_override(&state, "get_calendar", |s| {
-        crate::lua::req_set_str(s, "calendar", &calendar)
+async fn get_calendar_impl(state: AppState, account_id: &str, calendar: &str) -> Response {
+    let cal_owned = calendar.to_string();
+    if let Some(o) = super::maybe_override(&state, "get_calendar", move |s| {
+        crate::lua::req_set_str(s, "calendar", &cal_owned)
     }) {
         return o;
     }
     let fixture = state.fixture();
-    match resolve_calendar(&fixture, &calendar) {
+    match resolve_calendar(&fixture, calendar, account_id) {
         Some(c) => ok_json(serialize_calendar(&fixture, c)),
         None => error(
             StatusCode::NOT_FOUND,
@@ -112,18 +289,21 @@ async fn get_calendar(
     }
 }
 
-async fn list_events(
-    State(state): State<AppState>,
-    Path(calendar): Path<String>,
-    RawQuery(raw_query): RawQuery,
+async fn list_events_impl(
+    state: AppState,
+    account_id: &str,
+    calendar: &str,
+    raw_query: Option<String>,
+    me_path: bool,
 ) -> Response {
-    if let Some(o) = super::maybe_override(&state, "list_events", |s| {
-        crate::lua::req_set_str(s, "calendar", &calendar)
+    let cal_owned = calendar.to_string();
+    if let Some(o) = super::maybe_override(&state, "list_events", move |s| {
+        crate::lua::req_set_str(s, "calendar", &cal_owned)
     }) {
         return o;
     }
     let fixture = state.fixture();
-    if resolve_calendar(&fixture, &calendar).is_none() {
+    if resolve_calendar(&fixture, calendar, account_id).is_none() {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
@@ -139,19 +319,8 @@ async fn list_events(
         .or(q.skip)
         .unwrap_or(0);
 
-    // Pagination math (verified 2026-05-09):
-    //   skip=0/top=2/total=5 -> page=2, next_skip=2, link emitted.
-    //   skip=2/top=2         -> page=2, next_skip=4, link emitted.
-    //   skip=4/top=1         -> page=1, next_skip=5, no link.
-    //   skip=10/total=5      -> page=0, next_skip=10, no link.
-    //
-    // The page is built straight off a streaming iterator chain
-    // so we never materialise the full filtered list. The
-    // `nextLink` decision needs the total count, which is one
-    // additional pass and still avoids the O(N) clone.
     let page: Vec<Value> = fixture
-        .events
-        .iter()
+        .events_for(account_id)
         .filter(|e| e.calendar_id == calendar)
         .skip(skip as usize)
         .take(top as usize)
@@ -159,15 +328,19 @@ async fn list_events(
         .collect();
     let next_skip = (skip as usize) + page.len();
     let has_more = fixture
-        .events
-        .iter()
+        .events_for(account_id)
         .filter(|e| e.calendar_id == calendar)
         .nth(next_skip)
         .is_some();
     let next_link = if has_more {
-        Some(format!(
-            "https://graph.microsoft.com/v1.0/me/calendars/{calendar}/events?$skiptoken=s.{next_skip}"
-        ))
+        let base = if me_path {
+            format!("https://graph.microsoft.com/v1.0/me/calendars/{calendar}/events")
+        } else {
+            format!(
+                "https://graph.microsoft.com/v1.0/users/{account_id}/calendars/{calendar}/events"
+            )
+        };
+        Some(format!("{base}?$skiptoken=s.{next_skip}"))
     } else {
         None
     };
@@ -186,43 +359,39 @@ async fn list_events(
     ok_json(Value::Object(envelope))
 }
 
-async fn delta_events(
-    State(state): State<AppState>,
-    Path(calendar): Path<String>,
+async fn delta_events_impl(
+    state: AppState,
+    account_id: &str,
+    calendar: &str,
     headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
+    raw_query: Option<String>,
+    me_path: bool,
 ) -> Response {
-    if let Some(o) = super::maybe_override(&state, "delta_events", |s| {
-        crate::lua::req_set_str(s, "calendar", &calendar)
+    let cal_owned = calendar.to_string();
+    if let Some(o) = super::maybe_override(&state, "delta_events", move |s| {
+        crate::lua::req_set_str(s, "calendar", &cal_owned)
     }) {
         return o;
     }
     let fixture = state.fixture();
-    if resolve_calendar(&fixture, &calendar).is_none() {
+    if resolve_calendar(&fixture, calendar, account_id).is_none() {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
             &format!("calendar {calendar:?} not declared in fixture"),
         );
     }
-    // The "no changes vs no token" branch hinges on
-    // `q.deltatoken.is_some()`. An empty `?$deltatoken=` parses
-    // as `Some("")` per `odata::OdataQuery::parse`, so a client
-    // that sends an empty token still hits the follow-up branch
-    // (correct: any acknowledged token means "I've seen the
-    // initial dump").
     let q = odata::OdataQuery::parse(raw_query.as_deref());
     let host = host_or_default(&headers);
-    let path = format!("/v1.0/me/calendars/{calendar}/calendarView/delta");
+    let path = if me_path {
+        format!("/v1.0/me/calendars/{calendar}/calendarView/delta")
+    } else {
+        format!("/v1.0/users/{account_id}/calendars/{calendar}/calendarView/delta")
+    };
     let context = format!(
         "https://graph.microsoft.com/v1.0/$metadata#me/calendars(\"{calendar}\")/calendarView"
     );
 
-    // The `$deltatoken=latest` shortcut: client wants a fresh
-    // delta link with no event dump (mirrors the messages/delta
-    // shape). The token returned is the *current* fixture state
-    // so the next follow-up walks no transitions if nothing
-    // changes.
     if q.deltatoken.as_deref() == Some("latest") {
         let delta_link =
             odata::build_delta_link(&host, &path, raw_query.as_deref(), &fixture.state);
@@ -233,23 +402,11 @@ async fn delta_events(
         }));
     }
 
-    // Subsequent delta cycles: walk the fixture change log between
-    // the client-supplied token and the current state. Created /
-    // updated events project as `serialize_event`; destroyed events
-    // are emitted as Graph deletion stubs (id + `@removed.reason =
-    // "deleted"`). An unknown / evicted token falls back to a fresh
-    // bootstrap (returns the full event list); real Graph signals
-    // 410 Gone for this case but a re-bootstrap is the closest
-    // single-shot equivalent v0 can provide.
     if let Some(token) = q.deltatoken.as_deref() {
         let raw = odata::decode_deltatoken(token).unwrap_or("");
-        if let Some(delta) = fixture.event_delta_since(raw, &calendar) {
-            // Build an id -> &Event map once; the per-id lookup
-            // would otherwise scan `fixture.events` linearly per
-            // delta entry. O(K + N) instead of O(K · N).
+        if let Some(delta) = fixture.event_delta_since(raw, calendar) {
             let by_id: std::collections::HashMap<&str, &crate::fixture::Event> = fixture
-                .events
-                .iter()
+                .events_for(account_id)
                 .filter(|e| e.calendar_id == calendar)
                 .map(|e| (e.id.as_str(), e))
                 .collect();
@@ -259,9 +416,6 @@ async fn delta_events(
                     value.push(serialize_event(&fixture, e));
                 }
             }
-            // Tombstones are pre-filtered to this calendar by
-            // `event_delta_since`; sibling-calendar destroys never
-            // surface here.
             for id in &delta.destroyed {
                 value.push(graph_event_tombstone(id));
             }
@@ -273,16 +427,8 @@ async fn delta_events(
                 "@odata.deltaLink": delta_link,
             }));
         }
-        // Token unknown / evicted: fall through to full bootstrap.
     }
 
-    // Initial bootstrap: paginate the full event dump with
-    // `@odata.nextLink`; only on the final page emit
-    // `@odata.deltaLink`. Real Graph behaves the same way; v0
-    // previously short-circuited and emitted deltaLink on the
-    // first call regardless of size, which silently dropped
-    // pages off the wire for any calendar bigger than the
-    // default top.
     let top = q.page_size(EVENTS_DEFAULT_TOP, EVENTS_MAX_TOP);
     let offset = match q.offset() {
         Some(o) => o,
@@ -295,8 +441,7 @@ async fn delta_events(
         }
     };
     let page: Vec<Value> = fixture
-        .events
-        .iter()
+        .events_for(account_id)
         .filter(|e| e.calendar_id == calendar)
         .skip(offset as usize)
         .take(top as usize)
@@ -304,8 +449,7 @@ async fn delta_events(
         .collect();
     let next_offset_val = (offset as usize) + page.len();
     let has_more = fixture
-        .events
-        .iter()
+        .events_for(account_id)
         .filter(|e| e.calendar_id == calendar)
         .nth(next_offset_val)
         .is_some();
@@ -333,36 +477,15 @@ async fn delta_events(
     ok_json(Value::Object(envelope))
 }
 
-/// Graph-style deletion stub for `events/delta`. Real Graph emits
-/// `{"id": "...", "@removed": { "reason": "deleted" }}` for events
-/// that disappeared between two delta cycles. v0 follows the same
-/// shape so client deletion handlers light up the same code path.
-fn graph_event_tombstone(id: &str) -> Value {
-    json!({
-        "id": id,
-        "@removed": { "reason": "deleted" },
-    })
-}
-
-fn host_or_default(headers: &HeaderMap) -> String {
-    headers
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("graph.microsoft.com")
-        .to_string()
-}
-
-async fn get_event(
-    State(state): State<AppState>,
-    Path(event): Path<String>,
-) -> Response {
-    if let Some(o) = super::maybe_override(&state, "get_event", |s| {
-        crate::lua::req_set_str(s, "event", &event)
+async fn get_event_impl(state: AppState, account_id: &str, event: &str) -> Response {
+    let event_owned = event.to_string();
+    if let Some(o) = super::maybe_override(&state, "get_event", move |s| {
+        crate::lua::req_set_str(s, "event", &event_owned)
     }) {
         return o;
     }
     let fixture = state.fixture();
-    match fixture.events.iter().find(|e| e.id == event) {
+    match fixture.events_for(account_id).find(|e| e.id == event) {
         Some(e) => ok_json(serialize_event(&fixture, e)),
         None => error(
             StatusCode::NOT_FOUND,
@@ -372,28 +495,16 @@ async fn get_event(
     }
 }
 
-// ── Mutation echoes ─────────────────────────────────────────────────
-//
-// The fixture is read-only in v0, so POST/PATCH/DELETE never
-// mutate state. Each handler echoes the parsed body into the
-// response (real Graph also echoes on POST/PATCH) and appends the
-// body to the cross-protocol request log under `detail.body`, so
-// tests can assert on what the client tried to write.
-//
-// PATCH and DELETE return `ResourceNotFound` when the event id
-// is not declared in the fixture, mirroring real Graph and the
-// GET-side behaviour. The check happens before the body is
-// parsed / recorded so a 404 won't pollute the request log
-// either.
-
-async fn create_event(
-    State(state): State<AppState>,
-    Path(calendar): Path<String>,
+async fn create_event_impl(
+    state: AppState,
+    account_id: &str,
+    calendar: &str,
     body: AxumBody,
+    me_path: bool,
 ) -> Response {
     let calendar_known = {
         let fixture = state.fixture();
-        resolve_calendar(&fixture, &calendar).is_some()
+        resolve_calendar(&fixture, calendar, account_id).is_some()
     };
     if !calendar_known {
         return error(
@@ -402,28 +513,26 @@ async fn create_event(
             &format!("calendar {calendar:?} not declared in fixture"),
         );
     }
-    // calendar_known dropped before we await the body; the read
-    // guard does not span the await.
     let parsed = match parse_json_body(body).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    let log_path = if me_path {
+        format!("POST /v1.0/me/calendars/{calendar}/events")
+    } else {
+        format!("POST /v1.0/users/{account_id}/calendars/{calendar}/events")
+    };
     state.shared.request_log.record(
         "graph",
-        format!("POST /v1.0/me/calendars/{calendar}/events"),
+        log_path,
         crate::request_log::body_detail(&parsed),
     );
 
-    // Mutate the fixture under a write guard. The closure resolves
-    // `calendar` against the *current* event count to assign a
-    // deterministic `mock-event-N` id, then appends the new event.
     let result: Result<Value, Response> = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        let calendar_id = match resolve_calendar(&fix, &calendar) {
+        let calendar_id = match resolve_calendar(&fix, calendar, account_id) {
             Some(c) => c.id.clone(),
             None => {
-                // Calendar disappeared between the read-guard probe
-                // and the write-guard acquisition. Treat as 404.
                 return error(
                     StatusCode::NOT_FOUND,
                     "ResourceNotFound",
@@ -431,7 +540,7 @@ async fn create_event(
                 );
             }
         };
-        let event = match build_event_from_create(&mut fix, &calendar_id, &parsed) {
+        let event = match build_event_from_create(&mut fix, account_id, &calendar_id, &parsed) {
             Ok(e) => e,
             Err(resp) => return *resp,
         };
@@ -452,14 +561,16 @@ async fn create_event(
     }
 }
 
-async fn patch_event(
-    State(state): State<AppState>,
-    Path(event): Path<String>,
+async fn patch_event_impl(
+    state: AppState,
+    account_id: &str,
+    event: &str,
     body: AxumBody,
+    me_path: bool,
 ) -> Response {
     let event_known = {
         let fixture = state.fixture();
-        fixture.events.iter().any(|e| e.id == event)
+        fixture.events_for(account_id).any(|e| e.id == event)
     };
     if !event_known {
         return error(
@@ -472,15 +583,24 @@ async fn patch_event(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    let log_path = if me_path {
+        format!("PATCH /v1.0/me/events/{event}")
+    } else {
+        format!("PATCH /v1.0/users/{account_id}/events/{event}")
+    };
     state.shared.request_log.record(
         "graph",
-        format!("PATCH /v1.0/me/events/{event}"),
+        log_path,
         crate::request_log::body_detail(&parsed),
     );
 
     let result: Result<Value, Response> = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        let idx = match fix.events.iter().position(|e| e.id == event) {
+        let idx = match fix
+            .events
+            .iter()
+            .position(|e| e.account_id == account_id && e.id == event)
+        {
             Some(i) => i,
             None => {
                 return error(
@@ -511,13 +631,15 @@ async fn patch_event(
     }
 }
 
-async fn delete_event(
-    State(state): State<AppState>,
-    Path(event): Path<String>,
+async fn delete_event_impl(
+    state: AppState,
+    account_id: &str,
+    event: &str,
+    me_path: bool,
 ) -> Response {
     let event_known = {
         let fixture = state.fixture();
-        fixture.events.iter().any(|e| e.id == event)
+        fixture.events_for(account_id).any(|e| e.id == event)
     };
     if !event_known {
         return error(
@@ -526,26 +648,32 @@ async fn delete_event(
             &format!("event {event:?} not declared in fixture"),
         );
     }
+    let log_path = if me_path {
+        format!("DELETE /v1.0/me/events/{event}")
+    } else {
+        format!("DELETE /v1.0/users/{account_id}/events/{event}")
+    };
     state.shared.request_log.record(
         "graph",
-        format!("DELETE /v1.0/me/events/{event}"),
+        log_path,
         json!({ "id": event }),
     );
 
     {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        let event_id = event.clone();
+        let event_id = event.to_string();
+        let acct = account_id.to_string();
         // Snapshot the parent calendar BEFORE retain, so the
         // tombstone the change_log records carries the right
         // parent for per-calendar delta filtering.
         let parent = fix
             .events
             .iter()
-            .find(|e| e.id == event_id)
+            .find(|e| e.account_id == acct && e.id == event_id)
             .map(|e| e.calendar_id.clone());
         let _ = fix.mutate(|f| {
             let len_before = f.events.len();
-            f.events.retain(|e| e.id != event_id);
+            f.events.retain(|e| !(e.account_id == acct && e.id == event_id));
             if f.events.len() < len_before {
                 MutationDiff {
                     event_destroyed: vec![event_id.clone()],
@@ -564,6 +692,7 @@ async fn delete_event(
 
 fn build_event_from_create(
     fix: &mut Fixture,
+    account_id: &str,
     calendar_id: &str,
     body: &Value,
 ) -> Result<Event, Box<Response>> {
@@ -613,15 +742,9 @@ fn build_event_from_create(
         .map(|arr| arr.iter().filter_map(parse_graph_attendee).collect())
         .unwrap_or_default();
     let id = fix.mint_event_id();
-    let account_id = fix
-        .calendars
-        .iter()
-        .find(|c| c.id == calendar_id)
-        .map(|c| c.account_id.clone())
-        .unwrap_or_else(|| fix.primary_account().id.clone());
     Ok(Event {
         id,
-        account_id,
+        account_id: account_id.to_string(),
         calendar_id: calendar_id.to_string(),
         subject,
         body_preview: None,
@@ -633,8 +756,7 @@ fn build_event_from_create(
         attendees,
         is_all_day,
         // Graph mutations don't accept recurrence in v0; the wire
-        // body's `recurrence` block is ignored here. A separate
-        // slice grows structured-recurrence write paths if needed.
+        // body's `recurrence` block is ignored here.
         recurrence_rule: None,
         recurrence_exdates: vec![],
     })
@@ -693,10 +815,7 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
                     .unwrap_or_default();
             }
             _ => {
-                // Quietly ignore properties v0 doesn't model. Real
-                // Graph clients send a lot of fields we don't echo
-                // back (importance, sensitivity, ...); rejecting any
-                // unknown key would break harmless pass-throughs.
+                // Quietly ignore properties v0 doesn't model.
             }
         }
     }
@@ -705,10 +824,6 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
 
 fn parse_graph_datetime(v: Option<&Value>) -> Option<chrono::DateTime<chrono::Utc>> {
     let s = v?.get("dateTime")?.as_str()?;
-    // Graph timestamps drop the timezone offset (`2026-01-15T10:00:00.0000000`)
-    // and stash the zone in a sibling `timeZone` field. RFC 3339 needs a
-    // suffix; append `Z` if missing so `parse_ts` accepts it. v0 only
-    // honours UTC since the fixture has no tz database.
     let normalised = if s.ends_with('Z') || s.contains('+') || s.contains('-') {
         s.to_string()
     } else {
@@ -759,16 +874,25 @@ async fn parse_json_body(body: AxumBody) -> Result<Value, Response> {
 
 // ── Serialisation ───────────────────────────────────────────────────
 
-fn resolve_calendar<'a>(fixture: &'a Fixture, id_or_alias: &str) -> Option<&'a Calendar> {
+/// Resolve a calendar within one account. `default` resolves to that
+/// account's default calendar (or its first if none is flagged
+/// default). Scoping prevents the alias from leaking across accounts.
+fn resolve_calendar<'a>(
+    fixture: &'a Fixture,
+    id_or_alias: &str,
+    account_id: &'a str,
+) -> Option<&'a Calendar> {
     if id_or_alias == "default" {
-        fixture
-            .calendars
-            .iter()
+        let mut iter = fixture.calendars_for(account_id);
+        let first = iter.next();
+        return fixture
+            .calendars_for(account_id)
             .find(|c| c.is_default)
-            .or_else(|| fixture.calendars.first())
-    } else {
-        fixture.calendars.iter().find(|c| c.id == id_or_alias)
+            .or(first);
     }
+    fixture
+        .calendars_for(account_id)
+        .find(|c| c.id == id_or_alias)
 }
 
 fn serialize_calendar(_fixture: &Fixture, c: &Calendar) -> Value {
@@ -854,21 +978,8 @@ fn serialize_event(_fixture: &Fixture, e: &Event) -> Value {
 }
 
 /// Translate a parsed RRULE into Graph's structured `recurrence`
-/// object. Returns None when the RRULE has no `FREQ` (the parser
-/// couldn't identify it) - real Graph still emits the structured
-/// envelope but with `pattern.type = "daily"; interval = 1` as a
-/// degenerate single-instance shape; v0 chooses to omit the field
-/// entirely so the caller can distinguish "fixture didn't author
-/// recurrence" from "fixture authored an unparseable RRULE".
-///
-/// Schema reference:
-/// learn.microsoft.com/graph/api/resources/patternedrecurrence.
-/// Covered: pattern.type in {daily, weekly, absoluteMonthly,
-/// relativeMonthly, absoluteYearly, relativeYearly}; interval;
-/// daysOfWeek; dayOfMonth; month; index for relative-monthly.
-/// range.type in {noEnd, endDate, numbered} via UNTIL / COUNT.
-/// Stage 1 of recurrence keeps the relativeYearly path narrow
-/// (no BYSETPOS); extend when a fixture forces it.
+/// object. See `notes/ratatoskr-graph-surface.md` for the schema
+/// reference and Stage-1 scope.
 fn graph_recurrence(
     rule: &crate::recurrence::ParsedRule,
     start: chrono::DateTime<chrono::Utc>,
@@ -883,10 +994,6 @@ fn graph_recurrence(
             "interval": interval,
         }),
         Frequency::Weekly => {
-            // Real Graph requires daysOfWeek on weekly patterns; if
-            // BYDAY is absent, default to the event's own weekday
-            // (matches RFC 5545 §3.3.10 "the day of the week of the
-            // DTSTART").
             let days = if rule.by_day.is_empty() {
                 vec![weekday_of(start).graph().to_string()]
             } else {
@@ -900,9 +1007,6 @@ fn graph_recurrence(
             })
         }
         Frequency::Monthly => {
-            // BYMONTHDAY -> absoluteMonthly; BYDAY with ordinal ->
-            // relativeMonthly. Plain monthly with neither defaults
-            // to the DTSTART day-of-month, matching real Graph.
             if let Some(&day) = rule.by_month_day.first().filter(|d| **d > 0) {
                 json!({
                     "type": "absoluteMonthly",
@@ -992,16 +1096,30 @@ fn graph_week_index(ordinal: i32) -> &'static str {
         2 => "second",
         3 => "third",
         4 => "fourth",
-        // Real Graph encodes "last" for -1 and rejects anything
-        // outside [-1, 4]; v0 mirrors that and clamps unknown
-        // ordinals to "first" rather than failing the projection.
         -1 => "last",
         _ => "first",
     }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/// Graph-style deletion stub for `events/delta`.
+fn graph_event_tombstone(id: &str) -> Value {
+    json!({
+        "id": id,
+        "@removed": { "reason": "deleted" },
+    })
+}
+
+fn host_or_default(headers: &HeaderMap) -> String {
+    headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("graph.microsoft.com")
+        .to_string()
 }
 
 fn parse_skiptoken(t: Option<&str>) -> Option<u32> {
     let s = t?;
     s.strip_prefix("s.")?.parse().ok()
 }
-

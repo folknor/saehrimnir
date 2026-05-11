@@ -2,22 +2,17 @@
 //!
 //! Outlook's master category list is the Graph analogue of Gmail
 //! labels / JMAP keywords. Flat per account (no folder scope), and
-//! exposed under `/v1.0/me/outlook/masterCategories`. v0 covers:
-//!
-//! - `GET    /v1.0/me/outlook/masterCategories` (list).
-//! - `GET    /v1.0/me/outlook/masterCategories/{id}` (single).
-//! - `POST   /v1.0/me/outlook/masterCategories` (create).
-//! - `PATCH  /v1.0/me/outlook/masterCategories/{id}` (update).
-//! - `DELETE /v1.0/me/outlook/masterCategories/{id}` (delete).
+//! exposed under `/v1.0/me/outlook/masterCategories` (primary
+//! account) and `/v1.0/users/{userId}/outlook/masterCategories`
+//! (any declared account). v0 covers GET list/single + POST /
+//! PATCH / DELETE. `userId = me` aliases the primary; unknown
+//! userIds return 404 `ResourceNotFound`.
 //!
 //! Mutations land via `Fixture::mutate` and record
 //! `category_created` / `category_updated` / `category_destroyed`
-//! transitions. Real Graph has no `masterCategories/delta` endpoint,
-//! so v0 also doesn't expose one - the change_log entries are
-//! purely observability for tests asserting state moved.
-//!
-//! Bearer-enforcement and request-logging are applied by the parent
-//! router's middleware.
+//! transitions. Real Graph has no `masterCategories/delta`
+//! endpoint, so v0 also doesn't expose one - the change_log
+//! entries are observability for tests asserting state moved.
 
 use axum::{
     Router,
@@ -36,49 +31,151 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route(
             "/v1.0/me/outlook/masterCategories",
-            get(list_categories).post(create_category),
+            get(list_categories_me).post(create_category_me),
         )
         .route(
             "/v1.0/me/outlook/masterCategories/{category}",
-            get(get_category)
-                .patch(patch_category)
-                .delete(delete_category),
+            get(get_category_me)
+                .patch(patch_category_me)
+                .delete(delete_category_me),
+        )
+        .route(
+            "/v1.0/users/{user}/outlook/masterCategories",
+            get(list_categories_user).post(create_category_user),
+        )
+        .route(
+            "/v1.0/users/{user}/outlook/masterCategories/{category}",
+            get(get_category_user)
+                .patch(patch_category_user)
+                .delete(delete_category_user),
         )
 }
 
-// ── Read paths ──────────────────────────────────────────────────────
+// ── /me/ wrappers ───────────────────────────────────────────────────
 
-async fn list_categories(State(state): State<AppState>) -> Response {
+async fn list_categories_me(State(state): State<AppState>) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    list_categories_impl(state, &account_id).await
+}
+
+async fn get_category_me(
+    State(state): State<AppState>,
+    Path(category): Path<String>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_category_impl(state, &account_id, &category).await
+}
+
+async fn create_category_me(State(state): State<AppState>, body: AxumBody) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    create_category_impl(state, &account_id, body).await
+}
+
+async fn patch_category_me(
+    State(state): State<AppState>,
+    Path(category): Path<String>,
+    body: AxumBody,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    patch_category_impl(state, &account_id, &category, body).await
+}
+
+async fn delete_category_me(
+    State(state): State<AppState>,
+    Path(category): Path<String>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    delete_category_impl(state, &account_id, &category).await
+}
+
+// ── /users/{user}/ wrappers ─────────────────────────────────────────
+
+async fn list_categories_user(
+    State(state): State<AppState>,
+    Path(user): Path<String>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    list_categories_impl(state, &account_id).await
+}
+
+async fn get_category_user(
+    State(state): State<AppState>,
+    Path((user, category)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_category_impl(state, &account_id, &category).await
+}
+
+async fn create_category_user(
+    State(state): State<AppState>,
+    Path(user): Path<String>,
+    body: AxumBody,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    create_category_impl(state, &account_id, body).await
+}
+
+async fn patch_category_user(
+    State(state): State<AppState>,
+    Path((user, category)): Path<(String, String)>,
+    body: AxumBody,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    patch_category_impl(state, &account_id, &category, body).await
+}
+
+async fn delete_category_user(
+    State(state): State<AppState>,
+    Path((user, category)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    delete_category_impl(state, &account_id, &category).await
+}
+
+// ── Inner handlers (account-scoped) ─────────────────────────────────
+
+async fn list_categories_impl(state: AppState, account_id: &str) -> Response {
     if let Some(o) = super::maybe_override(&state, "list_categories", |_| Ok(())) {
         return o;
     }
     let fixture = state.fixture();
-    let value: Vec<Value> = fixture.categories.iter().map(serialize_category).collect();
+    let value: Vec<Value> = fixture.categories_for(account_id).map(serialize_category).collect();
     ok_json(json!({
         "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#me/outlook/masterCategories",
         "value": value,
     }))
 }
 
-async fn get_category(
-    State(state): State<AppState>,
-    Path(category): Path<String>,
-) -> Response {
-    if let Some(o) = super::maybe_override(&state, "get_category", |s| {
-        crate::lua::req_set_str(s, "category", &category)
+async fn get_category_impl(state: AppState, account_id: &str, category: &str) -> Response {
+    let category_owned = category.to_string();
+    if let Some(o) = super::maybe_override(&state, "get_category", move |s| {
+        crate::lua::req_set_str(s, "category", &category_owned)
     }) {
         return o;
     }
     let fixture = state.fixture();
-    match fixture.categories.iter().find(|c| c.id == category) {
+    match fixture.categories_for(account_id).find(|c| c.id == category) {
         Some(c) => ok_json(serialize_category(c)),
-        None => not_found(&category),
+        None => not_found(category),
     }
 }
 
-// ── Mutations ───────────────────────────────────────────────────────
-
-async fn create_category(State(state): State<AppState>, body: AxumBody) -> Response {
+async fn create_category_impl(state: AppState, account_id: &str, body: AxumBody) -> Response {
     let parsed = match parse_json_body(body).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -119,7 +216,7 @@ async fn create_category(State(state): State<AppState>, body: AxumBody) -> Respo
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
         let id = match client_id {
             Some(id) => {
-                if fix.categories.iter().any(|c| c.id == id) {
+                if fix.categories_for(account_id).any(|c| c.id == id) {
                     return error(
                         StatusCode::CONFLICT,
                         "Conflict",
@@ -132,7 +229,7 @@ async fn create_category(State(state): State<AppState>, body: AxumBody) -> Respo
         };
         let cat = Category {
             id: id.clone(),
-            account_id: fix.primary_account().id.clone(),
+            account_id: account_id.to_string(),
             display_name,
             color,
         };
@@ -152,17 +249,18 @@ async fn create_category(State(state): State<AppState>, body: AxumBody) -> Respo
     }
 }
 
-async fn patch_category(
-    State(state): State<AppState>,
-    Path(category): Path<String>,
+async fn patch_category_impl(
+    state: AppState,
+    account_id: &str,
+    category: &str,
     body: AxumBody,
 ) -> Response {
     let known = {
         let fixture = state.fixture();
-        fixture.categories.iter().any(|c| c.id == category)
+        fixture.categories_for(account_id).any(|c| c.id == category)
     };
     if !known {
-        return not_found(&category);
+        return not_found(category);
     }
     let parsed = match parse_json_body(body).await {
         Ok(v) => v,
@@ -186,9 +284,13 @@ async fn patch_category(
 
     let result: Result<Value, Response> = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        let idx = match fix.categories.iter().position(|c| c.id == category) {
+        let idx = match fix
+            .categories
+            .iter()
+            .position(|c| c.account_id == account_id && c.id == category)
+        {
             Some(i) => i,
-            None => return not_found(&category),
+            None => return not_found(category),
         };
         let mut clone = fix.categories[idx].clone();
         for (k, v) in obj {
@@ -226,16 +328,13 @@ async fn patch_category(
     }
 }
 
-async fn delete_category(
-    State(state): State<AppState>,
-    Path(category): Path<String>,
-) -> Response {
+async fn delete_category_impl(state: AppState, account_id: &str, category: &str) -> Response {
     let known = {
         let fixture = state.fixture();
-        fixture.categories.iter().any(|c| c.id == category)
+        fixture.categories_for(account_id).any(|c| c.id == category)
     };
     if !known {
-        return not_found(&category);
+        return not_found(category);
     }
     state.shared.request_log.record(
         "graph",
@@ -244,10 +343,11 @@ async fn delete_category(
     );
     {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        let id = category.clone();
+        let id = category.to_string();
+        let acct = account_id.to_string();
         let _ = fix.mutate(|f| {
             let before = f.categories.len();
-            f.categories.retain(|c| c.id != id);
+            f.categories.retain(|c| !(c.account_id == acct && c.id == id));
             if f.categories.len() < before {
                 MutationDiff {
                     category_destroyed: vec![id.clone()],

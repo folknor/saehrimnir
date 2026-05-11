@@ -38,8 +38,8 @@ to = ["primary@example.com"]
 subject = "Hello primary"
 body_text = "Primary account inbox email."
 
-# Secondary's resources. JMAP scopes to these via accountId =
-# account-secondary; other listeners ignore them in Stage 2.
+# Secondary's resources. JMAP and Graph route to these via
+# `accountId` / `/v1.0/users/{id}/...`; other listeners ignore them.
 
 [[mailbox]]
 id = "mbx-secondary-inbox"
@@ -56,3 +56,70 @@ from = "elsewhere@example.com"
 to = ["secondary@example.com"]
 subject = "Hello secondary"
 body_text = "Secondary account inbox email."
+
+# Calendar resources, one per account. Used by the Stage 3 Graph
+# calendar tests that hit `/v1.0/users/{account-secondary}/calendars`.
+
+[[calendar]]
+id = "cal-primary"
+account_id = "account-primary"
+name = "Primary Work"
+is_default = true
+
+[[event]]
+id = "ev-primary-001"
+calendar_id = "cal-primary"
+subject = "Primary standup"
+start = "2026-02-01T09:00:00Z"
+end = "2026-02-01T09:30:00Z"
+
+[[calendar]]
+id = "cal-secondary"
+account_id = "account-secondary"
+name = "Secondary Work"
+
+[[event]]
+id = "ev-secondary-001"
+calendar_id = "cal-secondary"
+subject = "Secondary review"
+start = "2026-02-05T14:00:00Z"
+end = "2026-02-05T15:00:00Z"
+
+# Contacts. One folder + contact per account.
+
+[[contact_folder]]
+id = "cf-primary"
+account_id = "account-primary"
+display_name = "Primary Contacts"
+is_default = true
+
+[[contact]]
+id = "contact-primary-001"
+folder_id = "cf-primary"
+display_name = "Alice (primary)"
+emails = ["alice@example.com"]
+
+[[contact_folder]]
+id = "cf-secondary"
+account_id = "account-secondary"
+display_name = "Secondary Contacts"
+
+[[contact]]
+id = "contact-secondary-001"
+folder_id = "cf-secondary"
+display_name = "Bob (secondary)"
+emails = ["bob@example.com"]
+
+# Categories.
+
+[[category]]
+id = "cat-primary-work"
+account_id = "account-primary"
+display_name = "Primary-Work"
+color = "preset0"
+
+[[category]]
+id = "cat-secondary-urgent"
+account_id = "account-secondary"
+display_name = "Secondary-Urgent"
+color = "preset5"

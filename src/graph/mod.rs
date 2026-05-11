@@ -197,3 +197,30 @@ async fn not_implemented(req: Request) -> Response {
 pub fn ok_json(v: Value) -> Response {
     (StatusCode::OK, Json(v)).into_response()
 }
+
+/// Resolve the `{user}` path segment from `/v1.0/users/{user}/...`
+/// to the matching declared `account_id`. `me` is accepted as an
+/// alias for the primary account. Returns `Err(Response)` (HTTP
+/// 404 with `{"error": {"code": "ResourceNotFound"}}`) for an
+/// unknown id so each handler can early-return with one line.
+///
+/// Used by the per-account routing layer in `mail.rs`,
+/// `calendar.rs`, `contacts.rs`, and `label_sync.rs`. Lives here
+/// so the four resource modules don't redeclare it.
+#[allow(clippy::result_large_err)]
+pub(crate) fn resolve_user_account(
+    fixture: &crate::fixture::Fixture,
+    user: &str,
+) -> Result<String, Response> {
+    if user == "me" {
+        return Ok(fixture.primary_account().id.clone());
+    }
+    match fixture.account(user) {
+        Some(a) => Ok(a.id.clone()),
+        None => Err(error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("user {user:?} not found"),
+        )),
+    }
+}

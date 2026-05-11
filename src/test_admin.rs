@@ -661,20 +661,53 @@ fn apply_change_step(
     for (i, op) in step.ops.iter().enumerate() {
         match op {
             ChangeOp::EmailCreate(email) => {
-                let email = (**email).clone();
+                let mut email = (**email).clone();
                 // Cross-ref guard: every mailbox the email points at
                 // must exist in the *current* fixture. Earlier ops in
                 // this step might have created the mailboxes, so we
                 // check at apply time, not at script load.
+                let mut first_mb_account: Option<String> = None;
                 for mid in &email.mailbox_ids {
-                    if !fix.mailboxes.iter().any(|m| &m.id == mid) {
+                    let Some(mb) = fix.mailboxes.iter().find(|m| &m.id == mid) else {
                         return Err(step_apply_error(
                             &step.id,
                             i,
                             "unknownMailbox",
                             &format!("email_create email {:?}: mailbox {mid:?} not in fixture", email.id),
                         ));
+                    };
+                    match &first_mb_account {
+                        None => first_mb_account = Some(mb.account_id.clone()),
+                        Some(prev) if prev != &mb.account_id => {
+                            return Err(step_apply_error(
+                                &step.id,
+                                i,
+                                "accountMismatch",
+                                &format!(
+                                    "email_create email {:?}: mailbox {mid:?} lives in account {:?} but a sibling mailbox lives in {:?}",
+                                    email.id, mb.account_id, prev
+                                ),
+                            ));
+                        }
+                        _ => {}
                     }
+                }
+                // Inherit account from the mailbox set (Stage 2 of
+                // the loader does the same for static fixtures).
+                let derived_account =
+                    first_mb_account.unwrap_or_else(|| fix.primary_account().id.clone());
+                if email.account_id.is_empty() {
+                    email.account_id = derived_account;
+                } else if email.account_id != derived_account {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "accountMismatch",
+                        &format!(
+                            "email_create email {:?}: declared account {:?} disagrees with mailbox-derived {:?}",
+                            email.id, email.account_id, derived_account
+                        ),
+                    ));
                 }
                 if fix.emails.iter().any(|e| e.id == email.id) {
                     return Err(step_apply_error(
@@ -764,7 +797,7 @@ fn apply_change_step(
                 diff.email_destroyed.push(id.clone());
             }
             ChangeOp::MailboxCreate(mailbox) => {
-                let mailbox = (**mailbox).clone();
+                let mut mailbox = (**mailbox).clone();
                 if fix.mailboxes.iter().any(|m| m.id == mailbox.id) {
                     return Err(step_apply_error(
                         &step.id,
@@ -773,16 +806,39 @@ fn apply_change_step(
                         &format!("mailbox_create {:?}: id already exists", mailbox.id),
                     ));
                 }
-                if let Some(parent) = &mailbox.parent_id
-                    && !fix.mailboxes.iter().any(|m| &m.id == parent)
-                {
+                let parent_account = if let Some(parent) = &mailbox.parent_id {
+                    let Some(p) = fix.mailboxes.iter().find(|m| &m.id == parent) else {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "unknownParent",
+                            &format!(
+                                "mailbox_create {:?}: parent {parent:?} not in fixture",
+                                mailbox.id
+                            ),
+                        ));
+                    };
+                    Some(p.account_id.clone())
+                } else {
+                    None
+                };
+                // Inherit account from parent when present; default
+                // to primary otherwise. The empty-string placeholder
+                // from `fixture::mailbox_create_op` triggers the
+                // default; an explicit `account_id` must match the
+                // parent's when there is one.
+                let primary_id = fix.primary_account().id.clone();
+                let default_account = parent_account.unwrap_or(primary_id);
+                if mailbox.account_id.is_empty() {
+                    mailbox.account_id = default_account;
+                } else if mailbox.account_id != default_account {
                     return Err(step_apply_error(
                         &step.id,
                         i,
-                        "unknownParent",
+                        "accountMismatch",
                         &format!(
-                            "mailbox_create {:?}: parent {parent:?} not in fixture",
-                            mailbox.id
+                            "mailbox_create {:?}: account {:?} disagrees with parent {:?}",
+                            mailbox.id, mailbox.account_id, default_account
                         ),
                     ));
                 }
@@ -840,8 +896,8 @@ fn apply_change_step(
                 diff.mailbox_destroyed.push(id.clone());
             }
             ChangeOp::EventCreate(event) => {
-                let event = (**event).clone();
-                if !fix.calendars.iter().any(|c| c.id == event.calendar_id) {
+                let mut event = (**event).clone();
+                let Some(cal) = fix.calendars.iter().find(|c| c.id == event.calendar_id) else {
                     return Err(step_apply_error(
                         &step.id,
                         i,
@@ -849,6 +905,19 @@ fn apply_change_step(
                         &format!(
                             "event_create {:?}: calendar {:?} not in fixture",
                             event.id, event.calendar_id
+                        ),
+                    ));
+                };
+                if event.account_id.is_empty() {
+                    event.account_id = cal.account_id.clone();
+                } else if event.account_id != cal.account_id {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "accountMismatch",
+                        &format!(
+                            "event_create {:?}: declared account {:?} disagrees with calendar's {:?}",
+                            event.id, event.account_id, cal.account_id
                         ),
                     ));
                 }
@@ -912,7 +981,7 @@ fn apply_change_step(
                     .push(parent.expect("event existed before retain"));
             }
             ChangeOp::ContactFolderCreate(folder) => {
-                let folder = (**folder).clone();
+                let mut folder = (**folder).clone();
                 if fix.contact_folders.iter().any(|f| f.id == folder.id) {
                     return Err(step_apply_error(
                         &step.id,
@@ -921,16 +990,34 @@ fn apply_change_step(
                         &format!("contact_folder_create {:?}: id already exists", folder.id),
                     ));
                 }
-                if let Some(parent) = &folder.parent_folder_id
-                    && !fix.contact_folders.iter().any(|f| &f.id == parent)
-                {
+                let parent_account = if let Some(parent) = &folder.parent_folder_id {
+                    let Some(p) = fix.contact_folders.iter().find(|f| &f.id == parent) else {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "unknownParent",
+                            &format!(
+                                "contact_folder_create {:?}: parent {parent:?} not in fixture",
+                                folder.id
+                            ),
+                        ));
+                    };
+                    Some(p.account_id.clone())
+                } else {
+                    None
+                };
+                let primary_id = fix.primary_account().id.clone();
+                let default_account = parent_account.unwrap_or(primary_id);
+                if folder.account_id.is_empty() {
+                    folder.account_id = default_account;
+                } else if folder.account_id != default_account {
                     return Err(step_apply_error(
                         &step.id,
                         i,
-                        "unknownParent",
+                        "accountMismatch",
                         &format!(
-                            "contact_folder_create {:?}: parent {parent:?} not in fixture",
-                            folder.id
+                            "contact_folder_create {:?}: account {:?} disagrees with parent {:?}",
+                            folder.id, folder.account_id, default_account
                         ),
                     ));
                 }
@@ -987,19 +1074,41 @@ fn apply_change_step(
                 diff.contact_folder_destroyed.push(id.clone());
             }
             ChangeOp::ContactCreate(contact) => {
-                let contact = (**contact).clone();
-                if !fix
+                let mut contact = (**contact).clone();
+                let folder = match fix
                     .contact_folders
                     .iter()
-                    .any(|f| f.id == contact.folder_id)
+                    .find(|f| f.id == contact.folder_id)
                 {
+                    Some(f) => f,
+                    None => {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "unknownFolder",
+                            &format!(
+                                "contact_create {:?}: folder {:?} not in fixture",
+                                contact.id, contact.folder_id
+                            ),
+                        ));
+                    }
+                };
+                // Inherit account_id from the parent folder when the
+                // change-script didn't set it (the empty string is
+                // the apply-time placeholder produced by
+                // `fixture::contact_create_op`). Reject cross-account
+                // pairings explicitly so the change-script can't
+                // smuggle a contact into a folder it doesn't belong to.
+                if contact.account_id.is_empty() {
+                    contact.account_id = folder.account_id.clone();
+                } else if contact.account_id != folder.account_id {
                     return Err(step_apply_error(
                         &step.id,
                         i,
-                        "unknownFolder",
+                        "accountMismatch",
                         &format!(
-                            "contact_create {:?}: folder {:?} not in fixture",
-                            contact.id, contact.folder_id
+                            "contact_create {:?}: account {:?} disagrees with folder's {:?}",
+                            contact.id, contact.account_id, folder.account_id
                         ),
                     ));
                 }

@@ -1538,3 +1538,146 @@ async fn graph_inbox_alias_resolves_within_named_account() {
     assert_eq!(msgs[0]["id"], "email-secondary-001");
 }
 
+#[tokio::test]
+async fn graph_users_calendars_scope_by_account() {
+    // /me/calendars sees primary; /users/{secondary}/calendars sees
+    // the secondary account's calendar.
+    let (status, v) = get_json_with(multi_account_graph_router(), "/v1.0/me/calendars").await;
+    assert_eq!(status, StatusCode::OK);
+    let cals = v["value"].as_array().unwrap();
+    assert_eq!(cals.len(), 1);
+    assert_eq!(cals[0]["id"], "cal-primary");
+
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/calendars",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cals = v["value"].as_array().unwrap();
+    assert_eq!(cals.len(), 1);
+    assert_eq!(cals[0]["id"], "cal-secondary");
+}
+
+#[tokio::test]
+async fn graph_users_events_scope_by_account() {
+    // Primary's calendar can be listed via /me/calendars/{id}/events;
+    // secondary's via /users/{secondary}/calendars/{id}/events. Cross-
+    // account lookup of a sibling-account event id returns 404.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/calendars/cal-secondary/events",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let evs = v["value"].as_array().unwrap();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0]["id"], "ev-secondary-001");
+
+    // Primary's /me/events/{event} doesn't see secondary's event.
+    let (status, _) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/me/events/ev-secondary-001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // /users/{secondary}/events/{event} does.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/events/ev-secondary-001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["subject"], "Secondary review");
+}
+
+#[tokio::test]
+async fn graph_users_contact_folders_scope_by_account() {
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/contactFolders",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let folders = v["value"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0]["id"], "cf-secondary");
+
+    // /me sees only primary's folder.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/me/contactFolders",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let folders = v["value"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0]["id"], "cf-primary");
+}
+
+#[tokio::test]
+async fn graph_users_contacts_scope_by_account() {
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/contactFolders/cf-secondary/contacts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cs = v["value"].as_array().unwrap();
+    assert_eq!(cs.len(), 1);
+    assert_eq!(cs[0]["id"], "contact-secondary-001");
+
+    // Folder-agnostic single-contact lookup: /me sees primary; the
+    // secondary's path sees secondary.
+    let (status, _) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/me/contacts/contact-secondary-001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/contacts/contact-secondary-001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["displayName"], "Bob (secondary)");
+}
+
+#[tokio::test]
+async fn graph_users_categories_scope_by_account() {
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/outlook/masterCategories",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cats = v["value"].as_array().unwrap();
+    assert_eq!(cats.len(), 1);
+    assert_eq!(cats[0]["id"], "cat-secondary-urgent");
+
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/me/outlook/masterCategories",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cats = v["value"].as_array().unwrap();
+    assert_eq!(cats.len(), 1);
+    assert_eq!(cats[0]["id"], "cat-primary-work");
+}
+
+#[tokio::test]
+async fn graph_users_unknown_for_each_resource_family_returns_404() {
+    for path in [
+        "/v1.0/users/account-bogus/calendars",
+        "/v1.0/users/account-bogus/contactFolders",
+        "/v1.0/users/account-bogus/outlook/masterCategories",
+    ] {
+        let (status, v) = get_json_with(multi_account_graph_router(), path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "expected 404 for {path}");
+        assert_eq!(v["error"]["code"], "ResourceNotFound", "for {path}");
+    }
+}
+
