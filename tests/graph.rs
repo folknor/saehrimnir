@@ -10,7 +10,7 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use saehrimnir::{fixture, graph, lua};
@@ -1371,5 +1371,61 @@ async fn graph_category_mutation_records_change_log_transition() {
     // Sibling categories untouched.
     assert!(fix.categories.iter().any(|c| c.id == "cat-work"));
     assert!(!fix.categories.iter().any(|c| c.id == "cat-new"));
+}
+
+// ── Calendar recurrence ─────────────────────────────────────────────
+
+fn recurrence_calendar_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/calendar-recurrence-small.toml",
+    ))
+    .unwrap();
+    graph::router(graph::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+#[tokio::test]
+async fn graph_event_get_emits_weekly_recurrence_structured() {
+    let app = recurrence_calendar_router();
+    let (status, v) = get_json_with(app, "/v1.0/me/events/ev-weekly").await;
+    assert_eq!(status, StatusCode::OK);
+    let rec = &v["recurrence"];
+    assert_eq!(rec["pattern"]["type"], "weekly");
+    assert_eq!(rec["pattern"]["interval"], 1);
+    // RFC 5545 BYDAY=MO,WE,FR translates to Graph daysOfWeek in the
+    // same order. ratatoskr's parse path doesn't care about order
+    // (it normalises into a set), but stable order keeps snapshots
+    // byte-deterministic.
+    assert_eq!(
+        rec["pattern"]["daysOfWeek"],
+        json!(["monday", "wednesday", "friday"])
+    );
+    assert_eq!(rec["range"]["type"], "numbered");
+    assert_eq!(rec["range"]["numberOfOccurrences"], 10);
+    assert_eq!(rec["range"]["startDate"], "2026-01-19");
+}
+
+#[tokio::test]
+async fn graph_event_get_emits_monthly_recurrence_with_end_date() {
+    let app = recurrence_calendar_router();
+    let (status, v) = get_json_with(app, "/v1.0/me/events/ev-monthly").await;
+    assert_eq!(status, StatusCode::OK);
+    let rec = &v["recurrence"];
+    assert_eq!(rec["pattern"]["type"], "absoluteMonthly");
+    assert_eq!(rec["pattern"]["dayOfMonth"], 15);
+    assert_eq!(rec["pattern"]["interval"], 1);
+    assert_eq!(rec["range"]["type"], "endDate");
+    assert_eq!(rec["range"]["endDate"], "2026-12-15");
+    assert_eq!(rec["range"]["startDate"], "2026-01-15");
+}
+
+#[tokio::test]
+async fn graph_single_instance_event_omits_recurrence() {
+    let app = recurrence_calendar_router();
+    let (status, v) = get_json_with(app, "/v1.0/me/events/ev-single").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        v.get("recurrence").is_none(),
+        "single instance leaked recurrence"
+    );
 }
 

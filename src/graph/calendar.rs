@@ -625,6 +625,11 @@ fn build_event_from_create(
         organizer: None,
         attendees,
         is_all_day,
+        // Graph mutations don't accept recurrence in v0; the wire
+        // body's `recurrence` block is ignored here. A separate
+        // slice grows structured-recurrence write paths if needed.
+        recurrence_rule: None,
+        recurrence_exdates: vec![],
     })
 }
 
@@ -832,7 +837,160 @@ fn serialize_event(_fixture: &Fixture, e: &Event) -> Value {
         })
         .collect();
     out.insert("attendees".to_string(), Value::Array(attendees));
+    if let Some(rrule) = &e.recurrence_rule {
+        let parsed = crate::recurrence::ParsedRule::parse(rrule);
+        if let Some(recurrence) = graph_recurrence(&parsed, e.start) {
+            out.insert("recurrence".to_string(), recurrence);
+        }
+    }
     Value::Object(out)
+}
+
+/// Translate a parsed RRULE into Graph's structured `recurrence`
+/// object. Returns None when the RRULE has no `FREQ` (the parser
+/// couldn't identify it) - real Graph still emits the structured
+/// envelope but with `pattern.type = "daily"; interval = 1` as a
+/// degenerate single-instance shape; v0 chooses to omit the field
+/// entirely so the caller can distinguish "fixture didn't author
+/// recurrence" from "fixture authored an unparseable RRULE".
+///
+/// Schema reference:
+/// learn.microsoft.com/graph/api/resources/patternedrecurrence.
+/// Covered: pattern.type in {daily, weekly, absoluteMonthly,
+/// relativeMonthly, absoluteYearly, relativeYearly}; interval;
+/// daysOfWeek; dayOfMonth; month; index for relative-monthly.
+/// range.type in {noEnd, endDate, numbered} via UNTIL / COUNT.
+/// Stage 1 of recurrence keeps the relativeYearly path narrow
+/// (no BYSETPOS); extend when a fixture forces it.
+fn graph_recurrence(
+    rule: &crate::recurrence::ParsedRule,
+    start: chrono::DateTime<chrono::Utc>,
+) -> Option<Value> {
+    use crate::recurrence::Frequency;
+    let freq = rule.freq?;
+    let interval = rule.interval.unwrap_or(1);
+
+    let pattern = match freq {
+        Frequency::Daily => json!({
+            "type": "daily",
+            "interval": interval,
+        }),
+        Frequency::Weekly => {
+            // Real Graph requires daysOfWeek on weekly patterns; if
+            // BYDAY is absent, default to the event's own weekday
+            // (matches RFC 5545 §3.3.10 "the day of the week of the
+            // DTSTART").
+            let days = if rule.by_day.is_empty() {
+                vec![weekday_of(start).graph().to_string()]
+            } else {
+                rule.by_day.iter().map(|d| d.weekday.graph().to_string()).collect()
+            };
+            json!({
+                "type": "weekly",
+                "interval": interval,
+                "daysOfWeek": days,
+                "firstDayOfWeek": "sunday",
+            })
+        }
+        Frequency::Monthly => {
+            // BYMONTHDAY -> absoluteMonthly; BYDAY with ordinal ->
+            // relativeMonthly. Plain monthly with neither defaults
+            // to the DTSTART day-of-month, matching real Graph.
+            if let Some(&day) = rule.by_month_day.first().filter(|d| **d > 0) {
+                json!({
+                    "type": "absoluteMonthly",
+                    "interval": interval,
+                    "dayOfMonth": day,
+                })
+            } else if let Some(first) = rule.by_day.first().filter(|d| d.ordinal.is_some()) {
+                let index = graph_week_index(first.ordinal.unwrap_or(1));
+                json!({
+                    "type": "relativeMonthly",
+                    "interval": interval,
+                    "daysOfWeek": [first.weekday.graph()],
+                    "index": index,
+                })
+            } else {
+                json!({
+                    "type": "absoluteMonthly",
+                    "interval": interval,
+                    "dayOfMonth": start.format("%-d").to_string().parse::<u32>().unwrap_or(1),
+                })
+            }
+        }
+        Frequency::Yearly => {
+            let month = rule
+                .by_month
+                .first()
+                .copied()
+                .unwrap_or_else(|| start.format("%-m").to_string().parse::<u8>().unwrap_or(1));
+            if let Some(&day) = rule.by_month_day.first().filter(|d| **d > 0) {
+                json!({
+                    "type": "absoluteYearly",
+                    "interval": interval,
+                    "dayOfMonth": day,
+                    "month": month,
+                })
+            } else {
+                json!({
+                    "type": "absoluteYearly",
+                    "interval": interval,
+                    "dayOfMonth": start.format("%-d").to_string().parse::<u32>().unwrap_or(1),
+                    "month": month,
+                })
+            }
+        }
+    };
+
+    let start_date = start.format("%Y-%m-%d").to_string();
+    let range = if let Some(count) = rule.count {
+        json!({
+            "type": "numbered",
+            "startDate": start_date,
+            "numberOfOccurrences": count,
+        })
+    } else if let Some(until) = rule.until {
+        json!({
+            "type": "endDate",
+            "startDate": start_date,
+            "endDate": until.format("%Y-%m-%d").to_string(),
+        })
+    } else {
+        json!({
+            "type": "noEnd",
+            "startDate": start_date,
+        })
+    };
+
+    Some(json!({ "pattern": pattern, "range": range }))
+}
+
+fn weekday_of(dt: chrono::DateTime<chrono::Utc>) -> crate::recurrence::Weekday {
+    use crate::recurrence::Weekday;
+    use chrono::Datelike;
+    match dt.weekday() {
+        chrono::Weekday::Mon => Weekday::Mo,
+        chrono::Weekday::Tue => Weekday::Tu,
+        chrono::Weekday::Wed => Weekday::We,
+        chrono::Weekday::Thu => Weekday::Th,
+        chrono::Weekday::Fri => Weekday::Fr,
+        chrono::Weekday::Sat => Weekday::Sa,
+        chrono::Weekday::Sun => Weekday::Su,
+    }
+}
+
+fn graph_week_index(ordinal: i32) -> &'static str {
+    match ordinal {
+        1 => "first",
+        2 => "second",
+        3 => "third",
+        4 => "fourth",
+        // Real Graph encodes "last" for -1 and rejects anything
+        // outside [-1, 4]; v0 mirrors that and clamps unknown
+        // ordinals to "first" rather than failing the projection.
+        -1 => "last",
+        _ => "first",
+    }
 }
 
 fn parse_skiptoken(t: Option<&str>) -> Option<u32> {

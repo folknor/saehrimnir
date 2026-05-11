@@ -621,3 +621,59 @@ async fn jmap_event_set_surfaces_in_graph_calendar_view_delta() {
         "expected JMAP-created event in Graph delta; got {value:?}"
     );
 }
+
+// ── Recurrence ──────────────────────────────────────────────────────
+
+fn recurrence_router() -> axum::Router {
+    let fix = fixture::load(Path::new("fixtures/calendar-recurrence-small.toml")).unwrap();
+    routes::router(routes::AppState::for_test(shared::handle(fix)))
+}
+
+#[tokio::test]
+async fn jmap_calendar_event_get_emits_recurrence_rules() {
+    let r = recurrence_router();
+    let resp = jmap_call(
+        &r,
+        "CalendarEvent/get",
+        json!({
+            "accountId": "account-1",
+            "ids": ["ev-weekly", "ev-monthly", "ev-single"],
+        }),
+    )
+    .await;
+    assert_eq!(resp[0], "CalendarEvent/get");
+    let body = &resp[1];
+    let by_id: std::collections::HashMap<&str, &Value> = body["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["id"].as_str().unwrap(), e))
+        .collect();
+
+    let weekly = by_id["ev-weekly"];
+    let rules = weekly["recurrenceRules"].as_array().unwrap();
+    assert_eq!(rules.len(), 1);
+    let rule = &rules[0];
+    assert_eq!(rule["@type"], "RecurrenceRule");
+    assert_eq!(rule["frequency"], "weekly");
+    let by_day = rule["byDay"].as_array().unwrap();
+    assert_eq!(by_day.len(), 3);
+    let days: Vec<&str> = by_day.iter().map(|d| d["day"].as_str().unwrap()).collect();
+    assert_eq!(days, vec!["mo", "we", "fr"]);
+    assert!(by_day.iter().all(|d| d.get("nthOfPeriod").is_none()));
+    assert_eq!(rule["count"], 10);
+    assert!(rule.get("interval").is_none(), "default interval=1 should be omitted");
+    assert!(rule.get("until").is_none());
+
+    let monthly = by_id["ev-monthly"];
+    let rule = &monthly["recurrenceRules"][0];
+    assert_eq!(rule["frequency"], "monthly");
+    assert_eq!(rule["byMonthDay"], json!([15]));
+    assert_eq!(rule["until"], "2026-12-15T17:00:00");
+
+    let single = by_id["ev-single"];
+    assert!(
+        single.get("recurrenceRules").is_none(),
+        "single instance leaked recurrenceRules"
+    );
+}

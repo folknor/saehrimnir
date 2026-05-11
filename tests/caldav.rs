@@ -1012,3 +1012,91 @@ async fn caldav_enforces_bearer_when_oauth_enforce_is_true() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ── Recurrence ──────────────────────────────────────────────────────
+
+fn recurrence_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new(
+        "fixtures/calendar-recurrence-small.toml",
+    ))
+    .unwrap();
+    caldav::router(caldav::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+#[tokio::test]
+async fn caldav_get_event_emits_rrule_and_exdate() {
+    let (status, body) = send_with(
+        recurrence_router(),
+        "GET",
+        "/calendars/account-1/cal-work/ev-monthly.ics",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("RRULE:FREQ=MONTHLY;BYMONTHDAY=15;UNTIL=20261215T170000Z"),
+        "missing RRULE: {body}"
+    );
+    // Both exdates round-trip in fixture-declaration order, one per
+    // line. (Real clients would also accept a single comma-joined
+    // line; v0 picks one-line-per-date for stable snapshots.)
+    assert!(body.contains("EXDATE:20260315T170000Z"), "missing first exdate: {body}");
+    assert!(body.contains("EXDATE:20260715T170000Z"), "missing second exdate: {body}");
+}
+
+#[tokio::test]
+async fn caldav_single_instance_event_omits_rrule_and_exdate() {
+    let (status, body) = send_with(
+        recurrence_router(),
+        "GET",
+        "/calendars/account-1/cal-work/ev-single.ics",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("RRULE"), "single instance leaked RRULE: {body}");
+    assert!(!body.contains("EXDATE"), "single instance leaked EXDATE: {body}");
+}
+
+#[tokio::test]
+async fn caldav_put_round_trips_rrule_and_exdate() {
+    // Author a new event with recurrence via PUT; assert the
+    // follow-up GET surfaces the same RRULE + EXDATE bytes.
+    let app = recurrence_router();
+    let ical = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//test//mock//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:ev-new\r\n\
+SUMMARY:Authored via PUT\r\n\
+DTSTART:20260401T140000Z\r\n\
+DTEND:20260401T150000Z\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=4\r\n\
+EXDATE:20260415T140000Z\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/calendars/account-1/cal-work/ev-new.ics")
+        .header(header::HOST, "127.0.0.1:0")
+        .header(header::CONTENT_TYPE, "text/calendar")
+        .body(Body::from(ical.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Round-trip GET.
+    let (status, body) = send_with(
+        app,
+        "GET",
+        "/calendars/account-1/cal-work/ev-new.ics",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=4"));
+    assert!(body.contains("EXDATE:20260415T140000Z"));
+}

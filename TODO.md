@@ -38,12 +38,17 @@ Concrete next-up items lifted above the per-protocol backlogs.
   `event_*`-parallel `calendar_created` transition so Graph
   `/v1.0/me/calendars` and JMAP `Calendar/changes` observe the
   new calendar. Lands in `src/caldav/mod.rs`.
-- **CalDAV recurrence (RRULE / EXDATE).** Round-trip recurrence
-  rules on VEVENT through the fixture `Event` type. Affects all
-  four calendar surfaces (CalDAV ical, Graph, gcal, JMAP
-  JSCalendar `recurrenceRules`). Fixture format needs an
-  `[[event.recurrence]]` shape; design before touching the
-  serializers.
+- **CalDAV recurrence write paths.** Read-side recurrence has
+  landed across all four calendar protocols (CalDAV RRULE/EXDATE
+  emit + parse, gcal `recurrence: [...]` array, Graph structured
+  `pattern`/`range`, JSCalendar `recurrenceRules`); fixtures
+  author recurrence on `Event` via `recurrence_rule` and
+  `recurrence_exdates`. What's still pending: gcal POST/PATCH,
+  Graph POST/PATCH, JMAP `CalendarEvent/set`, and the
+  change-script `event_create` / `event_update` ops accepting
+  recurrence fields. Stage 2 of recurrence covers them when a
+  fixture forces it. (CalDAV PUT already round-trips through the
+  existing parser.)
 - **Lua Gmail attachment + sendAs hooks.** Wire `on("gmail",
   "get_attachment", fn)` and `on("gmail", "send_as", fn)` through
   the dispatcher so fault-injection works against those routes

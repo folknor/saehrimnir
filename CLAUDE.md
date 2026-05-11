@@ -211,6 +211,14 @@ checking whether the fact is already in `notes/`.
   and `date` for all-day; mutations write through
   `Fixture::mutate` and record `event_*` transitions parallel
   to Graph / CalDAV / JMAP).
+- `src/recurrence.rs` - RFC 5545 RRULE parser shared by the
+  Graph and JMAP calendar serializers. Covers FREQ, INTERVAL,
+  COUNT, UNTIL, BYDAY (with optional ordinal), BYMONTHDAY,
+  BYMONTH; unknown keys are dropped quietly so unsupported
+  rules round-trip raw through CalDAV / gcal without breaking
+  the structured projections. Exposes `Frequency` and
+  `Weekday` helpers that pre-compute the Graph
+  (`"monday"`, ...) and JSCalendar (`"mo"`, ...) strings.
 - `src/people/` - Google People API mock (sibling listener to
   Gmail; real People API lives on a separate host). `mod.rs`
   (router, AppState, bearer middleware, `serve` entry,
@@ -479,6 +487,28 @@ projection of fixture emails into Gmail's nested mimePart shape) +
 (empty list). Catchall returns Gmail error envelope. Module
 structure leaves room for People-API contacts and Drive sibling
 files.
+
+Calendar recurrence (read paths, all four protocols): events grow
+`recurrence_rule: Option<String>` (raw RFC 5545 RRULE value, no
+`RRULE:` prefix) and `recurrence_exdates: Vec<DateTime<Utc>>` on
+the canonical `Event`. Authoring uses `recurrence_rule` /
+`recurrence_exdates` keys on TOML `[[event]]` and the Lua
+change-script `event_create` op. Per-protocol projections:
+CalDAV emits one `RRULE:` line plus one `EXDATE:` per excluded
+date (and parses them back on PUT for full round-trip);
+Google Calendar v3 emits a `recurrence: ["RRULE:...",
+"EXDATE:..."]` array; Microsoft Graph translates the parsed
+RRULE into a structured `recurrence: { pattern, range }` shape
+covering daily/weekly/absoluteMonthly/relativeMonthly/
+absoluteYearly patterns with `noEnd`/`endDate`/`numbered` range
+types; JMAP JSCalendar emits a `recurrenceRules` array of
+`RecurrenceRule` objects (`frequency`, `interval`, `byDay`,
+`byMonthDay`, `byMonth`, `count`, `until`). Mutation paths on
+the four protocols currently ignore inbound recurrence (writes
+zero `recurrence_rule` / `recurrence_exdates`); CalDAV PUT
+round-trips automatically through the iCal parser.
+`src/recurrence.rs` houses the shared RRULE parser used by Graph
+and JMAP.
 
 CalDAV: complete for v0's calendar-sync path. Discovery
 (`PROPFIND /` -> principal -> calendar-home-set -> calendar

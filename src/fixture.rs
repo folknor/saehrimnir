@@ -937,6 +937,20 @@ pub struct Event {
     pub organizer: Option<Address>,
     pub attendees: Vec<Address>,
     pub is_all_day: bool,
+    /// RFC 5545 RRULE value (no `RRULE:` prefix - just the body,
+    /// e.g. `"FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=10"`). None means
+    /// single-instance. CalDAV / gcal carry this verbatim; JMAP
+    /// (JSCalendar) and Graph parse it into structured form via
+    /// [`crate::recurrence::ParsedRule`].
+    pub recurrence_rule: Option<String>,
+    /// Per RFC 5545 EXDATE. Each entry renders as one EXDATE
+    /// line / array entry in CalDAV / gcal and as a recurrence
+    /// override (`recurrenceOverrides`) marker in JSCalendar /
+    /// Graph in a later slice; for v0 reads the dates round-trip
+    /// on CalDAV + gcal but are not emitted on JMAP / Graph (those
+    /// schemas want a per-date override object the v0 fixture
+    /// can't author yet). Empty by default.
+    pub recurrence_exdates: Vec<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1366,6 +1380,13 @@ pub(crate) struct RawEvent {
     pub(crate) attendees: Vec<RawAddress>,
     #[serde(default)]
     pub(crate) is_all_day: bool,
+    /// Raw RRULE value (no `RRULE:` prefix). Optional.
+    #[serde(default)]
+    pub(crate) recurrence_rule: Option<String>,
+    /// Excluded recurrence dates. Each entry is an RFC 3339
+    /// timestamp; parsed via `parse_ts` at normalize time.
+    #[serde(default)]
+    pub(crate) recurrence_exdates: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1662,6 +1683,13 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         let start =
             parse_ts(&ev.start).map_err(|e| format!("event {:?} start: {e}", ev.id))?;
         let end = parse_ts(&ev.end).map_err(|e| format!("event {:?} end: {e}", ev.id))?;
+        let mut recurrence_exdates: Vec<DateTime<Utc>> =
+            Vec::with_capacity(ev.recurrence_exdates.len());
+        for s in &ev.recurrence_exdates {
+            recurrence_exdates.push(
+                parse_ts(s).map_err(|e| format!("event {:?} recurrence_exdates: {e}", ev.id))?,
+            );
+        }
         events.push(Event {
             id: ev.id,
             calendar_id: ev.calendar_id,
@@ -1674,6 +1702,8 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             organizer: ev.organizer.map(Address::from),
             attendees: ev.attendees.into_iter().map(Address::from).collect(),
             is_all_day: ev.is_all_day,
+            recurrence_rule: ev.recurrence_rule,
+            recurrence_exdates,
         });
     }
 
@@ -1923,6 +1953,11 @@ pub(crate) fn event_create_op(raw: RawEvent) -> Result<ChangeOp, String> {
     let id_for_msg = raw.id.clone();
     let start = parse_ts(&raw.start).map_err(|e| format!("{id_for_msg:?} start: {e}"))?;
     let end = parse_ts(&raw.end).map_err(|e| format!("{id_for_msg:?} end: {e}"))?;
+    let mut recurrence_exdates: Vec<DateTime<Utc>> = Vec::with_capacity(raw.recurrence_exdates.len());
+    for s in &raw.recurrence_exdates {
+        recurrence_exdates
+            .push(parse_ts(s).map_err(|e| format!("{id_for_msg:?} recurrence_exdates: {e}"))?);
+    }
     Ok(ChangeOp::EventCreate(Box::new(Event {
         id: raw.id,
         calendar_id: raw.calendar_id,
@@ -1935,6 +1970,8 @@ pub(crate) fn event_create_op(raw: RawEvent) -> Result<ChangeOp, String> {
         organizer: raw.organizer.map(Address::from),
         attendees: raw.attendees.into_iter().map(Address::from).collect(),
         is_all_day: raw.is_all_day,
+        recurrence_rule: raw.recurrence_rule,
+        recurrence_exdates,
     })))
 }
 

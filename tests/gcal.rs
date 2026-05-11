@@ -366,3 +366,39 @@ async fn gcal_create_surfaces_in_graph_calendar_view_delta() {
         v["value"]
     );
 }
+
+// ── Recurrence ──────────────────────────────────────────────────────
+
+fn recurrence_router() -> axum::Router {
+    let fix = fixture::load(Path::new("fixtures/calendar-recurrence-small.toml")).unwrap();
+    gcal::router(gcal::AppState::for_test(shared::handle(fix)))
+}
+
+#[tokio::test]
+async fn gcal_recurring_event_emits_rrule_array() {
+    let r = recurrence_router();
+    let (status, v) = http(
+        &r,
+        "GET",
+        "/calendar/v3/calendars/cal-work/events",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = v["items"].as_array().unwrap();
+    let weekly = items.iter().find(|e| e["id"] == "ev-weekly").unwrap();
+    let rec = weekly["recurrence"].as_array().unwrap();
+    assert_eq!(rec.len(), 1);
+    assert_eq!(rec[0], "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=10");
+
+    let monthly = items.iter().find(|e| e["id"] == "ev-monthly").unwrap();
+    let rec = monthly["recurrence"].as_array().unwrap();
+    // RRULE first, then one EXDATE per excluded date.
+    assert_eq!(rec.len(), 3);
+    assert_eq!(rec[0], "RRULE:FREQ=MONTHLY;BYMONTHDAY=15;UNTIL=20261215T170000Z");
+    assert_eq!(rec[1], "EXDATE:20260315T170000Z");
+    assert_eq!(rec[2], "EXDATE:20260715T170000Z");
+
+    let single = items.iter().find(|e| e["id"] == "ev-single").unwrap();
+    assert!(single.get("recurrence").is_none(), "single instance leaked recurrence");
+}

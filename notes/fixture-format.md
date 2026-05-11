@@ -254,7 +254,41 @@ attendees = [
     "carol@example.com",
 ]                          # optional; addresses accept bare-string or table form
 is_all_day = false         # optional
+recurrence_rule = "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=10"   # optional;
+                                                          # raw RFC 5545
+                                                          # RRULE value
+                                                          # without the
+                                                          # "RRULE:" prefix
+recurrence_exdates = [
+    "2026-03-15T17:00:00Z",
+    "2026-07-15T17:00:00Z",
+]                                                         # optional;
+                                                          # excluded
+                                                          # recurrence
+                                                          # instances
 ```
+
+Recurrence per protocol:
+
+- CalDAV: emits one `RRULE:` line plus one `EXDATE:` per excluded
+  date in the VEVENT body; parses the same on PUT for full
+  round-trip. Unknown RRULE keys travel through verbatim.
+- Google Calendar v3: emits a `recurrence: ["RRULE:...",
+  "EXDATE:..."]` array per
+  developers.google.com/calendar/api/v3/reference/events.
+- Microsoft Graph: parses the RRULE and emits a structured
+  `recurrence: { pattern, range }` object covering daily /
+  weekly / absoluteMonthly / relativeMonthly / absoluteYearly
+  patterns with `noEnd` / `endDate` / `numbered` range types.
+- JMAP JSCalendar: emits a `recurrenceRules: [{ ... }]` array
+  with `frequency` / `interval` / `byDay` / `byMonthDay` /
+  `byMonth` / `count` / `until`.
+
+The four projections derive deterministically from the raw RRULE
++ EXDATE inputs in `src/recurrence.rs`; mutation paths on Graph /
+gcal / JMAP currently ignore inbound recurrence (writes leave
+`recurrence_rule` / `recurrence_exdates` empty). CalDAV PUT
+round-trips automatically.
 
 Validation rules:
 
@@ -262,6 +296,8 @@ Validation rules:
 - `event.id` is unique within the fixture.
 - `event.calendar_id` must reference a declared calendar.
 - `event.start` and `event.end` are RFC3339; sub-second precision is dropped.
+- `event.recurrence_exdates` entries are RFC3339 timestamps and parsed via
+  the same path as `start` / `end`.
 
 Calendars and events project over the Microsoft Graph
 `/v1.0/me/calendars/...` surface AND the CalDAV listener (same

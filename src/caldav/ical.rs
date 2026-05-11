@@ -2,8 +2,8 @@
 //!
 //! v0 emits the minimum VCALENDAR / VEVENT shape ratatoskr's
 //! `parse_icalendar` accepts: `UID`, `SUMMARY`, `DESCRIPTION`,
-//! `LOCATION`, `DTSTART`, `DTEND`, `ORGANIZER`, `ATTENDEE`. No
-//! recurrence, alarms, or attachments yet (the fixture types
+//! `LOCATION`, `DTSTART`, `DTEND`, `RRULE`, `EXDATE`, `ORGANIZER`,
+//! `ATTENDEE`. No alarms or attachments yet (the fixture types
 //! don't carry them).
 //!
 //! Filled in by the GET / REPORT / PUT wedges.
@@ -58,6 +58,23 @@ pub(crate) fn event_to_ical(event: &Event) -> String {
     write_line(&mut out, "DTEND", &format_dt(event.end));
     if event.is_all_day {
         write_line(&mut out, "X-MICROSOFT-CDO-ALLDAYEVENT", "TRUE");
+    }
+    if let Some(rrule) = &event.recurrence_rule {
+        // RRULE values are emitted unescaped: RFC 5545 §3.3.10 says
+        // the value is a structured RECUR (semicolon-separated
+        // pairs), not TEXT. Escaping `;` here would corrupt the
+        // wire form. Sanitize CR/LF to keep an authored rule from
+        // injecting a second property line.
+        let safe = rrule
+            .chars()
+            .filter(|c| *c != '\r' && *c != '\n')
+            .collect::<String>();
+        out.push_str("RRULE:");
+        out.push_str(&safe);
+        out.push_str("\r\n");
+    }
+    for ex in &event.recurrence_exdates {
+        write_line(&mut out, "EXDATE", &format_dt(*ex));
     }
     if let Some(org) = &event.organizer {
         write_address_line(&mut out, "ORGANIZER", org);
@@ -143,8 +160,8 @@ pub(crate) fn unescape_text(s: &str) -> String {
 }
 
 /// Parsed fields from an inbound VEVENT. Anything we don't care
-/// about gets dropped; the v0 fixture doesn't carry recurrence,
-/// alarms, or per-event timezones.
+/// about gets dropped; the v0 fixture doesn't carry alarms or
+/// per-event timezones.
 #[derive(Debug, Default)]
 pub(crate) struct ParsedEvent {
     pub uid: Option<String>,
@@ -156,6 +173,8 @@ pub(crate) struct ParsedEvent {
     pub is_all_day: bool,
     pub organizer: Option<Address>,
     pub attendees: Vec<Address>,
+    pub recurrence_rule: Option<String>,
+    pub recurrence_exdates: Vec<DateTime<Utc>>,
 }
 
 /// Parse a VCALENDAR body, returning the first VEVENT's fields.
@@ -207,6 +226,23 @@ pub(crate) fn parse_vevent(body: &str) -> Result<ParsedEvent, &'static str> {
             }
             "X-MICROSOFT-CDO-ALLDAYEVENT" if value.eq_ignore_ascii_case("TRUE") => {
                 parsed.is_all_day = true;
+            }
+            // RRULE values are not TEXT-escaped (see emit), so keep
+            // the raw value. A client that round-trips through us
+            // gets the same bytes back even for rules we don't
+            // structurally model.
+            "RRULE" => parsed.recurrence_rule = Some(value.to_string()),
+            "EXDATE" => {
+                // RFC 5545 lets a single EXDATE line carry a
+                // comma-separated list of dates. Split and parse
+                // each independently; unparseable entries are
+                // dropped (a strict server would reject; v0 is
+                // permissive to avoid masking client bugs as 400s).
+                for part in value.split(',') {
+                    if let Some(dt) = parse_dt(part.trim()) {
+                        parsed.recurrence_exdates.push(dt);
+                    }
+                }
             }
             _ => {}
         }
@@ -317,6 +353,8 @@ mod tests {
                 name: None,
             }],
             is_all_day: false,
+            recurrence_rule: None,
+            recurrence_exdates: vec![],
         };
         let ical = event_to_ical(&event);
         let parsed = parse_vevent(&ical).expect("parse");
@@ -347,6 +385,8 @@ mod tests {
             organizer: None,
             attendees: vec![],
             is_all_day: false,
+            recurrence_rule: None,
+            recurrence_exdates: vec![],
         };
         let ical = event_to_ical(&event);
         assert!(ical.contains("Q1\\; budget review"));
@@ -413,6 +453,8 @@ mod tests {
             }),
             attendees: vec![],
             is_all_day: false,
+            recurrence_rule: None,
+            recurrence_exdates: vec![],
         };
         let ical = event_to_ical(&event);
         // The injected payload is concatenated into the ORGANIZER

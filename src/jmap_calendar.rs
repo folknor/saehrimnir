@@ -243,7 +243,80 @@ fn serialize_event(e: &Event) -> Value {
         out.insert("participants".into(), Value::Object(participants));
     }
 
+    if let Some(rrule) = &e.recurrence_rule {
+        let parsed = crate::recurrence::ParsedRule::parse(rrule);
+        if let Some(rule_obj) = jscalendar_recurrence_rule(&parsed) {
+            out.insert("recurrenceRules".into(), Value::Array(vec![rule_obj]));
+        }
+    }
+
     Value::Object(out)
+}
+
+/// Translate a parsed RRULE into a single JSCalendar
+/// `RecurrenceRule` object. JSCalendar (RFC 8984 §4.3.3) shape:
+/// `{ @type: RecurrenceRule, frequency, interval?, byDay?,
+///    byMonthDay?, byMonth?, count?, until? }`. `byDay` is an
+/// array of `NDay` objects (`{@type: NDay, day, nthOfPeriod?}`).
+/// Returns None when FREQ is missing.
+fn jscalendar_recurrence_rule(rule: &crate::recurrence::ParsedRule) -> Option<Value> {
+    let freq = rule.freq?;
+    let mut obj = Map::new();
+    obj.insert("@type".into(), Value::String("RecurrenceRule".into()));
+    obj.insert("frequency".into(), Value::String(freq.jscalendar().into()));
+    if let Some(n) = rule.interval
+        && n > 1
+    {
+        obj.insert("interval".into(), Value::Number(n.into()));
+    }
+    if !rule.by_day.is_empty() {
+        let by_day: Vec<Value> = rule
+            .by_day
+            .iter()
+            .map(|d| {
+                let mut nd = Map::new();
+                nd.insert("@type".into(), Value::String("NDay".into()));
+                nd.insert("day".into(), Value::String(d.weekday.jscalendar().into()));
+                if let Some(ord) = d.ordinal {
+                    nd.insert("nthOfPeriod".into(), Value::Number(ord.into()));
+                }
+                Value::Object(nd)
+            })
+            .collect();
+        obj.insert("byDay".into(), Value::Array(by_day));
+    }
+    if !rule.by_month_day.is_empty() {
+        let by_md: Vec<Value> = rule
+            .by_month_day
+            .iter()
+            .map(|d| Value::Number((*d).into()))
+            .collect();
+        obj.insert("byMonthDay".into(), Value::Array(by_md));
+    }
+    if !rule.by_month.is_empty() {
+        // RFC 8984 expects month strings (`"1"`, ..., `"12"`,
+        // optionally suffixed with `"L"` for leap). v0 emits the
+        // numeric form as a string per spec.
+        let by_m: Vec<Value> = rule
+            .by_month
+            .iter()
+            .map(|m| Value::String(m.to_string()))
+            .collect();
+        obj.insert("byMonth".into(), Value::Array(by_m));
+    }
+    if let Some(c) = rule.count {
+        obj.insert("count".into(), Value::Number(c.into()));
+    }
+    if let Some(u) = rule.until {
+        // JSCalendar `until` is a LocalDateTime (no Z suffix).
+        // Drop the trailing Z; the canonical timeZone for our
+        // events is UTC anyway.
+        obj.insert(
+            "until".into(),
+            Value::String(u.format("%Y-%m-%dT%H:%M:%S").to_string()),
+        );
+    }
+    Some(Value::Object(obj))
 }
 
 fn serialize_participant(addr: &Address, is_owner: bool) -> Value {
@@ -486,6 +559,10 @@ fn build_event_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
             organizer,
             attendees,
             is_all_day,
+            // JMAP mutations don't accept recurrence in v0; the
+            // wire body's `recurrenceRules` is ignored on create.
+            recurrence_rule: None,
+            recurrence_exdates: vec![],
         },
     ))
 }

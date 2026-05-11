@@ -1570,6 +1570,8 @@ fn read_event_create(
             organizer: read_address_opt(state, entry_idx, "organizer")?,
             attendees: read_address_array_opt(state, entry_idx, "attendees")?,
             is_all_day: read_bool_opt(state, entry_idx, "is_all_day")?.unwrap_or(false),
+            recurrence_rule: read_string_opt(state, entry_idx, "recurrence_rule")?,
+            recurrence_exdates: read_string_array_opt(state, entry_idx, "recurrence_exdates")?,
         };
         state.pop(1);
         let op = crate::fixture::event_create_op(raw).map_err(|e| {

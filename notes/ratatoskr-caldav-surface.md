@@ -164,9 +164,13 @@ when a fixture forces it (mirrors the JMAP path).
 - Calendar color / display name updates via `PROPPATCH`.
 - Delegation (`calendar-proxy-read-for` / `-write-for`).
 - Free-busy queries.
-- VEVENT recurrence (RRULE / EXDATE), alarms (VALARM),
-  attachments, scheduling (iTIP / iMIP), or per-event VTIMEZONE
-  blocks.
+- VEVENT alarms (VALARM), attachments, scheduling (iTIP / iMIP),
+  per-event VTIMEZONE blocks.
+- VEVENT recurrence beyond simple RRULE / EXDATE round-trip: the
+  v0 parser captures RRULE values verbatim and EXDATE dates per
+  RFC 5545 §3.8.5.1, and writes them back on PUT, but RDATE,
+  recurrence-id overrides (REID), and per-instance overrides are
+  out of scope.
 
 These all wait on a fixture that needs them. The module
 structure is flat enough to grow them in place without a

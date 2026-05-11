@@ -1037,6 +1037,8 @@ async fn handle_put(
         organizer: parsed.organizer,
         attendees: parsed.attendees,
         is_all_day: parsed.is_all_day,
+        recurrence_rule: parsed.recurrence_rule,
+        recurrence_exdates: parsed.recurrence_exdates,
     };
     let was_create = existing_idx.is_none();
     fixture.mutate(|f| {

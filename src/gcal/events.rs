@@ -288,6 +288,24 @@ fn serialize_event(e: &Event) -> Value {
             .collect();
         obj.insert("attendees".into(), Value::Array(attendees));
     }
+    // Google Calendar v3 emits a `recurrence` array carrying the
+    // full iCal RRULE / EXDATE / RDATE lines verbatim (per
+    // developers.google.com/calendar/api/v3/reference/events). v0
+    // emits RRULE first, then one EXDATE per excluded date so the
+    // wire ordering is stable for byte-deterministic snapshots.
+    if e.recurrence_rule.is_some() || !e.recurrence_exdates.is_empty() {
+        let mut rec: Vec<Value> = Vec::new();
+        if let Some(r) = &e.recurrence_rule {
+            rec.push(Value::String(format!("RRULE:{r}")));
+        }
+        for ex in &e.recurrence_exdates {
+            rec.push(Value::String(format!(
+                "EXDATE:{}",
+                ex.format("%Y%m%dT%H%M%SZ")
+            )));
+        }
+        obj.insert("recurrence".into(), Value::Array(rec));
+    }
     Value::Object(obj)
 }
 
@@ -506,6 +524,12 @@ fn build_event_from_create(
         organizer,
         attendees,
         is_all_day,
+        // gcal POSTs don't honour `recurrence: [...]` in v0; reads
+        // surface fixture-authored recurrence verbatim, writes
+        // ignore it. Stage 2 of CalDAV recurrence covers gcal
+        // writes when a fixture forces it.
+        recurrence_rule: None,
+        recurrence_exdates: vec![],
     })
 }
 
