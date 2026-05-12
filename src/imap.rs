@@ -1102,8 +1102,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     f.emails[idx].mailbox_ids.retain(|m| m != &selected_id);
                     f.retire_uid(&selected_id, id);
                     if f.emails[idx].mailbox_ids.is_empty() {
+                        let account_id = f.emails[idx].account_id.clone();
                         f.emails.remove(idx);
                         diff.email_destroyed.push(id.clone());
+                        diff.email_destroyed_accounts.push(account_id);
                     } else {
                         diff.email_updated.push(id.clone());
                     }
@@ -2502,6 +2504,7 @@ mod tests {
             contacts: vec![],
             categories: vec![],
             groups: vec![],
+            send_as: vec![],
             mailbox_uid_history: HashMap::new(),
             synthetic_event_seq: 0,
             synthetic_email_seq: 0,
@@ -2596,6 +2599,7 @@ mod tests {
             contacts: vec![],
             categories: vec![],
             groups: vec![],
+            send_as: vec![],
             mailbox_uid_history: HashMap::new(),
             synthetic_event_seq: 0,
             synthetic_email_seq: 0,

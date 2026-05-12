@@ -54,6 +54,13 @@ pub struct Fixture {
     /// surface plus the `/v1.0/me/memberOf` /
     /// `/v1.0/users/{userId}/memberOf` walkers. Empty by default.
     pub groups: Vec<Group>,
+    /// Gmail SendAs identities. Flat per-account: an account may
+    /// declare zero or more `[[send_as]]` rows. Real Gmail uses the
+    /// `sendAsEmail` as the primary key; v0 enforces uniqueness per
+    /// `(account_id, send_as_email)` so a multi-account fixture can
+    /// reuse the same address across accounts. Empty by default;
+    /// fixtures that don't need sendAs coverage can omit the table.
+    pub send_as: Vec<SendAs>,
     /// Per-mutation transition log. Empty at load time (the seed
     /// state is the only known state); each successful `Email/set`
     /// or `Mailbox/set` envelope appends a transition and bumps
@@ -140,9 +147,17 @@ pub struct Transition {
     pub email_created: Vec<String>,
     pub email_updated: Vec<String>,
     pub email_destroyed: Vec<String>,
+    /// Parallel to `email_destroyed`: the `account_id` each destroyed
+    /// email belonged to at retire time. Captured at destroy because
+    /// the email is gone from the live fixture by the time the
+    /// per-account delta walker reads it. Length must equal
+    /// `email_destroyed`. Same role as `event_destroyed_parents`.
+    pub email_destroyed_accounts: Vec<String>,
     pub mailbox_created: Vec<String>,
     pub mailbox_updated: Vec<String>,
     pub mailbox_destroyed: Vec<String>,
+    /// Parallel to `mailbox_destroyed`. Captured at destroy time.
+    pub mailbox_destroyed_accounts: Vec<String>,
     pub event_created: Vec<String>,
     pub event_updated: Vec<String>,
     pub event_destroyed: Vec<String>,
@@ -154,6 +169,12 @@ pub struct Transition {
     /// doesn't surface tombstones for sibling calendars. Length
     /// must equal `event_destroyed`.
     pub event_destroyed_parents: Vec<String>,
+    pub calendar_created: Vec<String>,
+    pub calendar_updated: Vec<String>,
+    pub calendar_destroyed: Vec<String>,
+    /// Parallel to `calendar_destroyed`: the `account_id` each
+    /// destroyed calendar belonged to.
+    pub calendar_destroyed_accounts: Vec<String>,
     pub contact_created: Vec<String>,
     pub contact_updated: Vec<String>,
     pub contact_destroyed: Vec<String>,
@@ -184,13 +205,23 @@ pub struct MutationDiff {
     pub email_created: Vec<String>,
     pub email_updated: Vec<String>,
     pub email_destroyed: Vec<String>,
+    /// Parallel to `email_destroyed`: account_id of each destroyed
+    /// email. Producers must push to both vectors at the same time
+    /// so the per-account delta walker can filter tombstones.
+    pub email_destroyed_accounts: Vec<String>,
     pub mailbox_created: Vec<String>,
     pub mailbox_updated: Vec<String>,
     pub mailbox_destroyed: Vec<String>,
+    /// Parallel to `mailbox_destroyed`.
+    pub mailbox_destroyed_accounts: Vec<String>,
     pub event_created: Vec<String>,
     pub event_updated: Vec<String>,
     pub event_destroyed: Vec<String>,
     pub event_destroyed_parents: Vec<String>,
+    pub calendar_created: Vec<String>,
+    pub calendar_updated: Vec<String>,
+    pub calendar_destroyed: Vec<String>,
+    pub calendar_destroyed_accounts: Vec<String>,
     pub contact_created: Vec<String>,
     pub contact_updated: Vec<String>,
     pub contact_destroyed: Vec<String>,
@@ -214,6 +245,9 @@ impl MutationDiff {
             && self.event_created.is_empty()
             && self.event_updated.is_empty()
             && self.event_destroyed.is_empty()
+            && self.calendar_created.is_empty()
+            && self.calendar_updated.is_empty()
+            && self.calendar_destroyed.is_empty()
             && self.contact_created.is_empty()
             && self.contact_updated.is_empty()
             && self.contact_destroyed.is_empty()
@@ -339,6 +373,14 @@ impl Fixture {
         account_id: &'a str,
     ) -> impl Iterator<Item = &'a Category> + 'a {
         self.categories.iter().filter(move |c| c.account_id == account_id)
+    }
+
+    /// SendAs identities scoped to one account.
+    pub fn send_as_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a SendAs> + 'a {
+        self.send_as.iter().filter(move |s| s.account_id == account_id)
     }
 
     /// Read-only view of the per-mailbox UID history. Returns the
@@ -514,13 +556,19 @@ impl Fixture {
                 email_created: vec![],
                 email_updated: vec![],
                 email_destroyed: vec![],
+                email_destroyed_accounts: vec![],
                 mailbox_created: vec![],
                 mailbox_updated: vec![],
                 mailbox_destroyed: vec![],
+                mailbox_destroyed_accounts: vec![],
                 event_created: vec![],
                 event_updated: vec![],
                 event_destroyed: vec![],
                 event_destroyed_parents: vec![],
+                calendar_created: vec![],
+                calendar_updated: vec![],
+                calendar_destroyed: vec![],
+                calendar_destroyed_accounts: vec![],
                 contact_created: vec![],
                 contact_updated: vec![],
                 contact_destroyed: vec![],
@@ -542,13 +590,19 @@ impl Fixture {
             email_created: diff.email_created,
             email_updated: diff.email_updated,
             email_destroyed: diff.email_destroyed,
+            email_destroyed_accounts: diff.email_destroyed_accounts,
             mailbox_created: diff.mailbox_created,
             mailbox_updated: diff.mailbox_updated,
             mailbox_destroyed: diff.mailbox_destroyed,
+            mailbox_destroyed_accounts: diff.mailbox_destroyed_accounts,
             event_created: diff.event_created,
             event_updated: diff.event_updated,
             event_destroyed: diff.event_destroyed,
             event_destroyed_parents: diff.event_destroyed_parents,
+            calendar_created: diff.calendar_created,
+            calendar_updated: diff.calendar_updated,
+            calendar_destroyed: diff.calendar_destroyed,
+            calendar_destroyed_accounts: diff.calendar_destroyed_accounts,
             contact_created: diff.contact_created,
             contact_updated: diff.contact_updated,
             contact_destroyed: diff.contact_destroyed,
@@ -569,6 +623,21 @@ impl Fixture {
             trans.contact_destroyed.len(),
             trans.contact_destroyed_parents.len(),
             "contact_destroyed_parents must be parallel to contact_destroyed"
+        );
+        debug_assert_eq!(
+            trans.email_destroyed.len(),
+            trans.email_destroyed_accounts.len(),
+            "email_destroyed_accounts must be parallel to email_destroyed"
+        );
+        debug_assert_eq!(
+            trans.mailbox_destroyed.len(),
+            trans.mailbox_destroyed_accounts.len(),
+            "mailbox_destroyed_accounts must be parallel to mailbox_destroyed"
+        );
+        debug_assert_eq!(
+            trans.calendar_destroyed.len(),
+            trans.calendar_destroyed_accounts.len(),
+            "calendar_destroyed_accounts must be parallel to calendar_destroyed"
         );
         if self.change_log.transitions.len() >= ChangeLog::MAX_TRANSITIONS {
             self.change_log.transitions.pop_front();
@@ -597,6 +666,40 @@ impl Fixture {
         })
     }
 
+    /// Per-account email delta. Filters created / updated ids by the
+    /// live email's `account_id` and destroyed ids by the parallel
+    /// `email_destroyed_accounts` recorded at retire time. Drives the
+    /// JMAP `Email/changes` handler so a multi-account fixture's
+    /// mutations on the secondary do not surface in the primary's
+    /// delta walk. Pre-fix the walker was global, so `Email/changes`
+    /// against the primary reported every secondary mutation too -
+    /// invisible in single-account fixtures but a multi-account
+    /// scoping bug.
+    pub fn email_delta_since_account(
+        &self,
+        since: &str,
+        account_id: &str,
+    ) -> Option<DeltaSet> {
+        let mut delta = self.delta_since_filtered_destroys(
+            since,
+            |t| (&t.email_created, &t.email_updated, &t.email_destroyed),
+            |t| Some(&t.email_destroyed_accounts),
+            account_id,
+        )?;
+        let live: std::collections::HashMap<&str, &str> = self
+            .emails
+            .iter()
+            .map(|e| (e.id.as_str(), e.account_id.as_str()))
+            .collect();
+        delta
+            .created
+            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
+        delta
+            .updated
+            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
+        Some(delta)
+    }
+
     /// Mailbox-side analogue of [`email_delta_since`].
     pub fn mailbox_delta_since(&self, since: &str) -> Option<DeltaSet> {
         self.delta_since(since, |t| {
@@ -606,6 +709,33 @@ impl Fixture {
                 &t.mailbox_destroyed,
             )
         })
+    }
+
+    /// Per-account mailbox delta. Same shape as
+    /// [`email_delta_since_account`].
+    pub fn mailbox_delta_since_account(
+        &self,
+        since: &str,
+        account_id: &str,
+    ) -> Option<DeltaSet> {
+        let mut delta = self.delta_since_filtered_destroys(
+            since,
+            |t| (&t.mailbox_created, &t.mailbox_updated, &t.mailbox_destroyed),
+            |t| Some(&t.mailbox_destroyed_accounts),
+            account_id,
+        )?;
+        let live: std::collections::HashMap<&str, &str> = self
+            .mailboxes
+            .iter()
+            .map(|m| (m.id.as_str(), m.account_id.as_str()))
+            .collect();
+        delta
+            .created
+            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
+        delta
+            .updated
+            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
+        Some(delta)
     }
 
     /// Event-side analogue of [`email_delta_since`]. Drives the
@@ -646,6 +776,36 @@ impl Fixture {
         delta
             .updated
             .retain(|id| live.get(id.as_str()).copied() == Some(calendar_id));
+        Some(delta)
+    }
+
+    /// Per-account calendar delta. Drives the JMAP `Calendar/changes`
+    /// walker once MKCALENDAR / DELETE on calendar collections wire
+    /// transitions through. Pre-MKCALENDAR the change_log never
+    /// recorded calendar-side transitions, so the walk always
+    /// returns the empty delta.
+    pub fn calendar_delta_since_account(
+        &self,
+        since: &str,
+        account_id: &str,
+    ) -> Option<DeltaSet> {
+        let mut delta = self.delta_since_filtered_destroys(
+            since,
+            |t| (&t.calendar_created, &t.calendar_updated, &t.calendar_destroyed),
+            |t| Some(&t.calendar_destroyed_accounts),
+            account_id,
+        )?;
+        let live: std::collections::HashMap<&str, &str> = self
+            .calendars
+            .iter()
+            .map(|c| (c.id.as_str(), c.account_id.as_str()))
+            .collect();
+        delta
+            .created
+            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
+        delta
+            .updated
+            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
         Some(delta)
     }
 
@@ -1083,6 +1243,33 @@ pub struct Category {
     pub color: Option<String>,
 }
 
+/// Gmail SendAs identity. Mirrors the wire shape exposed under
+/// `GET /gmail/v1/users/me/settings/sendAs` and accepted by the
+/// `PATCH .../sendAs/{sendAsEmail}` mutation. Real Gmail tracks many
+/// fields (`smtpMsa`, `verificationStatus`, etc.); v0 carries the
+/// subset ratatoskr's sync code reads or writes. Mutations land
+/// through a brief write guard on `Fixture` without bumping the
+/// state token - Gmail does not expose a `/changes` endpoint for
+/// sendAs, so harness scripts re-fetch to observe the update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendAs {
+    /// Account this identity belongs to.
+    pub account_id: String,
+    /// `sendAsEmail` in the wire shape; the primary key per account.
+    pub send_as_email: String,
+    pub display_name: Option<String>,
+    pub reply_to_address: Option<String>,
+    /// HTML signature blob. Real Gmail accepts inline HTML; we
+    /// pass it through unchanged.
+    pub signature: Option<String>,
+    pub is_primary: bool,
+    pub is_default: bool,
+    /// Real Gmail's `treatAsAlias` flag. Defaults to true for
+    /// fixture-authored entries so the wire shape mirrors how real
+    /// accounts present their primary identity.
+    pub treat_as_alias: bool,
+}
+
 /// Microsoft Graph group. Distinct from the account-scoped
 /// resources above: a group is a directory object whose `members`
 /// list points at one or more declared accounts. The Graph
@@ -1297,6 +1484,8 @@ pub(crate) struct RawFixture {
     pub(crate) categories: Vec<RawCategory>,
     #[serde(default, rename = "group")]
     pub(crate) groups: Vec<RawGroup>,
+    #[serde(default, rename = "send_as")]
+    pub(crate) send_as: Vec<RawSendAs>,
     #[serde(default, rename = "change")]
     pub(crate) change_script: Vec<RawChangeStep>,
 }
@@ -1452,6 +1641,25 @@ pub(crate) struct RawCategory {
     pub(crate) color: Option<String>,
     #[serde(default)]
     pub(crate) account_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawSendAs {
+    pub(crate) send_as_email: String,
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) reply_to_address: Option<String>,
+    #[serde(default)]
+    pub(crate) signature: Option<String>,
+    #[serde(default)]
+    pub(crate) is_primary: Option<bool>,
+    #[serde(default)]
+    pub(crate) is_default: Option<bool>,
+    #[serde(default)]
+    pub(crate) treat_as_alias: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2064,6 +2272,36 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    // SendAs identities. Flat per-account; primary key per account
+    // is the `send_as_email` address. Real Gmail accepts the same
+    // address under multiple accounts (e.g. an alias shared across
+    // mailboxes), so we scope the uniqueness check to
+    // `(account_id, send_as_email)`.
+    let mut send_as_keys: HashMap<(String, String), ()> = HashMap::new();
+    let mut send_as_entries = Vec::with_capacity(raw.send_as.len());
+    for sa in raw.send_as {
+        let acct = resolve_account(sa.account_id.as_ref(), "send_as", &sa.send_as_email)?;
+        if send_as_keys
+            .insert((acct.clone(), sa.send_as_email.clone()), ())
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate send_as {:?} on account {:?}",
+                sa.send_as_email, acct,
+            ));
+        }
+        send_as_entries.push(SendAs {
+            account_id: acct,
+            send_as_email: sa.send_as_email,
+            display_name: sa.display_name,
+            reply_to_address: sa.reply_to_address,
+            signature: sa.signature,
+            is_primary: sa.is_primary.unwrap_or(false),
+            is_default: sa.is_default.unwrap_or(false),
+            treat_as_alias: sa.treat_as_alias.unwrap_or(true),
+        });
+    }
+
     // Master categories. Flat list per account, ids unique.
     let mut category_ids: HashMap<String, ()> = HashMap::new();
     let mut categories = Vec::with_capacity(raw.categories.len());
@@ -2143,6 +2381,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         contacts,
         categories,
         groups,
+        send_as: send_as_entries,
         change_log,
         change_script,
         mailbox_uid_history,

@@ -45,7 +45,11 @@ pub fn router() -> Router<AppState> {
             "/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}",
             get(get_attachment),
         )
-        .route("/gmail/v1/users/me/settings/sendAs", get(send_as))
+        .route("/gmail/v1/users/me/settings/sendAs", get(list_send_as))
+        .route(
+            "/gmail/v1/users/me/settings/sendAs/{send_as_email}",
+            get(get_send_as).patch(patch_send_as),
+        )
 }
 
 // ── Profile / Labels ────────────────────────────────────────────────
@@ -600,11 +604,128 @@ async fn get_attachment(
 
 // ── SendAs ──────────────────────────────────────────────────────────
 
-async fn send_as() -> Response {
-    // v0 emits an empty list so ratatoskr's signature-sync path
-    // becomes a no-op. Real signatures will land alongside the
-    // fixture's `[account.signature]` block in v1.
-    ok_json(json!({"sendAs": []}))
+async fn list_send_as(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(r) = super::maybe_override(&state, "send_as", |_s| Ok(())) {
+        return r;
+    }
+    let account_id = bearer_account(&state, &headers);
+    let fixture = state.fixture();
+    let entries: Vec<Value> = fixture
+        .send_as_for(&account_id)
+        .map(serialize_send_as)
+        .collect();
+    ok_json(json!({ "sendAs": entries }))
+}
+
+async fn get_send_as(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(send_as_email): Path<String>,
+) -> Response {
+    let send_as_email_lua = send_as_email.clone();
+    if let Some(r) = super::maybe_override(&state, "send_as", move |s| {
+        crate::lua::req_set_str(s, "send_as_email", &send_as_email_lua)
+    }) {
+        return r;
+    }
+    let account_id = bearer_account(&state, &headers);
+    let fixture = state.fixture();
+    let Some(sa) = fixture
+        .send_as_for(&account_id)
+        .find(|s| s.send_as_email == send_as_email)
+    else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("sendAs {send_as_email:?} not found"),
+            "notFound",
+        );
+    };
+    ok_json(serialize_send_as(sa))
+}
+
+async fn patch_send_as(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(send_as_email): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let send_as_email_lua = send_as_email.clone();
+    if let Some(r) = super::maybe_override(&state, "send_as", move |s| {
+        crate::lua::req_set_str(s, "send_as_email", &send_as_email_lua)
+    }) {
+        return r;
+    }
+    let account_id = bearer_account(&state, &headers);
+    let patch: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid JSON body: {e}"),
+                "invalidInput",
+            );
+        }
+    };
+    let mut fixture = state.shared.fixture.write().expect("fixture lock poisoned");
+    let Some(idx) = fixture
+        .send_as
+        .iter()
+        .position(|s| s.account_id == account_id && s.send_as_email == send_as_email)
+    else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("sendAs {send_as_email:?} not found"),
+            "notFound",
+        );
+    };
+    // Real Gmail's PATCH is a sparse merge: any field present in the
+    // body replaces the stored value; absent fields are left alone.
+    // We apply the same shape so ratatoskr's signature-sync path can
+    // toggle a single field without round-tripping the rest.
+    let entry = &mut fixture.send_as[idx];
+    if let Some(v) = patch.get("displayName") {
+        entry.display_name = v.as_str().map(String::from);
+    }
+    if let Some(v) = patch.get("replyToAddress") {
+        entry.reply_to_address = v.as_str().map(String::from);
+    }
+    if let Some(v) = patch.get("signature") {
+        entry.signature = v.as_str().map(String::from);
+    }
+    if let Some(v) = patch.get("isDefault").and_then(Value::as_bool) {
+        entry.is_default = v;
+    }
+    if let Some(v) = patch.get("treatAsAlias").and_then(Value::as_bool) {
+        entry.treat_as_alias = v;
+    }
+    // `isPrimary` is read-only in real Gmail (mirrors the underlying
+    // account's primary address); v0 ignores the field on PATCH so a
+    // client mistakenly setting it doesn't corrupt the fixture.
+    let updated = entry.clone();
+    ok_json(serialize_send_as(&updated))
+}
+
+fn serialize_send_as(sa: &crate::fixture::SendAs) -> Value {
+    let mut out = Map::new();
+    out.insert(
+        "sendAsEmail".to_string(),
+        Value::String(sa.send_as_email.clone()),
+    );
+    if let Some(d) = &sa.display_name {
+        out.insert("displayName".to_string(), Value::String(d.clone()));
+    }
+    if let Some(r) = &sa.reply_to_address {
+        out.insert("replyToAddress".to_string(), Value::String(r.clone()));
+    }
+    if let Some(s) = &sa.signature {
+        out.insert("signature".to_string(), Value::String(s.clone()));
+    }
+    out.insert("isPrimary".to_string(), Value::Bool(sa.is_primary));
+    out.insert("isDefault".to_string(), Value::Bool(sa.is_default));
+    out.insert("treatAsAlias".to_string(), Value::Bool(sa.treat_as_alias));
+    // Real Gmail emits `verificationStatus` and `smtpMsa`; v0 omits
+    // both since ratatoskr's sync code doesn't read them.
+    Value::Object(out)
 }
 
 // ── Query parsing ───────────────────────────────────────────────────

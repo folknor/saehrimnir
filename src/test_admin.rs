@@ -792,11 +792,13 @@ fn apply_change_step(
                     ));
                 };
                 let mailboxes = fix.emails[idx].mailbox_ids.clone();
+                let account_id = fix.emails[idx].account_id.clone();
                 fix.emails.remove(idx);
                 for mb in &mailboxes {
                     fix.retire_uid(mb, id);
                 }
                 diff.email_destroyed.push(id.clone());
+                diff.email_destroyed_accounts.push(account_id);
             }
             ChangeOp::MailboxCreate(mailbox) => {
                 let mut mailbox = (**mailbox).clone();
@@ -885,6 +887,11 @@ fn apply_change_step(
                         &format!("mailbox_destroy {id:?}: mailbox is referenced by an email"),
                     ));
                 }
+                let account_id = fix
+                    .mailboxes
+                    .iter()
+                    .find(|m| &m.id == id)
+                    .map(|m| m.account_id.clone());
                 let len_before = fix.mailboxes.len();
                 fix.mailboxes.retain(|m| &m.id != id);
                 if fix.mailboxes.len() == len_before {
@@ -896,6 +903,8 @@ fn apply_change_step(
                     ));
                 }
                 diff.mailbox_destroyed.push(id.clone());
+                diff.mailbox_destroyed_accounts
+                    .push(account_id.expect("mailbox existed before retain"));
             }
             ChangeOp::EventCreate(event) => {
                 let mut event = (**event).clone();

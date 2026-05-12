@@ -105,46 +105,29 @@ fn my_rights_all_true() -> Value {
 pub(crate) fn calendar_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?;
     let since_state = require_since_state(args)?;
-    // Calendars themselves are a near-static surface in v0; the
-    // change_log doesn't track per-calendar transitions. Per RFC
-    // 8620 §5.2 a server may treat a known historical state as
-    // "no changes for this resource type" when it can prove
-    // nothing changed in that window - here, since v0 has no
-    // calendar-mutation surface, every retained state is a known-
-    // empty point. Returning `cannotCalculateChanges` for those
-    // would push the client into an unnecessary full re-bootstrap
-    // every time an unrelated event mutation bumped
-    // `fixture.state`.
-    //
-    // Known states: current, seed, or any retained transition's
-    // from_state / to_state (see `Fixture::change_log_*`). Unknown
-    // states still return `cannotCalculateChanges`.
-    let known = since_state == fixture.state
-        || since_state == fixture.change_log_seed()
-        || fixture
-            .change_log_transitions()
-            .any(|t| t.from_state == since_state || t.to_state == since_state);
-    if known {
-        // Empty delta with `newState` echoing the current state.
-        // The call is observably idempotent only when the state
-        // matches; for older known states we still advance
-        // `newState` so the client persists the latest token.
-        return Ok(json!({
-            "accountId": account_id,
-            "oldState": since_state,
-            "newState": fixture.state,
-            "hasMoreChanges": false,
-            "created": [],
-            "updated": [],
-            "destroyed": [],
-        }));
-    }
-    Err(json!({
-        "type": "cannotCalculateChanges",
-        "description": format!(
-            "sinceState {since_state:?} is not a known fixture state \
-             (older than the seed or evicted from the bounded change log)"
-        ),
+    // Walk the per-account calendar delta. MKCALENDAR / DELETE on a
+    // collection record `calendar_*` transitions; on a fixture that
+    // hasn't seen any of those, every retained state yields the
+    // empty delta.
+    let delta = fixture
+        .calendar_delta_since_account(since_state, account_id)
+        .ok_or_else(|| {
+            json!({
+                "type": "cannotCalculateChanges",
+                "description": format!(
+                    "sinceState {since_state:?} is not a known fixture state \
+                     (older than the seed or evicted from the bounded change log)"
+                ),
+            })
+        })?;
+    Ok(json!({
+        "accountId": account_id,
+        "oldState": since_state,
+        "newState": fixture.state,
+        "hasMoreChanges": false,
+        "created": delta.created,
+        "updated": delta.updated,
+        "destroyed": delta.destroyed,
     }))
 }
 

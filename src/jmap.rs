@@ -367,15 +367,17 @@ const QUERY_LIMIT_CAP: u64 = 256;
 fn mailbox_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?;
     let since_state = require_since_state(args)?;
-    let delta = fixture.mailbox_delta_since(since_state).ok_or_else(|| {
-        json!({
-            "type": "cannotCalculateChanges",
-            "description": format!(
-                "sinceState {since_state:?} is not a known fixture state \
-                 (older than the seed or evicted from the bounded change log)"
-            ),
-        })
-    })?;
+    let delta = fixture
+        .mailbox_delta_since_account(since_state, account_id)
+        .ok_or_else(|| {
+            json!({
+                "type": "cannotCalculateChanges",
+                "description": format!(
+                    "sinceState {since_state:?} is not a known fixture state \
+                     (older than the seed or evicted from the bounded change log)"
+                ),
+            })
+        })?;
     Ok(changes_response(
         account_id,
         since_state,
@@ -388,15 +390,17 @@ fn mailbox_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
 fn email_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?;
     let since_state = require_since_state(args)?;
-    let delta = fixture.email_delta_since(since_state).ok_or_else(|| {
-        json!({
-            "type": "cannotCalculateChanges",
-            "description": format!(
-                "sinceState {since_state:?} is not a known fixture state \
-                 (older than the seed or evicted from the bounded change log)"
-            ),
-        })
-    })?;
+    let delta = fixture
+        .email_delta_since_account(since_state, account_id)
+        .ok_or_else(|| {
+            json!({
+                "type": "cannotCalculateChanges",
+                "description": format!(
+                    "sinceState {since_state:?} is not a known fixture state \
+                     (older than the seed or evicted from the bounded change log)"
+                ),
+            })
+        })?;
     Ok(changes_response(
         account_id,
         since_state,
@@ -1110,26 +1114,30 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
             }
         }
 
-        // Destroys: snapshot mailbox memberships for every id we're
-        // about to drop, then a single-pass retain. Pre-fix this was
-        // an O(D · N) loop of `position` + `remove`. Walking the
-        // request `destroys` afterwards preserves response order.
+        // Destroys: snapshot mailbox memberships + account for every
+        // id we're about to drop, then a single-pass retain. Pre-fix
+        // this was an O(D · N) loop of `position` + `remove`. Walking
+        // the request `destroys` afterwards preserves response order.
+        // The account snapshot lands in `email_destroyed_accounts`
+        // so the per-account `Email/changes` walker can filter
+        // tombstones.
         let destroy_set: std::collections::HashSet<&str> =
             destroys.iter().map(String::as_str).collect();
-        let memberships: std::collections::HashMap<String, Vec<String>> = fix
+        let memberships: std::collections::HashMap<String, (Vec<String>, String)> = fix
             .emails
             .iter()
             .filter(|e| destroy_set.contains(e.id.as_str()))
-            .map(|e| (e.id.clone(), e.mailbox_ids.clone()))
+            .map(|e| (e.id.clone(), (e.mailbox_ids.clone(), e.account_id.clone())))
             .collect();
         fix.emails.retain(|e| !destroy_set.contains(e.id.as_str()));
         for id in &destroys {
             match memberships.get(id) {
-                Some(mailboxes) => {
+                Some((mailboxes, account_id)) => {
                     for mb in mailboxes {
                         fix.retire_uid(mb, id);
                     }
                     diff.email_destroyed.push(id.clone());
+                    diff.email_destroyed_accounts.push(account_id.clone());
                     destroyed_out.push(id.clone());
                 }
                 None => {
@@ -1338,7 +1346,7 @@ fn mailbox_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
         let mut diff = crate::fixture::MutationDiff::default();
 
         for (client_id, body) in &creates {
-            match build_mailbox_from_create(fix, body) {
+            match build_mailbox_from_create(fix, &account_id, body) {
                 Ok(mailbox) => {
                     let server_id = mailbox.id.clone();
                     fix.mailboxes.push(mailbox);
@@ -1404,10 +1412,19 @@ fn mailbox_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
                 );
                 continue;
             }
+            // Snapshot the account before removal so we can record it
+            // parallel to the destroyed id.
+            let account = fix
+                .mailboxes
+                .iter()
+                .find(|m| &m.id == id)
+                .map(|m| m.account_id.clone());
             let len_before = fix.mailboxes.len();
             fix.mailboxes.retain(|m| &m.id != id);
             if fix.mailboxes.len() < len_before {
                 diff.mailbox_destroyed.push(id.clone());
+                diff.mailbox_destroyed_accounts
+                    .push(account.expect("mailbox existed before retain"));
                 destroyed_out.push(id.clone());
             } else {
                 not_destroyed.insert(id.clone(), set_error("notFound", "no such mailbox"));
@@ -1432,6 +1449,7 @@ fn mailbox_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
 
 fn build_mailbox_from_create(
     fix: &Fixture,
+    request_account_id: &str,
     body: &Value,
 ) -> Result<Mailbox, Value> {
     let body = body.as_object().ok_or_else(|| {
@@ -1445,13 +1463,27 @@ fn build_mailbox_from_create(
     let parent_id = body
         .get("parentId")
         .and_then(|v| if v.is_null() { None } else { v.as_str().map(String::from) });
-    if let Some(pid) = &parent_id
-        && !fix.mailboxes.iter().any(|m| &m.id == pid)
-    {
-        return Err(set_error(
-            "invalidProperties",
-            &format!("unknown parentId {pid:?}"),
-        ));
+    if let Some(pid) = &parent_id {
+        let parent = fix.mailboxes.iter().find(|m| &m.id == pid);
+        let Some(parent) = parent else {
+            return Err(set_error(
+                "invalidProperties",
+                &format!("unknown parentId {pid:?}"),
+            ));
+        };
+        // A child mailbox must inherit the parent's account. If the
+        // request targets a different account than the parent's,
+        // there's no way to honour both - reject so callers see the
+        // mismatch.
+        if parent.account_id != request_account_id {
+            return Err(set_error(
+                "invalidProperties",
+                &format!(
+                    "parentId {pid:?} belongs to account {:?} but request accountId is {request_account_id:?}",
+                    parent.account_id,
+                ),
+            ));
+        }
     }
     let sort_order = body.get("sortOrder").and_then(Value::as_i64);
     let is_subscribed = body
@@ -1465,19 +1497,9 @@ fn build_mailbox_from_create(
         .transpose()
         .map_err(|e: String| set_error("invalidProperties", &e))?;
     let id = format!("mock-mailbox-{}", fix.mailboxes.len() + 1);
-    // Mailbox/set create is scoped to the primary account in v0.
-    let account_id = match &parent_id {
-        Some(pid) => fix
-            .mailboxes
-            .iter()
-            .find(|m| &m.id == pid)
-            .map(|m| m.account_id.clone())
-            .unwrap_or_else(|| fix.primary_account().id.clone()),
-        None => fix.primary_account().id.clone(),
-    };
     Ok(Mailbox {
         id,
-        account_id,
+        account_id: request_account_id.to_string(),
         name,
         role,
         parent_id,
@@ -1727,6 +1749,7 @@ mod tests {
             contacts: vec![],
             categories: vec![],
             groups: vec![],
+            send_as: vec![],
             mailbox_uid_history: std::collections::HashMap::new(),
             synthetic_event_seq: 0,
             synthetic_email_seq: 0,
@@ -1914,6 +1937,7 @@ mod tests {
             contacts: vec![],
             categories: vec![],
             groups: vec![],
+            send_as: vec![],
             mailbox_uid_history: std::collections::HashMap::new(),
             synthetic_event_seq: 0,
             synthetic_email_seq: 0,
@@ -2202,6 +2226,7 @@ mod tests {
             contacts: vec![],
             categories: vec![],
             groups: vec![],
+            send_as: vec![],
             mailbox_uid_history: std::collections::HashMap::new(),
             synthetic_event_seq: 0,
             synthetic_email_seq: 0,

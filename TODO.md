@@ -8,39 +8,13 @@ tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
 Concrete next-up items lifted above the per-protocol backlogs.
 
-- **Multi-account refactor follow-ups.** Stages 1-5 landed the
-  fixture model, JMAP multi-account scoping, Graph per-account
-  routing across all four resource families, OAuth-scoped
-  tokens for Gmail / gcal / People, and IMAP / SMTP
-  per-connection AUTH binding (LOGIN / AUTHENTICATE PLAIN /
-  LOGIN / XOAUTH2 / OAUTHBEARER parse the credential and bind
-  the connection state to a matching declared account; SMTP
-  `Submission` records the resolved account). What's left:
-  - CalDAV: primary-filter rewrite, plus per-principal account
-    resolution. CalDAV's `/principals/{user}/` URL shape
-    already names a user; today every request resolves to
-    primary regardless.
-  - JMAP `Mailbox/changes` / `Email/changes` partition the
-    change_log by account so a multi-account fixture's
-    mutations on the secondary don't surface in the primary's
-    delta walk.
-- **Gmail SendAs / signatures bidirectional sync.** Today
-  `/gmail/v1/users/me/settings/sendAs` returns an empty list.
-  Wire a `[[account.send_as]]` (or similar) fixture table, honour
-  it on GET, and accept PATCH to record signature changes via
-  `Fixture::mutate`. Lands in `src/gmail/mail.rs` plus a fixture
-  schema addition in `src/fixture.rs`.
-- **CalDAV MKCALENDAR.** Create-calendar verb. Should land an
-  `event_*`-parallel `calendar_created` transition so Graph
-  `/v1.0/me/calendars` and JMAP `Calendar/changes` observe the
-  new calendar. Lands in `src/caldav/mod.rs`.
 - **Lua Gmail attachment + sendAs hooks.** Wire `on("gmail",
-  "get_attachment", fn)` and `on("gmail", "send_as", fn)` through
-  the dispatcher so fault-injection works against those routes
-  the same way it does for `list_threads` etc. One-line additions
-  in `src/gmail/mail.rs` once the underlying handlers exist
-  (sendAs needs a real handler first; see Gmail SendAs item
-  above).
+  "get_attachment", fn)` through the dispatcher so fault-injection
+  works against the attachment route the same way it does for
+  `list_threads` etc. The sendAs handlers (`list_send_as` /
+  `get_send_as` / `patch_send_as`) already consult `maybe_override`
+  on `"send_as"`; remaining work is the attachment route in
+  `src/gmail/mail.rs`.
 
 ## From the 2026-05-10 multi-agent review (today's slice)
 
@@ -256,9 +230,10 @@ future Graph work:
 
 ## Gmail (future work)
 
-v0 mail-sync surface is complete. SendAs / signatures bidirectional
-sync is tracked under "Priority" above. Remaining future Gmail
-work:
+v0 mail-sync surface is complete. SendAs / signatures
+bidirectional sync (list + per-address GET + PATCH on
+`/gmail/v1/users/me/settings/sendAs`) is landed with the
+`[[send_as]]` fixture table. Remaining future Gmail work:
 
 - Google Drive resumable uploads
   (`<ratatoskr>/crates/gmail/src/gdrive.rs`). Needed once the
@@ -268,18 +243,22 @@ work:
 ## CalDAV (future work)
 
 v0 surface is complete (see `CLAUDE.md` "Status"). Recurrence
-read + write paths are landed across all four calendar protocols.
-MKCALENDAR is tracked under "Priority" above. Out of scope until
-a fixture forces it: PROPPATCH, ACLs, delegation, free-busy,
-scheduling (iTIP / iMIP), VALARM, attachments, per-event
-VTIMEZONE.
+read + write paths are landed across all four calendar protocols,
+and `MKCALENDAR` creates new calendar collections (records a
+`calendar_created` transition observable by Graph `/me/calendars`
+and JMAP `Calendar/changes`). Out of scope until a fixture forces
+it: PROPPATCH, ACLs, delegation, free-busy, scheduling (iTIP /
+iMIP), VALARM, attachments, per-event VTIMEZONE.
 
 ## Lua dynamic surface
 
 Phase 2 callbacks (`on(protocol, command, fn)`) are wired across all
 five protocols, mapped via `Override::Tagged { status, message }`.
-The SMTP `cmd_auth` hook and Gmail `get_attachment` / `send_as`
-hooks are tracked under "Priority" above. What's left:
+The Gmail `send_as` hook is wired alongside the SendAs handlers
+(`list_send_as` / `get_send_as` / `patch_send_as` consult
+`maybe_override` with command `"send_as"`). The Gmail
+`get_attachment` hook is tracked under "Priority" above. What's
+left:
 
 - Per-protocol callbacks for the new gcal and People listeners
   (`list_events`, `calendar_list`, `list_connections`,

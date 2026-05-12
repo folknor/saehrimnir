@@ -2050,6 +2050,188 @@ async fn multi_account_unknown_accountid_returns_account_not_found() {
 }
 
 #[tokio::test]
+async fn multi_account_email_changes_partition_destroyed_by_account() {
+    // A destroy on the secondary's email lands in the change log;
+    // primary's per-account walker must NOT see the tombstone, and
+    // secondary's must. Pre-fix `email_delta_since` was global and
+    // primary's /changes would surface every secondary mutation too.
+    let app = multi_account_router();
+
+    // Capture the load-time state token (= fixture seed) so we can
+    // walk forward from it after the mutation.
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({ "accountId": "account-primary", "ids": [] }),
+        "c0",
+    )
+    .await;
+    let seed = v["methodResponses"][0][1]["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Destroy secondary's only email.
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-secondary",
+            "destroy": ["email-secondary-001"],
+        }),
+        "c1",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["destroyed"], json!(["email-secondary-001"]));
+
+    // Primary's /changes walk from the seed sees nothing.
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({ "accountId": "account-primary", "sinceState": seed }),
+        "c2",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(
+        body["destroyed"],
+        json!([]),
+        "primary's /changes leaked secondary's destroy: {body}"
+    );
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["updated"], json!([]));
+
+    // Secondary's /changes walk from the seed sees the destroy.
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({ "accountId": "account-secondary", "sinceState": seed }),
+        "c3",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["destroyed"], json!(["email-secondary-001"]));
+}
+
+#[tokio::test]
+async fn multi_account_email_changes_partition_updates_by_account() {
+    // A keyword flip on the secondary's email must not surface in
+    // primary's /changes walk. Pre-fix the global walker reported
+    // every update regardless of account.
+    let app = multi_account_router();
+
+    // Capture the seed.
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({ "accountId": "account-primary", "ids": [] }),
+        "c0",
+    )
+    .await;
+    let seed = v["methodResponses"][0][1]["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Flip $seen on secondary's email.
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-secondary",
+            "update": { "email-secondary-001": { "keywords/$seen": true } },
+        }),
+        "c1",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["updated"],
+        json!({ "email-secondary-001": null })
+    );
+
+    // Primary's /changes walk: empty.
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({ "accountId": "account-primary", "sinceState": seed }),
+        "c2",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["updated"], json!([]));
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["destroyed"], json!([]));
+
+    // Secondary's /changes walk: the update.
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({ "accountId": "account-secondary", "sinceState": seed }),
+        "c3",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["updated"], json!(["email-secondary-001"]));
+}
+
+#[tokio::test]
+async fn multi_account_mailbox_changes_partition_by_account() {
+    // Create + destroy a mailbox on the secondary; primary's
+    // /changes must not surface it.
+    let app = multi_account_router();
+
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/get",
+        json!({ "accountId": "account-primary", "ids": [] }),
+        "c0",
+    )
+    .await;
+    let seed = v["methodResponses"][0][1]["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({
+            "accountId": "account-secondary",
+            "create": { "scratch": { "name": "Scratch" } },
+        }),
+        "c1",
+    )
+    .await;
+    let server_id = v["methodResponses"][0][1]["created"]["scratch"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/changes",
+        json!({ "accountId": "account-primary", "sinceState": seed }),
+        "c2",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["updated"], json!([]));
+    assert_eq!(body["destroyed"], json!([]));
+
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/changes",
+        json!({ "accountId": "account-secondary", "sinceState": seed }),
+        "c3",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["created"], json!([server_id]));
+}
+
+#[tokio::test]
 async fn multi_account_email_query_scopes_by_accountid() {
     // The query path is Email/query with a filter; assert that
     // primary's filter sees only primary's emails.

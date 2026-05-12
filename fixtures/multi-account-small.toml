@@ -124,6 +124,26 @@ account_id = "account-secondary"
 display_name = "Secondary-Urgent"
 color = "preset5"
 
+# SendAs identities. One per account, mirroring real Gmail where
+# the primary address is always present on the sendAs list. Tests
+# assert that each account's bearer surfaces its own identity only.
+
+[[send_as]]
+account_id = "account-primary"
+send_as_email = "primary@example.com"
+display_name = "Primary User"
+signature = "<p>Sent from primary</p>"
+is_primary = true
+is_default = true
+
+[[send_as]]
+account_id = "account-secondary"
+send_as_email = "secondary@example.com"
+display_name = "Secondary User"
+signature = "<p>Sent from secondary</p>"
+is_primary = true
+is_default = true
+
 # Groups span accounts. Engineering contains both; Leadership
 # contains only primary. Used by tests/graph.rs to assert
 # /v1.0/groups, /v1.0/groups/{id}/members, and /me/memberOf

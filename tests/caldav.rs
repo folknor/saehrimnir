@@ -1100,3 +1100,332 @@ END:VCALENDAR\r\n";
     assert!(body.contains("RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=4"));
     assert!(body.contains("EXDATE:20260415T140000Z"));
 }
+
+// ── Multi-account principal scoping ─────────────────────────────────
+
+fn multi_account_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    caldav::router(caldav::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+#[tokio::test]
+async fn multi_account_secondary_principal_lists_only_secondary_calendars() {
+    // The fixture declares `cal-primary` (account-primary) and
+    // `cal-secondary` (account-secondary). Pre-fix, every principal
+    // url resolved to `account-1` regardless and the secondary
+    // principal 404'd. Post-fix the URL-named account scopes the
+    // PROPFIND listing.
+    let (status, body) = send_with(
+        multi_account_router(),
+        "PROPFIND",
+        "/calendars/account-secondary/",
+        Some("1"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        body.contains("/calendars/account-secondary/cal-secondary/"),
+        "secondary's calendar missing: {body}"
+    );
+    assert!(
+        !body.contains("/calendars/account-secondary/cal-primary/"),
+        "primary's calendar leaked into secondary's listing: {body}"
+    );
+
+    // The primary principal still sees only its own calendars.
+    let (_, primary_body) = send_with(
+        multi_account_router(),
+        "PROPFIND",
+        "/calendars/account-primary/",
+        Some("1"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert!(primary_body.contains("/calendars/account-primary/cal-primary/"));
+    assert!(
+        !primary_body.contains("cal-secondary"),
+        "secondary leaked into primary: {primary_body}"
+    );
+}
+
+#[tokio::test]
+async fn multi_account_cross_principal_calendar_lookup_404s() {
+    // Request the primary's calendar through the secondary's
+    // principal URL. The path parses (both segments are valid) but
+    // the calendar does not belong to the secondary, so 404.
+    let (status, _) = send_with(
+        multi_account_router(),
+        "PROPFIND",
+        "/calendars/account-secondary/cal-primary/",
+        Some("0"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn multi_account_secondary_principal_get_event_works() {
+    // The secondary principal can fetch its own event.
+    let (status, body) = send_with(
+        multi_account_router(),
+        "GET",
+        "/calendars/account-secondary/cal-secondary/ev-secondary-001.ics",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("UID:ev-secondary-001"));
+    assert!(body.contains("SUMMARY:Secondary review"));
+}
+
+#[tokio::test]
+async fn multi_account_propfind_unknown_principal_returns_404() {
+    let (status, _) = send_with(
+        multi_account_router(),
+        "PROPFIND",
+        "/principals/account-bogus/",
+        Some("0"),
+        PROPFIND_PRINCIPAL,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn options_advertises_mkcalendar_verb() {
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let allow = resp.headers().get("Allow").unwrap().to_str().unwrap();
+    assert!(allow.contains("MKCALENDAR"), "Allow missing MKCALENDAR: {allow}");
+}
+
+#[tokio::test]
+async fn mkcalendar_creates_a_new_calendar_collection() {
+    let app = router();
+    // Body uses Apple namespace for calendar-color the same way
+    // real clients do.
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"
+              xmlns:IC="http://apple.com/ns/ical/">
+  <D:set>
+    <D:prop>
+      <D:displayname>Holidays</D:displayname>
+      <IC:calendar-color>lightOrange</IC:calendar-color>
+    </D:prop>
+  </D:set>
+</C:mkcalendar>"#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("MKCALENDAR")
+                .uri("/calendars/account-1/cal-holidays/")
+                .header(header::HOST, "127.0.0.1:0")
+                .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The new calendar appears in the depth=1 PROPFIND listing
+    // with its displayname and calendar-color round-tripped.
+    let (status, listing) = send_with(
+        app,
+        "PROPFIND",
+        "/calendars/account-1/",
+        Some("1"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        listing.contains("/calendars/account-1/cal-holidays/"),
+        "MKCALENDAR result missing from listing: {listing}"
+    );
+    assert!(
+        listing.contains("<D:displayname>Holidays</D:displayname>"),
+        "displayname not propagated: {listing}"
+    );
+    assert!(
+        listing.contains("<IC:calendar-color>lightOrange</IC:calendar-color>"),
+        "calendar-color not propagated: {listing}"
+    );
+}
+
+#[tokio::test]
+async fn mkcalendar_on_existing_calendar_returns_405() {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:set>
+    <D:prop>
+      <D:displayname>Duplicate</D:displayname>
+    </D:prop>
+  </D:set>
+</C:mkcalendar>"#;
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("MKCALENDAR")
+                .uri("/calendars/account-1/cal-work/")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn mkcalendar_under_unknown_principal_returns_404() {
+    let body = "<C:mkcalendar xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"></C:mkcalendar>";
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("MKCALENDAR")
+                .uri("/calendars/account-nobody/whatever/")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mkcalendar_visible_through_jmap_calendar_changes() {
+    // Same fixture handle for caldav + jmap. MKCALENDAR records a
+    // calendar_created transition; the next JMAP Calendar/changes
+    // call against the principal's account returns the new id.
+    use saehrimnir::routes;
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
+    let seed_state = fix.state.clone();
+    let handle = saehrimnir::shared::handle(fix);
+    let caldav_app = caldav::router(caldav::AppState {
+        shared: saehrimnir::shared::SharedHandles::for_test(std::sync::Arc::clone(&handle)),
+    });
+    let jmap_app = routes::router(routes::AppState::for_test(std::sync::Arc::clone(&handle)));
+
+    // MKCALENDAR through CalDAV.
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:set><D:prop><D:displayname>Fresh</D:displayname></D:prop></D:set>
+</C:mkcalendar>"#;
+    let resp = caldav_app
+        .oneshot(
+            Request::builder()
+                .method("MKCALENDAR")
+                .uri("/calendars/account-1/cal-fresh/")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // JMAP Calendar/changes since the post-load seed: the new id
+    // appears in `created`.
+    let req = serde_json::json!({
+        "using": [
+            "urn:ietf:params:jmap:core",
+            "urn:ietf:params:jmap:mail",
+            "urn:ietf:params:jmap:calendars"
+        ],
+        "methodCalls": [[
+            "Calendar/changes",
+            { "accountId": "account-1", "sinceState": seed_state },
+            "c0"
+        ]],
+    });
+    let resp = jmap_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/api")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(
+        body["created"],
+        serde_json::json!(["cal-fresh"]),
+        "JMAP Calendar/changes did not see MKCALENDAR write: {body}"
+    );
+}
+
+#[tokio::test]
+async fn multi_account_put_under_secondary_principal_binds_event_to_secondary() {
+    // PUT on /calendars/account-secondary/cal-secondary/ev-new.ics
+    // creates an event whose account_id is account-secondary, not
+    // primary. Verifies via a follow-up GET that the resource is
+    // reachable through the secondary's URL.
+    let app = multi_account_router();
+    let body = "BEGIN:VCALENDAR\r\n\
+                VERSION:2.0\r\n\
+                BEGIN:VEVENT\r\n\
+                UID:ev-secondary-new\r\n\
+                SUMMARY:Authored on secondary\r\n\
+                DTSTART:20260301T100000Z\r\n\
+                DTEND:20260301T110000Z\r\n\
+                END:VEVENT\r\n\
+                END:VCALENDAR\r\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/calendars/account-secondary/cal-secondary/ev-secondary-new.ics")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The same event 404s under the primary's principal URL even
+    // though the calendar segment is different (path parses but the
+    // calendar isn't in primary's account).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-primary/cal-secondary/ev-secondary-new.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Reachable through the secondary's URL.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/account-secondary/cal-secondary/ev-secondary-new.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

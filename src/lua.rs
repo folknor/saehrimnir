@@ -180,6 +180,8 @@ struct Builder {
     categories: Vec<crate::fixture::RawCategory>,
     /// Microsoft Graph groups accumulated via `group({...})`.
     groups: Vec<crate::fixture::RawGroup>,
+    /// Gmail SendAs identities accumulated via `send_as({...})`.
+    send_as: Vec<crate::fixture::RawSendAs>,
 }
 
 impl Builder {
@@ -203,6 +205,7 @@ impl Builder {
             contacts: self.contacts,
             categories: self.categories,
             groups: self.groups,
+            send_as: self.send_as,
             // Lua change_script lives in `Builder::change_script`
             // (fully-typed `Vec<ChangeStep>`) and is grafted onto
             // the Fixture after `normalize_with_dir` returns; the
@@ -244,6 +247,8 @@ fn install_builders(state: &mut State) {
     state.set_global("category");
     state.push_rust_fn(builder_group);
     state.set_global("group");
+    state.push_rust_fn(builder_send_as);
+    state.set_global("send_as");
     state.push_rust_fn(builder_wait);
     state.set_global("wait");
     state.push_rust_fn(builder_mock_done);
@@ -454,6 +459,27 @@ fn builder_category(state: &mut State) -> dellingr::Result<u8> {
         account_id: read_string_opt(state, 1, "account_id")?,
     };
     builder_mut(state)?.categories.push(cat);
+    Ok(0)
+}
+
+/// `send_as { send_as_email, display_name?, reply_to_address?,
+///   signature?, is_primary?, is_default?, treat_as_alias?,
+///   account_id? }`. Gmail SendAs identity. The `send_as_email` is
+/// the primary key per account. Multi-account fixtures may declare
+/// the same address under different accounts.
+fn builder_send_as(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "send_as")?;
+    let sa = crate::fixture::RawSendAs {
+        send_as_email: read_string(state, 1, "send_as_email")?,
+        account_id: read_string_opt(state, 1, "account_id")?,
+        display_name: read_string_opt(state, 1, "display_name")?,
+        reply_to_address: read_string_opt(state, 1, "reply_to_address")?,
+        signature: read_string_opt(state, 1, "signature")?,
+        is_primary: read_bool_opt(state, 1, "is_primary")?,
+        is_default: read_bool_opt(state, 1, "is_default")?,
+        treat_as_alias: read_bool_opt(state, 1, "treat_as_alias")?,
+    };
+    builder_mut(state)?.send_as.push(sa);
     Ok(0)
 }
 

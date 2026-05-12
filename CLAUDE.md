@@ -87,9 +87,12 @@ checking whether the fact is already in `notes/`.
   or token lookup via `TokenStore`); LIST / STATUS / SELECT /
   FETCH then scope by that account. SMTP `AUTH` shares the same
   SASL helpers; `Submission` records the resolved account
-  (exposed on `GET /test/smtp/submissions`). CalDAV still
-  scopes to primary; the limitation is invisible in current
-  single-account fixtures.
+  (exposed on `GET /test/smtp/submissions`). CalDAV resolves
+  the `{user}` segment in `/principals/{user}/` and
+  `/calendars/{user}/...` against every declared account id;
+  PROPFIND / GET / PUT / DELETE scope listings + lookups
+  through `Fixture::calendars_for`, so a cross-principal
+  calendar reference 404s. Unknown principals 404 too.
 - One shared fixture per process, behind a single
   `Arc<RwLock<Fixture>>` (`shared::FixtureHandle`). Read paths take
   brief read guards; the JMAP `Email/set` / `Mailbox/set` mutators
@@ -100,9 +103,16 @@ checking whether the fact is already in `notes/`.
 - `Fixture::state` advances on every successful mutation; the
   `change_log` (bounded at 256 transitions) records per-resource
   ids per transition. `Email/changes` and `Mailbox/changes` walk
-  it to compute real deltas with RFC 8620 §5.2 dominance applied
-  (created+destroyed cancels, created+updated collapses, etc.).
-  Unknown / evicted `sinceState` returns `cannotCalculateChanges`.
+  it via `email_delta_since_account` / `mailbox_delta_since_account`
+  to partition the wire delta by the request's `accountId`:
+  created / updated ids filter against the live resource's
+  `account_id`, and destroyed ids filter against the parallel
+  `email_destroyed_accounts` / `mailbox_destroyed_accounts`
+  recorded at retire time. Mutations on a multi-account fixture's
+  secondary do not leak into the primary's /changes walk. RFC 8620
+  §5.2 dominance applies after the filter (created+destroyed
+  cancels, created+updated collapses, etc.). Unknown / evicted
+  `sinceState` returns `cannotCalculateChanges`.
   Out-of-scope JMAP methods (`EmailSubmission/set`, push,
   `Thread/get`, etc.) still return `unknownMethod`. Out-of-scope
   IMAP commands (write paths, IDLE, NOTIFY, etc.) return `BAD`.
@@ -515,7 +525,16 @@ Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`
 projection of fixture emails into Gmail's nested mimePart shape) +
 `/history` (read-only no-op since fixtures don't change) +
 `/messages/{id}/attachments/{aid}` (404 stub) + `/settings/sendAs`
-(empty list). Catchall returns Gmail error envelope. Module
+(list + per-address GET + PATCH). SendAs identities project from
+fixture `[[send_as]]` rows (TOML) or Lua `send_as({...})` builder,
+keyed `(account_id, send_as_email)`. List + GET scope to the
+bearer-resolved account; PATCH does a sparse merge on
+`displayName` / `replyToAddress` / `signature` / `isDefault` /
+`treatAsAlias` (real Gmail's read-only `isPrimary` is silently
+ignored on write). PATCH writes through a brief write guard
+without recording a change-log transition, since Gmail has no
+`sendAs`-side `/changes` endpoint and harness scripts re-GET to
+observe the update. Catchall returns Gmail error envelope. Module
 structure leaves room for People-API contacts and Drive sibling
 files.
 
@@ -567,8 +586,16 @@ the event with the same If-Match semantics. Mutations land on
 the change_log so a subsequent Graph `calendarView/delta`
 observes the CalDAV write through the same `event_*` id sets.
 ETags and CTags derive deterministically from `Fixture::state`
-plus the resource id. v0 explicitly does not implement
-MKCALENDAR / PROPPATCH / ACLs / scheduling / recurrence.
+plus the resource id. `MKCALENDAR` on
+`/calendars/{user}/{cal}/` parses optional `displayname` /
+`calendar-color` props from the request body, creates the
+fixture `Calendar` bound to the principal's account, and records
+a `calendar_created` transition; Graph `/v1.0/me/calendars`
+(live read) and JMAP `Calendar/changes` (delta walk via
+`calendar_delta_since_account`) both observe the write. Returns
+405 on an existing calendar id and 404 under an unknown
+principal. v0 explicitly does not implement PROPPATCH / ACLs /
+scheduling.
 
 Lua fixture loader: wired via [dellingr](https://crates.io/crates/dellingr),
 a pure-Rust deterministic sandboxed Lua VM with cost-bounded

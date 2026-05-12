@@ -272,11 +272,180 @@ async fn attachment_fetch_returns_404_for_missing_blobs() {
 }
 
 #[tokio::test]
-async fn send_as_is_empty_so_signature_sync_is_a_noop() {
+async fn send_as_empty_fixture_returns_empty_list() {
+    // `fixtures/jmap-small.toml` declares no `[[send_as]]` rows;
+    // a GET still returns the envelope with an empty array.
     let (status, v) =
         get_json("/gmail/v1/users/me/settings/sendAs").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["sendAs"].as_array().unwrap().len(), 0);
+}
+
+fn multi_account_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    gmail::router(gmail::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+async fn get_json_with_bearer(
+    router: axum::Router,
+    uri: &str,
+    bearer: &str,
+) -> (StatusCode, Value) {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn send_as_lists_fixture_authored_identities() {
+    // The multi-account fixture declares one `[[send_as]]` per
+    // account. Without a bearer token, sæhrimnir falls back to the
+    // primary account, so we see only the primary's identity.
+    let (status, v) =
+        get_json_with(multi_account_router(), "/gmail/v1/users/me/settings/sendAs").await;
+    assert_eq!(status, StatusCode::OK);
+    let list = v["sendAs"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["sendAsEmail"], "primary@example.com");
+    assert_eq!(list[0]["displayName"], "Primary User");
+    assert_eq!(list[0]["isPrimary"], true);
+    assert_eq!(list[0]["isDefault"], true);
+    assert!(list[0]["signature"].as_str().unwrap().contains("primary"));
+}
+
+#[tokio::test]
+async fn send_as_get_by_email_returns_the_entry() {
+    let (status, v) = get_json_with(
+        multi_account_router(),
+        "/gmail/v1/users/me/settings/sendAs/primary@example.com",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["sendAsEmail"], "primary@example.com");
+    assert_eq!(v["displayName"], "Primary User");
+}
+
+#[tokio::test]
+async fn send_as_get_unknown_email_returns_404() {
+    let (status, v) = get_json_with(
+        multi_account_router(),
+        "/gmail/v1/users/me/settings/sendAs/nobody@example.com",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
+}
+
+#[tokio::test]
+async fn send_as_patch_replaces_listed_fields_only() {
+    let app = multi_account_router();
+    let patch = serde_json::json!({
+        "signature": "<p>new sig</p>",
+        "displayName": "Renamed User"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/gmail/v1/users/me/settings/sendAs/primary@example.com")
+                .header(header::AUTHORIZATION, "Bearer x")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&patch).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["signature"], "<p>new sig</p>");
+    assert_eq!(v["displayName"], "Renamed User");
+    // isDefault/isPrimary were not in the body; their original
+    // values must survive.
+    assert_eq!(v["isPrimary"], true);
+    assert_eq!(v["isDefault"], true);
+
+    // GET after PATCH surfaces the updated signature - the write
+    // persisted on the shared fixture handle.
+    let (status, v) = get_json_with(
+        app,
+        "/gmail/v1/users/me/settings/sendAs/primary@example.com",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["signature"], "<p>new sig</p>");
+    assert_eq!(v["displayName"], "Renamed User");
+}
+
+#[tokio::test]
+async fn send_as_patch_ignores_is_primary_per_real_gmail() {
+    // Real Gmail rejects writes to `isPrimary`; v0 silently ignores
+    // it so a misbehaving client doesn't corrupt the fixture.
+    let app = multi_account_router();
+    let patch = serde_json::json!({ "isPrimary": false });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/gmail/v1/users/me/settings/sendAs/primary@example.com")
+                .header(header::AUTHORIZATION, "Bearer x")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&patch).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = serde_json::from_slice(
+        &resp.into_body().collect().await.unwrap().to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(v["isPrimary"], true, "isPrimary should be read-only");
+}
+
+#[tokio::test]
+async fn send_as_with_bearer_scoping_returns_each_accounts_identity() {
+    // Mint a token bound to the secondary account; the resulting
+    // sendAs list contains only secondary's identity.
+    use saehrimnir::oauth::TokenStore;
+    let store = TokenStore::default();
+    let token_secondary = store.mint("authorization_code", "account-secondary", 1);
+
+    let mut fix = fixture::load(std::path::Path::new(
+        "fixtures/multi-account-small.toml",
+    ))
+    .unwrap();
+    fix.oauth = saehrimnir::fixture::OAuthConfig {
+        enforce: false,
+        issuer: "https://saehrimnir.test/oauth".to_string(),
+    };
+    let handle = saehrimnir::shared::handle(fix);
+    let shared = saehrimnir::shared::SharedHandles::for_test(handle).with_token_store(store);
+    let app = gmail::router(gmail::AppState { shared });
+
+    let (status, v) = get_json_with_bearer(
+        app,
+        "/gmail/v1/users/me/settings/sendAs",
+        &token_secondary,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let list = v["sendAs"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["sendAsEmail"], "secondary@example.com");
 }
 
 #[tokio::test]

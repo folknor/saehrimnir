@@ -134,6 +134,7 @@ pub async fn serve(
 /// stack) emits them that way.
 const PROPFIND: &str = "PROPFIND";
 const REPORT: &str = "REPORT";
+const MKCALENDAR: &str = "MKCALENDAR";
 
 async fn dispatch(
     State(state): State<AppState>,
@@ -161,6 +162,9 @@ async fn dispatch(
     }
     if m == REPORT {
         return handle_report(&state, &path, &headers, &body).await;
+    }
+    if m == MKCALENDAR {
+        return handle_mkcalendar(&state, &path, &body).await;
     }
     match method {
         Method::GET => handle_get(&state, &path, &headers).await,
@@ -246,20 +250,24 @@ fn parse_path(fixture: &crate::fixture::Fixture, path: &str) -> ResourcePath {
         .filter(|s| !s.is_empty())
         .map(percent_decode)
         .collect();
-    let user = &fixture.primary_account().id;
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    // The `{user}` segment in `/principals/{user}/` and
+    // `/calendars/{user}/...` names a declared account by id. Multi-
+    // account fixtures hand each principal its own URL space; pre-fix
+    // we only accepted the primary id, which left secondary
+    // principals 404 even when the fixture declared them.
     match segs.as_slice() {
-        ["principals", u] if u == user => ResourcePath::Principal {
+        ["principals", u] if fixture.account(u).is_some() => ResourcePath::Principal {
             user: (*u).to_string(),
         },
-        ["calendars", u] if u == user => ResourcePath::CalendarHome {
+        ["calendars", u] if fixture.account(u).is_some() => ResourcePath::CalendarHome {
             user: (*u).to_string(),
         },
-        ["calendars", u, cal] if u == user => ResourcePath::Calendar {
+        ["calendars", u, cal] if fixture.account(u).is_some() => ResourcePath::Calendar {
             user: (*u).to_string(),
             calendar_id: (*cal).to_string(),
         },
-        ["calendars", u, cal, event] if u == user => {
+        ["calendars", u, cal, event] if fixture.account(u).is_some() => {
             let event_id = event.strip_suffix(".ics").unwrap_or(event).to_string();
             ResourcePath::Event {
                 user: (*u).to_string(),
@@ -366,7 +374,10 @@ fn propfind_principal(fixture: &crate::fixture::Fixture, user: &str, body: &str)
 }
 
 /// PROPFIND on `/calendars/{user}/`. Depth=0 returns just the home
-/// collection; Depth=1 lists every calendar plus the home.
+/// collection; Depth=1 lists every calendar plus the home. The
+/// listing is account-scoped to `user`'s principal so a multi-account
+/// fixture's secondary principal does not surface the primary's
+/// calendars (or vice versa).
 fn propfind_calendar_home(
     fixture: &crate::fixture::Fixture,
     user: &str,
@@ -384,7 +395,7 @@ fn propfind_calendar_home(
     let mut per_calendar_hrefs = Vec::new();
     let mut per_calendar_props = Vec::new();
     if depth >= 1 {
-        for cal in &fixture.calendars {
+        for cal in fixture.calendars_for(user) {
             per_calendar_hrefs.push(format!("/calendars/{user}/{}/", cal.id));
             per_calendar_props.push(calendar_props(fixture, cal, &requested));
         }
@@ -399,8 +410,10 @@ fn propfind_calendar_home(
 }
 
 /// PROPFIND on `/calendars/{user}/{cal}/`. Depth=0 returns just
-/// the calendar's own props; Depth=1 also lists each event resource
-/// (handled in wedge C).
+/// the calendar's own props; Depth=1 also lists each event resource.
+/// The calendar must belong to the `{user}` principal - a request
+/// for another account's calendar through this principal's URL
+/// returns 404 so principals stay isolated.
 fn propfind_calendar(
     fixture: &crate::fixture::Fixture,
     user: &str,
@@ -409,7 +422,7 @@ fn propfind_calendar(
     depth: u8,
 ) -> Response {
     let requested = xml::requested_props(body);
-    let cal = match fixture.calendars.iter().find(|c| c.id == calendar_id) {
+    let cal = match fixture.calendars_for(user).find(|c| c.id == calendar_id) {
         Some(c) => c,
         None => return not_found(&format!("/calendars/{user}/{calendar_id}/")),
     };
@@ -420,7 +433,6 @@ fn propfind_calendar(
         href: &cal_href,
         ok_props: &cal_props,
     }];
-    // Depth=1 event listing handled in wedge C.
     let mut event_hrefs = Vec::new();
     let mut event_props = Vec::new();
     if depth >= 1 {
@@ -439,7 +451,9 @@ fn propfind_calendar(
 }
 
 /// PROPFIND on a single event resource. Used rarely; ratatoskr
-/// prefers `REPORT calendar-multiget` for the bulk fetch path.
+/// prefers `REPORT calendar-multiget` for the bulk fetch path. The
+/// event's calendar must belong to `{user}` - a cross-account lookup
+/// through this principal's URL 404s.
 fn propfind_event(
     fixture: &crate::fixture::Fixture,
     user: &str,
@@ -448,6 +462,12 @@ fn propfind_event(
     body: &str,
 ) -> Response {
     let requested = xml::requested_props(body);
+    let calendar_in_account = fixture
+        .calendars_for(user)
+        .any(|c| c.id == calendar_id);
+    if !calendar_in_account {
+        return not_found(&format!("/calendars/{user}/{calendar_id}/{event_id}.ics"));
+    }
     let ev = match fixture
         .events
         .iter()
@@ -740,7 +760,7 @@ async fn handle_report(
         // filters.
         _ => return not_found(path),
     };
-    if !fixture.calendars.iter().any(|c| c.id == calendar_id) {
+    if !fixture.calendars_for(&user).any(|c| c.id == calendar_id) {
         return not_found(path);
     }
 
@@ -904,13 +924,13 @@ async fn handle_get(state: &AppState, path: &str, _headers: &HeaderMap) -> Respo
     let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
     match parse_path(&fixture, path) {
         ResourcePath::Event {
-            user: _,
+            user,
             calendar_id,
             event_id,
         } => match fixture
             .events
             .iter()
-            .find(|e| e.id == event_id && e.calendar_id == calendar_id)
+            .find(|e| e.id == event_id && e.calendar_id == calendar_id && e.account_id == user)
         {
             Some(ev) => {
                 let body = ical::event_to_ical(ev);
@@ -950,17 +970,17 @@ async fn handle_put(
     // taking the write guard. The fixture image stays read-locked
     // for the duration of the parse + validate; we drop it before
     // re-acquiring as a write.
-    let (calendar_id, event_id, parsed) = {
+    let (user, calendar_id, event_id, parsed) = {
         let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
-        let (cal, event_id) = match parse_path(&fixture, path) {
+        let (user, cal, event_id) = match parse_path(&fixture, path) {
             ResourcePath::Event {
-                user: _,
+                user,
                 calendar_id,
                 event_id,
-            } => (calendar_id, event_id),
+            } => (user, calendar_id, event_id),
             _ => return not_found(path),
         };
-        if !fixture.calendars.iter().any(|c| c.id == cal) {
+        if !fixture.calendars_for(&user).any(|c| c.id == cal) {
             return not_found(path);
         }
         let parsed = match ical::parse_vevent(body_str) {
@@ -980,15 +1000,16 @@ async fn handle_put(
                 "PUT body UID {body_uid:?} does not match URL event id {event_id:?}"
             ));
         }
-        (cal, event_id, parsed)
+        (user, cal, event_id, parsed)
     };
 
     // Now acquire write. Re-validate the calendar (it might have
     // been destroyed between the read and write guard) and
     // honour If-Match against the current event ETag (or the
-    // wildcard `*` against existence).
+    // wildcard `*` against existence). Calendar must still belong
+    // to `user`'s principal after any concurrent mutation.
     let mut fixture = state.shared.fixture.write().expect("fixture lock poisoned");
-    if !fixture.calendars.iter().any(|c| c.id == calendar_id) {
+    if !fixture.calendars_for(&user).any(|c| c.id == calendar_id) {
         return not_found(path);
     }
     let existing_idx = fixture
@@ -1025,16 +1046,13 @@ async fn handle_put(
         // match `synthesize_event_dto`'s behaviour in ratatoskr.
         None => start + chrono::Duration::hours(1),
     };
-    // Derive the event's account from its calendar's account.
-    let calendar_account_id = fixture
-        .calendars
-        .iter()
-        .find(|c| c.id == calendar_id)
-        .map(|c| c.account_id.clone())
-        .unwrap_or_else(|| fixture.primary_account().id.clone());
+    // Derive the event's account from the principal that owns the
+    // URL. The calendar exists in this principal's space (we already
+    // checked `calendars_for(&user)` above), so `user` is the
+    // authoritative source.
     let new_event = crate::fixture::Event {
         id: id.clone(),
-        account_id: calendar_account_id,
+        account_id: user.clone(),
         calendar_id: calendar_id.clone(),
         subject: parsed.summary.unwrap_or_default(),
         body_preview: None,
@@ -1086,14 +1104,18 @@ async fn handle_delete(state: &AppState, path: &str, headers: &HeaderMap) -> Res
         .and_then(|v| v.to_str().ok())
         .map(str::trim);
     let mut fixture = state.shared.fixture.write().expect("fixture lock poisoned");
-    let (calendar_id, event_id) = match parse_path(&fixture, path) {
+    let (user, calendar_id, event_id) = match parse_path(&fixture, path) {
         ResourcePath::Event {
-            user: _,
+            user,
             calendar_id,
             event_id,
-        } => (calendar_id, event_id),
+        } => (user, calendar_id, event_id),
         _ => return not_found(path),
     };
+    // Cross-account lookups under this principal's URL 404.
+    if !fixture.calendars_for(&user).any(|c| c.id == calendar_id) {
+        return not_found(path);
+    }
     let idx = fixture
         .events
         .iter()
@@ -1143,9 +1165,74 @@ fn handle_options() -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header("DAV", "1, calendar-access")
-        .header("Allow", "OPTIONS, PROPFIND, REPORT, GET, PUT, DELETE")
+        .header(
+            "Allow",
+            "OPTIONS, PROPFIND, REPORT, GET, PUT, DELETE, MKCALENDAR",
+        )
         .body(Body::empty())
         .expect("static OPTIONS response builds")
+}
+
+/// `MKCALENDAR` on `/calendars/{user}/{cal}/`. Parses the optional
+/// `<D:set><D:prop>...</D:prop></D:set>` block for `displayname` and
+/// Apple `calendar-color`, then creates a new fixture `Calendar`
+/// bound to the principal's account. Records a `calendar_created`
+/// transition so Graph `/v1.0/me/calendars` (which reads live
+/// state) and JMAP `Calendar/changes` (which walks the delta) both
+/// observe the new calendar.
+///
+/// RFC 4791 §5.3.1 wire shape:
+/// - 201 Created on success
+/// - 405 Method Not Allowed if the URL already exists
+/// - 409 Conflict for unknown intermediate collections (we 404
+///   instead since the URL space is fixed by the principal)
+async fn handle_mkcalendar(state: &AppState, path: &str, body: &[u8]) -> Response {
+    let body_str = match body_to_str(body) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let (user, calendar_id) = {
+        let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
+        match parse_path(&fixture, path) {
+            ResourcePath::Calendar { user, calendar_id } => (user, calendar_id),
+            _ => return not_found(path),
+        }
+    };
+
+    let display_name = xml::text_value(body_str, "displayname").unwrap_or_else(|| calendar_id.clone());
+    let color = xml::text_value(body_str, "calendar-color");
+
+    let mut fixture = state.shared.fixture.write().expect("fixture lock poisoned");
+    if fixture.calendars.iter().any(|c| c.id == calendar_id) {
+        // Existing calendar at this URL: RFC 4791 §5.3.1.2 (HTTP
+        // 405). Real clients fall back to PROPPATCH; we simply
+        // refuse the create.
+        return Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Body::from(format!(
+                "calendar {calendar_id:?} already exists",
+            )))
+            .expect("static 405 response builds");
+    }
+    let new_cal = crate::fixture::Calendar {
+        id: calendar_id.clone(),
+        name: display_name,
+        color,
+        is_default: false,
+        account_id: user.clone(),
+    };
+    let cal_id_for_diff = calendar_id.clone();
+    fixture.mutate(|f| {
+        f.calendars.push(new_cal.clone());
+        crate::fixture::MutationDiff {
+            calendar_created: vec![cal_id_for_diff.clone()],
+            ..Default::default()
+        }
+    });
+    Response::builder()
+        .status(StatusCode::CREATED)
+        .body(Body::empty())
+        .expect("static MKCALENDAR response builds")
 }
 
 fn not_implemented(verb: &str) -> Response {

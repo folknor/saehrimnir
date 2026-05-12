@@ -139,6 +139,34 @@ pub(crate) fn collect_hrefs(body: &str) -> Vec<String> {
     }
 }
 
+/// Extract the trimmed text inside the first `<...local_name>...
+/// </...local_name>` element in `body`, ignoring namespace prefixes.
+/// Returns `None` when the element is absent or self-closing.
+/// Used by MKCALENDAR to read `displayname` / `calendar-color` /
+/// `description` out of the request body. The result is *not*
+/// XML-unescaped because the v0 fixture format doesn't use entity
+/// references; clients that send `&amp;` in a displayname will see
+/// the literal `&amp;` round-trip back through GET. Tracked as a
+/// future limitation; trivial to lift if a fixture needs it.
+pub(crate) fn text_value(body: &str, local_name: &str) -> Option<String> {
+    let open = find_tag_open(body, local_name)?;
+    let after_open = &body[open..];
+    let gt = after_open.find('>')?;
+    // Self-closing (`<displayname/>`) carries no text.
+    if after_open.as_bytes()[gt - 1] == b'/' {
+        return None;
+    }
+    let value_start = open + gt + 1;
+    let value_slice = &body[value_start..];
+    let close = find_tag_close(value_slice, local_name)?;
+    let value = value_slice[..close].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 /// Find an opening tag for `local_name`, allowing any namespace
 /// prefix. Returns the byte offset of the opening `<` or `None`.
 fn find_tag_open(haystack: &str, local_name: &str) -> Option<usize> {
