@@ -136,6 +136,24 @@ const PROPFIND: &str = "PROPFIND";
 const REPORT: &str = "REPORT";
 const MKCALENDAR: &str = "MKCALENDAR";
 
+/// Resolve the requesting principal from an `Authorization: Basic`
+/// header. Returns `Some(account_id)` when the decoded username matches
+/// a declared fixture account by id, else `None`. Multi-account CalDAV
+/// fixtures rely on this to route the bootstrap PROPFIND on `/` to the
+/// authenticating principal rather than always to the fixture's
+/// primary - real CalDAV servers identify the user from the credential.
+fn account_from_basic_auth(
+    fixture: &crate::fixture::Fixture,
+    headers: &HeaderMap,
+) -> Option<String> {
+    let value = headers.get("authorization")?.to_str().ok()?;
+    let b64 = value.strip_prefix("Basic ").or_else(|| value.strip_prefix("basic "))?;
+    let decoded = crate::imap::sasl_decode_b64(b64.trim())?;
+    let creds = std::str::from_utf8(&decoded).ok()?;
+    let (user, _pass) = creds.split_once(':')?;
+    fixture.account(user).map(|a| a.id.clone())
+}
+
 async fn dispatch(
     State(state): State<AppState>,
     method: Method,
@@ -190,9 +208,10 @@ async fn handle_propfind(
     let depth = depth_header(headers);
     let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
 
+    let auth_user = account_from_basic_auth(&fixture, headers);
     match parse_path(&fixture, path) {
-        ResourcePath::Root => propfind_root(&fixture, body_str),
-        ResourcePath::WellKnown => propfind_root(&fixture, body_str),
+        ResourcePath::Root => propfind_root(&fixture, auth_user.as_deref(), body_str),
+        ResourcePath::WellKnown => propfind_root(&fixture, auth_user.as_deref(), body_str),
         ResourcePath::Principal { user } => {
             propfind_principal(&fixture, &user, body_str)
         }
@@ -318,9 +337,21 @@ fn percent_decode(segment: &str) -> String {
 /// properties on the root resource; we honour
 /// `current-user-principal` and silently drop anything else (a
 /// truly conformant server would emit them under a 404 propstat).
-fn propfind_root(fixture: &crate::fixture::Fixture, body: &str) -> Response {
+fn propfind_root(
+    fixture: &crate::fixture::Fixture,
+    auth_user: Option<&str>,
+    body: &str,
+) -> Response {
     let requested = xml::requested_props(body);
-    let user = &fixture.primary_account().id;
+    // Multi-account fixtures want the bootstrap PROPFIND to surface
+    // the authenticating principal, not the fixture-level primary -
+    // otherwise a secondary account would discover the primary's
+    // principal URL and import the primary's calendars. Fall back to
+    // the primary id when no usable Basic Auth header is present so
+    // single-account fixtures (which never send credentials in tests)
+    // keep working.
+    let primary_id = fixture.primary_account().id.clone();
+    let user = auth_user.unwrap_or(&primary_id);
     let principal_url = format!("/principals/{user}/");
     let mut props = String::new();
     if requested.contains("current-user-principal") {
