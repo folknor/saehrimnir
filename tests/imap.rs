@@ -883,6 +883,82 @@ async fn imap_authenticate_xoauth2_resolves_via_token_store() {
     // the body subject through a FETCH.
 }
 
+/// Two TCP connections against the same shared `RequestLog` each
+/// get a distinct `connection_id`, and every command on a given
+/// connection carries the same id. The Phase 7 ratatoskr harness
+/// assertion ("one LOGIN + one SELECT per (account, folder) batch")
+/// is derived directly from this primitive.
+#[tokio::test]
+async fn per_connection_id_groups_request_log_entries() {
+    let fix = saehrimnir::shared::handle(
+        fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap(),
+    );
+    let shared_log = saehrimnir::request_log::RequestLog::default();
+
+    async fn drive_session(
+        fix: saehrimnir::shared::FixtureHandle,
+        log: saehrimnir::request_log::RequestLog,
+        script: &[u8],
+    ) {
+        let (server, mut client) = tokio::io::duplex(32 * 1024);
+        let (_tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let mut rx = rx;
+            imap::serve_connection(
+                server,
+                fix,
+                None,
+                saehrimnir::oauth::TokenStore::default(),
+                log,
+                saehrimnir::latency::LatencyKnob::default(),
+                &mut rx,
+            )
+            .await
+        });
+        client.write_all(script).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    drive_session(
+        Arc::clone(&fix),
+        shared_log.clone(),
+        b"a LOGIN u p\r\nb SELECT INBOX\r\nc UID FETCH 1 (UID)\r\nq LOGOUT\r\n",
+    )
+    .await;
+    drive_session(
+        Arc::clone(&fix),
+        shared_log.clone(),
+        b"a LOGIN u p\r\nb SELECT INBOX\r\nq LOGOUT\r\n",
+    )
+    .await;
+
+    let entries: Vec<_> = shared_log
+        .snapshot()
+        .into_iter()
+        .filter(|e| e.protocol == "imap")
+        .collect();
+    let ids: Vec<u64> = entries.iter().filter_map(|e| e.connection_id).collect();
+    assert_eq!(ids.len(), entries.len(), "every imap entry has an id");
+    let mut distinct: Vec<u64> = ids.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 2, "two TCP connections, two ids: {ids:?}");
+
+    // First session: 4 commands (LOGIN, SELECT, UID FETCH, LOGOUT).
+    // Second session: 3 (LOGIN, SELECT, LOGOUT). Verify the run
+    // lengths match by walking the log in order.
+    let first_id = ids[0];
+    let first_run = ids.iter().take_while(|&&i| i == first_id).count();
+    let second_run = ids.iter().skip(first_run).count();
+    assert_eq!(first_run, 4);
+    assert_eq!(second_run, 3);
+    let second_id = ids[first_run];
+    assert!(ids[first_run..].iter().all(|&i| i == second_id));
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     // Standard base64 with `=` padding.
     const ALPHA: &[u8; 64] =

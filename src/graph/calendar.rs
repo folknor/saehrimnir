@@ -128,27 +128,30 @@ async fn get_event_me(State(state): State<AppState>, Path(event): Path<String>) 
 async fn create_event_me(
     State(state): State<AppState>,
     Path(calendar): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: AxumBody,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    create_event_impl(state, &account_id, &calendar, body, true).await
+    create_event_impl(state, &account_id, &calendar, body, true, connection_id).await
 }
 
 async fn patch_event_me(
     State(state): State<AppState>,
     Path(event): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: AxumBody,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    patch_event_impl(state, &account_id, &event, body, true).await
+    patch_event_impl(state, &account_id, &event, body, true, connection_id).await
 }
 
 async fn delete_event_me(
     State(state): State<AppState>,
     Path(event): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    delete_event_impl(state, &account_id, &event, true).await
+    delete_event_impl(state, &account_id, &event, true, connection_id).await
 }
 
 // ── /users/{user}/ wrappers ─────────────────────────────────────────
@@ -216,36 +219,39 @@ async fn get_event_user(
 async fn create_event_user(
     State(state): State<AppState>,
     Path((user, calendar)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: AxumBody,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    create_event_impl(state, &account_id, &calendar, body, false).await
+    create_event_impl(state, &account_id, &calendar, body, false, connection_id).await
 }
 
 async fn patch_event_user(
     State(state): State<AppState>,
     Path((user, event)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: AxumBody,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    patch_event_impl(state, &account_id, &event, body, false).await
+    patch_event_impl(state, &account_id, &event, body, false, connection_id).await
 }
 
 async fn delete_event_user(
     State(state): State<AppState>,
     Path((user, event)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    delete_event_impl(state, &account_id, &event, false).await
+    delete_event_impl(state, &account_id, &event, false, connection_id).await
 }
 
 // ── Inner handlers ──────────────────────────────────────────────────
@@ -501,6 +507,7 @@ async fn create_event_impl(
     calendar: &str,
     body: AxumBody,
     me_path: bool,
+    connection_id: Option<u64>,
 ) -> Response {
     let calendar_known = {
         let fixture = state.fixture();
@@ -522,10 +529,11 @@ async fn create_event_impl(
     } else {
         format!("POST /v1.0/users/{account_id}/calendars/{calendar}/events")
     };
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "graph",
         log_path,
         crate::request_log::body_detail(&parsed),
+        connection_id,
     );
 
     let result: Result<Value, Response> = {
@@ -567,6 +575,7 @@ async fn patch_event_impl(
     event: &str,
     body: AxumBody,
     me_path: bool,
+    connection_id: Option<u64>,
 ) -> Response {
     let event_known = {
         let fixture = state.fixture();
@@ -588,10 +597,11 @@ async fn patch_event_impl(
     } else {
         format!("PATCH /v1.0/users/{account_id}/events/{event}")
     };
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "graph",
         log_path,
         crate::request_log::body_detail(&parsed),
+        connection_id,
     );
 
     let result: Result<Value, Response> = {
@@ -636,6 +646,7 @@ async fn delete_event_impl(
     account_id: &str,
     event: &str,
     me_path: bool,
+    connection_id: Option<u64>,
 ) -> Response {
     let event_known = {
         let fixture = state.fixture();
@@ -653,10 +664,11 @@ async fn delete_event_impl(
     } else {
         format!("DELETE /v1.0/users/{account_id}/events/{event}")
     };
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "graph",
         log_path,
         json!({ "id": event }),
+        connection_id,
     );
 
     {

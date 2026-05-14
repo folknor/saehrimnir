@@ -44,6 +44,20 @@ pub struct RequestEntry {
     pub command: String,
     pub received_at: DateTime<Utc>,
     pub detail: Value,
+    /// Per-accepted-TCP-connection id assigned by
+    /// `crate::connection_id::next()` in the listener's
+    /// `serve_connection` path. `None` when the entry was recorded
+    /// outside any connection boundary - which today means
+    /// `tower::ServiceExt::oneshot` test paths (they bypass
+    /// axum's `into_make_service_with_connect_info`) and direct
+    /// `RequestLog` construction in unit tests. Harness scripts
+    /// group entries by this field to assert per-session
+    /// behavior (e.g. "one LOGIN + one SELECT per folder").
+    /// `GET /test/requests?stable=true` rewrites raw ids to
+    /// dense first-seen indices for byte-deterministic snapshots;
+    /// see `routes::requests_get`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<u64>,
 }
 
 /// Shared, cheap-to-clone handle. Backed by a
@@ -81,11 +95,28 @@ impl RequestLog {
     /// callers should use this rather than constructing
     /// `RequestEntry` by hand.
     pub fn record(&self, protocol: &'static str, command: impl Into<String>, detail: Value) {
+        self.record_with_conn(protocol, command, detail, None);
+    }
+
+    /// Like [`record`], but stamps a per-connection id. Used by the
+    /// protocol layers from inside `serve_connection` (IMAP, SMTP)
+    /// or from an axum handler that extracted
+    /// `ConnectInfo<crate::connection_id::ConnInfo>`. Pass `None`
+    /// when no connection boundary is meaningful (test-only paths,
+    /// background recorders).
+    pub fn record_with_conn(
+        &self,
+        protocol: &'static str,
+        command: impl Into<String>,
+        detail: Value,
+        connection_id: Option<u64>,
+    ) {
         self.push(RequestEntry {
             protocol,
             command: command.into(),
             received_at: Utc::now(),
             detail,
+            connection_id,
         });
     }
 

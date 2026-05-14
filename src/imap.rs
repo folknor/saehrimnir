@@ -125,6 +125,7 @@ where
         latency,
         selected: None,
         account_id: primary_account_id,
+        connection_id: crate::connection_id::next(),
     };
 
     conn.write_line(GREETING.trim_end_matches("\r\n")).await?;
@@ -176,6 +177,12 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     /// credential that doesn't match any account leaves this on
     /// primary, matching the v0 "no auth in v0" baseline.
     account_id: String,
+    /// Per-accepted-TCP-connection id stamped onto every entry this
+    /// connection records into [`request_log`]. Allocated once per
+    /// `serve_connection` call from `connection_id::next()`; lets
+    /// harness scripts group entries by session (one LOGIN +
+    /// N SELECTs vs N LOGINs + N SELECTs).
+    connection_id: u64,
 }
 
 enum ReadOutcome {
@@ -333,7 +340,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             detail["attrs"] = serde_json::json!(attr_names);
             detail["body"] = serde_json::json!(body);
         }
-        self.request_log.record("imap", recorded, detail);
+        self.request_log
+            .record_with_conn("imap", recorded, detail, Some(self.connection_id));
         match cmd_upper.as_str() {
             "CAPABILITY" => self.cmd_capability(parsed.tag).await,
             "NOOP" => self.cmd_noop(parsed.tag).await,

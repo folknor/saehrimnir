@@ -116,15 +116,18 @@ pub async fn serve(
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let app = router(state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            while shutdown.changed().await.is_ok() {
-                if *shutdown.borrow() {
-                    return;
-                }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<crate::connection_id::ConnInfo>(),
+    )
+    .with_graceful_shutdown(async move {
+        while shutdown.changed().await.is_ok() {
+            if *shutdown.borrow() {
+                return;
             }
-        })
-        .await
+        }
+    })
+    .await
 }
 
 /// Method-name constants. Axum's `Method::PROPFIND` / `Method::REPORT`
@@ -159,6 +162,7 @@ async fn dispatch(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: Bytes,
 ) -> Response {
     let path = uri.path().to_string();
@@ -167,10 +171,11 @@ async fn dispatch(
     // `GET /test/requests` covers CalDAV the same way it covers
     // Graph + Gmail. Query strings are stripped from `command` and
     // surfaced in `detail.query` to match the existing convention.
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "caldav",
         format!("{method} {path}"),
         json!({ "query": uri.query() }),
+        connection_id,
     );
     state.shared.latency.sleep_for("caldav").await;
 

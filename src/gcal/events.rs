@@ -344,6 +344,7 @@ async fn create_event(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(calendar): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: axum::body::Body,
 ) -> Response {
     let account_id = bearer_account(&state, &headers);
@@ -364,10 +365,11 @@ async fn create_event(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "gcal",
         format!("POST /calendar/v3/calendars/{calendar}/events"),
         crate::request_log::body_detail(&parsed),
+        connection_id,
     );
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
@@ -391,6 +393,7 @@ async fn patch_event(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((calendar, event_id)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: axum::body::Body,
 ) -> Response {
     let account_id = bearer_account(&state, &headers);
@@ -411,10 +414,11 @@ async fn patch_event(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "gcal",
         format!("PATCH /calendar/v3/calendars/{calendar}/events/{event_id}"),
         crate::request_log::body_detail(&parsed),
+        connection_id,
     );
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
@@ -445,6 +449,7 @@ async fn delete_event(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((calendar, event_id)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = bearer_account(&state, &headers);
     {
@@ -460,10 +465,11 @@ async fn delete_event(
             );
         }
     }
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "gcal",
         format!("DELETE /calendar/v3/calendars/{calendar}/events/{event_id}"),
         json!({"id": event_id}),
+        connection_id,
     );
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");

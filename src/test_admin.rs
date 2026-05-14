@@ -134,15 +134,27 @@ async fn clear_smtp_submissions(State(state): State<AppState>) -> StatusCode {
 
 /// `GET /test/requests` -> JSON array of every protocol-level
 /// dispatch event the binary has handled. With `?stable=true` the
-/// `received_at` wall-clock timestamp is stripped from each entry so
-/// the rendered JSON is byte-deterministic across runs (useful for
-/// snapshot-style assertions).
+/// `received_at` wall-clock timestamp is stripped and `connection_id`
+/// is rewritten to a 0-based first-seen index (raw ids are monotonic
+/// from process start, so absolute values aren't byte-stable across
+/// restarts; the normalized projection still distinguishes sessions).
+/// Entries that recorded no connection (`None`) stay null.
 async fn list_requests(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let snap = state.shared.request_log.snapshot();
     if params.get("stable").map(String::as_str) == Some("true") {
+        // Walk once to build the raw-id -> dense-index map, then
+        // emit the view rows. O(n) per call; the deque is bounded
+        // at `REQUEST_LOG_CAP` so this is bounded too.
+        let mut dense: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        for entry in &snap {
+            if let Some(raw) = entry.connection_id {
+                let next = dense.len() as u64;
+                dense.entry(raw).or_insert(next);
+            }
+        }
         // Borrow-and-serialize via a view struct: serde walks each
         // `detail` once at write time, no per-row JSON tree rebuild.
         #[derive(serde::Serialize)]
@@ -150,6 +162,8 @@ async fn list_requests(
             protocol: &'a str,
             command: &'a str,
             detail: &'a Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            connection_id: Option<u64>,
         }
         let stripped: Vec<Stable<'_>> = snap
             .iter()
@@ -157,6 +171,7 @@ async fn list_requests(
                 protocol: e.protocol,
                 command: &e.command,
                 detail: &e.detail,
+                connection_id: e.connection_id.and_then(|r| dense.get(&r).copied()),
             })
             .collect();
         Json(stripped).into_response()

@@ -176,7 +176,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // JMAP server via axum + watch-driven graceful shutdown.
     let jmap_shutdown_rx = shutdown_rx.clone();
     let jmap_task = tokio::spawn(
-        axum::serve(jmap_listener, app)
+        axum::serve(
+            jmap_listener,
+            app.into_make_service_with_connect_info::<saehrimnir::connection_id::ConnInfo>(),
+        )
             .with_graceful_shutdown(async move {
                 let mut rx = jmap_shutdown_rx;
                 while rx.changed().await.is_ok() {
@@ -246,7 +249,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let graph_shutdown_rx = shutdown_rx.clone();
     let graph_task = tokio::spawn(
-        axum::serve(graph_listener, graph_app)
+        axum::serve(
+            graph_listener,
+            graph_app.into_make_service_with_connect_info::<saehrimnir::connection_id::ConnInfo>(),
+        )
             .with_graceful_shutdown(async move {
                 let mut rx = graph_shutdown_rx;
                 while rx.changed().await.is_ok() {
@@ -264,7 +270,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let gmail_shutdown_rx = shutdown_rx.clone();
     let gmail_task = tokio::spawn(
-        axum::serve(gmail_listener, gmail_app)
+        axum::serve(
+            gmail_listener,
+            gmail_app.into_make_service_with_connect_info::<saehrimnir::connection_id::ConnInfo>(),
+        )
             .with_graceful_shutdown(async move {
                 let mut rx = gmail_shutdown_rx;
                 while rx.changed().await.is_ok() {

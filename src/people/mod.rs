@@ -121,10 +121,15 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_string);
-    state.shared.request_log.record(
+    let conn_id = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<crate::connection_id::ConnInfo>>()
+        .map(|c| c.id);
+    state.shared.request_log.record_with_conn(
         "people",
         format!("{method} {path}"),
         json!({ "query": query }),
+        conn_id,
     );
     state.shared.latency.sleep_for("people").await;
     next.run(req).await
@@ -171,15 +176,18 @@ pub async fn serve(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let app = router(state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            while shutdown_rx.changed().await.is_ok() {
-                if *shutdown_rx.borrow() {
-                    return;
-                }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<crate::connection_id::ConnInfo>(),
+    )
+    .with_graceful_shutdown(async move {
+        while shutdown_rx.changed().await.is_ok() {
+            if *shutdown_rx.borrow() {
+                return;
             }
-        })
-        .await
+        }
+    })
+    .await
 }
 
 // Suppress unused-import warning when test helpers aren't compiled.

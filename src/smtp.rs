@@ -258,6 +258,7 @@ where
         request_log,
         latency,
         account_id: primary_account_id,
+        connection_id: crate::connection_id::next(),
     };
     conn.write_str(GREETING).await?;
     loop {
@@ -311,6 +312,11 @@ struct Conn {
     /// rebinds when a SASL response names (PLAIN / LOGIN) or
     /// authorizes (XOAUTH2 / OAUTHBEARER) a declared account.
     account_id: String,
+    /// Per-accepted-TCP-connection id, allocated once per
+    /// `serve_connection`. Stamped onto every `request_log` entry
+    /// so harness scripts can group `EHLO` / `MAIL FROM` /
+    /// `RCPT TO` / `DATA` by session.
+    connection_id: u64,
 }
 
 enum ReadOutcome {
@@ -409,10 +415,11 @@ impl Conn {
         } else {
             rest
         };
-        self.request_log.record(
+        self.request_log.record_with_conn(
             "smtp",
             upper.clone(),
             serde_json::json!({ "args": logged_args }),
+            Some(self.connection_id),
         );
         match upper.as_str() {
             "EHLO" | "HELO" => self.cmd_ehlo(rest).await.map(|_| false),

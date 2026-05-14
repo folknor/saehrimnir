@@ -167,9 +167,25 @@ checking whether the fact is already in `notes/`.
 - `src/request_log.rs` - cross-protocol request log. `RequestLog`
   is a cheap-to-clone `Arc<Mutex<Vec<RequestEntry>>>` threaded into
   every protocol layer; each command/dispatch event appends one
-  entry. Read out via `GET /test/requests`, cleared via
+  entry. Each entry carries an optional `connection_id: u64`
+  (allocated by `src/connection_id.rs::next()` once per accepted
+  TCP socket) so harness scripts can group entries by session
+  without sæhrimnir locking in an aggregation schema - the
+  Phase 7 "one LOGIN + one SELECT per (account, folder) batch"
+  assertion is a `GROUP BY connection_id`. `?stable=true` rewrites
+  raw ids to dense first-seen indices for byte-deterministic
+  snapshots. Read out via `GET /test/requests`, cleared via
   `DELETE /test/requests` or `POST /test/fixture/reset`. See
   `notes/orchestration.md` "Test / admin control plane".
+- `src/connection_id.rs` - process-wide monotonic `u64` generator
+  plus the `ConnInfo` carrier and `OptConnId` extractor. IMAP /
+  SMTP `serve_connection` call `next()` once per accepted
+  socket; HTTP listeners go through axum's
+  `into_make_service_with_connect_info::<ConnInfo>`. Handlers
+  pull the id with the infallible `OptConnId` extractor
+  (`Option<u64>` newtype) so test paths that bypass
+  connect-info plumbing (`tower::ServiceExt::oneshot`)
+  serialize as `connection_id: null` rather than 500-ing.
 - `src/oauth.rs` - mock OAuth 2.0 / OIDC provider. `TokenStore` is
   the analogous `Arc<Mutex<...>>` handle for active tokens, also
   cleared by `POST /test/fixture/reset`. Endpoints

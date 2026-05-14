@@ -66,26 +66,32 @@ async fn get_category_me(
     get_category_impl(state, &account_id, &category).await
 }
 
-async fn create_category_me(State(state): State<AppState>, body: AxumBody) -> Response {
+async fn create_category_me(
+    State(state): State<AppState>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
+    body: AxumBody,
+) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    create_category_impl(state, &account_id, body).await
+    create_category_impl(state, &account_id, body, connection_id).await
 }
 
 async fn patch_category_me(
     State(state): State<AppState>,
     Path(category): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: AxumBody,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    patch_category_impl(state, &account_id, &category, body).await
+    patch_category_impl(state, &account_id, &category, body, connection_id).await
 }
 
 async fn delete_category_me(
     State(state): State<AppState>,
     Path(category): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    delete_category_impl(state, &account_id, &category).await
+    delete_category_impl(state, &account_id, &category, connection_id).await
 }
 
 // ── /users/{user}/ wrappers ─────────────────────────────────────────
@@ -115,36 +121,39 @@ async fn get_category_user(
 async fn create_category_user(
     State(state): State<AppState>,
     Path(user): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: AxumBody,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    create_category_impl(state, &account_id, body).await
+    create_category_impl(state, &account_id, body, connection_id).await
 }
 
 async fn patch_category_user(
     State(state): State<AppState>,
     Path((user, category)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: AxumBody,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    patch_category_impl(state, &account_id, &category, body).await
+    patch_category_impl(state, &account_id, &category, body, connection_id).await
 }
 
 async fn delete_category_user(
     State(state): State<AppState>,
     Path((user, category)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    delete_category_impl(state, &account_id, &category).await
+    delete_category_impl(state, &account_id, &category, connection_id).await
 }
 
 // ── Inner handlers (account-scoped) ─────────────────────────────────
@@ -175,15 +184,21 @@ async fn get_category_impl(state: AppState, account_id: &str, category: &str) ->
     }
 }
 
-async fn create_category_impl(state: AppState, account_id: &str, body: AxumBody) -> Response {
+async fn create_category_impl(
+    state: AppState,
+    account_id: &str,
+    body: AxumBody,
+    connection_id: Option<u64>,
+) -> Response {
     let parsed = match parse_json_body(body).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "graph",
         "POST /v1.0/me/outlook/masterCategories".to_string(),
         crate::request_log::body_detail(&parsed),
+        connection_id,
     );
     let obj = match parsed.as_object() {
         Some(o) => o,
@@ -254,6 +269,7 @@ async fn patch_category_impl(
     account_id: &str,
     category: &str,
     body: AxumBody,
+    connection_id: Option<u64>,
 ) -> Response {
     let known = {
         let fixture = state.fixture();
@@ -266,10 +282,11 @@ async fn patch_category_impl(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "graph",
         format!("PATCH /v1.0/me/outlook/masterCategories/{category}"),
         crate::request_log::body_detail(&parsed),
+        connection_id,
     );
     let obj = match parsed.as_object() {
         Some(o) => o,
@@ -328,7 +345,12 @@ async fn patch_category_impl(
     }
 }
 
-async fn delete_category_impl(state: AppState, account_id: &str, category: &str) -> Response {
+async fn delete_category_impl(
+    state: AppState,
+    account_id: &str,
+    category: &str,
+    connection_id: Option<u64>,
+) -> Response {
     let known = {
         let fixture = state.fixture();
         fixture.categories_for(account_id).any(|c| c.id == category)
@@ -336,10 +358,11 @@ async fn delete_category_impl(state: AppState, account_id: &str, category: &str)
     if !known {
         return not_found(category);
     }
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "graph",
         format!("DELETE /v1.0/me/outlook/masterCategories/{category}"),
         json!({ "id": category }),
+        connection_id,
     );
     {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");

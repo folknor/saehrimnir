@@ -157,10 +157,15 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_string);
-    state.shared.request_log.record(
+    let conn_id = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<crate::connection_id::ConnInfo>>()
+        .map(|c| c.id);
+    state.shared.request_log.record_with_conn(
         "graph",
         format!("{method} {path}"),
         json!({ "query": query }),
+        conn_id,
     );
     state.shared.latency.sleep_for("graph").await;
     next.run(req).await

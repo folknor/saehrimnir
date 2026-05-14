@@ -24,17 +24,62 @@ Each row carries:
 
 ```
 {
-  "protocol":   "jmap" | "imap" | "smtp" | "graph" | "gmail" | "caldav",
-  "command":    string  (protocol-native verb)
-  "received_at": RFC 3339 timestamp (wall clock; not byte-stable)
-  "detail":     object  (per-protocol structured extras)
+  "protocol":     "jmap" | "imap" | "smtp" | "graph" | "gmail" | "caldav" | "people",
+  "command":      string  (protocol-native verb)
+  "received_at":  RFC 3339 timestamp (wall clock; not byte-stable)
+  "detail":       object  (per-protocol structured extras)
+  "connection_id": optional u64  (per-TCP-connection id, omitted when
+                                  the entry has no connection context)
 }
 ```
 
 `received_at` is a wall-clock timestamp, so rendered JSON is not
 byte-identical across runs. Tests that need byte-stable output
-should assert on `protocol` / `command` / `detail` and ignore
+should pass `?stable=true` (see "Stable projection" below) or
+assert on `protocol` / `command` / `detail` and ignore
 `received_at`.
+
+### `connection_id`
+
+A monotonic `u64` allocated once per accepted TCP connection (IMAP /
+SMTP `serve_connection`, plus every axum HTTP connection via
+`into_make_service_with_connect_info::<ConnInfo>`). Stamped onto
+every entry the connection records, so harness scripts can group
+the log by session without sæhrimnir locking in an aggregation
+schema. Counter starts at 1 per process; resets only on restart.
+
+Useful patterns:
+
+- Phase 7 "one LOGIN + one SELECT per (account, folder) batch":
+  group `protocol == "imap"` entries by `connection_id`, assert
+  exactly one `LOGIN` per id and exactly one `SELECT <folder>`
+  per (id, folder).
+- HTTP keep-alive grouping: an `axum` connection that serves
+  multiple Graph or Gmail requests under the same TCP socket
+  produces multiple entries with the same `connection_id`; a
+  fresh socket gets a fresh id.
+- SMTP MAIL / RCPT / DATA per submission: every command on the
+  same SMTP connection shares one id; one DATA per id is the
+  per-submission count.
+
+The field is omitted (Lua-side: `nil`) when no connection boundary
+applies. Today that means test paths that use
+`tower::ServiceExt::oneshot` against the HTTP routers (they bypass
+`into_make_service_with_connect_info`) and direct
+`RequestLog::record` calls outside any listener context.
+
+### Stable projection
+
+`GET /test/requests?stable=true` produces a byte-deterministic view
+of the log for snapshot-style assertions:
+
+- `received_at` is stripped from each entry.
+- `connection_id` is rewritten to a 0-based first-seen dense index
+  (raw ids are monotonic from process start, so absolute values
+  aren't stable across restarts). Entries with no connection stay
+  null and are omitted from the output. The rewriting is per
+  `GET`, so two successive `?stable=true` reads of the same log
+  produce identical output.
 
 `command` is the protocol-native verb. For HTTP-based protocols
 (JMAP / Graph / Gmail), the convention is `METHOD /path` with the

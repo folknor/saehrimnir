@@ -242,6 +242,7 @@ async fn update_contact(
     headers: HeaderMap,
     Path(spec): Path<String>,
     Query(params): Query<UpdateParams>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: axum::body::Body,
 ) -> Response {
     let account_id = bearer_account(&state, &headers);
@@ -257,13 +258,14 @@ async fn update_contact(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "people",
         format!("PATCH /v1/people/{id}:updateContact"),
         json!({
             "updatePersonFields": params.update_person_fields,
             "body": crate::request_log::body_detail(&parsed),
         }),
+        connection_id,
     );
 
     if let Some(o) = super::maybe_override(&state, "update_contact", |s| {
@@ -307,6 +309,7 @@ async fn delete_contact(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(spec): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = bearer_account(&state, &headers);
     let Some(id) = spec.strip_suffix(":deleteContact") else {
@@ -317,10 +320,11 @@ async fn delete_contact(
         );
     };
     let id = id.to_string();
-    state.shared.request_log.record(
+    state.shared.request_log.record_with_conn(
         "people",
         format!("DELETE /v1/people/{id}:deleteContact"),
         json!({ "id": id }),
+        connection_id,
     );
 
     if let Some(o) = super::maybe_override(&state, "delete_contact", |s| {

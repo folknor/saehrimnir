@@ -260,6 +260,7 @@ async fn session(
 async fn api(
     State(state): State<AppState>,
     headers: HeaderMap,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     Json(req): Json<JmapRequest>,
 ) -> Result<Json<JmapResponse>, Response> {
     enforce_bearer(&state, &headers).map_err(|b| *b)?;
@@ -304,6 +305,7 @@ async fn api(
                 command: method.clone(),
                 received_at: now,
                 detail,
+                connection_id,
             }
         }));
     // `jmap::handle` decides between a read and a write guard
