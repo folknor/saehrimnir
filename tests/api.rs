@@ -2397,6 +2397,69 @@ async fn oauth_token_endpoint_accepts_account_id_form_field() {
 }
 
 #[tokio::test]
+async fn jmap_session_primary_accounts_follow_bearer_token() {
+    // Regression: `primaryAccounts.{mail,calendars}` and `username`
+    // used to pin to the fixture primary regardless of bearer, so
+    // ratatoskr's second-account JMAP sync routed every method call
+    // under the wrong accountId. The session resource now resolves
+    // the bearer via `oauth::account_from_bearer` (same helper Gmail
+    // / Graph / People / IMAP-SASL use) and pins primaryAccounts to
+    // the caller. No-bearer / unknown-token requests still fall back
+    // to primary - see the no-bearer test above.
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let app = routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)));
+
+    // Mint a token bound to the secondary account via the same
+    // form-field path harness scripts use.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "grant_type=authorization_code&account_id=account-secondary",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let secondary_token = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .header(header::AUTHORIZATION, format!("Bearer {secondary_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(
+        v["primaryAccounts"]["urn:ietf:params:jmap:mail"],
+        "account-secondary"
+    );
+    assert_eq!(
+        v["primaryAccounts"]["urn:ietf:params:jmap:core"],
+        "account-secondary"
+    );
+    assert_eq!(v["username"], "secondary@example.com");
+    // The accounts map still enumerates every declared account
+    // (the bearer doesn't filter the map - only the primary
+    // pointers).
+    let accounts = v["accounts"].as_object().unwrap();
+    assert!(accounts.contains_key("account-primary"));
+    assert!(accounts.contains_key("account-secondary"));
+}
+
+#[tokio::test]
 async fn oauth_token_endpoint_rejects_unknown_account_id() {
     let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
     let app = routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)));

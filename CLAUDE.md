@@ -66,9 +66,13 @@ checking whether the fact is already in `notes/`.
   the declared `[[account]]` set at load time.
   `Fixture::*_for(account_id)` helpers expose filtered
   iterators. JMAP advertises every declared account in its
-  session resource and method handlers (`Mailbox/get`,
-  `Email/get`, `Email/query`, `Calendar/get`,
-  `CalendarEvent/get`) honour the request's `accountId` arg.
+  session resource; `primaryAccounts.{core,mail,calendars}` and
+  `username` resolve through `oauth::account_from_bearer` so a
+  bearer minted for the secondary account sees the secondary as
+  its default scope (no-bearer / unknown-token requests fall
+  back to primary). Method handlers (`Mailbox/get`, `Email/get`,
+  `Email/query`, `Calendar/get`, `CalendarEvent/get`) honour the
+  request's `accountId` arg.
   Every Graph resource family (mail, calendar, contacts,
   categories) exposes parallel `/v1.0/users/{userId}/...`
   routes alongside `/v1.0/me/...` (`me` aliases the primary;

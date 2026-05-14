@@ -160,9 +160,26 @@ async fn session(
 ) -> Result<Json<Value>, Response> {
     enforce_bearer(&state, &headers).map_err(|b| *b)?;
     let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
-    let primary_account = fixture.primary_account();
-    let primary_id = primary_account.id.clone();
-    let primary_name = primary_account.name.clone();
+    // Resolve the caller's account from the bearer token (parallel
+    // to Gmail / Graph / People / IMAP-SASL). Falls back to the
+    // fixture primary when no token is bound or auth is not
+    // enforced, which keeps single-account fixtures and the
+    // no-auth baseline working unchanged. Without this, every
+    // bearer (including a secondary-account token minted via
+    // `/oauth/token`) sees `primaryAccounts.{mail,calendars}`
+    // pinned to the fixture primary - and ratatoskr's JMAP client
+    // then routes every subsequent method call under the wrong
+    // accountId.
+    let caller_id = crate::oauth::account_from_bearer(
+        &fixture,
+        &state.shared.token_store,
+        &headers,
+    );
+    let caller_account = fixture
+        .account(&caller_id)
+        .unwrap_or_else(|| fixture.primary_account());
+    let primary_id = caller_account.id.clone();
+    let primary_name = caller_account.name.clone();
     let base = state.base_url.as_str();
 
     // Stage 2 of the multi-account refactor: enumerate every
@@ -197,9 +214,13 @@ async fn session(
         );
     }
 
-    // The top-level capabilities advertisement and `primaryAccounts`
-    // mapping pin the primary account; per-method `accountId` args
-    // select the actual scope on follow-up calls.
+    // `primaryAccounts` advertises the bearer-resolved caller as
+    // the default account for each capability (resolved above via
+    // `account_from_bearer`); per-method `accountId` args still
+    // select the actual scope on follow-up calls. With no bearer
+    // or with `[oauth] enforce = false`, this falls back to the
+    // fixture primary - same shape single-account fixtures saw
+    // before the multi-account refactor.
     let primary_has_calendars = fixture.calendars_for(&primary_id).next().is_some();
     let mut primary = serde_json::Map::new();
     primary.insert(
