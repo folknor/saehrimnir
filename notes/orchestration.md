@@ -250,6 +250,18 @@ feature gate guards these. All routes are scoped under `/test/`.
   `global + per_protocol[<tag>]` ms before doing real work, so a
   harness can simulate slow links for sync benchmarks. Cleared by
   `POST /test/fixture/reset`.
+
+  The `"attachment"` tag is special: it fires once before serving
+  attachment bytes on every protocol that exposes a per-attachment
+  fetch endpoint - JMAP `/jmap/download/...`, Gmail
+  `/messages/{id}/attachments/{aid}`, Graph
+  `/messages/{id}/attachments/{aid}` (both the JSON-with-bytes and
+  the `/$value` raw-bytes variants), and IMAP `FETCH BODY[N]` for
+  `N >= 2` (the attachment-part path; `BODY[1]` is the text body
+  and is not gated). Stacks with the per-protocol sleep, so e.g.
+  `{"per_protocol": {"attachment": 2000}}` adds 2s to every
+  attachment fetch regardless of protocol. Lets a harness race a
+  SIGINT against an in-flight prefetch without flake.
 - `POST /test/fixture/reset` -> 204; reset in-process mutable
   state to the post-load baseline. The route is the source of
   truth on what "reset" means; the handler in

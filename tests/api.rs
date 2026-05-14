@@ -378,6 +378,49 @@ async fn jmap_download_returns_blob_bytes() {
 }
 
 #[tokio::test]
+async fn attachment_latency_tag_delays_jmap_download() {
+    // Share one router so the latency we set is the same SharedHandles
+    // the download endpoint consults. `attach_router()` builds a fresh
+    // state per call.
+    let app = attach_router();
+
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/latency")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "per_protocol": { "attachment": 120 }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/download/account-1/blob-att-001/sample.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(100),
+        "expected >=100ms attachment delay, got {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn jmap_download_unknown_blob_returns_404_envelope() {
     let resp = attach_router()
         .oneshot(

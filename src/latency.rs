@@ -22,6 +22,16 @@ use std::time::Duration;
 /// `"global"` key applied to every protocol. Values are
 /// milliseconds.
 ///
+/// Beyond the per-protocol command sleep, the `"attachment"` tag
+/// fires once before serving attachment bytes on every protocol
+/// that exposes a per-attachment fetch: JMAP `/jmap/download/...`,
+/// Gmail `/messages/{id}/attachments/{aid}`, Graph
+/// `/messages/{id}/attachments/{aid}` (both the JSON-with-bytes
+/// and the `/$value` raw-bytes variants), and IMAP `FETCH BODY[N]`
+/// for `N >= 2` (the attachment-part path; `BODY[1]` is the text
+/// body and skipped). Lets a harness script race a SIGINT against
+/// an in-flight attachment fetch without flake.
+///
 /// Defaults to all-zero; a fresh process applies no latency.
 #[derive(Debug, Clone, Default)]
 pub struct LatencyKnob(Arc<Mutex<HashMap<String, u64>>>);

@@ -190,7 +190,12 @@ checking whether the fact is already in `notes/`.
   Each protocol's dispatch entry calls `latency.sleep_for("<tag>")`
   before doing real work; the sum of `"global"` plus the per-tag
   value is the effective delay. Cleared by
-  `POST /test/fixture/reset`.
+  `POST /test/fixture/reset`. The `"attachment"` tag is special:
+  it fires once before serving attachment bytes on JMAP
+  `/jmap/download/...`, Gmail `/messages/{id}/attachments/{aid}`,
+  Graph `/messages/{id}/attachments/{aid}` (JSON + `/$value`), and
+  IMAP `FETCH BODY[N]` for `N >= 2` - the per-protocol fetch path
+  ratatoskr's prefetch hits across all four backends.
 - `src/jmap.rs` - JMAP request envelope, dispatcher, per-method
   handlers.
 - `src/jmap_calendar.rs` - JMAP calendar surface (`Calendar/get`

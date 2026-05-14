@@ -813,7 +813,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             Vec::new()
         };
 
+        let wants_attachment_bytes = attrs
+            .iter()
+            .any(|a| matches!(a, FetchAttr::BodyPart(n) if *n >= 2));
         for (seq, uid, email) in snapshot {
+            if wants_attachment_bytes && !email.attachments.is_empty() {
+                self.latency.sleep_for("attachment").await;
+            }
             let line = fetch_response_line(seq, uid, &email, &attrs);
             self.write_response(&line).await?;
         }

@@ -373,6 +373,7 @@ async fn download(
     if let Err(deny) = enforce_bearer(&state, &headers) {
         return *deny;
     }
+    state.shared.latency.sleep_for("attachment").await;
     let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
     for email in &fixture.emails {
         for att in &email.attachments {

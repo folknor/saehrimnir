@@ -617,6 +617,7 @@ async fn get_message_attachment_impl(
     message_id: &str,
     attachment_id: &str,
 ) -> Response {
+    state.shared.latency.sleep_for("attachment").await;
     let fixture = state.fixture();
     let Some((email, att)) = find_email_with_attachment(&fixture, account_id, message_id, attachment_id)
     else {
@@ -635,6 +636,7 @@ async fn get_message_attachment_value_impl(
     message_id: &str,
     attachment_id: &str,
 ) -> Response {
+    state.shared.latency.sleep_for("attachment").await;
     let fixture = state.fixture();
     let Some((_, att)) = find_email_with_attachment(&fixture, account_id, message_id, attachment_id)
     else {
