@@ -32,6 +32,14 @@ use std::time::Duration;
 /// body and skipped). Lets a harness script race a SIGINT against
 /// an in-flight attachment fetch without flake.
 ///
+/// Per-attachment overrides keyed by blob_id stack on top of
+/// `"attachment"`: setting `"attachment:<blob_id>"` to N adds N ms
+/// to the sleep that fires when that specific attachment is served,
+/// so a script can stage one slow attachment among several fast
+/// ones (set `"attachment"` to 0 to keep the others instant).
+/// Stacks symmetrically across all four protocols since each
+/// attachment carries the same `blob_id` regardless of wire shape.
+///
 /// Defaults to all-zero; a fresh process applies no latency.
 #[derive(Debug, Clone, Default)]
 pub struct LatencyKnob(Arc<Mutex<HashMap<String, u64>>>);
@@ -59,6 +67,27 @@ impl LatencyKnob {
         let global = g.get("global").copied().unwrap_or(0);
         let specific = g.get(protocol).copied().unwrap_or(0);
         global.saturating_add(specific)
+    }
+
+    /// Compute the effective delay for serving a specific attachment
+    /// and sleep that long. The sleep is `global + attachment +
+    /// attachment:<blob_id>`, so a script can leave the base
+    /// `attachment` knob at 0 and stage one slow blob via
+    /// `attachment:<blob_id>` without slowing the others.
+    pub async fn sleep_for_attachment(&self, blob_id: &str) {
+        let ms = {
+            let g = self.0.lock().expect("latency knob mutex poisoned");
+            let global = g.get("global").copied().unwrap_or(0);
+            let base = g.get("attachment").copied().unwrap_or(0);
+            let per = g
+                .get(&format!("attachment:{blob_id}"))
+                .copied()
+                .unwrap_or(0);
+            global.saturating_add(base).saturating_add(per)
+        };
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
     }
 
     /// Set a per-key value. Pass `protocol = "global"` for the

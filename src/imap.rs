@@ -813,12 +813,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             Vec::new()
         };
 
-        let wants_attachment_bytes = attrs
-            .iter()
-            .any(|a| matches!(a, FetchAttr::BodyPart(n) if *n >= 2));
+        // Per-attachment-byte sleep. Walk requested BODY[N] attrs
+        // (N>=2 is the attachment-part path; N=1 is the text body
+        // and not gated). For each that resolves to an actual
+        // attachment on this email, sleep with the per-blob_id
+        // override so a script can stage one slow attachment among
+        // several fast ones.
         for (seq, uid, email) in snapshot {
-            if wants_attachment_bytes && !email.attachments.is_empty() {
-                self.latency.sleep_for("attachment").await;
+            for attr in &attrs {
+                if let FetchAttr::BodyPart(n) = attr
+                    && *n >= 2
+                    && let Some(att) = email.attachments.get((*n as usize) - 2)
+                {
+                    self.latency.sleep_for_attachment(&att.blob_id).await;
+                }
             }
             let line = fetch_response_line(seq, uid, &email, &attrs);
             self.write_response(&line).await?;

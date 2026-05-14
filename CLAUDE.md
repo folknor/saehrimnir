@@ -195,7 +195,11 @@ checking whether the fact is already in `notes/`.
   `/jmap/download/...`, Gmail `/messages/{id}/attachments/{aid}`,
   Graph `/messages/{id}/attachments/{aid}` (JSON + `/$value`), and
   IMAP `FETCH BODY[N]` for `N >= 2` - the per-protocol fetch path
-  ratatoskr's prefetch hits across all four backends.
+  ratatoskr's prefetch hits across all four backends. Per-attachment
+  overrides keyed by blob_id stack on top: `attachment:<blob_id>`
+  adds to the base `attachment` value when that specific blob is
+  served, so a script can stage one slow attachment among several
+  fast ones (leave `attachment` at 0 to keep the others instant).
 - `src/jmap.rs` - JMAP request envelope, dispatcher, per-method
   handlers.
 - `src/jmap_calendar.rs` - JMAP calendar surface (`Calendar/get`

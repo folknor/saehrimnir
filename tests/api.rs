@@ -421,6 +421,68 @@ async fn attachment_latency_tag_delays_jmap_download() {
 }
 
 #[tokio::test]
+async fn attachment_latency_per_blob_override_targets_one_attachment() {
+    // Base "attachment" stays 0 so the matched blob is the only one
+    // that sleeps. Two downloads: the targeted blob is slow, an
+    // unrelated 404 is fast. (Single-attachment fixture, so we use a
+    // 404 download as the "fast" comparison since both share the
+    // download() entry point.)
+    let app = attach_router();
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/latency")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "per_protocol": { "attachment:blob-att-001": 150 }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/download/account-1/blob-att-001/sample.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let slow = start.elapsed();
+    assert!(
+        slow >= std::time::Duration::from_millis(120),
+        "expected >=120ms for targeted blob, got {slow:?}"
+    );
+
+    let start = std::time::Instant::now();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/download/account-1/blob-other/x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let fast = start.elapsed();
+    assert!(
+        fast < std::time::Duration::from_millis(50),
+        "expected unrelated blob to skip the override, got {fast:?}"
+    );
+}
+
+#[tokio::test]
 async fn jmap_download_unknown_blob_returns_404_envelope() {
     let resp = attach_router()
         .oneshot(

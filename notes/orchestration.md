@@ -262,6 +262,15 @@ feature gate guards these. All routes are scoped under `/test/`.
   `{"per_protocol": {"attachment": 2000}}` adds 2s to every
   attachment fetch regardless of protocol. Lets a harness race a
   SIGINT against an in-flight prefetch without flake.
+
+  Per-attachment overrides keyed by blob_id stack on top:
+  `{"per_protocol": {"attachment:blob-att-001": 2000}}` adds 2s
+  to the sleep that fires when that one blob is served, leaving
+  the others at the base `attachment` value (default 0). The
+  blob_id is the canonical id across all four protocols (JMAP
+  blobId, Gmail attachmentId, Graph attachment id, and the
+  fixture-side `[[email.attachment]] blob_id` IMAP looks up via
+  `BODY[N]` -> `attachments[N-2]`).
 - `POST /test/fixture/reset` -> 204; reset in-process mutable
   state to the post-load baseline. The route is the source of
   truth on what "reset" means; the handler in

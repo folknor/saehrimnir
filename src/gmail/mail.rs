@@ -579,7 +579,11 @@ async fn get_attachment(
     Path((message_id, attachment_id)): Path<(String, String)>,
 ) -> Response {
     let account_id = bearer_account(&state, &headers);
-    state.shared.latency.sleep_for("attachment").await;
+    state
+        .shared
+        .latency
+        .sleep_for_attachment(&attachment_id)
+        .await;
     let fixture = state.fixture();
     let Some(email) = fixture.emails_for(&account_id).find(|e| e.id == message_id) else {
         return error(
