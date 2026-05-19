@@ -38,6 +38,10 @@ resource modules), and `notes/` for the per-protocol surface docs.
   `/oauth/userinfo`, `/test/oauth/invalidate`) plus the
   fixture-side `[oauth]` block that gates bearer enforcement on
   the mail listeners.
+- `notes/ratatoskr-discovery-surface.md` - account-discovery
+  routes (WebFinger / OIDC discovery / Mozilla autoconfig XML)
+  mounted on the JMAP HTTP listener. Drives ratatoskr's
+  multi-stage discovery cascade.
 - `notes/request-log.md` - cross-protocol request log
   (`/test/requests`): per-protocol command / detail-key
   contract harness scripts can rely on.
@@ -190,6 +194,13 @@ checking whether the fact is already in `notes/`.
   (`Option<u64>` newtype) so test paths that bypass
   connect-info plumbing (`tower::ServiceExt::oneshot`)
   serialize as `connection_id: null` rather than 500-ing.
+- `src/discovery.rs` - account-discovery routes (WebFinger /
+  OIDC discovery / Mozilla autoconfig XML). Single
+  `/{*discovery_path}` catch-all on the JMAP listener, suffix-
+  matches in `dispatch` to fan out to the three response shapes.
+  Path-relative URLs in fixture docs get prefixed with the live
+  listener base URL at emit time; absolute URLs pass through
+  verbatim so negative tests can stage non-HTTPS hrefs.
 - `src/oauth.rs` - mock OAuth 2.0 / OIDC provider. `TokenStore` is
   the analogous `Arc<Mutex<...>>` handle for active tokens, also
   cleared by `POST /test/fixture/reset`. Endpoints
@@ -321,6 +332,14 @@ checking whether the fact is already in `notes/`.
   patch / delete round-trip, and a cross-protocol assertion
   that a Google-Calendar create surfaces in a Graph
   `calendarView/delta`.
+- `tests/discovery.rs` - account-discovery integration tests
+  via `tower::ServiceExt::oneshot`. Covers WebFinger JRD shape +
+  rel filter + emit-time href prefixing, OIDC discovery
+  (chained + direct + issuer mismatch passthrough), Mozilla
+  autoconfig XML with `${BASE}` substitution, the four
+  negative-test escape hatches (404, raw_body, http:// href,
+  issuer mismatch), and the catch-all's non-interference with
+  the existing JMAP routes.
 - `tests/people.rs` - People API integration tests via
   `tower::ServiceExt::oneshot`. Covers the no-token bootstrap
   + paging via `nextPageToken`, the same-token empty-delta
@@ -625,6 +644,25 @@ a `calendar_created` transition; Graph `/v1.0/me/calendars`
 405 on an existing calendar id and 404 under an unknown
 principal. v0 explicitly does not implement PROPPATCH / ACLs /
 scheduling.
+
+Discovery (WebFinger / OIDC / autoconfig): complete for v0.
+Mounted on the JMAP HTTP listener, unauthenticated (real
+discovery is a public surface). Three suffixes share one
+`/{*discovery_path}` catch-all that fans out by suffix match:
+`/.well-known/webfinger` returns a JRD with `subject` echoed
+from the `resource=` query param and `links[]` filtered by the
+`rel=` query param when present; `/.well-known/openid-configuration`
+returns the OIDC discovery document with path-relative endpoints
+spliced into the listener base URL at emit time;
+`/mail/config-v1.1.xml` returns the fixture-authored XML with
+`${BASE}` substituted. Each shape has a `raw_body` /
+`raw_content_type` escape hatch for negative tests (malformed
+JRD, non-HTTPS href, issuer mismatch). The loader does NOT
+enforce OIDC's issuer self-claim, so a fixture can stage a
+deliberate mismatch and the route serves it verbatim - the
+client (ratatoskr) is the one that checks. See
+`notes/ratatoskr-discovery-surface.md`. Integration tests in
+`tests/discovery.rs`.
 
 Lua fixture loader: wired via [dellingr](https://crates.io/crates/dellingr),
 a pure-Rust deterministic sandboxed Lua VM with cost-bounded

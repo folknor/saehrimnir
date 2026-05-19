@@ -137,6 +137,7 @@ pub fn router(state: AppState) -> Router {
             "/jmap/download/{account_id}/{blob_id}/{name}",
             get(download),
         )
+        .route("/{*discovery_path}", get(crate::discovery::dispatch))
         .with_state(state.clone())
         .merge(crate::test_admin::router(state))
         .merge(oauth_token_router)

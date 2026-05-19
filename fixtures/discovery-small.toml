@@ -1,0 +1,97 @@
+name = "discovery-small"
+
+[[account]]
+id = "account-1"
+name = "user@corp.test"
+is_personal = true
+
+# WebFinger entry at the user's bare domain. Advertises one
+# RFC 7033 link of rel="http://openid.net/specs/connect/1.0/issuer"
+# pointing at a sub-realm issuer; that href feeds stage 6's OIDC
+# discovery probe.
+[discovery."corp.test".webfinger]
+links = [
+  { rel = "http://openid.net/specs/connect/1.0/issuer", href = "/idp/realms/corp" },
+]
+
+# Chained OIDC discovery document at the realm's path. The
+# advertised endpoints point at saehrimnir's existing mock OAuth
+# provider (/oauth/token, /oauth/userinfo on the JMAP listener)
+# so the discovered config is immediately usable for token
+# issuance against fixtures that opt into bearer enforcement.
+[discovery."idp/realms/corp".oidc]
+issuer = "/idp/realms/corp"
+authorization_endpoint = "/oauth/authorize"
+token_endpoint = "/oauth/token"
+userinfo_endpoint = "/oauth/userinfo"
+scopes_supported = ["openid", "email", "profile", "offline_access"]
+code_challenge_methods_supported = ["S256"]
+token_endpoint_auth_methods_supported = ["none"]
+
+# Direct (no-WebFinger) OIDC discovery at the domain itself, for
+# fixtures driving stage 6 in parallel with WebFinger. Issuer
+# matches the request URL prefix.
+[discovery."corp.test".oidc]
+issuer = "/corp.test"
+authorization_endpoint = "/oauth/authorize"
+token_endpoint = "/oauth/token"
+scopes_supported = ["openid", "email"]
+code_challenge_methods_supported = ["S256"]
+token_endpoint_auth_methods_supported = ["none"]
+
+# Mozilla autoconfig XML. The ${BASE} token is replaced with the
+# live listener base at emit time so smoke harnesses can pin URLs
+# back at sæhrimnir without baking the test-time port into the
+# fixture. IMAP / SMTP host:port stay hand-authored for v0
+# (ratatoskr stage 2 doesn't yet drive sæhrimnir).
+[discovery."corp.test".autoconfig]
+raw_body = """<?xml version="1.0" encoding="UTF-8"?>
+<clientConfig version="1.1">
+  <emailProvider id="corp.test">
+    <domain>corp.test</domain>
+    <displayName>Corp Mail</displayName>
+    <displayShortName>Corp</displayShortName>
+    <incomingServer type="imap">
+      <hostname>imap.corp.test</hostname>
+      <port>143</port>
+      <socketType>STARTTLS</socketType>
+      <authentication>OAuth2</authentication>
+    </incomingServer>
+    <outgoingServer type="smtp">
+      <hostname>smtp.corp.test</hostname>
+      <port>587</port>
+      <socketType>STARTTLS</socketType>
+      <authentication>OAuth2</authentication>
+    </outgoingServer>
+  </emailProvider>
+  <oAuth2>
+    <issuer>${BASE}/idp/realms/corp</issuer>
+  </oAuth2>
+</clientConfig>
+"""
+
+# Negative-test entries: each parks a single defect under its
+# own prefix so a test can drive one failure at a time.
+
+# WebFinger that serves malformed JRD (not parseable as JSON).
+[discovery."malformed-jrd.test".webfinger]
+raw_body = "this is not json {{["
+raw_content_type = "application/jrd+json"
+
+# WebFinger whose advertised issuer href is plain http:// - the
+# probe must reject the scheme.
+[discovery."insecure-href.test".webfinger]
+links = [
+  { rel = "http://openid.net/specs/connect/1.0/issuer", href = "http://insecure.example/issuer" },
+]
+
+# OIDC whose self-claimed issuer disagrees with the URL it's
+# served from. Mounted at "wrong-issuer.test" but advertises
+# "/something-else" - violates OIDC Discovery 1.0 §4.3.
+[discovery."wrong-issuer.test".oidc]
+issuer = "/something-else"
+authorization_endpoint = "/oauth/authorize"
+token_endpoint = "/oauth/token"
+scopes_supported = ["openid"]
+code_challenge_methods_supported = ["S256"]
+token_endpoint_auth_methods_supported = ["none"]

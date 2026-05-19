@@ -29,6 +29,12 @@ pub struct Fixture {
     pub mailboxes: Vec<Mailbox>,
     pub emails: Vec<Email>,
     pub oauth: OAuthConfig,
+    /// Discovery surface (WebFinger / OIDC discovery / Mozilla
+    /// autoconfig) served on the JMAP HTTP listener. Empty by
+    /// default; fixtures that don't exercise ratatoskr's
+    /// account-setup cascade can omit the section. See
+    /// `DiscoveryConfig`.
+    pub discovery: DiscoveryConfig,
     /// Calendars projected over the Microsoft Graph
     /// `/v1.0/me/calendars/...` surface (and, eventually, the
     /// CalDAV listener). Empty by default; fixtures that don't need
@@ -1144,6 +1150,95 @@ impl Default for OAuthConfig {
     }
 }
 
+/// Account-discovery surface served on the JMAP HTTP listener.
+///
+/// Mirrors ratatoskr's multi-stage discovery cascade: WebFinger
+/// (`/.well-known/webfinger`), OIDC discovery
+/// (`/.well-known/openid-configuration`), and Mozilla autoconfig
+/// (`/mail/config-v1.1.xml`). Each entry is keyed by the URL
+/// path-prefix the request arrives at - ratatoskr's discovery
+/// rewrites `https://{domain}/.well-known/...` to
+/// `${BASE}/{domain}/.well-known/...`, so the prefix is typically
+/// the bare domain (`corp.test`) but may be any sub-path
+/// (`idp/realms/corp`) when a WebFinger response chained the
+/// client onto a sub-issuer. See
+/// `notes/ratatoskr-discovery-surface.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiscoveryConfig {
+    pub entries: Vec<DiscoveryEntry>,
+}
+
+impl DiscoveryConfig {
+    pub fn lookup(&self, prefix: &str) -> Option<&DiscoveryEntry> {
+        self.entries.iter().find(|e| e.prefix == prefix)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryEntry {
+    /// Path prefix without surrounding slashes - the bit between
+    /// the listener root and `/.well-known/...` (or the
+    /// `/mail/config-v1.1.xml` suffix). Insertion-ordered.
+    pub prefix: String,
+    pub webfinger: Option<WebFingerDoc>,
+    pub oidc: Option<OidcDoc>,
+    pub autoconfig: Option<AutoconfigDoc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebFingerDoc {
+    pub links: Vec<WebFingerLink>,
+    /// Escape hatch: when present, the handler serves this body
+    /// verbatim and ignores `links`. Drives malformed-JRD
+    /// negative tests.
+    pub raw_body: Option<String>,
+    /// Overrides the default `application/jrd+json` content type.
+    /// Used to assert ratatoskr tolerates `application/json` and
+    /// rejects `text/html`.
+    pub raw_content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebFingerLink {
+    pub rel: String,
+    /// Absolute (`http://...` / `https://...`) -> emitted verbatim;
+    /// path-relative (`/idp/realms/corp`) -> the handler prefixes
+    /// the live listener base URL at emit time. Path-relative is
+    /// the right default; the absolute form exists for negative
+    /// tests (non-HTTPS scheme check).
+    pub href: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcDoc {
+    /// Self-claimed issuer. Path-relative -> prefixed at emit
+    /// time. Per OIDC Discovery 1.0 §4.3, must equal the request
+    /// URL minus `/.well-known/openid-configuration`; the loader
+    /// does NOT enforce that match so negative tests can stage
+    /// the mismatch by setting the issuer to a different prefix.
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub userinfo_endpoint: Option<String>,
+    pub scopes_supported: Vec<String>,
+    pub code_challenge_methods_supported: Vec<String>,
+    pub token_endpoint_auth_methods_supported: Vec<String>,
+    pub raw_body: Option<String>,
+    pub raw_content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoconfigDoc {
+    /// Raw XML body. Substring `${BASE}` is replaced with the
+    /// live listener base URL at emit time; other tokens are
+    /// passed through verbatim. v0 leaves IMAP / SMTP port
+    /// plumbing to the test author since ratatoskr's stage 2
+    /// is not yet exercised against sæhrimnir.
+    pub raw_body: String,
+    /// Defaults to `application/xml` when None.
+    pub raw_content_type: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Calendar {
     pub id: String,
@@ -1472,6 +1567,14 @@ pub(crate) struct RawFixture {
     pub(crate) emails: Vec<RawEmail>,
     #[serde(default)]
     pub(crate) oauth: Option<RawOAuth>,
+    /// `[discovery."prefix"]` table. Iteration order matters
+    /// (preserved insertion order via `toml::Table`) so the
+    /// emitted fixture is byte-deterministic; the runtime is
+    /// keyed by prefix anyway, so the order only affects
+    /// debug-print ordering and the lua-vs-toml equivalence
+    /// check.
+    #[serde(default)]
+    pub(crate) discovery: std::collections::BTreeMap<String, RawDiscoveryEntry>,
     #[serde(default, rename = "calendar")]
     pub(crate) calendars: Vec<RawCalendar>,
     #[serde(default, rename = "event")]
@@ -1752,6 +1855,76 @@ pub(crate) struct RawOAuth {
     pub(crate) enforce: bool,
     #[serde(default)]
     pub(crate) issuer: Option<String>,
+}
+
+/// TOML form: `[discovery."prefix"]` map. The bare table is the
+/// path-prefix key; nested `webfinger` / `oidc` / `autoconfig`
+/// are the per-shape docs. Authoring shape mirrors the user-
+/// proposal:
+/// ```toml
+/// [discovery."corp.test"]
+/// webfinger.links = [
+///   { rel = "...", href = "/idp/realms/corp" },
+/// ]
+///
+/// [discovery."idp/realms/corp".oidc]
+/// issuer = "/idp/realms/corp"
+/// authorization_endpoint = "/oauth/authorize"
+/// token_endpoint = "/oauth/token"
+/// scopes_supported = ["openid", "email"]
+/// code_challenge_methods_supported = ["S256"]
+/// token_endpoint_auth_methods_supported = ["none"]
+/// ```
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawDiscoveryEntry {
+    #[serde(default)]
+    pub(crate) webfinger: Option<RawWebFinger>,
+    #[serde(default)]
+    pub(crate) oidc: Option<RawOidc>,
+    #[serde(default)]
+    pub(crate) autoconfig: Option<RawAutoconfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawWebFinger {
+    #[serde(default)]
+    pub(crate) links: Vec<RawWebFingerLink>,
+    #[serde(default)]
+    pub(crate) raw_body: Option<String>,
+    #[serde(default)]
+    pub(crate) raw_content_type: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawWebFingerLink {
+    pub(crate) rel: String,
+    pub(crate) href: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawOidc {
+    pub(crate) issuer: String,
+    pub(crate) authorization_endpoint: String,
+    pub(crate) token_endpoint: String,
+    #[serde(default)]
+    pub(crate) userinfo_endpoint: Option<String>,
+    #[serde(default)]
+    pub(crate) scopes_supported: Vec<String>,
+    #[serde(default)]
+    pub(crate) code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    pub(crate) token_endpoint_auth_methods_supported: Vec<String>,
+    #[serde(default)]
+    pub(crate) raw_body: Option<String>,
+    #[serde(default)]
+    pub(crate) raw_content_type: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawAutoconfig {
+    pub(crate) raw_body: String,
+    #[serde(default)]
+    pub(crate) raw_content_type: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2058,6 +2231,8 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         }
         None => OAuthConfig::default(),
     };
+
+    let discovery = normalize_discovery(raw.discovery)?;
 
     // Calendars and events. Validate that every event references a
     // declared calendar - same shape as the email -> mailbox check.
@@ -2375,6 +2550,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         mailboxes,
         emails,
         oauth,
+        discovery,
         calendars,
         events,
         contact_folders,
@@ -2389,6 +2565,63 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         synthetic_email_seq,
         synthetic_category_seq,
     })
+}
+
+/// Normalise the raw `[discovery."prefix"]` map into the typed
+/// `DiscoveryConfig`. Validation is intentionally light: prefixes
+/// must be non-empty and free of surrounding slashes (so the
+/// runtime lookup against the URL-derived prefix is a plain
+/// string compare); per-doc shape is otherwise pass-through
+/// since negative tests rely on staging deliberately-broken
+/// docs (issuer mismatch, http:// href, malformed JRD).
+fn normalize_discovery(
+    raw: std::collections::BTreeMap<String, RawDiscoveryEntry>,
+) -> Result<DiscoveryConfig, String> {
+    let mut entries = Vec::with_capacity(raw.len());
+    for (prefix, entry) in raw {
+        if prefix.is_empty() {
+            return Err("discovery prefix must be non-empty".to_string());
+        }
+        if prefix.starts_with('/') || prefix.ends_with('/') {
+            return Err(format!(
+                "discovery prefix {prefix:?} must not start or end with '/'"
+            ));
+        }
+        let webfinger = entry.webfinger.map(|w| WebFingerDoc {
+            links: w
+                .links
+                .into_iter()
+                .map(|l| WebFingerLink {
+                    rel: l.rel,
+                    href: l.href,
+                })
+                .collect(),
+            raw_body: w.raw_body,
+            raw_content_type: w.raw_content_type,
+        });
+        let oidc = entry.oidc.map(|o| OidcDoc {
+            issuer: o.issuer,
+            authorization_endpoint: o.authorization_endpoint,
+            token_endpoint: o.token_endpoint,
+            userinfo_endpoint: o.userinfo_endpoint,
+            scopes_supported: o.scopes_supported,
+            code_challenge_methods_supported: o.code_challenge_methods_supported,
+            token_endpoint_auth_methods_supported: o.token_endpoint_auth_methods_supported,
+            raw_body: o.raw_body,
+            raw_content_type: o.raw_content_type,
+        });
+        let autoconfig = entry.autoconfig.map(|a| AutoconfigDoc {
+            raw_body: a.raw_body,
+            raw_content_type: a.raw_content_type,
+        });
+        entries.push(DiscoveryEntry {
+            prefix,
+            webfinger,
+            oidc,
+            autoconfig,
+        });
+    }
+    Ok(DiscoveryConfig { entries })
 }
 
 /// Highest `<prefix>N` suffix value seen across `ids`. Used at

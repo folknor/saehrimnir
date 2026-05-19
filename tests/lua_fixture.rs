@@ -92,6 +92,13 @@ fn lua_fixture_matches_equivalent_toml() {
 }
 
 #[test]
+fn discovery_lua_fixture_matches_equivalent_toml() {
+    let from_toml = fixture::load(Path::new("fixtures/discovery-small.toml")).unwrap();
+    let from_lua = fixture::load(Path::new("fixtures/discovery-small.lua")).unwrap();
+    assert_eq!(from_toml, from_lua);
+}
+
+#[test]
 fn body_raw_bytes_loads_and_lives_alongside_body_text() {
     // Adversarial-shape escape hatch: body_raw_bytes coexists with
     // body_text. Structured projections (JMAP/Gmail/Graph) read

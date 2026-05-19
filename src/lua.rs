@@ -161,6 +161,9 @@ struct Builder {
     mailboxes: Vec<RawMailbox>,
     emails: Vec<RawEmail>,
     oauth: Option<RawOAuth>,
+    /// Discovery entries accumulated via `discovery({...})`. Keyed
+    /// by prefix; duplicate prefixes are rejected at builder time.
+    discovery: std::collections::BTreeMap<String, crate::fixture::RawDiscoveryEntry>,
     /// Reactive callbacks registered via the global `on()` RustFunc.
     /// Each entry holds an `Anchor` keeping the Lua closure alive
     /// in the State's registry until the Dispatcher releases it (or
@@ -199,6 +202,7 @@ impl Builder {
             mailboxes: self.mailboxes,
             emails: self.emails,
             oauth: self.oauth,
+            discovery: self.discovery,
             calendars: vec![],
             events: vec![],
             contact_folders: self.contact_folders,
@@ -249,6 +253,8 @@ fn install_builders(state: &mut State) {
     state.set_global("group");
     state.push_rust_fn(builder_send_as);
     state.set_global("send_as");
+    state.push_rust_fn(builder_discovery);
+    state.set_global("discovery");
     state.push_rust_fn(builder_wait);
     state.set_global("wait");
     state.push_rust_fn(builder_mock_done);
@@ -481,6 +487,147 @@ fn builder_send_as(state: &mut State) -> dellingr::Result<u8> {
     };
     builder_mut(state)?.send_as.push(sa);
     Ok(0)
+}
+
+/// `discovery { prefix = "...", webfinger = {...}, oidc = {...},
+/// autoconfig = {...} }`. At least one of the three nested tables
+/// must be present; absent fields stay None. Calling `discovery`
+/// twice with the same prefix is rejected so a scenario can't
+/// shadow itself silently. Multiple distinct prefixes accumulate.
+#[allow(clippy::cast_possible_wrap)]
+fn builder_discovery(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "discovery")?;
+    let prefix = read_string(state, 1, "prefix")?;
+
+    let webfinger = read_table_opt(state, 1, "webfinger", |state| {
+        let arr_idx = state.get_top() as isize;
+        let links = read_webfinger_links(state, arr_idx)?;
+        let raw_body = read_string_opt(state, arr_idx, "raw_body")?;
+        let raw_content_type = read_string_opt(state, arr_idx, "raw_content_type")?;
+        Ok(crate::fixture::RawWebFinger {
+            links,
+            raw_body,
+            raw_content_type,
+        })
+    })?;
+
+    let oidc = read_table_opt(state, 1, "oidc", |state| {
+        let idx = state.get_top() as isize;
+        Ok(crate::fixture::RawOidc {
+            issuer: read_string(state, idx, "issuer")?,
+            authorization_endpoint: read_string(state, idx, "authorization_endpoint")?,
+            token_endpoint: read_string(state, idx, "token_endpoint")?,
+            userinfo_endpoint: read_string_opt(state, idx, "userinfo_endpoint")?,
+            scopes_supported: read_string_array_opt(state, idx, "scopes_supported")?,
+            code_challenge_methods_supported: read_string_array_opt(
+                state,
+                idx,
+                "code_challenge_methods_supported",
+            )?,
+            token_endpoint_auth_methods_supported: read_string_array_opt(
+                state,
+                idx,
+                "token_endpoint_auth_methods_supported",
+            )?,
+            raw_body: read_string_opt(state, idx, "raw_body")?,
+            raw_content_type: read_string_opt(state, idx, "raw_content_type")?,
+        })
+    })?;
+
+    let autoconfig = read_table_opt(state, 1, "autoconfig", |state| {
+        let idx = state.get_top() as isize;
+        Ok(crate::fixture::RawAutoconfig {
+            raw_body: read_string(state, idx, "raw_body")?,
+            raw_content_type: read_string_opt(state, idx, "raw_content_type")?,
+        })
+    })?;
+
+    if webfinger.is_none() && oidc.is_none() && autoconfig.is_none() {
+        return fail(
+            state,
+            "discovery { ... } must declare at least one of webfinger / oidc / autoconfig",
+        );
+    }
+
+    let builder = builder_mut(state)?;
+    if builder.discovery.contains_key(&prefix) {
+        return fail(
+            state,
+            format!("discovery {{ prefix = {prefix:?} }} declared twice"),
+        );
+    }
+    builder.discovery.insert(
+        prefix,
+        crate::fixture::RawDiscoveryEntry {
+            webfinger,
+            oidc,
+            autoconfig,
+        },
+    );
+    Ok(0)
+}
+
+/// If table `t.key` is a Lua table, push it on the stack, call
+/// `f` with the inner table at the top, pop, and return its
+/// result wrapped in `Some`. Nil = None.
+fn read_table_opt<T>(
+    state: &mut State,
+    t: isize,
+    key: &str,
+    f: impl FnOnce(&mut State) -> dellingr::Result<T>,
+) -> dellingr::Result<Option<T>> {
+    let typ = lookup(state, t, key)?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1);
+            Ok(None)
+        }
+        LuaType::Table => {
+            let r = f(state)?;
+            state.pop(1);
+            Ok(Some(r))
+        }
+        _ => {
+            state.pop(1);
+            fail(state, format!("field {key:?} must be a table"))
+        }
+    }
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_webfinger_links(
+    state: &mut State,
+    t: isize,
+) -> dellingr::Result<Vec<crate::fixture::RawWebFingerLink>> {
+    let typ = lookup(state, t, "links")?;
+    let result = match typ {
+        LuaType::Nil => Ok(Vec::new()),
+        LuaType::Table => {
+            let arr = state.get_top() as isize;
+            let len = state.table_len(arr);
+            let mut out = Vec::with_capacity(len);
+            for i in 1..=len {
+                state.push_number(i as f64);
+                state.get_table_raw(arr)?;
+                if state.typ(-1) != LuaType::Table {
+                    state.pop(1);
+                    return fail(
+                        state,
+                        format!("field \"links\" entry {i} must be a {{rel, href}} table"),
+                    );
+                }
+                let entry_idx = state.get_top() as isize;
+                let rel = read_string(state, entry_idx, "rel")?;
+                let href = read_string(state, entry_idx, "href")?;
+                state.pop(1);
+                out.push(crate::fixture::RawWebFingerLink { rel, href });
+            }
+            Ok(out)
+        }
+        _ => fail(state, "field \"links\" must be an array".to_string()),
+    };
+    state.pop(1);
+    result
 }
 
 /// `group { id, display_name, description?, mail?, mail_enabled?,

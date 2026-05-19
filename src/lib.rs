@@ -13,6 +13,7 @@
 pub mod caldav;
 pub mod cli;
 pub mod connection_id;
+pub mod discovery;
 pub mod fixture;
 pub mod gcal;
 pub mod gmail;
