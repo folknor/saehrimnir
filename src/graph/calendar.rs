@@ -32,7 +32,7 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::SecondsFormat;
 use serde_json::{Map, Value, json};
@@ -64,6 +64,7 @@ pub fn router() -> Router<AppState> {
             "/v1.0/me/events/{event}",
             get(get_event_me).patch(patch_event_me).delete(delete_event_me),
         )
+        .route("/v1.0/me/events/{event}/{action}", post(rsvp_me))
         // /users/{user}/...
         .route("/v1.0/users/{user}/calendars", get(list_calendars_user))
         .route(
@@ -87,6 +88,10 @@ pub fn router() -> Router<AppState> {
             get(get_event_user)
                 .patch(patch_event_user)
                 .delete(delete_event_user),
+        )
+        .route(
+            "/v1.0/users/{user}/events/{event}/{action}",
+            post(rsvp_user),
         )
 }
 
@@ -135,6 +140,59 @@ async fn delta_events_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     delta_events_impl(state, &account_id, &calendar, headers, raw_query, true).await
+}
+
+async fn rsvp_me(
+    State(state): State<AppState>,
+    Path((event, action)): Path<(String, String)>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    rsvp_impl(state, &account_id, &event, &action).await
+}
+
+async fn rsvp_user(
+    State(state): State<AppState>,
+    Path((user, event, action)): Path<(String, String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    rsvp_impl(state, &account_id, &event, &action).await
+}
+
+/// `POST /v1.0/me/events/{id}/{accept|decline|tentativelyAccept}` -
+/// RSVP to a meeting invite (bifrost `calendar.rs::rsvp`). The fixture
+/// `Event` has no per-attendee response-status slot, so v0
+/// accept-and-ignores: it validates the action + event and returns
+/// 202 Accepted without recording a transition (nothing durably
+/// changes). Unknown action -> 400, unknown event -> 404.
+async fn rsvp_impl(state: AppState, account_id: &str, event: &str, action: &str) -> Response {
+    if !matches!(action, "accept" | "decline" | "tentativelyAccept") {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "ErrorInvalidRequest",
+            &format!("unsupported event action {action:?}"),
+        );
+    }
+    let event_owned = event.to_string();
+    if let Some(o) = super::maybe_override(&state, "rsvp", move |s| {
+        crate::lua::req_set_str(s, "event", &event_owned)
+    }) {
+        return o;
+    }
+    let exists = {
+        let fixture = state.fixture();
+        fixture.events_for(account_id).any(|e| e.id == event)
+    };
+    if !exists {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("event {event:?} not declared in fixture"),
+        );
+    }
+    StatusCode::ACCEPTED.into_response()
 }
 
 async fn get_event_me(State(state): State<AppState>, Path(event): Path<String>) -> Response {

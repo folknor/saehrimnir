@@ -24,6 +24,7 @@ catchall 404).
 |---|---|
 | `GET /v1.0/me` | Bearer-resolved account (`oauth::account_from_bearer`, fallback-to-primary), projected as a Graph user: `id`, `displayName`, `mail`, `userPrincipalName` (all derived from `account.name` since the fixture `Account` carries only id + email). `$select` is ignored (we always emit the full set). |
 | `GET /v1.0/users/{id}` | The named declared account; `me` aliases the primary; unknown id 404s `ResourceNotFound`. Same projection. |
+| `GET /v1.0/users` + `GET /v1.0/me/users` | GAL directory search (bifrost's `directory_search`, which addresses `/me/users`). Matches declared accounts by `startswith(displayName,'X') or startswith(mail,'X')` (case-insensitive); no filter lists all. Returns a `value` collection of bare user entities. |
 
 ## Calendar (`src/graph/calendar.rs`)
 
@@ -43,6 +44,7 @@ fixture.
 | `POST /v1.0/me/calendars/{id}/events` | 201 with the freshly created event projected via `serialize_event`. Server id is `mock-event-N` (1-based, counted against current `fixture.events.len()`). Mutates the fixture under a write guard, bumps `Fixture::state`, records `event_created` in the change log. Logs `(graph, "POST /v1.0/me/calendars/{id}/events", { body })` to the request log. |
 | `PATCH /v1.0/me/events/{id}` | 200 with the post-patch event. Honours `subject`, `start`, `end`, `body.content`, `location.displayName`, `isAllDay`, `attendees`. Records `event_updated`. |
 | `DELETE /v1.0/me/events/{id}` | 204 with no body. Removes the event and records `event_destroyed`. Logs `(graph, "DELETE /v1.0/me/events/{id}", { id })`. |
+| `POST /v1.0/me/events/{id}/{accept\|decline\|tentativelyAccept}` | RSVP (bifrost addresses it via `/me/events/{id}`, not the calendar-scoped path). 202 Accepted; accept-and-ignore - the fixture `Event` has no per-attendee response-status slot, so nothing durably changes and no transition is recorded. Unknown action -> 400, unknown event -> 404. |
 
 Event projection populates `subject`, `bodyPreview`, `body`
 (`contentType: "text"`), `start`/`end` (`{ dateTime, timeZone }`,

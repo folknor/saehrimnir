@@ -15,12 +15,12 @@
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::HeaderMap,
     response::Response,
     routing::get,
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::{AppState, ok_json};
 use crate::fixture::Account;
@@ -29,6 +29,48 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1.0/me", get(profile_me))
         .route("/v1.0/users/{user}", get(profile_user))
+        // GAL directory search. bifrost addresses it as `/me/users`
+        // (real Graph uses `/users`); accept both.
+        .route("/v1.0/users", get(list_users))
+        .route("/v1.0/me/users", get(list_users))
+}
+
+/// `GET /v1.0/users` / `/v1.0/me/users` - directory (GAL) search.
+/// bifrost's `directory_search` filters with
+/// `startswith(displayName,'X') or startswith(mail,'X')`; v0 matches
+/// declared accounts whose name starts with the term (case-
+/// insensitive), projecting each as a Graph user. No filter lists
+/// every account. (bifrost swallows a 403 on personal Gmail-style
+/// accounts; the mock simply returns the matches.)
+async fn list_users(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    if let Some(o) = super::maybe_override(&state, "list_users", |_| Ok(())) {
+        return o;
+    }
+    let q = super::odata::OdataQuery::parse(raw.as_deref());
+    let term = q.filter.as_deref().and_then(parse_startswith_term);
+    let fixture = state.fixture();
+    let value: Vec<Value> = fixture
+        .accounts
+        .iter()
+        .filter(|a| match &term {
+            None => true,
+            Some(t) => a.name.to_lowercase().starts_with(&t.to_lowercase()),
+        })
+        .map(serialize_user)
+        .collect();
+    ok_json(json!({
+        "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users",
+        "value": value,
+    }))
+}
+
+/// Extract the search term from a `startswith(displayName,'X') or
+/// startswith(mail,'X')` `$filter` (the first quoted substring).
+fn parse_startswith_term(filter: &str) -> Option<String> {
+    let start = filter.find('\'')?;
+    let rest = &filter[start + 1..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
 }
 
 async fn profile_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -72,11 +114,21 @@ async fn profile_user(State(state): State<AppState>, Path(user): Path<String>) -
 /// `userPrincipalName` all derive from `name` - the same convention
 /// `group_sync::serialize_user_member` uses.
 fn serialize_profile(a: &Account) -> Value {
+    let mut v = serialize_user(a);
+    if let Value::Object(ref mut m) = v {
+        m.insert(
+            "@odata.context".into(),
+            Value::String("https://graph.microsoft.com/v1.0/$metadata#users/$entity".into()),
+        );
+    }
+    v
+}
+
+/// The bare Graph user entity (no `@odata.context`), used as a
+/// collection member by GAL search and wrapped by `serialize_profile`
+/// for the single-entity reads.
+fn serialize_user(a: &Account) -> Value {
     let mut obj = Map::new();
-    obj.insert(
-        "@odata.context".into(),
-        Value::String("https://graph.microsoft.com/v1.0/$metadata#users/$entity".into()),
-    );
     obj.insert("id".into(), Value::String(a.id.clone()));
     obj.insert("displayName".into(), Value::String(a.name.clone()));
     obj.insert("mail".into(), Value::String(a.name.clone()));

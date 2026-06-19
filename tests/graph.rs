@@ -427,6 +427,31 @@ async fn graph_users_profile_resolves_named_and_404s_unknown() {
 }
 
 #[tokio::test]
+async fn graph_directory_search_matches_accounts() {
+    // startswith 'test' matches account-1 (test@example.com).
+    let (status, v) = get_json(
+        "/v1.0/me/users?$filter=startswith(displayName,'test')%20or%20startswith(mail,'test')",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mails: Vec<&str> = v["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|u| u["mail"].as_str())
+        .collect();
+    assert!(mails.contains(&"test@example.com"), "got {mails:?}");
+
+    // A non-matching prefix yields an empty directory.
+    let (status, v) = get_json(
+        "/v1.0/users?$filter=startswith(displayName,'zzz')%20or%20startswith(mail,'zzz')",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v["value"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn graph_list_message_attachments_returns_metadata_with_bytes() {
     let (status, v) = get_json_with(
         attach_router(),
@@ -967,6 +992,28 @@ async fn graph_calendar_view_filters_by_range() {
     // Unknown calendar 404s.
     let (status, _) =
         get_json_with(calendar_router(), "/v1.0/me/calendars/ghost/calendarView").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_event_rsvp() {
+    let app = calendar_router();
+    // accept -> 202 Accepted (no durable status slot in v0).
+    let (status, _) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/events/ev-001/accept",
+        Some(json!({ "sendResponse": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // unknown action -> 400, unknown event -> 404.
+    let (status, _) =
+        send_json(&app, "POST", "/v1.0/me/events/ev-001/frobnicate", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) =
+        send_json(&app, "POST", "/v1.0/me/events/ghost/accept", Some(json!({}))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 

@@ -546,7 +546,10 @@ named ids resolve declared accounts, unknown ids 404
 (`id` / `displayName` / `mail` / `userPrincipalName`). This is the
 FIRST request `GraphAccountFactory::open` makes (to learn the
 account's own address); without it the bare `/v1.0/me` path fell to
-the catchall 404 and no Graph account could open. Mail:
+the catchall 404 and no Graph account could open. `GET /v1.0/users`
++ `GET /v1.0/me/users` serve GAL directory search: match declared
+accounts by `startswith(displayName|mail,'...')`, projecting each as
+a user (no filter = all). Mail:
 `/v1.0/me/mailFolders` (list, by-id, by-well-known-alias,
 childFolders; plus CRUD - POST create [top-level + childFolders],
 PATCH rename, POST `/move` re-parent [`msgfolderroot` = top], DELETE,
@@ -580,7 +583,10 @@ alias + events list with `$top`/`$skiptoken` pagination + delta
 view + non-delta `calendarView?startDateTime=&endDateTime=` range
 read bifrost's `events_in_range` drives, coarse overlap filter),
 `/v1.0/me/events/{id}` GET / PATCH / DELETE, plus
-`POST /v1.0/me/calendars/{id}/events`. Calendar mutations are
+`POST /v1.0/me/calendars/{id}/events`, plus RSVP
+`POST /v1.0/me/events/{id}/{accept|decline|tentativelyAccept}`
+(returns 202; accept-and-ignore - the fixture `Event` has no
+per-attendee status slot). Calendar mutations are
 persistent: POST/PATCH/DELETE on `/v1.0/me/events` mutate the
 shared fixture, bump `Fixture::state`, and record `event_created`
 / `event_updated` / `event_destroyed` in the change log. The next

@@ -183,10 +183,15 @@ folder-scoped) + the contact list `$filter=emailAddresses/any(...)`
 - `src/graph/contacts.rs`, mutating the shared `Contact` set with
 `contact_*` transitions.
 
+**DONE:** event RSVP actions (`POST /me/events/{id}/{accept|decline|
+tentativelyAccept}` -> 202, accept-and-ignore) and GAL directory
+search (`GET /users` + `/me/users` with `startswith` filter over
+accounts) - `src/graph/calendar.rs` + `src/graph/profile.rs`.
+
 Still open (the rest of the write tier): mail send/draft (`POST
 /me/messages`, `/sendMail`, drafts); `mailboxSettings` (vacation);
-`messageRules` (server-side filters); GAL `/users?$filter=startswith`;
-event RSVP actions; `POST /subscriptions` webhooks (opt-in push only).
+`messageRules` (server-side filters); `POST /subscriptions` webhooks
+(opt-in push only).
 
 ### Confirmed safe (do not flag)
 EWS, public folders, OneDrive/`host_attachment`, `attachment_upload`
