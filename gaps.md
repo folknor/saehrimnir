@@ -33,7 +33,7 @@ L = large (subsystem).
 | 1 | ~~`GET /v1.0/me` (profile root) MISSING -> no Graph account opens at all~~ **DONE** (`src/graph/profile.rs`) | Graph | P0 | S |
 | 2 | ~~IMAP `FETCH` parser rejects `ENVELOPE` + `MODSEQ` -> initial inventory FETCH returns `BAD`~~ **DONE** (`src/imap.rs`) | IMAP | P0 (conditional) | M |
 | 3 | ~~`Thread/changes` MISSING -> first delta cycle after open fails~~ **DONE** (`src/jmap.rs`) | JMAP | P1 | S |
-| 4 | Graph `POST /$batch` MISSING -> all message hydration + writes fail | Graph | P0/P1 | L |
+| 4 | ~~Graph `POST /$batch` MISSING -> all message hydration + writes fail~~ **DONE** for the read/hydration path (`src/graph/mail.rs`); write sub-requests still per-item 501 | Graph | P0/P1 | L |
 | 5 | CalDAV `sync-collection` REPORT + `sync-token` PROPFIND prop MISSING (ship together) | CalDAV | P1 | M |
 | 6 | People `GET /v1/people/{id}` (single) **DONE** (`src/people/contacts.rs`); `contactGroups.list` STILL MISSING (drives `address_books_list`) | Google | P1 | M |
 | 7 | ~~`CalendarEvent/query` MISSING -> JMAP calendar read path (query-based) cannot run~~ **DONE** (`src/jmap_calendar.rs`) | JMAP | P1 | M |
@@ -144,7 +144,7 @@ client-side pre-wire.
 | METHOD path | bifrost evidence | sæhrimnir status | Effort |
 |---|---|---|---|
 | `GET /v1.0/me?$select=displayName,mail,userPrincipalName` (+ `/users/{id}?$select=...` for shared) | the FIRST call `GraphAccountFactory::open` makes (`research/bifrost/.../graph/src/account/mod.rs:290`, `api.rs:6-12`) | **DONE** - `src/graph/profile.rs` serves `/v1.0/me` (bearer-resolved) + `/v1.0/users/{id}` (named, `me` alias, unknown 404), projecting `id`/`displayName`/`mail`/`userPrincipalName` | S (shipped) |
-| `POST /v1.0/$batch` | `client.rs:323-328`; message hydration (`get.rs:95-123`) + every PIM write | MISSING -> catchall 404. Blocks metadata hydration + all writes (P0 for hydration, not for inventory/changes which use delta endpoints) | L - JSON-batch envelope: fan sub-requests through the router, collect responses |
+| `POST /v1.0/$batch` | `client.rs:323-328`; message hydration (`get.rs:95-123`) + every PIM write | **DONE for hydration** - `src/graph/mail.rs::batch` services `GET .../messages/{id}` sub-requests (the metadata-hydration path) and returns a per-item error for others, so write batches degrade per-item rather than batch-wide. Write sub-requests (PATCH/move/destroy) still per-item 501 -> P2 follow-up | L (read path shipped) |
 
 ### P1
 

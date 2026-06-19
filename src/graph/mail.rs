@@ -15,11 +15,11 @@
 //! powers both paths.
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Response,
-    routing::get,
+    routing::{get, post},
 };
 use chrono::SecondsFormat;
 use serde_json::{Map, Value, json};
@@ -68,6 +68,9 @@ pub fn router() -> Router<AppState> {
             get(get_message_attachment_value_me),
         )
         .route("/v1.0/me/messages/{message_id}", get(get_message_me))
+        // JSON batching. bifrost hydrates message metadata by batching
+        // per-id GET /me/messages/{id} sub-requests through here.
+        .route("/v1.0/$batch", post(batch))
         // /v1.0/users/{userId}/...
         .route("/v1.0/users/{user}/mailFolders", get(list_folders_user))
         .route("/v1.0/users/{user}/mailFolders/{folder}", get(get_folder_user))
@@ -844,6 +847,131 @@ fn message_get_value(
     let e = fixture.emails_for(account_id).find(|e| e.id == message_id)?;
     let parent = e.mailbox_ids.first().map(String::as_str).unwrap_or("");
     Some(message_value(e, parent, expand))
+}
+
+/// `POST /v1.0/$batch` (Microsoft Graph JSON batching). bifrost
+/// hydrates message metadata by batching per-id `GET /me/messages/{id}`
+/// sub-requests through here (`client.rs::post_batch`,
+/// `account/get.rs`); without it the hydration pass 404'd at the
+/// catchall. The whole batch is read-only in v0: GET message
+/// sub-requests are serviced; any other sub-request gets a per-item
+/// error (bifrost surfaces that as one failed sub-request, not a
+/// batch-level failure), so write batches (`pim.rs`) degrade
+/// gracefully rather than corrupting state.
+async fn batch(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let requests = body
+        .get("requests")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let fixture = state.fixture();
+    let responses: Vec<Value> = requests
+        .iter()
+        .map(|r| batch_sub_response(&fixture, r))
+        .collect();
+    drop(fixture);
+    ok_json(json!({ "responses": responses }))
+}
+
+fn batch_sub_response(fixture: &Fixture, req: &Value) -> Value {
+    let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let method = req
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("GET")
+        .to_ascii_uppercase();
+    let url = req.get("url").and_then(Value::as_str).unwrap_or("");
+    let (status, body) = dispatch_batch_request(fixture, &method, url);
+    json!({
+        "id": id,
+        "status": status,
+        "headers": { "Content-Type": "application/json" },
+        "body": body,
+    })
+}
+
+/// Route one `$batch` sub-request against the fixture. v0 services
+/// `GET /me/messages/{id}` and `GET /users/{u}/messages/{id}` (the
+/// hydration path). Sub-request URLs are relative (`/me/...`) and may
+/// or may not carry the `/v1.0` prefix.
+fn dispatch_batch_request(fixture: &Fixture, method: &str, url: &str) -> (u16, Value) {
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (url, None),
+    };
+    let path = path.strip_prefix("/v1.0").unwrap_or(path);
+
+    let unsupported = || {
+        (
+            404,
+            batch_error(
+                "ResourceNotImplemented",
+                &format!("v0 $batch does not implement {method} {url}"),
+            ),
+        )
+    };
+
+    if method != "GET" {
+        return (
+            501,
+            batch_error(
+                "ResourceNotImplemented",
+                &format!("v0 $batch does not implement {method} {url}"),
+            ),
+        );
+    }
+
+    if let Some(id) = path.strip_prefix("/me/messages/") {
+        if id.is_empty() || id.contains('/') {
+            return unsupported();
+        }
+        let account_id = fixture.primary_account().id.clone();
+        return batch_message(fixture, &account_id, id, query);
+    }
+    if let Some(rest) = path.strip_prefix("/users/")
+        && let Some((user, tail)) = rest.split_once("/messages/")
+    {
+        if tail.is_empty() || tail.contains('/') {
+            return unsupported();
+        }
+        let account_id = if user == "me" {
+            fixture.primary_account().id.clone()
+        } else {
+            match fixture.account(user) {
+                Some(a) => a.id.clone(),
+                None => {
+                    return (
+                        404,
+                        batch_error("ResourceNotFound", &format!("user {user:?} not found")),
+                    );
+                }
+            }
+        };
+        return batch_message(fixture, &account_id, tail, query);
+    }
+
+    unsupported()
+}
+
+fn batch_message(
+    fixture: &Fixture,
+    account_id: &str,
+    message_id: &str,
+    query: Option<&str>,
+) -> (u16, Value) {
+    let q = odata::OdataQuery::parse(query);
+    let expand = expand_attachments(q.expand.as_deref());
+    match message_get_value(fixture, account_id, message_id, expand) {
+        Some(v) => (200, v),
+        None => (
+            404,
+            batch_error("ErrorItemNotFound", &format!("message {message_id:?} not found")),
+        ),
+    }
+}
+
+fn batch_error(code: &str, message: &str) -> Value {
+    json!({ "error": { "code": code, "message": message } })
 }
 
 fn message_value(e: &Email, parent_folder_id: &str, expand_attachments: bool) -> Value {

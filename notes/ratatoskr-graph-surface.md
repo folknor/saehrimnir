@@ -230,6 +230,27 @@ inbox. v0 mock honours both.
 
 ## Mail-sync endpoints
 
+### Single-message read + `$batch` hydration (bifrost)
+
+bifrost's NEW client (research/bifrost/crates/graph) hydrates message
+metadata differently from the delta-only path the rest of this doc
+describes: after `messages/delta` surfaces ids, it batches per-id
+`GET /me/messages/{id}?$select=...` sub-requests through
+`POST /v1.0/$batch` (`client.rs::post_batch`, `account/get.rs`).
+v0 serves:
+
+- `GET /v1.0/me/messages/{id}` + `/v1.0/users/{u}/messages/{id}` -
+  single-message projection (reuses `message_value`), 404
+  `ErrorItemNotFound` on unknown id. `$select` parsed + ignored.
+- `POST /v1.0/$batch` - `{ requests: [{id, method, url}] }` ->
+  `{ responses: [{id, status, headers, body}] }`. Services GET
+  message sub-requests (urls are relative, `/me/...` or
+  `/users/{u}/...`, with or without the `/v1.0` prefix); any other
+  sub-request returns a per-item error (404 for unknown route, 501
+  for non-GET) so a write batch degrades per-item, not batch-wide.
+  Read-only in v0 - write sub-requests (PATCH categories / isRead /
+  importance, move, destroy from `pim.rs`) are the P2 follow-up.
+
 ### Folder resolution
 
 ```

@@ -85,6 +85,51 @@ async fn graph_get_single_message_projects_email() {
 }
 
 #[tokio::test]
+async fn graph_batch_hydrates_messages() {
+    // bifrost batches per-id GET /me/messages/{id} to hydrate metadata.
+    let body = json!({
+        "requests": [
+            { "id": "1", "method": "GET", "url": "/me/messages/email-001?$select=subject" },
+            { "id": "2", "method": "GET", "url": "/me/messages/email-002" },
+            { "id": "3", "method": "GET", "url": "/me/messages/no-such-message" },
+        ]
+    });
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1.0/$batch")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let responses = v["responses"].as_array().unwrap();
+    assert_eq!(responses.len(), 3);
+    let by_id = |id: &str| responses.iter().find(|r| r["id"] == id).unwrap();
+
+    let r1 = by_id("1");
+    assert_eq!(r1["status"], 200);
+    assert_eq!(r1["body"]["id"], "email-001");
+    assert_eq!(r1["body"]["subject"], "Hello");
+
+    let r2 = by_id("2");
+    assert_eq!(r2["status"], 200);
+    assert_eq!(r2["body"]["id"], "email-002");
+
+    // Unknown id fails per-item, not at the batch level.
+    let r3 = by_id("3");
+    assert_eq!(r3["status"], 404);
+    assert_eq!(r3["body"]["error"]["code"], "ErrorItemNotFound");
+}
+
+#[tokio::test]
 async fn graph_me_profile_returns_account_identity() {
     // GraphAccountFactory::open's FIRST request. Without this route it
     // hit the catchall 404 and no Graph account could open.
