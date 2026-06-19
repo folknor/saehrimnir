@@ -582,7 +582,11 @@ rather than batch-wide),
 `/v1.0/me/messages` (account-wide collection honouring
 `$filter=conversationId eq '...'` for bifrost's thread fetch, with
 `$top` / `$skiptoken` paging; non-`conversationId` filters and
-`$search` fall through to the full list). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
+`$search` fall through to the full list; plus POST = draft create -
+stores a `$draft` Email in the Drafts-role mailbox [or the first
+mailbox], so GET/PATCH find it), `POST /v1.0/me/messages/{id}/send`
+(202; the draft stays put - v0 doesn't model the Sent-folder
+transition). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
 alias + events list with `$top`/`$skiptoken` pagination + delta
 view + non-delta `calendarView?startDateTime=&endDateTime=` range
 read bifrost's `events_in_range` drives, coarse overlap filter),

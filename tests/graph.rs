@@ -99,6 +99,44 @@ async fn send_json(
 }
 
 #[tokio::test]
+async fn graph_create_draft_then_send() {
+    let app = router();
+
+    // Create a draft (no Drafts-role mailbox in jmap-small, so it
+    // falls back to the first mailbox).
+    let (status, v) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/messages",
+        Some(json!({
+            "subject": "Hi",
+            "toRecipients": [{ "emailAddress": { "address": "bob@example.com" } }],
+            "body": { "contentType": "text", "content": "Hello there" },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(v["subject"], "Hi");
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // Stored as a draft: a follow-up GET finds it.
+    let (status, v) = get_json_with(app.clone(), &format!("/v1.0/me/messages/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["isDraft"], true);
+    assert_eq!(
+        v["toRecipients"][0]["emailAddress"]["address"],
+        "bob@example.com"
+    );
+
+    // Send it (bifrost POSTs an empty body); unknown id 404s.
+    let (status, _) =
+        send_json(&app, "POST", &format!("/v1.0/me/messages/{id}/send"), None).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _) = send_json(&app, "POST", "/v1.0/me/messages/ghost/send", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn graph_settings_stubs() {
     let app = router();
 

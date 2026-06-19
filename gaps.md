@@ -194,8 +194,14 @@ accounts) - `src/graph/calendar.rs` + `src/graph/profile.rs`.
 stubs), `POST /subscriptions` + renew/delete (webhook push, opt-in).
 None durably stored - no fixture slot.
 
-Still open (the rest of the write tier): mail send/draft (`POST
-/me/messages`, `/sendMail`, drafts).
+**DONE:** mail draft create + send - `POST /me/messages` stores a
+`$draft` Email in the Drafts-role mailbox (or first mailbox) and
+`POST /me/messages/{id}/send` returns 202 (the draft stays; v0 does
+not model the Sent transition). bifrost's send path is
+create-draft-then-send, not `/sendMail`. `src/graph/mail.rs`.
+
+The Graph write tier is now complete - every gap the audit
+identified (P0 / P1 read+sync AND the P2 write surface) is closed.
 
 ### Confirmed safe (do not flag)
 EWS, public folders, OneDrive/`host_attachment`, `attachment_upload`
@@ -334,14 +340,15 @@ shipped commits):
   sync against the mock.
 - **JMAP:** `Thread/changes` + `CalendarEvent/query` shipped - the
   basic-mail-after-open and calendar-read gaps are closed.
-- **Graph read/sync surface is COMPLETE:** profile, single-message
-  GET, `$value`, `POST /$batch` (hydration), `/me/messages`
-  collection (conversationId), `calendarView` range, and
-  `/me/contacts` folder-agnostic list all shipped. Remaining Graph
-  gaps are the **P2 write tier** (send/draft, mailFolder CRUD,
-  mailboxSettings, messageRules, contact write verbs, RSVP,
-  `/subscriptions`, and PATCH/DELETE/move `$batch` sub-requests) -
-  bifrost's mutation pipeline, not the read/sync path.
+- **Graph is COMPLETE - read/sync AND write.** Reads: profile,
+  single-message GET, `$value`, `POST /$batch` (hydration + write
+  sub-requests), `/me/messages` collection, `calendarView` range,
+  `/me/contacts` list, GAL `/users` search. Writes: message
+  PATCH/DELETE/move (direct + `$batch`), mailFolder CRUD, contact
+  CRUD + email `$filter`, event RSVP, draft create + send, and the
+  accept-and-ignore stubs (mailboxSettings, messageRules,
+  `/subscriptions`). Only deliberately-out-of-scope surfaces remain
+  (EWS, public folders, OneDrive, Drive hosting).
 - **Google:** People single-GET shipped; `contactGroups.list`
   (address-book enumeration) still open.
 - **SMTP** is clean (one P2: `FUTURERELEASE`).

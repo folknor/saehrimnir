@@ -266,6 +266,15 @@ v0 serves:
   with `[destinationId]`, syncs UIDs, records `email_updated`.
   Returns 201 with the moved message; 400 on missing `destinationId`,
   404 on unknown message.
+- `POST /v1.0/me/messages` (draft create) + `POST
+  /v1.0/me/messages/{id}/send` (+ `/users/{u}` twins) - bifrost's
+  send path is create-draft-then-send (`pim.rs::send_message`), not
+  `/sendMail`. Create stores a `$draft`-keyworded Email (subject /
+  from / to / cc / bcc / body parsed from the Graph shape) in the
+  Drafts-role mailbox, or the first mailbox if none, recording
+  `email_created`; returns 201 with the message so the id is real
+  (GET/PATCH then find it). Send returns 202 and leaves the draft -
+  v0 models neither the Sent-folder transition nor delivery.
 - `GET /v1.0/me/messages/{id}/$value` (+ `/users/{u}` twin) -
   assembled RFC 822 bytes (`text/plain`), bifrost's `open_raw_rfc822`
   body-fetch path. Reuses `crate::imap::assembled_rfc822`, so the

@@ -93,7 +93,11 @@ pub fn router() -> Router<AppState> {
             "/v1.0/me/messages/{message_id}/move",
             post(move_message_me),
         )
-        .route("/v1.0/me/messages", get(list_messages_collection_me))
+        .route("/v1.0/me/messages/{message_id}/send", post(send_message_me))
+        .route(
+            "/v1.0/me/messages",
+            get(list_messages_collection_me).post(create_draft_me),
+        )
         // JSON batching. bifrost hydrates message metadata by batching
         // per-id GET /me/messages/{id} sub-requests through here.
         .route("/v1.0/$batch", post(batch))
@@ -151,8 +155,12 @@ pub fn router() -> Router<AppState> {
             post(move_message_user),
         )
         .route(
+            "/v1.0/users/{user}/messages/{message_id}/send",
+            post(send_message_user),
+        )
+        .route(
             "/v1.0/users/{user}/messages",
-            get(list_messages_collection_user),
+            get(list_messages_collection_user).post(create_draft_user),
         )
 }
 
@@ -1712,6 +1720,178 @@ async fn move_message_impl(
             &format!("message {message_id:?} not found"),
         ),
     }
+}
+
+// ── Draft create + send ─────────────────────────────────────────────
+//
+// bifrost's send path (pim.rs::send_message) creates a draft via
+// POST .../messages (reading its id), optionally PATCHes a deferred
+// send time, then POSTs .../messages/{id}/send. v0 stores the draft
+// as a `$draft`-keyworded Email in the account's Drafts folder (or
+// the first mailbox if none has the Drafts role), so the id is real,
+// GET/PATCH find it, and a harness can inspect the composed message.
+// Send returns 202 and leaves the draft in place - v0 does not model
+// the Sent-folder transition or actual delivery.
+
+async fn create_draft_me(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    create_draft_impl(state, &account_id, body).await
+}
+
+async fn create_draft_user(
+    State(state): State<AppState>,
+    Path(user): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    create_draft_impl(state, &account_id, body).await
+}
+
+async fn send_message_me(State(state): State<AppState>, Path(message_id): Path<String>) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    send_message_impl(state, &account_id, &message_id).await
+}
+
+async fn send_message_user(
+    State(state): State<AppState>,
+    Path((user, message_id)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    send_message_impl(state, &account_id, &message_id).await
+}
+
+async fn create_draft_impl(state: AppState, account_id: &str, body: Value) -> Response {
+    if let Some(o) = super::maybe_override(&state, "create_draft", |_| Ok(())) {
+        return o;
+    }
+    // The Drafts-role mailbox, else the first mailbox of the account.
+    let folder_id = {
+        let fixture = state.fixture();
+        let folder = fixture
+            .mailboxes_for(account_id)
+            .find(|m| m.role == Some(Role::Drafts))
+            .or_else(|| fixture.mailboxes_for(account_id).next());
+        match folder {
+            Some(m) => m.id.clone(),
+            None => {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "ErrorItemNotFound",
+                    "account has no mailbox to hold the draft",
+                );
+            }
+        }
+    };
+    let projected = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        create_draft_core(&mut fix, account_id, &folder_id, &body)
+    };
+    (StatusCode::CREATED, axum::Json(projected)).into_response()
+}
+
+async fn send_message_impl(state: AppState, account_id: &str, message_id: &str) -> Response {
+    let message_owned = message_id.to_string();
+    if let Some(o) = super::maybe_override(&state, "send_message", move |s| {
+        crate::lua::req_set_str(s, "message_id", &message_owned)
+    }) {
+        return o;
+    }
+    let exists = {
+        let fixture = state.fixture();
+        fixture.emails_for(account_id).any(|e| e.id == message_id)
+    };
+    if exists {
+        StatusCode::ACCEPTED.into_response()
+    } else {
+        error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("message {message_id:?} not found"),
+        )
+    }
+}
+
+fn create_draft_core(fix: &mut Fixture, account_id: &str, folder_id: &str, body: &Value) -> Value {
+    let subject = body.get("subject").and_then(Value::as_str).map(str::to_string);
+    let from = parse_graph_recipient(body.get("from"));
+    let to = parse_graph_recipients(body.get("toRecipients"));
+    let cc = parse_graph_recipients(body.get("ccRecipients"));
+    let bcc = parse_graph_recipients(body.get("bccRecipients"));
+    let body_text = body
+        .get("body")
+        .and_then(|b| b.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let acct = account_id.to_string();
+    let fid = folder_id.to_string();
+    let mut projected = Value::Null;
+    let _ = fix.mutate(|f| {
+        let id = f.mint_email_id();
+        // Determinism: anchor to the newest existing message, or a
+        // fixed epoch in an empty fixture (mirrors JMAP Email/set).
+        let received_at = f.emails.iter().map(|e| e.received_at).max().unwrap_or_else(|| {
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .expect("hardcoded RFC3339")
+                .with_timezone(&chrono::Utc)
+        });
+        let size = i64::try_from(body_text.len()).unwrap_or(i64::MAX);
+        let email = Email {
+            id: id.clone(),
+            account_id: acct.clone(),
+            thread_id: id.clone(),
+            mailbox_ids: vec![fid.clone()],
+            keywords: vec!["$draft".to_string()],
+            size,
+            received_at,
+            sent_at: received_at,
+            from,
+            to,
+            cc,
+            bcc,
+            reply_to: vec![],
+            subject,
+            preview: None,
+            message_id: vec![],
+            in_reply_to: vec![],
+            references: vec![],
+            has_attachment: false,
+            body: Body::Text(body_text),
+            attachments: vec![],
+            raw_bytes: None,
+        };
+        f.emails.push(email.clone());
+        f.assign_uid(&fid, id.clone());
+        projected = message_value(&email, &fid, false);
+        MutationDiff {
+            email_created: vec![id],
+            ..Default::default()
+        }
+    });
+    projected
+}
+
+/// Graph single recipient (`{ emailAddress: { address, name? } }`)
+/// -> fixture `Address`.
+fn parse_graph_recipient(v: Option<&Value>) -> Option<Address> {
+    let ea = v?.get("emailAddress")?;
+    let email = ea.get("address").and_then(Value::as_str)?.to_string();
+    let name = ea.get("name").and_then(Value::as_str).map(str::to_string);
+    Some(Address { email, name })
+}
+
+/// Graph recipient array -> fixture `Address`es.
+fn parse_graph_recipients(v: Option<&Value>) -> Vec<Address> {
+    let Some(arr) = v.and_then(Value::as_array) else {
+        return vec![];
+    };
+    arr.iter().filter_map(|r| parse_graph_recipient(Some(r))).collect()
 }
 
 /// Find a message by id within the account and project it via
