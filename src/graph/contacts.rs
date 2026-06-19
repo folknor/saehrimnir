@@ -56,6 +56,7 @@ pub fn router() -> Router<AppState> {
             get(get_contact_in_folder_me),
         )
         .route("/v1.0/me/contacts/{contact}", get(get_contact_me))
+        .route("/v1.0/me/contacts", get(list_all_contacts_me))
         // /users/{user}/...
         .route(
             "/v1.0/users/{user}/contactFolders",
@@ -81,6 +82,7 @@ pub fn router() -> Router<AppState> {
             "/v1.0/users/{user}/contacts/{contact}",
             get(get_contact_user),
         )
+        .route("/v1.0/users/{user}/contacts", get(list_all_contacts_user))
 }
 
 // ── /me/ wrappers ───────────────────────────────────────────────────
@@ -110,6 +112,15 @@ async fn list_contacts_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     list_contacts_impl(state, &account_id, &folder, headers, raw_query, true).await
+}
+
+async fn list_all_contacts_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    list_all_contacts_impl(state, &account_id, headers, raw_query, true).await
 }
 
 async fn delta_contacts_me(
@@ -175,6 +186,19 @@ async fn list_contacts_user(
         Err(r) => return r,
     };
     list_contacts_impl(state, &account_id, &folder, headers, raw_query, false).await
+}
+
+async fn list_all_contacts_user(
+    State(state): State<AppState>,
+    Path(user): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    list_all_contacts_impl(state, &account_id, headers, raw_query, false).await
 }
 
 async fn delta_contacts_user(
@@ -359,6 +383,77 @@ async fn list_contacts_impl(
         Value::String(format!(
             "https://graph.microsoft.com/v1.0/$metadata#me/contactFolders(\"{folder_id}\")/contacts"
         )),
+    );
+    envelope.insert("value".to_string(), Value::Array(value));
+    if has_more {
+        let next_off = u32::try_from(next_offset_val).unwrap_or(u32::MAX);
+        envelope.insert(
+            "@odata.nextLink".to_string(),
+            Value::String(odata::build_next_link(
+                &host,
+                &path,
+                raw_query.as_deref(),
+                next_off,
+            )),
+        );
+    }
+    ok_json(Value::Object(envelope))
+}
+
+/// `GET /v1.0/me/contacts` (account-wide, folder-agnostic). bifrost's
+/// `contacts_list(None)` / `contact_search(None)` hit this when no
+/// address book is named (the mock only had the folder-scoped
+/// `/contactFolders/{id}/contacts` and the single `/contacts/{id}`).
+/// Lists every contact in the account across folders, `$top` /
+/// `$skiptoken` paginated; `$select` / `$filter` are parsed and
+/// ignored (we always emit the full projection, matching the
+/// folder-scoped handler).
+async fn list_all_contacts_impl(
+    state: AppState,
+    account_id: &str,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    me_path: bool,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "list_contacts", |_| Ok(())) {
+        return o;
+    }
+    let fixture = state.fixture();
+    let q = odata::OdataQuery::parse(raw_query.as_deref());
+    let top = q.page_size(CONTACTS_DEFAULT_TOP, CONTACTS_MAX_TOP);
+    let offset = match q.offset() {
+        Some(o) => o,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidQueryParameter",
+                "$skiptoken did not decode - reset pagination by retrying without it",
+            );
+        }
+    };
+    let host = host_or_default(&headers);
+    let path = if me_path {
+        "/v1.0/me/contacts".to_string()
+    } else {
+        format!("/v1.0/users/{account_id}/contacts")
+    };
+
+    let value: Vec<Value> = fixture
+        .contacts_for(account_id)
+        .skip(offset as usize)
+        .take(top as usize)
+        .map(serialize_contact)
+        .collect();
+    let next_offset_val = (offset as usize) + value.len();
+    let has_more = fixture
+        .contacts_for(account_id)
+        .nth(next_offset_val)
+        .is_some();
+
+    let mut envelope = Map::new();
+    envelope.insert(
+        "@odata.context".to_string(),
+        Value::String("https://graph.microsoft.com/v1.0/$metadata#contacts".to_string()),
     );
     envelope.insert("value".to_string(), Value::Array(value));
     if has_more {

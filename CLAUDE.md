@@ -584,6 +584,8 @@ emit the full `id, displayName, emailAddresses, parentFolderId`
 projection ratatoskr's `CONTACT_SELECT` requests),
 `/v1.0/me/contactFolders/{id}/contacts/{cid}` (folder-scoped
 single), `/v1.0/me/contacts/{cid}` (folder-agnostic single),
+`/v1.0/me/contacts` (folder-agnostic list across the account -
+bifrost's `contacts_list(None)`; `$top` / `$skiptoken` paging),
 `/v1.0/me/contactFolders/{id}/contacts/delta` (initial dump
 paginated to a final-page deltaLink, follow-ups walk the change
 log, `$deltatoken=latest` shortcut, unknown / evicted token falls

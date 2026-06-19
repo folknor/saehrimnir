@@ -69,6 +69,7 @@ shape matches what ratatoskr's `GraphContact` /
 | `GET /v1.0/me/contactFolders/{id}/contacts` | Paged via `$top` / `$skiptoken`; default top 50, max 999 (matches ratatoskr's `?$top=999`). `$select` is parsed and ignored; we always emit the full `id, displayName, emailAddresses, parentFolderId` projection. |
 | `GET /v1.0/me/contactFolders/{id}/contacts/{cid}` | Single contact scoped to a folder. 404 if id mismatches the folder. |
 | `GET /v1.0/me/contacts/{cid}` | Folder-agnostic single-contact resolver. |
+| `GET /v1.0/me/contacts` | Folder-agnostic list across the whole account (bifrost's `contacts_list(None)` / `contact_search(None)` when no address book is named). `$top` / `$skiptoken` paginate; `$select` / `$filter` parsed + ignored (full projection always). |
 | `GET /v1.0/me/contactFolders/{id}/contacts/delta` | First call (no `$deltatoken`) paginates the full contact dump for the folder, emitting `@odata.deltaLink` only on the final page. Follow-ups walk `Fixture::change_log` between the supplied state and the current state. Created/updated contacts project as full bodies; destroyed contacts emit Graph tombstones (`{ id, "@removed": { reason: "deleted" } }`). `$deltatoken=latest` returns an empty page with a fresh deltaLink (no contact dump). Unknown / evicted token falls back to bootstrap (real Graph emits 410 Gone; ratatoskr handles that by retriggering full sync, so an immediate bootstrap is a coherent v0 stand-in). |
 
 Change-script ops (Lua `change({...})`):

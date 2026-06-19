@@ -154,7 +154,7 @@ client-side pre-wire.
 | `GET /v1.0/me/messages?$select=...&$filter=conversationId eq '...'&$top=50` (collection + thread) | `pim.rs:932-944`, `search_url` `pim.rs:1487+` | **DONE** - `src/graph/mail.rs::list_messages_collection_impl` (account-wide, honours `conversationId` filter -> `thread_id`, `$top`/`$skiptoken` paging). `$search` falls through to full list -> P2 | M (shipped) |
 | `GET /v1.0/me/messages/{id}/$value` (assembled RFC822) | `blob.rs:198,259-266` (the only honest body path; metadata hydration defers real bytes here) | **DONE** - `src/graph/mail.rs::get_message_value_impl` reuses `crate::imap::assembled_rfc822` (multipart when attachments present) | M (shipped) |
 | `GET /v1.0/me/calendars/{id}/calendarView?startDateTime=&endDateTime=...` (non-delta range) | `calendar.rs:75-80` (`events_in_range`) | **DONE** - `src/graph/calendar.rs::calendar_view_impl` (+ `/users/{u}` twin); coarse `[start, end)` overlap filter, `$top`/`$skiptoken` paging | S (shipped) |
-| `GET /v1.0/me/contacts?$select=...&$top=N` (folder-agnostic list) | `contacts.rs:351,396` (`contacts_path` with no/`default` book) | MISSING (we have `/me/contacts/{id}` single, not the list) | S |
+| `GET /v1.0/me/contacts?$select=...&$top=N` (folder-agnostic list) | `contacts.rs:351,396` (`contacts_path` with no/`default` book) | **DONE** - `src/graph/contacts.rs::list_all_contacts_impl` (+ `/users/{u}` twin); account-wide across folders, `$top`/`$skiptoken` paging | S (shipped) |
 
 The shared-mailbox `/v1.0/users/{userId}/...` twins are covered for
 mail/calendar/contacts/categories delta, but the same single-message /

@@ -1211,6 +1211,30 @@ async fn graph_single_contact_folder_agnostic_resolves_by_id() {
 }
 
 #[tokio::test]
+async fn graph_list_all_contacts_spans_folders() {
+    // bifrost's contacts_list(None) hits the folder-agnostic list.
+    let (status, v) =
+        get_json_with(router_contacts(), "/v1.0/me/contacts?$select=id,displayName").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = v["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    // All four fixture contacts, across cf-default and cf-vendors.
+    assert_eq!(ids.len(), 4);
+    assert!(ids.contains(&"contact-001"));
+    assert!(ids.contains(&"contact-100")); // lives in cf-vendors
+
+    // $top paginates with an @odata.nextLink.
+    let (status, v) = get_json_with(router_contacts(), "/v1.0/me/contacts?$top=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["value"].as_array().unwrap().len(), 2);
+    assert!(v["@odata.nextLink"].is_string());
+}
+
+#[tokio::test]
 async fn graph_contacts_delta_initial_dump_then_latest_shortcut() {
     let app = router_contacts();
 
