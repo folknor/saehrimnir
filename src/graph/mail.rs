@@ -73,7 +73,13 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/v1.0/me/messages/{message_id}",
-            get(get_message_me).patch(patch_message_me),
+            get(get_message_me)
+                .patch(patch_message_me)
+                .delete(delete_message_me),
+        )
+        .route(
+            "/v1.0/me/messages/{message_id}/move",
+            post(move_message_me),
         )
         .route("/v1.0/me/messages", get(list_messages_collection_me))
         // JSON batching. bifrost hydrates message metadata by batching
@@ -112,7 +118,13 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/v1.0/users/{user}/messages/{message_id}",
-            get(get_message_user).patch(patch_message_user),
+            get(get_message_user)
+                .patch(patch_message_user)
+                .delete(delete_message_user),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{message_id}/move",
+            post(move_message_user),
         )
         .route(
             "/v1.0/users/{user}/messages",
@@ -214,6 +226,23 @@ async fn patch_message_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     patch_message_impl(state, &account_id, &message_id, body).await
+}
+
+async fn delete_message_me(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    delete_message_impl(state, &account_id, &message_id).await
+}
+
+async fn move_message_me(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    move_message_impl(state, &account_id, &message_id, body).await
 }
 
 async fn list_messages_collection_me(
@@ -356,6 +385,29 @@ async fn patch_message_user(
         Err(r) => return r,
     };
     patch_message_impl(state, &account_id, &message_id, body).await
+}
+
+async fn delete_message_user(
+    State(state): State<AppState>,
+    Path((user, message_id)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    delete_message_impl(state, &account_id, &message_id).await
+}
+
+async fn move_message_user(
+    State(state): State<AppState>,
+    Path((user, message_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    move_message_impl(state, &account_id, &message_id, body).await
 }
 
 async fn list_messages_collection_user(
@@ -1124,6 +1176,133 @@ fn set_keyword(keywords: &mut Vec<String>, kw: &str, present: bool) {
     } else if !present && has {
         keywords.retain(|k| k != kw);
     }
+}
+
+/// `DELETE /v1.0/me/messages/{id}` - permanent delete. Mirrors the
+/// JMAP `Email/set` destroy path: retires the message's UID slot in
+/// every mailbox it belonged to (so IMAP UIDs stay stable) and
+/// records an `email_destroyed` transition with the owning account,
+/// so the next `messages/delta` emits the tombstone and a
+/// multi-account fixture's per-account delta filters correctly. 204
+/// on success, 404 `ErrorItemNotFound` on unknown id.
+async fn delete_message_impl(state: AppState, account_id: &str, message_id: &str) -> Response {
+    let message_owned = message_id.to_string();
+    if let Some(o) = super::maybe_override(&state, "delete_message", move |s| {
+        crate::lua::req_set_str(s, "message_id", &message_owned)
+    }) {
+        return o;
+    }
+    let exists = {
+        let fixture = state.fixture();
+        fixture.emails_for(account_id).any(|e| e.id == message_id)
+    };
+    if !exists {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("message {message_id:?} not found"),
+        );
+    }
+
+    let acct = account_id.to_string();
+    let mid = message_id.to_string();
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        // Snapshot membership + account before the retain so the UID
+        // retirement and the tombstone carry the right values.
+        let membership = fix
+            .emails
+            .iter()
+            .find(|e| e.account_id == acct && e.id == mid)
+            .map(|e| (e.mailbox_ids.clone(), e.account_id.clone()));
+        let _ = fix.mutate(|f| {
+            let Some((mailboxes, owner)) = &membership else {
+                return MutationDiff::default();
+            };
+            f.emails.retain(|e| !(e.account_id == acct && e.id == mid));
+            for mb in mailboxes {
+                f.retire_uid(mb, &mid);
+            }
+            MutationDiff {
+                email_destroyed: vec![mid.clone()],
+                email_destroyed_accounts: vec![owner.clone()],
+                ..Default::default()
+            }
+        });
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /v1.0/me/messages/{id}/move` - moves the message to the
+/// folder named by the body's `destinationId`. The fixture models a
+/// single-folder membership, so the move replaces `mailbox_ids` with
+/// `[destinationId]`; `sync_mailbox_uids` assigns a UID in the
+/// destination and retires the old slots (RFC 3501 UID stability).
+/// Records an `email_updated` transition. Returns 201 with the moved
+/// message (Graph mints a new id on move; v0 keeps the id stable,
+/// which the fixture's deterministic-id contract relies on). 404 on
+/// unknown message, 400 on a missing/blank `destinationId`.
+async fn move_message_impl(
+    state: AppState,
+    account_id: &str,
+    message_id: &str,
+    body: Value,
+) -> Response {
+    let message_owned = message_id.to_string();
+    if let Some(o) = super::maybe_override(&state, "move_message", move |s| {
+        crate::lua::req_set_str(s, "message_id", &message_owned)
+    }) {
+        return o;
+    }
+    let Some(dest) = body
+        .get("destinationId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "ErrorInvalidRequest",
+            "move requires a non-empty destinationId",
+        );
+    };
+    let exists = {
+        let fixture = state.fixture();
+        fixture.emails_for(account_id).any(|e| e.id == message_id)
+    };
+    if !exists {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("message {message_id:?} not found"),
+        );
+    }
+
+    let acct = account_id.to_string();
+    let mid = message_id.to_string();
+    let dest = dest.to_string();
+    let mut projected = Value::Null;
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        let _ = fix.mutate(|f| {
+            let Some(idx) = f
+                .emails
+                .iter()
+                .position(|e| e.account_id == acct && e.id == mid)
+            else {
+                return MutationDiff::default();
+            };
+            let old_mailboxes = f.emails[idx].mailbox_ids.clone();
+            let new_mailboxes = vec![dest.clone()];
+            f.emails[idx].mailbox_ids = new_mailboxes.clone();
+            f.sync_mailbox_uids(&mid, &old_mailboxes, &new_mailboxes);
+            projected = message_value(&f.emails[idx], &dest, false);
+            MutationDiff {
+                email_updated: vec![mid.clone()],
+                ..Default::default()
+            }
+        });
+    }
+    (StatusCode::CREATED, axum::Json(projected)).into_response()
 }
 
 /// Find a message by id within the account and project it via

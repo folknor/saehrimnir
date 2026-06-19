@@ -163,6 +163,58 @@ async fn graph_patch_message_updates_flags() {
 }
 
 #[tokio::test]
+async fn graph_delete_message_removes_it() {
+    let app = router();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1.0/me/messages/email-001")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Gone afterwards.
+    let (status, _) = get_json_with(app, "/v1.0/me/messages/email-001").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_move_message_changes_parent_folder() {
+    let app = router();
+    let body = json!({ "destinationId": "mbx-archive" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1.0/me/messages/email-001/move")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["parentFolderId"], "mbx-archive");
+
+    // Persisted: the message now lives in the archive folder.
+    let (status, v) = get_json_with(app, "/v1.0/me/messages/email-001").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["parentFolderId"], "mbx-archive");
+}
+
+#[tokio::test]
 async fn graph_batch_hydrates_messages() {
     // bifrost batches per-id GET /me/messages/{id} to hydrate metadata.
     let body = json!({

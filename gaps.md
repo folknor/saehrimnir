@@ -161,14 +161,15 @@ mail/calendar/contacts/categories delta, but the same single-message /
 `$value` / `$batch` / `calendarView` gaps apply on that prefix too.
 
 ### P2
-**DONE:** `PATCH /me/messages/{id}` flag writeback (`isRead` /
+**DONE:** message writeback - `PATCH /me/messages/{id}` (`isRead` /
 `flag.flagStatus` / `categories` mapped to fixture keywords;
-`importance` accepted but not stored) - `src/graph/mail.rs::
-patch_message_impl`.
+`importance` accepted but not stored), `DELETE /me/messages/{id}`
+(UID-retiring permanent delete + `email_destroyed`), and
+`POST /me/messages/{id}/move` (`destinationId` re-parent + UID sync).
+`src/graph/mail.rs`.
 
-Still open (the rest of the write tier): `DELETE /me/messages/{id}`
-+ `POST /me/messages/{id}/move`; PATCH/DELETE/move as `$batch`
-sub-requests (currently per-item error); mail send/draft (`POST
+Still open (the rest of the write tier): PATCH/DELETE/move as
+`$batch` sub-requests (currently per-item error); mail send/draft (`POST
 /me/messages`, `/sendMail`, drafts); mailFolder CRUD + move;
 `mailboxSettings` (vacation); `messageRules` (server-side filters);
 GAL `/users?$filter=startswith`; contact `$filter` (route exists,

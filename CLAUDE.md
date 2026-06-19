@@ -556,7 +556,10 @@ the email - the per-id read bifrost hydrates through `$batch`; 404
 `ErrorItemNotFound` on unknown id - plus PATCH writeback mapping
 `isRead` <-> `$seen`, `flag.flagStatus` <-> `$flagged`, `categories`
 <-> user keywords through `Fixture::mutate` with an `email_updated`
-transition; `importance` is accepted but not durably stored),
+transition (`importance` accepted but not durably stored), DELETE
+(permanent delete: retires UID slots + records `email_destroyed`),
+and `POST /v1.0/me/messages/{id}/move` (re-parents to the body's
+`destinationId`, syncs UIDs, records `email_updated`)),
 `/v1.0/me/messages/{id}/$value`
 (assembled RFC 822 bytes - bifrost's `open_raw_rfc822` body-fetch
 path; reuses the IMAP module's `assembled_rfc822` so the two body

@@ -252,6 +252,15 @@ v0 serves:
   `If-Match` not enforced in v0. bifrost drives this both directly
   and as `$batch` sub-requests (the `$batch` write path is still a
   P2 gap - see gaps.md).
+- `DELETE /v1.0/me/messages/{id}` (+ `/users/{u}` twin) - permanent
+  delete. Retires the message's UID slots (IMAP stability) and
+  records `email_destroyed` + the owning account, so the next
+  `messages/delta` tombstones it. 204 / 404.
+- `POST /v1.0/me/messages/{id}/move` (+ `/users/{u}` twin) - body
+  `{ destinationId }`. Single-folder model: replaces `mailbox_ids`
+  with `[destinationId]`, syncs UIDs, records `email_updated`.
+  Returns 201 with the moved message; 400 on missing `destinationId`,
+  404 on unknown message.
 - `GET /v1.0/me/messages/{id}/$value` (+ `/users/{u}` twin) -
   assembled RFC 822 bytes (`text/plain`), bifrost's `open_raw_rfc822`
   body-fetch path. Reuses `crate::imap::assembled_rfc822`, so the
