@@ -244,6 +244,14 @@ v0 serves:
 - `GET /v1.0/me/messages/{id}` + `/v1.0/users/{u}/messages/{id}` -
   single-message projection (reuses `message_value`), 404
   `ErrorItemNotFound` on unknown id. `$select` parsed + ignored.
+- `PATCH /v1.0/me/messages/{id}` (+ `/users/{u}` twin) - flag
+  writeback (`isRead` <-> `$seen`, `flag.flagStatus: flagged` <->
+  `$flagged`, `categories[]` <-> user keywords) through
+  `Fixture::mutate`, recording an `email_updated` transition.
+  `importance` is accepted but not durably stored (no fixture slot).
+  `If-Match` not enforced in v0. bifrost drives this both directly
+  and as `$batch` sub-requests (the `$batch` write path is still a
+  P2 gap - see gaps.md).
 - `GET /v1.0/me/messages/{id}/$value` (+ `/users/{u}` twin) -
   assembled RFC 822 bytes (`text/plain`), bifrost's `open_raw_rfc822`
   body-fetch path. Reuses `crate::imap::assembled_rfc822`, so the

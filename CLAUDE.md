@@ -553,7 +553,11 @@ childFolders), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
 messages/delta` (initial dump, follow-up no-op, `$deltatoken=latest`
 shortcut), `/v1.0/me/messages/{id}` (single-message GET projecting
 the email - the per-id read bifrost hydrates through `$batch`; 404
-`ErrorItemNotFound` on unknown id), `/v1.0/me/messages/{id}/$value`
+`ErrorItemNotFound` on unknown id - plus PATCH writeback mapping
+`isRead` <-> `$seen`, `flag.flagStatus` <-> `$flagged`, `categories`
+<-> user keywords through `Fixture::mutate` with an `email_updated`
+transition; `importance` is accepted but not durably stored),
+`/v1.0/me/messages/{id}/$value`
 (assembled RFC 822 bytes - bifrost's `open_raw_rfc822` body-fetch
 path; reuses the IMAP module's `assembled_rfc822` so the two body
 surfaces agree byte-for-byte), `POST /v1.0/$batch` (Graph JSON

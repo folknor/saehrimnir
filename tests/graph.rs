@@ -127,6 +127,42 @@ async fn graph_messages_collection_filters_by_conversation() {
 }
 
 #[tokio::test]
+async fn graph_patch_message_updates_flags() {
+    let app = router();
+    let body = json!({
+        "isRead": true,
+        "flag": { "flagStatus": "flagged" },
+        "categories": ["Work"],
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/v1.0/me/messages/email-001")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["isRead"], true);
+    assert_eq!(v["flag"]["flagStatus"], "flagged");
+    assert_eq!(v["categories"], json!(["Work"]));
+
+    // Persisted: a follow-up GET on the same fixture reflects it.
+    let (status, v) = get_json_with(app, "/v1.0/me/messages/email-001").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["isRead"], true);
+    assert_eq!(v["categories"], json!(["Work"]));
+}
+
+#[tokio::test]
 async fn graph_batch_hydrates_messages() {
     // bifrost batches per-id GET /me/messages/{id} to hydrate metadata.
     let body = json!({

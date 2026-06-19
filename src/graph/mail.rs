@@ -29,7 +29,7 @@ use axum::http::header;
 use axum::response::IntoResponse;
 
 use super::{AppState, error, odata, ok_json};
-use crate::fixture::{Address, Attachment, Body, Disposition, Email, Fixture, Mailbox, Role};
+use crate::fixture::{Address, Attachment, Body, Disposition, Email, Fixture, Mailbox, MutationDiff, Role};
 
 /// Default page size for messages, matching ratatoskr's BATCH_SIZE.
 const MESSAGES_DEFAULT_TOP: u32 = 50;
@@ -71,7 +71,10 @@ pub fn router() -> Router<AppState> {
             "/v1.0/me/messages/{message_id}/$value",
             get(get_message_value_me),
         )
-        .route("/v1.0/me/messages/{message_id}", get(get_message_me))
+        .route(
+            "/v1.0/me/messages/{message_id}",
+            get(get_message_me).patch(patch_message_me),
+        )
         .route("/v1.0/me/messages", get(list_messages_collection_me))
         // JSON batching. bifrost hydrates message metadata by batching
         // per-id GET /me/messages/{id} sub-requests through here.
@@ -109,7 +112,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/v1.0/users/{user}/messages/{message_id}",
-            get(get_message_user),
+            get(get_message_user).patch(patch_message_user),
         )
         .route(
             "/v1.0/users/{user}/messages",
@@ -202,6 +205,15 @@ async fn get_message_value_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_message_value_impl(state, &account_id, &message_id).await
+}
+
+async fn patch_message_me(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    patch_message_impl(state, &account_id, &message_id, body).await
 }
 
 async fn list_messages_collection_me(
@@ -332,6 +344,18 @@ async fn get_message_value_user(
         Err(r) => return r,
     };
     get_message_value_impl(state, &account_id, &message_id).await
+}
+
+async fn patch_message_user(
+    State(state): State<AppState>,
+    Path((user, message_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    patch_message_impl(state, &account_id, &message_id, body).await
 }
 
 async fn list_messages_collection_user(
@@ -997,6 +1021,109 @@ async fn get_message_value_impl(state: AppState, account_id: &str, message_id: &
         AxumBody::from(bytes),
     )
         .into_response()
+}
+
+/// `PATCH /v1.0/me/messages/{id}` - the message-flag writeback
+/// bifrost's mutation pipeline drives (mark read, flag/star,
+/// categorize, set importance), both directly and as `$batch`
+/// sub-requests. Maps the Graph fields onto fixture keywords:
+/// `isRead` <-> `$seen`, `flag.flagStatus: flagged` <-> `$flagged`,
+/// `categories[]` <-> the email's non-`$` (user) keywords.
+/// `importance` is accepted but not durably stored (the fixture
+/// `Email` has no importance field; reads always project "normal").
+/// Records an `email_updated` transition so the change surfaces in
+/// the next `messages/delta`. `If-Match` is not enforced in v0.
+async fn patch_message_impl(
+    state: AppState,
+    account_id: &str,
+    message_id: &str,
+    body: Value,
+) -> Response {
+    let message_owned = message_id.to_string();
+    if let Some(o) = super::maybe_override(&state, "patch_message", move |s| {
+        crate::lua::req_set_str(s, "message_id", &message_owned)
+    }) {
+        return o;
+    }
+    let exists = {
+        let fixture = state.fixture();
+        fixture.emails_for(account_id).any(|e| e.id == message_id)
+    };
+    if !exists {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("message {message_id:?} not found"),
+        );
+    }
+
+    let acct = account_id.to_string();
+    let mid = message_id.to_string();
+    let mut projected = Value::Null;
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        let _ = fix.mutate(|f| {
+            let Some(idx) = f
+                .emails
+                .iter()
+                .position(|e| e.account_id == acct && e.id == mid)
+            else {
+                return MutationDiff::default();
+            };
+            let mut email = f.emails[idx].clone();
+            apply_graph_message_patch(&mut email, &body);
+            let parent = email.mailbox_ids.first().map(String::as_str).unwrap_or("");
+            projected = message_value(&email, parent, false);
+            f.emails[idx] = email;
+            MutationDiff {
+                email_updated: vec![mid.clone()],
+                ..Default::default()
+            }
+        });
+    }
+    ok_json(projected)
+}
+
+/// Apply the Graph message-PATCH fields bifrost sends to a fixture
+/// `Email`'s keyword set. See `patch_message_impl` for the mapping.
+fn apply_graph_message_patch(email: &mut Email, body: &Value) {
+    if let Some(read) = body.get("isRead").and_then(Value::as_bool) {
+        set_keyword(&mut email.keywords, "$seen", read);
+    }
+    if let Some(status) = body
+        .get("flag")
+        .and_then(|f| f.get("flagStatus"))
+        .and_then(Value::as_str)
+    {
+        set_keyword(
+            &mut email.keywords,
+            "$flagged",
+            status.eq_ignore_ascii_case("flagged"),
+        );
+    }
+    if let Some(cats) = body.get("categories").and_then(Value::as_array) {
+        // categories replace the user (non-system) keyword set; the
+        // `$`-prefixed system flags ($seen / $flagged / ...) survive.
+        email.keywords.retain(|k| k.starts_with('$'));
+        for c in cats {
+            if let Some(s) = c.as_str()
+                && !email.keywords.iter().any(|k| k == s)
+            {
+                email.keywords.push(s.to_string());
+            }
+        }
+    }
+    // `importance` has no fixture slot; accepted and ignored.
+}
+
+/// Add or remove a single keyword, idempotently.
+fn set_keyword(keywords: &mut Vec<String>, kw: &str, present: bool) {
+    let has = keywords.iter().any(|k| k == kw);
+    if present && !has {
+        keywords.push(kw.to_string());
+    } else if !present && has {
+        keywords.retain(|k| k != kw);
+    }
 }
 
 /// Find a message by id within the account and project it via

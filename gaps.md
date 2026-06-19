@@ -161,12 +161,20 @@ mail/calendar/contacts/categories delta, but the same single-message /
 `$value` / `$batch` / `calendarView` gaps apply on that prefix too.
 
 ### P2
-Mail send/draft (`POST /me/messages`, `/sendMail`, `PATCH/DELETE
-/messages/{id}`); mailFolder CRUD + move; `mailboxSettings` (vacation);
-`messageRules` (server-side filters); GAL `/users?$filter=startswith`;
-contact `$filter` (route exists, filter parsed-and-ignored -> returns
-unfiltered, not 404); contact write verbs; event RSVP actions;
-`POST /subscriptions` webhooks (opt-in push only).
+**DONE:** `PATCH /me/messages/{id}` flag writeback (`isRead` /
+`flag.flagStatus` / `categories` mapped to fixture keywords;
+`importance` accepted but not stored) - `src/graph/mail.rs::
+patch_message_impl`.
+
+Still open (the rest of the write tier): `DELETE /me/messages/{id}`
++ `POST /me/messages/{id}/move`; PATCH/DELETE/move as `$batch`
+sub-requests (currently per-item error); mail send/draft (`POST
+/me/messages`, `/sendMail`, drafts); mailFolder CRUD + move;
+`mailboxSettings` (vacation); `messageRules` (server-side filters);
+GAL `/users?$filter=startswith`; contact `$filter` (route exists,
+filter parsed-and-ignored -> returns unfiltered, not 404); contact
+write verbs; event RSVP actions; `POST /subscriptions` webhooks
+(opt-in push only).
 
 ### Confirmed safe (do not flag)
 EWS, public folders, OneDrive/`host_attachment`, `attachment_upload`
@@ -297,18 +305,25 @@ has.
 
 ## Summary
 
-- **2 true blockers:** Graph `GET /v1.0/me` (no Graph account opens)
-  and IMAP `FETCH ENVELOPE`/`MODSEQ` (initial mail sync BADs). Both
-  fire in real `[ratatoskr]` runs the moment open is routed through
-  bifrost.
-- **JMAP** is in good shape: `Thread/changes` (S) is the only thing
-  that breaks a basic mail account after open; `CalendarEvent/query`
-  (M) gates the calendar flow.
-- **SMTP** is clean (one P2).
-- **Graph** has the most surface debt once open is unblocked ($batch,
-  single-message read, `$value`, calendarView range).
-- **Google** open is safe; the People single-GET + contactGroups gaps
-  block JMAP-free Google contacts.
+Progress as of this pass (see the per-protocol tables above for the
+shipped commits):
+
+- **Both true blockers fixed:** Graph `GET /v1.0/me` and IMAP `FETCH
+  ENVELOPE`/`MODSEQ`. Graph accounts now open and run initial mail
+  sync against the mock.
+- **JMAP:** `Thread/changes` + `CalendarEvent/query` shipped - the
+  basic-mail-after-open and calendar-read gaps are closed.
+- **Graph read/sync surface is COMPLETE:** profile, single-message
+  GET, `$value`, `POST /$batch` (hydration), `/me/messages`
+  collection (conversationId), `calendarView` range, and
+  `/me/contacts` folder-agnostic list all shipped. Remaining Graph
+  gaps are the **P2 write tier** (send/draft, mailFolder CRUD,
+  mailboxSettings, messageRules, contact write verbs, RSVP,
+  `/subscriptions`, and PATCH/DELETE/move `$batch` sub-requests) -
+  bifrost's mutation pipeline, not the read/sync path.
+- **Google:** People single-GET shipped; `contactGroups.list`
+  (address-book enumeration) still open.
+- **SMTP** is clean (one P2: `FUTURERELEASE`).
 - **CalDAV** discovery/write are correct; the sync-token +
   sync-collection pair is the one real gap (ship together).
 - **CardDAV** is an entire missing protocol, but latent until a fixture
