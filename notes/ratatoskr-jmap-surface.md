@@ -301,8 +301,16 @@ What the mock serves:
 - `state` reuses the fixture-level state token, like the other
   `/get` responses.
 
-`Thread/changes` is still out of scope (`unknownMethod`); add it if
-a future bifrost path polls thread deltas.
+`Thread/changes` (RFC 8621 §3.2) is implemented: bifrost seeds a
+Thread cursor at open and drives it on the first delta cycle. The
+mock has no thread-specific change log, so it projects the
+per-account email delta (`email_delta_since_account`) onto threads -
+threads of created emails go to `created`, of updated emails to
+`updated` (deduped). `destroyed` is always empty: a destroyed
+email's `thread_id` is unrecoverable from the log, so v0 emits no
+thread tombstones; bifrost re-fetches the reported threads via
+`Thread/get` and reconciles (an emptied thread reads back with empty
+`emailIds`). Unknown / evicted `sinceState` -> `cannotCalculateChanges`.
 
 ## Contacts (`AddressBook/*` + `ContactCard/*`)
 

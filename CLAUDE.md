@@ -122,8 +122,9 @@ checking whether the fact is already in `notes/`.
   cancels, created+updated collapses, etc.). Unknown / evicted
   `sinceState` returns `cannotCalculateChanges`.
   Out-of-scope JMAP methods (`EmailSubmission/set`, push,
-  `Thread/changes`, etc.) still return `unknownMethod`. Out-of-scope
-  IMAP commands (write paths, IDLE, NOTIFY, etc.) return `BAD`.
+  `CalendarEvent/query`, etc.) still return `unknownMethod`.
+  Out-of-scope IMAP commands (write paths, IDLE, NOTIFY, etc.)
+  return `BAD`.
 - The session must NOT advertise `urn:ietf:params:jmap:principals`.
   It would pull the client into `Principal/get` and
   `ShareNotification` paths the mock cannot satisfy.
@@ -403,7 +404,12 @@ shapes ratatoskr drives - `keywords` / `keywords/<flag>`, `mailboxIds`
 (`{ id, emailIds }`, emailIds sorted by `receivedAt` ascending,
 account-scoped); bifrost's JMAP `Account::open` probes it during
 discovery, so without it the account fails to open with
-`Wire(Jmap(UnknownMethod))`.
+`Wire(Jmap(UnknownMethod))`. `Thread/changes` projects the
+per-account email delta onto threads (threads of created emails ->
+`created`, of updated emails -> `updated`, deduped; `destroyed`
+always empty since a gone email's `thread_id` is unrecoverable -
+bifrost re-fetches via `Thread/get` and reconciles). bifrost drives
+it on the first delta cycle after open.
 
 JMAP contacts: complete for v0 (RFC 9610 over RFC 9553 JSContact),
 in `src/jmap_contacts.rs`. Session advertises

@@ -32,7 +32,7 @@ L = large (subsystem).
 |---|---|---|---|---|
 | 1 | ~~`GET /v1.0/me` (profile root) MISSING -> no Graph account opens at all~~ **DONE** (`src/graph/profile.rs`) | Graph | P0 | S |
 | 2 | ~~IMAP `FETCH` parser rejects `ENVELOPE` + `MODSEQ` -> initial inventory FETCH returns `BAD`~~ **DONE** (`src/imap.rs`) | IMAP | P0 (conditional) | M |
-| 3 | `Thread/changes` MISSING -> first delta cycle after open fails | JMAP | P1 | S |
+| 3 | ~~`Thread/changes` MISSING -> first delta cycle after open fails~~ **DONE** (`src/jmap.rs`) | JMAP | P1 | S |
 | 4 | Graph `POST /$batch` MISSING -> all message hydration + writes fail | Graph | P0/P1 | L |
 | 5 | CalDAV `sync-collection` REPORT + `sync-token` PROPFIND prop MISSING (ship together) | CalDAV | P1 | M |
 | 6 | People `GET /v1/people/{id}` (single) MISSING -> breaks contact read + update etag-prefetch; `contactGroups.list` MISSING | Google | P1 | M |
@@ -56,7 +56,7 @@ capability we deliberately never advertise, so it is never sent.
 
 | Method | bifrost evidence | sæhrimnir status | Effort |
 |---|---|---|---|
-| `Thread/changes` | `sync/changes.rs:239-253`, driven for the Thread cursor scope seeded at `factory.rs:214-221`; fires unconditionally on the first delta cycle after open | MISSING -> `unknownMethod` catchall (`src/jmap.rs` dispatch). Documented out-of-scope, but bifrost DOES drive it -> genuine gap | S - derive thread ids like `thread_get`, reuse the `change_log` delta walk (mirror `email_changes`) |
+| `Thread/changes` | `sync/changes.rs:239-253`, driven for the Thread cursor scope seeded at `factory.rs:214-221`; fires unconditionally on the first delta cycle after open | **DONE** - `src/jmap.rs::thread_changes` projects the per-account email delta onto threads (created/updated email threads; `destroyed` empty, bifrost reconciles via `Thread/get`) | S (shipped) |
 | `CalendarEvent/query` | `sync/calendar_ops.rs:52-60` (`events_in_range`), the core calendar read; gated on `calendars` capability | MISSING - we have `Calendar/get`, `CalendarEvent/get`/`changes`/`set` but not `query` | M - time-range (`before`/`after`) + `position`/`limit`/`calculateTotal`, project fixture `Event` (mirror `Email/query`) |
 
 ### P2

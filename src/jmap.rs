@@ -144,6 +144,10 @@ fn dispatch(
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
+        "Thread/changes" => match thread_changes(&fix, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
         "AddressBook/get" => match crate::jmap_contacts::address_book_get(&fix, args) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
@@ -1119,6 +1123,85 @@ fn serialize_thread(fixture: &Fixture, account_id: &str, thread_id: &str) -> Val
     obj.insert("id".to_string(), Value::String(thread_id.to_string()));
     obj.insert("emailIds".to_string(), Value::Array(email_ids));
     Value::Object(obj)
+}
+
+// ── Thread/changes ──────────────────────────────────────────────────
+//
+// RFC 8621 §3.2. bifrost seeds a Thread cursor at account open
+// (`sync/factory.rs`) and drives `Thread/changes` for it on the first
+// delta cycle right after open (`sync/changes.rs`); before this
+// landed the dispatcher returned `unknownMethod`, terminating the
+// Thread sync scope.
+//
+// The mock has no thread-specific change log - threads are derived
+// from each email's `thread_id`. So we project the per-account email
+// delta onto threads: a thread is reported whenever one of its emails
+// changed in the window. Threads of created emails land in `created`,
+// threads of updated emails in `updated` (deduped; a thread already
+// in `created` is not repeated). `destroyed` is always empty: a
+// destroyed email's `thread_id` is unrecoverable from the log (the
+// email is gone), so v0 does not synthesise thread tombstones -
+// bifrost re-fetches the reported threads via `Thread/get` and
+// reconciles membership, which collapses an emptied thread to an
+// empty `emailIds` rather than a tombstone. Unknown / evicted
+// `sinceState` returns `cannotCalculateChanges`, same as
+// `Email/changes`.
+fn thread_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = require_account(fixture, args)?;
+    let since_state = require_since_state(args)?;
+    let delta = fixture
+        .email_delta_since_account(since_state, account_id)
+        .ok_or_else(|| {
+            json!({
+                "type": "cannotCalculateChanges",
+                "description": format!(
+                    "sinceState {since_state:?} is not a known fixture state \
+                     (older than the seed or evicted from the bounded change log)"
+                ),
+            })
+        })?;
+
+    let thread_of = |email_id: &str| {
+        fixture
+            .emails
+            .iter()
+            .find(|e| e.id == email_id)
+            .map(|e| e.thread_id.clone())
+    };
+
+    let mut created: Vec<String> = Vec::new();
+    for id in &delta.created {
+        if let Some(t) = thread_of(id)
+            && !created.contains(&t)
+        {
+            created.push(t);
+        }
+    }
+    let mut updated: Vec<String> = Vec::new();
+    for id in &delta.updated {
+        if let Some(t) = thread_of(id)
+            && !created.contains(&t)
+            && !updated.contains(&t)
+        {
+            updated.push(t);
+        }
+    }
+
+    let mut out = Map::new();
+    out.insert("accountId".to_string(), Value::String(account_id.to_string()));
+    out.insert("oldState".to_string(), Value::String(since_state.to_string()));
+    out.insert("newState".to_string(), Value::String(fixture.state.clone()));
+    out.insert("hasMoreChanges".to_string(), Value::Bool(false));
+    out.insert(
+        "created".to_string(),
+        Value::Array(created.into_iter().map(Value::String).collect()),
+    );
+    out.insert(
+        "updated".to_string(),
+        Value::Array(updated.into_iter().map(Value::String).collect()),
+    );
+    out.insert("destroyed".to_string(), Value::Array(vec![]));
+    Ok(Value::Object(out))
 }
 
 // ── Email/set ───────────────────────────────────────────────────────

@@ -341,6 +341,83 @@ async fn thread_get_explicit_ids_partitions_found_and_not_found() {
     assert_eq!(result["notFound"], json!(["no-such-thread"]));
 }
 
+#[tokio::test]
+async fn thread_changes_projects_email_delta_onto_threads() {
+    // bifrost drives Thread/changes on the first delta cycle after
+    // open; before it existed the dispatcher returned unknownMethod.
+    let app = router();
+
+    // Seed state via an empty Email/get.
+    let v = jmap_call_on(&app, "Email/get", json!({ "accountId": "account-1", "ids": [] }), "t0")
+        .await;
+    let seed = v["methodResponses"][0][1]["state"].as_str().unwrap().to_string();
+
+    // No changes since the seed -> empty delta, state echoes back.
+    let v = jmap_call_on(
+        &app,
+        "Thread/changes",
+        json!({ "accountId": "account-1", "sinceState": seed }),
+        "t1",
+    )
+    .await;
+    let r = &v["methodResponses"][0][1];
+    assert_eq!(v["methodResponses"][0][0], "Thread/changes");
+    assert_eq!(r["created"], json!([]));
+    assert_eq!(r["updated"], json!([]));
+    assert_eq!(r["destroyed"], json!([]));
+    assert_eq!(r["newState"], json!(seed));
+
+    // Mutate email-001 (its threadId defaults to its own id), which
+    // bumps the fixture state.
+    jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "update": { "email-001": { "keywords/$flagged": true } },
+        }),
+        "t2",
+    )
+    .await;
+
+    // Thread/changes since the seed now reports email-001's thread as
+    // updated.
+    let v = jmap_call_on(
+        &app,
+        "Thread/changes",
+        json!({ "accountId": "account-1", "sinceState": seed }),
+        "t3",
+    )
+    .await;
+    let r = &v["methodResponses"][0][1];
+    assert_eq!(r["created"], json!([]));
+    assert_eq!(r["updated"], json!(["email-001"]));
+    assert_eq!(r["destroyed"], json!([]));
+    let new_state = r["newState"].as_str().unwrap().to_string();
+    assert_ne!(new_state, seed);
+
+    // From the post-mutation state, the delta is empty again.
+    let v = jmap_call_on(
+        &app,
+        "Thread/changes",
+        json!({ "accountId": "account-1", "sinceState": new_state }),
+        "t4",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["updated"], json!([]));
+
+    // An unknown sinceState cannot be calculated.
+    let v = jmap_call_on(
+        &app,
+        "Thread/changes",
+        json!({ "accountId": "account-1", "sinceState": "bogus-state" }),
+        "t5",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][0], "error");
+    assert_eq!(v["methodResponses"][0][1]["type"], "cannotCalculateChanges");
+}
+
 fn contacts_router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/graph-contacts-small.toml")).unwrap();
     routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))
