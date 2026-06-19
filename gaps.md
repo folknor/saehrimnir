@@ -35,7 +35,7 @@ L = large (subsystem).
 | 3 | ~~`Thread/changes` MISSING -> first delta cycle after open fails~~ **DONE** (`src/jmap.rs`) | JMAP | P1 | S |
 | 4 | Graph `POST /$batch` MISSING -> all message hydration + writes fail | Graph | P0/P1 | L |
 | 5 | CalDAV `sync-collection` REPORT + `sync-token` PROPFIND prop MISSING (ship together) | CalDAV | P1 | M |
-| 6 | People `GET /v1/people/{id}` (single) MISSING -> breaks contact read + update etag-prefetch; `contactGroups.list` MISSING | Google | P1 | M |
+| 6 | People `GET /v1/people/{id}` (single) **DONE** (`src/people/contacts.rs`); `contactGroups.list` STILL MISSING (drives `address_books_list`) | Google | P1 | M |
 | 7 | ~~`CalendarEvent/query` MISSING -> JMAP calendar read path (query-based) cannot run~~ **DONE** (`src/jmap_calendar.rs`) | JMAP | P1 | M |
 | 8 | No CardDAV surface at all (latent: only when an IMAP fixture configures `carddav`) | CardDAV | P1 (latent) | M |
 
@@ -192,7 +192,7 @@ all routed. Gaps are on the PIM / contacts / write paths.
 
 | METHOD path | sub-API | bifrost evidence | sæhrimnir status | Effort |
 |---|---|---|---|---|
-| `GET /v1/people/{resourceName}?personFields=...` (single) | People | `contacts.rs:213-227` (`get_person`); also the etag prefetch before `updateContact` | MISSING - we register only `PATCH`/`DELETE` on `/v1/people/{spec}`, no `GET`. Breaks `contact_get` AND contact update (etag prefetch 404s) | M |
+| `GET /v1/people/{resourceName}?personFields=...` (single) | People | `contacts.rs:213-227` (`get_person`); also the etag prefetch before `updateContact` | **DONE** - `src/people/contacts.rs::get_person` (bare-id GET on `/v1/people/{spec}`; `{id}:verb` forms keep PATCH/DELETE). Unblocks `contact_get` + the update etag prefetch | M (shipped) |
 | `GET /v1/contactGroups?groupFields=...` | People | `contacts.rs:42-43,490` (drives `address_books_list`) | MISSING -> catchall 404 | M |
 | `GET /v1/people/me/connections` without syncToken (full-page) | People | `contacts.rs:74-81` | PARTIAL - route exists but is built around `syncToken`/410 delta recovery that bifrost never uses; verify the plain full-list (no-token) path returns all connections | S (verify) |
 

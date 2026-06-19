@@ -622,7 +622,11 @@ listener to Gmail (real People API lives on a different host).
 `syncToken` / `requestSyncToken`; tombstones via
 `metadata.deleted`; `nextSyncToken` on final page only) +
 `/v1/otherContacts` (empty list in v0; fixture format has no
-`[other_contact]` table yet). Sync-token recovery: an unknown
+`[other_contact]` table yet) + `GET /v1/people/{id}` (single
+Person; bifrost's `get_person` drives this for `contact_get` and
+the etag prefetch before `updateContact`, so without it both the
+read and the write-back 404 - the `{id}:verb` custom-verb forms
+still route to PATCH / DELETE). Sync-token recovery: an unknown
 token returns 410 with the People error envelope, matching the
 substrings ratatoskr's recovery path checks for ("syncToken").
 A token matching the current fixture state returns an empty
@@ -640,6 +644,8 @@ envelope. Mounted on `--people-port`; sentinel grows a
 `RATATOSKR_TEST_PEOPLE_ENDPOINT`. ratatoskr-side override
 (parallel to `RATATOSKR_TEST_GMAIL_ENDPOINT`) hasn't landed yet
 - when it does, sæhrimnir is already in place to receive it.
+Remaining bifrost gap: `GET /v1/contactGroups` (drives bifrost's
+`address_books_list`); not yet implemented (see `gaps.md`).
 
 Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`
 + `/labels` + `/threads` (list paginated by `nextPageToken`, with

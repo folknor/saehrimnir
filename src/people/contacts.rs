@@ -53,8 +53,54 @@ pub fn router() -> Router<AppState> {
         // handler.
         .route(
             "/v1/people/{spec}",
-            axum::routing::patch(update_contact).delete(delete_contact),
+            get(get_person)
+                .patch(update_contact)
+                .delete(delete_contact),
         )
+}
+
+/// `GET /v1/people/{resourceName}` - a single Person. bifrost's
+/// `get_person` drives this for `contact_get` AND for the etag
+/// prefetch before `updateContact`, so without it both the contact
+/// read and the contact write-back 404. The resource name arrives
+/// as the bare id segment (`people/{id}` -> `{id}` after the route
+/// prefix); the `{id}:verb` custom-verb forms keep their PATCH /
+/// DELETE handlers, so a `spec` carrying a `:` is not a plain GET.
+async fn get_person(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(spec): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
+) -> Response {
+    if spec.contains(':') {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("v0 mock does not implement GET /v1/people/{spec}"),
+            "notFound",
+        );
+    }
+    let account_id = bearer_account(&state, &headers);
+    state.shared.request_log.record_with_conn(
+        "people",
+        format!("GET /v1/people/{spec}"),
+        json!({}),
+        connection_id,
+    );
+    if let Some(o) = super::maybe_override(&state, "get_contact", {
+        let spec = spec.clone();
+        move |s| crate::lua::req_set_str(s, "contact_id", &spec)
+    }) {
+        return o;
+    }
+    let fixture = state.fixture();
+    match fixture.contacts_for(&account_id).find(|c| c.id == spec) {
+        Some(c) => ok_json(serialize_person(c)),
+        None => error(
+            StatusCode::NOT_FOUND,
+            &format!("person people/{spec} not found"),
+            "notFound",
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

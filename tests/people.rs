@@ -69,6 +69,24 @@ async fn get(r: &axum::Router, uri: &str) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+async fn get_single_person_returns_projection_and_404s_unknown() {
+    let r = router();
+
+    // bifrost's get_person drives this for contact_get AND the
+    // etag-prefetch before updateContact; without it both 404.
+    let (status, v) = get(&r, "/v1/people/contact-001?personFields=names,emailAddresses").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["resourceName"], "people/contact-001");
+    assert_eq!(v["etag"], "etag-contact-001");
+    assert_eq!(v["names"][0]["displayName"], "Alice Anderson");
+    assert_eq!(v["emailAddresses"][0]["value"], "alice@example.com");
+
+    // Unknown resource name 404s.
+    let (status, _) = get(&r, "/v1/people/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn connections_initial_listing_returns_full_set_with_sync_token() {
     let r = router();
     let (status, v) = get(

@@ -140,6 +140,28 @@ The custom verbs arrive on `/v1/people/{id}:updateContact` /
 `/v1/people/{id}:deleteContact` - the colon-prefixed verb is part
 of the path segment, not a query string.
 
+## bifrost note (the client we are migrating to)
+
+The sections above describe the OLD ratatoskr People client (delta
+via `syncToken`). bifrost's `crates/google/src/account/contacts.rs`
+differs and the mock must serve:
+
+- `GET /v1/people/{resourceName}` (single Person) - `get_person`,
+  used by `contact_get` AND the etag prefetch before `updateContact`.
+  Implemented: bare-id GET on `/v1/people/{spec}` (the `{id}:verb`
+  forms keep PATCH / DELETE). Reads `resourceName` + `etag` + the
+  projected fields. **Without it both the contact read and the
+  contact write-back 404.**
+- bifrost full-pages `connections` (no `syncToken` / `requestSyncToken`
+  - the mock's 410 sync-token recovery is unused by bifrost, but the
+  plain paged list path still serves it).
+- STILL MISSING: `GET /v1/contactGroups?groupFields=...` drives
+  bifrost's `address_books_list` (each group is an address book
+  `contactGroups/{id}`, with per-Person `memberships[].
+  contactGroupMembership.contactGroupResourceName` used to filter
+  contacts by group). Project the fixture `ContactFolder`s as
+  contactGroups when implementing. See `gaps.md`.
+
 ## What v0 doesn't surface
 
 - `POST /v1/people:createContact`. ratatoskr doesn't yet create
