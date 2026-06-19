@@ -11,6 +11,20 @@ shared mailboxes, webhooks, autodiscover) are listed at the end so
 the next reader knows what scaffolding the module structure has to
 accommodate.
 
+## Profile / account-open (`src/graph/profile.rs`)
+
+`GraphAccountFactory::open` (bifrost `crates/graph/src/account/mod.rs:288`)
+issues `GET /me?$select=displayName,mail,userPrincipalName` as its
+FIRST request, then derives the account's own address from
+`profile.mail.or(profile.user_principal_name)`. This must succeed or
+the account never opens (the bare `/v1.0/me` path used to fall to the
+catchall 404).
+
+| Endpoint | Behaviour |
+|---|---|
+| `GET /v1.0/me` | Bearer-resolved account (`oauth::account_from_bearer`, fallback-to-primary), projected as a Graph user: `id`, `displayName`, `mail`, `userPrincipalName` (all derived from `account.name` since the fixture `Account` carries only id + email). `$select` is ignored (we always emit the full set). |
+| `GET /v1.0/users/{id}` | The named declared account; `me` aliases the primary; unknown id 404s `ResourceNotFound`. Same projection. |
+
 ## Calendar (`src/graph/calendar.rs`)
 
 GET endpoints project from `[[calendar]]` and `[[event]]` fixture

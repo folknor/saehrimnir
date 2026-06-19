@@ -15,6 +15,7 @@ pub mod group_sync;
 pub mod label_sync;
 pub mod mail;
 pub mod odata;
+pub mod profile;
 
 use std::sync::Arc;
 
@@ -104,6 +105,7 @@ pub fn maybe_override(
 /// auth allows them through.
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(profile::router())
         .merge(mail::router())
         .merge(calendar::router())
         .merge(contacts::router())

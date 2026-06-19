@@ -269,7 +269,9 @@ checking whether the fact is already in `notes/`.
   `Fixture::mutate`), `group_sync.rs` (cross-account groups -
   `/v1.0/groups`, `/v1.0/groups/{id}`,
   `/v1.0/groups/{id}/members`, `/v1.0/me/memberOf`,
-  `/v1.0/users/{id}/memberOf`). Sibling files for drive / EWS
+  `/v1.0/users/{id}/memberOf`), `profile.rs` (user profile -
+  `/v1.0/me` + `/v1.0/users/{id}`, the first call
+  `GraphAccountFactory::open` makes). Sibling files for drive / EWS
   land here when those surfaces are scouted.
 - `src/caldav/` - CalDAV mock. `mod.rs` (single-handler dispatch
   on PROPFIND / REPORT / GET / PUT / DELETE / OPTIONS for the
@@ -519,7 +521,14 @@ including a TCP-level STARTTLS round-trip; the route shape is
 covered in `tests/api.rs`.
 
 Graph: mail-sync, calendar, contacts, master categories, and
-groups are complete for v0. Mail:
+groups are complete for v0. Profile: `GET /v1.0/me` +
+`GET /v1.0/users/{id}` (`me` aliases the bearer-resolved account,
+named ids resolve declared accounts, unknown ids 404
+`ResourceNotFound`) project the account as a Graph user
+(`id` / `displayName` / `mail` / `userPrincipalName`). This is the
+FIRST request `GraphAccountFactory::open` makes (to learn the
+account's own address); without it the bare `/v1.0/me` path fell to
+the catchall 404 and no Graph account could open. Mail:
 `/v1.0/me/mailFolders` (list, by-id, by-well-known-alias,
 childFolders), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
 `$skip` / `$skiptoken` / `$filter`), `/v1.0/me/mailFolders/{id}/

@@ -68,6 +68,36 @@ fn attach_router() -> axum::Router {
 }
 
 #[tokio::test]
+async fn graph_me_profile_returns_account_identity() {
+    // GraphAccountFactory::open's FIRST request. Without this route it
+    // hit the catchall 404 and no Graph account could open.
+    let (status, v) = get_json("/v1.0/me?$select=displayName,mail,userPrincipalName").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "account-1");
+    assert_eq!(v["mail"], "test@example.com");
+    assert_eq!(v["userPrincipalName"], "test@example.com");
+    assert_eq!(v["displayName"], "test@example.com");
+}
+
+#[tokio::test]
+async fn graph_users_profile_resolves_named_and_404s_unknown() {
+    // `me` alias resolves to the primary account.
+    let (status, v) = get_json("/v1.0/users/me").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "account-1");
+
+    // A named declared account resolves directly.
+    let (status, v) = get_json("/v1.0/users/account-1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["mail"], "test@example.com");
+
+    // An unknown user 404s with the Graph error envelope.
+    let (status, v) = get_json("/v1.0/users/nobody").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
 async fn graph_list_message_attachments_returns_metadata_with_bytes() {
     let (status, v) = get_json_with(
         attach_router(),
