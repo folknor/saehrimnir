@@ -136,6 +136,10 @@ fn dispatch(
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
+        "Thread/get" => match thread_get(&fix, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
         "Mailbox/changes" => match mailbox_changes(&fix, args) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
@@ -991,6 +995,110 @@ fn serialize_address_list(xs: &[Address]) -> Value {
     } else {
         Value::Array(xs.iter().map(serialize_address).collect())
     }
+}
+
+// ── Thread/get ──────────────────────────────────────────────────────
+//
+// RFC 8621 §3. A Thread groups every Email that shares a `threadId`;
+// the object is `{ id, emailIds }`. Bifrost's JMAP `Account::open`
+// probes `Thread/get` during account discovery - before this landed
+// the dispatcher returned `unknownMethod` and the account failed to
+// open with `Wire(Jmap(UnknownMethod))`, so the whole sync never
+// started. The mock derives threads from the fixture's existing
+// per-email `thread_id`; there is no separate thread resource to
+// author. `state` reuses the fixture-level state token, like the
+// other `/get` responses. Reads scope to the request's `accountId`
+// so a multi-account fixture's secondary threads don't leak.
+
+/// RFC 8621 §3.1. `ids = null` lists every thread in the account;
+/// an explicit id array returns matched threads with unknown ids in
+/// `notFound`.
+fn thread_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = args.get("accountId").and_then(Value::as_str).ok_or_else(|| {
+        json!({
+            "type": "invalidArguments",
+            "description": "missing accountId",
+        })
+    })?;
+    if fixture.account(account_id).is_none() {
+        return Err(json!({
+            "type": "accountNotFound",
+            "description": format!("account {account_id:?} not found"),
+        }));
+    }
+
+    let (list, not_found) = match args.get("ids") {
+        None | Some(Value::Null) => {
+            // RFC: null = all threads. Distinct threadIds in the
+            // account, sorted for byte-stable ordering.
+            let mut threads: Vec<&str> = fixture
+                .emails_for(account_id)
+                .map(|e| e.thread_id.as_str())
+                .collect();
+            threads.sort_unstable();
+            threads.dedup();
+            let all = threads
+                .into_iter()
+                .map(|tid| serialize_thread(fixture, account_id, tid))
+                .collect::<Vec<_>>();
+            (Value::Array(all), Value::Array(vec![]))
+        }
+        Some(Value::Array(requested)) => {
+            let mut list = Vec::with_capacity(requested.len());
+            let mut not_found = Vec::new();
+            for v in requested {
+                let Some(tid) = v.as_str() else {
+                    return Err(json!({
+                        "type": "invalidArguments",
+                        "description": "ids must be an array of strings",
+                    }));
+                };
+                if fixture.emails_for(account_id).any(|e| e.thread_id == tid) {
+                    list.push(serialize_thread(fixture, account_id, tid));
+                } else {
+                    not_found.push(Value::String(tid.to_string()));
+                }
+            }
+            (Value::Array(list), Value::Array(not_found))
+        }
+        Some(_) => {
+            return Err(json!({
+                "type": "invalidArguments",
+                "description": "ids must be an array or null",
+            }));
+        }
+    };
+
+    let mut out = Map::new();
+    out.insert(
+        "accountId".to_string(),
+        Value::String(account_id.to_string()),
+    );
+    out.insert("state".to_string(), Value::String(fixture.state.clone()));
+    out.insert("list".to_string(), list);
+    out.insert("notFound".to_string(), not_found);
+    Ok(Value::Object(out))
+}
+
+/// One Thread object: `emailIds` are the account's emails in this
+/// thread, sorted by `receivedAt` ascending (RFC 8621 §3) with `id`
+/// lexicographic as a deterministic tiebreak.
+fn serialize_thread(fixture: &Fixture, account_id: &str, thread_id: &str) -> Value {
+    let mut emails: Vec<&Email> = fixture
+        .emails_for(account_id)
+        .filter(|e| e.thread_id == thread_id)
+        .collect();
+    emails.sort_by(|a, b| {
+        a.received_at
+            .cmp(&b.received_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let email_ids: Vec<Value> = emails.iter().map(|e| Value::String(e.id.clone())).collect();
+
+    let mut obj = Map::new();
+    obj.insert("id".to_string(), Value::String(thread_id.to_string()));
+    obj.insert("emailIds".to_string(), Value::Array(email_ids));
+    Value::Object(obj)
 }
 
 // ── Email/set ───────────────────────────────────────────────────────

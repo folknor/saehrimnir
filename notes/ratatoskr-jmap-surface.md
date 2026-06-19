@@ -276,6 +276,34 @@ against `fixture.emails.len()` at create time) and created
 mailboxes as `mock-mailbox-<n>`. Counter values reset across
 fixture loads but advance monotonically within one process.
 
+## `Thread/get`
+
+RFC 8621 §3. Not part of `jmap_initial_sync`, but bifrost's JMAP
+`Account::open` probes it during account discovery (`discover`); if
+the method returns `unknownMethod` the open fails with
+`Wire(Jmap(UnknownMethod))` and no sync runs at all. The legacy
+`jmap-client` open path never needed it, so this only surfaced once
+account-open was routed through bifrost's JMAP account.
+
+What the mock serves:
+
+- Request: `{ accountId, ids }`. `ids = null` (or omitted) lists
+  every thread in the account; an explicit id array returns matched
+  threads, unknown ids land in `notFound`.
+- Per Thread object: `{ id, emailIds }`. The mock has no separate
+  thread resource - threads are derived from each email's
+  `thread_id` (which defaults to the email's own id when the fixture
+  doesn't set one, so an un-threaded fixture is all single-message
+  threads). `emailIds` is sorted by `receivedAt` ascending (RFC 8621
+  §3) with `id` lexicographic as a deterministic tiebreak.
+- Reads scope to the request's `accountId` via `emails_for`, so a
+  multi-account fixture's secondary threads don't leak.
+- `state` reuses the fixture-level state token, like the other
+  `/get` responses.
+
+`Thread/changes` is still out of scope (`unknownMethod`); add it if
+a future bifrost path polls thread deltas.
+
 ## Constants worth knowing
 
 - `BATCH_SIZE = 50` - `Email/query` limit, `Email/get` chunk size.

@@ -300,6 +300,44 @@ async fn email_get_full_email_shape_with_body_values() {
     }
 }
 
+#[tokio::test]
+async fn thread_get_null_ids_lists_every_thread() {
+    // Bifrost's JMAP Account::open probes Thread/get during discovery;
+    // before the method landed this returned an `unknownMethod` error
+    // envelope and the account failed to open. Each fixture email
+    // defaults its threadId to its own id, so the two emails are two
+    // single-message threads, sorted by id.
+    let v = jmap_call("Thread/get", json!({ "accountId": "account-1" }), "t0").await;
+    let result = &v["methodResponses"][0][1];
+    assert_eq!(v["methodResponses"][0][0], "Thread/get");
+    assert_eq!(result["accountId"], "account-1");
+    assert!(result["state"].is_string());
+    assert_eq!(result["notFound"], json!([]));
+    assert_eq!(
+        result["list"],
+        json!([
+            { "id": "email-001", "emailIds": ["email-001"] },
+            { "id": "email-002", "emailIds": ["email-002"] },
+        ]),
+    );
+}
+
+#[tokio::test]
+async fn thread_get_explicit_ids_partitions_found_and_not_found() {
+    let v = jmap_call(
+        "Thread/get",
+        json!({ "accountId": "account-1", "ids": ["email-002", "no-such-thread"] }),
+        "t1",
+    )
+    .await;
+    let result = &v["methodResponses"][0][1];
+    assert_eq!(
+        result["list"],
+        json!([{ "id": "email-002", "emailIds": ["email-002"] }]),
+    );
+    assert_eq!(result["notFound"], json!(["no-such-thread"]));
+}
+
 fn attach_router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap();
     routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))

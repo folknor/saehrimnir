@@ -122,7 +122,7 @@ checking whether the fact is already in `notes/`.
   cancels, created+updated collapses, etc.). Unknown / evicted
   `sinceState` returns `cannotCalculateChanges`.
   Out-of-scope JMAP methods (`EmailSubmission/set`, push,
-  `Thread/get`, etc.) still return `unknownMethod`. Out-of-scope
+  `Thread/changes`, etc.) still return `unknownMethod`. Out-of-scope
   IMAP commands (write paths, IDLE, NOTIFY, etc.) return `BAD`.
 - The session must NOT advertise `urn:ietf:params:jmap:principals`.
   It would pull the client into `Principal/get` and
@@ -379,12 +379,17 @@ checking whether the fact is already in `notes/`.
 ## Status
 
 JMAP: complete for v0 (session resource, `Mailbox/get`, `Email/query`,
-`Email/get`, `Mailbox/changes` + `Email/changes` walking the real
-per-state change log, plus `Email/set` and `Mailbox/set` mutators
-honouring the create / update / destroy maps and the patch shapes
-ratatoskr drives - `keywords` / `keywords/<flag>`, `mailboxIds` /
-`mailboxIds/<id>`, plus `name` / `parentId` / `sortOrder` / `role` /
+`Email/get`, `Thread/get`, `Mailbox/changes` + `Email/changes` walking
+the real per-state change log, plus `Email/set` and `Mailbox/set`
+mutators honouring the create / update / destroy maps and the patch
+shapes ratatoskr drives - `keywords` / `keywords/<flag>`, `mailboxIds`
+/ `mailboxIds/<id>`, plus `name` / `parentId` / `sortOrder` / `role` /
 `isSubscribed` on mailboxes. Full integration test coverage).
+`Thread/get` derives threads from each email's `thread_id`
+(`{ id, emailIds }`, emailIds sorted by `receivedAt` ascending,
+account-scoped); bifrost's JMAP `Account::open` probes it during
+discovery, so without it the account fails to open with
+`Wire(Jmap(UnknownMethod))`.
 
 JMAP calendars: complete for v0. Session advertises
 `urn:ietf:params:jmap:calendars` whenever the fixture has any
