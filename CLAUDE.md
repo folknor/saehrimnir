@@ -122,9 +122,8 @@ checking whether the fact is already in `notes/`.
   cancels, created+updated collapses, etc.). Unknown / evicted
   `sinceState` returns `cannotCalculateChanges`.
   Out-of-scope JMAP methods (`EmailSubmission/set`, push,
-  `CalendarEvent/query`, etc.) still return `unknownMethod`.
-  Out-of-scope IMAP commands (write paths, IDLE, NOTIFY, etc.)
-  return `BAD`.
+  `Email/copy`, etc.) still return `unknownMethod`. Out-of-scope
+  IMAP commands (write paths, IDLE, NOTIFY, etc.) return `BAD`.
 - The session must NOT advertise `urn:ietf:params:jmap:principals`.
   It would pull the client into `Principal/get` and
   `ShareNotification` paths the mock cannot satisfy.
@@ -451,10 +450,16 @@ JSCalendar (`@type: Event`, `id` / `uid`, `calendarIds`,
 8601, `timeZone: UTC`, `showWithoutTime` for all-day,
 `locations` with `loc1` named entry, `participants` with owner
 + attendee roles + `sendTo: {imip: mailto:...}`),
-`CalendarEvent/changes` unioning `event_delta_since` across
-every declared calendar (JMAP carries no per-calendar filter
-on `/changes`), and `CalendarEvent/set` create / update /
-destroy through `Fixture::mutate`. Mutations record the same
+`CalendarEvent/query` (the read path bifrost actually drives -
+`Email/query`-shaped envelope with an AND FilterOperator of
+`inCalendar` + `after` + `before` plus `text`, `position` /
+`limit` / `calculateTotal` paging, start-sorted; bifrost
+re-filters the time range client-side so the mock's overlap
+test stays coarse), `CalendarEvent/changes` unioning
+`event_delta_since` across every declared calendar (JMAP carries
+no per-calendar filter on `/changes`), and `CalendarEvent/set`
+create / update / destroy through `Fixture::mutate`. Mutations
+record the same
 `event_*` transitions Graph and CalDAV write, so a JMAP
 create surfaces in a follow-up Graph `calendarView/delta`.
 Integration tests in `tests/jmap_calendar.rs` cover the

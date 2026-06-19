@@ -450,6 +450,14 @@ objects. The wire shape needs:
   `extract_location`, `resolve_calendar_id`,
   `extract_organizer_email`, `extract_attendees_json`,
   `parse_jscalendar_times`.
+- `CalendarEvent/query` - the read path bifrost's calendar sync
+  actually drives (`sync/calendar_ops.rs::events_in_range`): an
+  `Email/query`-shaped envelope. Supports an AND FilterOperator
+  (`{ operator, conditions }`) of `inCalendar` + `after` + `before`
+  (and `text` for search), plus `position` / `limit` /
+  `calculateTotal`. Events sort by `start` ascending (id tiebreak).
+  bifrost re-filters the time range client-side, so the mock's
+  overlap test is coarse (`end > after`, `start < before`).
 - `CalendarEvent/changes` - walks the change_log via
   `Fixture::event_delta_since` unioned across every declared
   calendar, since JMAP carries no calendar-id filter on

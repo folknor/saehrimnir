@@ -184,6 +184,10 @@ fn dispatch(
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
+        "CalendarEvent/query" => match crate::jmap_calendar::calendar_event_query(&fix, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
         "CalendarEvent/changes" => {
             match crate::jmap_calendar::calendar_event_changes(&fix, args) {
                 Ok(v) => (name.to_string(), v),

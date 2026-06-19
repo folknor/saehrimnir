@@ -36,7 +36,7 @@ L = large (subsystem).
 | 4 | Graph `POST /$batch` MISSING -> all message hydration + writes fail | Graph | P0/P1 | L |
 | 5 | CalDAV `sync-collection` REPORT + `sync-token` PROPFIND prop MISSING (ship together) | CalDAV | P1 | M |
 | 6 | People `GET /v1/people/{id}` (single) MISSING -> breaks contact read + update etag-prefetch; `contactGroups.list` MISSING | Google | P1 | M |
-| 7 | `CalendarEvent/query` MISSING -> JMAP calendar read path (query-based) cannot run | JMAP | P1 | M |
+| 7 | ~~`CalendarEvent/query` MISSING -> JMAP calendar read path (query-based) cannot run~~ **DONE** (`src/jmap_calendar.rs`) | JMAP | P1 | M |
 | 8 | No CardDAV surface at all (latent: only when an IMAP fixture configures `carddav`) | CardDAV | P1 (latent) | M |
 
 Items 1 and 2 are true open/initial-sync blockers and should land
@@ -57,7 +57,7 @@ capability we deliberately never advertise, so it is never sent.
 | Method | bifrost evidence | sæhrimnir status | Effort |
 |---|---|---|---|
 | `Thread/changes` | `sync/changes.rs:239-253`, driven for the Thread cursor scope seeded at `factory.rs:214-221`; fires unconditionally on the first delta cycle after open | **DONE** - `src/jmap.rs::thread_changes` projects the per-account email delta onto threads (created/updated email threads; `destroyed` empty, bifrost reconciles via `Thread/get`) | S (shipped) |
-| `CalendarEvent/query` | `sync/calendar_ops.rs:52-60` (`events_in_range`), the core calendar read; gated on `calendars` capability | MISSING - we have `Calendar/get`, `CalendarEvent/get`/`changes`/`set` but not `query` | M - time-range (`before`/`after`) + `position`/`limit`/`calculateTotal`, project fixture `Event` (mirror `Email/query`) |
+| `CalendarEvent/query` | `sync/calendar_ops.rs:52-60` (`events_in_range`), the core calendar read; gated on `calendars` capability | **DONE** - `src/jmap_calendar.rs::calendar_event_query`: AND FilterOperator of `inCalendar`/`after`/`before`/`text`, `position`/`limit`/`calculateTotal`, start-sorted | M (shipped) |
 
 ### P2
 

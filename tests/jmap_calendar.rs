@@ -88,6 +88,56 @@ async fn jmap_call(r: &axum::Router, method: &str, args: Value) -> Value {
 }
 
 #[tokio::test]
+async fn calendar_event_query_filters_by_calendar_and_range() {
+    // bifrost's calendar read sends an AND of inCalendar + after +
+    // before, then re-filters client-side; before this method existed
+    // the JMAP calendar flow could not run.
+    let r = router();
+
+    // inCalendar only: both cal-work events, sorted by start.
+    let resp = jmap_call(
+        &r,
+        "CalendarEvent/query",
+        json!({
+            "accountId": "account-1",
+            "filter": { "operator": "AND", "conditions": [ { "inCalendar": "cal-work" } ] },
+            "calculateTotal": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp[0], "CalendarEvent/query");
+    assert_eq!(resp[1]["ids"], json!(["ev-001", "ev-002"]));
+    assert_eq!(resp[1]["total"], 2);
+
+    // after/before narrows to the January event.
+    let resp = jmap_call(
+        &r,
+        "CalendarEvent/query",
+        json!({
+            "accountId": "account-1",
+            "filter": { "operator": "AND", "conditions": [
+                { "inCalendar": "cal-work" },
+                { "after": "2026-01-01T00:00:00Z" },
+                { "before": "2026-01-31T00:00:00Z" },
+            ] },
+            "calculateTotal": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp[1]["ids"], json!(["ev-001"]));
+    assert_eq!(resp[1]["total"], 1);
+
+    // text matches the subject of the February event.
+    let resp = jmap_call(
+        &r,
+        "CalendarEvent/query",
+        json!({ "accountId": "account-1", "filter": { "text": "quarterly" } }),
+    )
+    .await;
+    assert_eq!(resp[1]["ids"], json!(["ev-002"]));
+}
+
+#[tokio::test]
 async fn session_advertises_calendars_when_fixture_has_calendars() {
     let resp = router()
         .oneshot(

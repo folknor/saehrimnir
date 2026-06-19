@@ -437,6 +437,198 @@ pub(crate) fn calendar_event_changes(
     }))
 }
 
+// ── CalendarEvent/query ─────────────────────────────────────────────
+
+/// RFC 8621 (JMAP Calendars) `CalendarEvent/query`. Same envelope as
+/// `Email/query`. bifrost's calendar read (`sync/calendar_ops.rs`)
+/// sends an AND FilterOperator of `inCalendar` + `after` + `before`
+/// (and `text` for search), then re-filters client-side - so the
+/// mock's time filter only needs to be coarse. Results sort by
+/// `start` ascending with `id` lexicographic as a deterministic
+/// tiebreak, for byte-stable paging.
+// `expect()` calls are bounds-checked one line above each use; they
+// cannot panic and are not wire errors to surface.
+#[allow(clippy::unwrap_in_result)]
+pub(crate) fn calendar_event_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = require_account(fixture, args)?;
+    let filter = parse_event_filter(args.get("filter"))?;
+
+    let position = match args.get("position") {
+        None | Some(Value::Null) => 0u64,
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| invalid_args("position must be an integer"))?;
+            if n < 0 {
+                return Err(invalid_args("negative position not supported in v0"));
+            }
+            u64::try_from(n).expect("position non-negative checked above")
+        }
+    };
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => 50u64,
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| invalid_args("limit must be an integer"))?;
+            if n < 0 {
+                return Err(invalid_args("limit must be non-negative"));
+            }
+            u64::try_from(n)
+                .expect("limit non-negative checked above")
+                .min(256)
+        }
+    };
+    let calculate_total = args
+        .get("calculateTotal")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut matches: Vec<&Event> = fixture
+        .events_for(account_id)
+        .filter(|e| filter.matches(e))
+        .collect();
+    matches.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
+
+    let total = matches.len() as u64;
+    let start = usize::try_from(position.min(total)).expect("start <= matches.len()");
+    let end = usize::try_from((position + limit).min(total)).expect("end <= matches.len()");
+    let ids: Vec<Value> = matches[start..end]
+        .iter()
+        .map(|e| Value::String(e.id.clone()))
+        .collect();
+
+    let mut out = Map::new();
+    out.insert("accountId".into(), Value::String(account_id.to_string()));
+    out.insert("queryState".into(), Value::String(fixture.state.clone()));
+    out.insert("canCalculateChanges".into(), Value::Bool(false));
+    out.insert("position".into(), Value::Number(position.into()));
+    out.insert("ids".into(), Value::Array(ids));
+    if calculate_total {
+        out.insert("total".into(), Value::Number(total.into()));
+    }
+    Ok(Value::Object(out))
+}
+
+/// v0 `CalendarEvent/query` filter. Supports the conditions bifrost
+/// sends: `inCalendar`, `after`, `before`, `text`.
+#[derive(Default)]
+struct EventFilter {
+    in_calendar: Option<String>,
+    after: Option<i64>,
+    before: Option<i64>,
+    text: Option<String>,
+}
+
+impl EventFilter {
+    fn matches(&self, e: &Event) -> bool {
+        if let Some(c) = &self.in_calendar
+            && &e.calendar_id != c
+        {
+            return false;
+        }
+        // `after` is the range start: keep events that end after it.
+        if let Some(a) = self.after
+            && e.end.timestamp() <= a
+        {
+            return false;
+        }
+        // `before` is the range end: keep events that start before it.
+        if let Some(b) = self.before
+            && e.start.timestamp() >= b
+        {
+            return false;
+        }
+        if let Some(t) = &self.text {
+            let needle = t.to_lowercase();
+            let in_title = e.subject.to_lowercase().contains(&needle);
+            let in_body = e
+                .body_text
+                .as_deref()
+                .is_some_and(|d| d.to_lowercase().contains(&needle));
+            if !in_title && !in_body {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn parse_event_filter(raw: Option<&Value>) -> Result<EventFilter, Value> {
+    let mut f = EventFilter::default();
+    let Some(v) = raw else { return Ok(f) };
+    if v.is_null() {
+        return Ok(f);
+    }
+    let obj = v
+        .as_object()
+        .ok_or_else(|| invalid_args("filter must be an object"))?;
+    // FilterOperator form (`{ operator, conditions }`): bifrost only
+    // sends AND, so v0 ANDs every condition regardless of the operator
+    // (OR / NOT are not used on the calendar read path).
+    if obj.contains_key("operator") {
+        let conditions = obj
+            .get("conditions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_args("filter.conditions must be an array"))?;
+        for c in conditions {
+            apply_event_condition(&mut f, c)?;
+        }
+        return Ok(f);
+    }
+    apply_event_condition(&mut f, v)?;
+    Ok(f)
+}
+
+fn apply_event_condition(f: &mut EventFilter, c: &Value) -> Result<(), Value> {
+    let obj = c
+        .as_object()
+        .ok_or_else(|| invalid_args("filter condition must be an object"))?;
+    for (k, val) in obj {
+        match k.as_str() {
+            "inCalendar" => {
+                f.in_calendar = Some(
+                    val.as_str()
+                        .ok_or_else(|| invalid_args("filter.inCalendar must be a string"))?
+                        .to_string(),
+                );
+            }
+            "after" => f.after = Some(parse_event_utc(val)?),
+            "before" => f.before = Some(parse_event_utc(val)?),
+            "text" => {
+                f.text = Some(
+                    val.as_str()
+                        .ok_or_else(|| invalid_args("filter.text must be a string"))?
+                        .to_string(),
+                );
+            }
+            other => {
+                return Err(json!({
+                    "type": "unsupportedFilter",
+                    "description": format!("v0 does not support CalendarEvent filter.{other:?}"),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Accept a JSCalendar `UTCDate` (RFC3339, e.g. `"2026-01-15T09:00:00Z"`)
+/// or a unix-seconds integer, returning the unix timestamp.
+fn parse_event_utc(val: &Value) -> Result<i64, Value> {
+    if let Some(i) = val.as_i64() {
+        return Ok(i);
+    }
+    if let Some(s) = val.as_str() {
+        return DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.timestamp())
+            .map_err(|_| invalid_args("after/before must be an RFC3339 UTCDate or unix seconds"));
+    }
+    Err(invalid_args(
+        "after/before must be an RFC3339 UTCDate or unix seconds",
+    ))
+}
+
 // ── CalendarEvent/set ───────────────────────────────────────────────
 
 pub(crate) fn calendar_event_set(
