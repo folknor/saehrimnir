@@ -271,8 +271,12 @@ checking whether the fact is already in `notes/`.
   `/v1.0/groups/{id}/members`, `/v1.0/me/memberOf`,
   `/v1.0/users/{id}/memberOf`), `profile.rs` (user profile -
   `/v1.0/me` + `/v1.0/users/{id}`, the first call
-  `GraphAccountFactory::open` makes). Sibling files for drive / EWS
-  land here when those surfaces are scouted.
+  `GraphAccountFactory::open` makes - plus GAL directory search on
+  `/v1.0/users` + `/v1.0/me/users`), `settings.rs` (accept-and-ignore
+  stubs with no fixture slot: `mailboxSettings` vacation,
+  `messageRules` inbox filters, `/subscriptions` webhook push).
+  Sibling files for drive / EWS land here when those surfaces are
+  scouted.
 - `src/caldav/` - CalDAV mock. `mod.rs` (single-handler dispatch
   on PROPFIND / REPORT / GET / PUT / DELETE / OPTIONS for the
   WebDAV verb surface ratatoskr's CalDavClient exercises), `xml.rs`

@@ -467,6 +467,23 @@ attachments, this is the moment to fill it in.
 - 401 triggers token refresh; v0 never returns 401.
 - 429 triggers exponential-backoff retry; v0 never emits.
 
+## Account settings + opt-in (accept-and-ignore, `src/graph/settings.rs`)
+
+These have no fixture slot, so v0 serves shaped-but-non-durable
+responses (no change-log transitions):
+
+- `GET /v1.0/me/mailboxSettings` (+ `/users/{u}`) -> a disabled
+  `automaticRepliesSetting` (bifrost reads it as "vacation off").
+  `PATCH` echoes the submitted setting (`vacation_set` ignores the
+  response body).
+- `GET /v1.0/me/mailFolders/{folder}/messageRules` -> empty `value`;
+  POST create echoes the body with a minted id; PATCH echoes; DELETE
+  204; GET-by-id 404 (no rules stored).
+- `POST /v1.0/subscriptions` -> 201 with a minted id + echoed
+  `expirationDateTime` / `resource`; PATCH renew echoes the new
+  expiration; DELETE 204. Only driven in
+  `PushMode::GraphSubscriptions`; the mock delivers no notifications.
+
 ## Constants worth knowing
 
 - `BATCH_SIZE = 50` (messages per page on initial sync).

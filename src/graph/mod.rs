@@ -16,6 +16,7 @@ pub mod label_sync;
 pub mod mail;
 pub mod odata;
 pub mod profile;
+pub mod settings;
 
 use std::sync::Arc;
 
@@ -111,6 +112,7 @@ pub fn router(state: AppState) -> Router {
         .merge(contacts::router())
         .merge(label_sync::router())
         .merge(group_sync::router())
+        .merge(settings::router())
         .fallback(any(not_implemented))
         .layer(middleware::from_fn_with_state(
             state.clone(),

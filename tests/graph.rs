@@ -99,6 +99,61 @@ async fn send_json(
 }
 
 #[tokio::test]
+async fn graph_settings_stubs() {
+    let app = router();
+
+    // mailboxSettings: GET reports a disabled auto-reply; PATCH echoes.
+    let (status, v) = send_json(
+        &app,
+        "GET",
+        "/v1.0/me/mailboxSettings?$select=automaticRepliesSetting",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["automaticRepliesSetting"]["status"], "disabled");
+
+    let (status, v) = send_json(
+        &app,
+        "PATCH",
+        "/v1.0/me/mailboxSettings",
+        Some(json!({ "automaticRepliesSetting": { "status": "alwaysEnabled" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["automaticRepliesSetting"]["status"], "alwaysEnabled");
+
+    // messageRules: empty list, create echoes an id.
+    let (status, v) = send_json(&app, "GET", "/v1.0/me/mailFolders/inbox/messageRules", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v["value"].as_array().unwrap().is_empty());
+    let (status, v) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/mailFolders/inbox/messageRules",
+        Some(json!({ "displayName": "Rule" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(v["id"].is_string());
+
+    // subscriptions: create echoes the expiration; delete is 204.
+    let (status, v) = send_json(
+        &app,
+        "POST",
+        "/v1.0/subscriptions",
+        Some(json!({ "resource": "/me/messages", "expirationDateTime": "2026-07-01T00:00:00Z" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(v["id"].is_string());
+    assert_eq!(v["expirationDateTime"], "2026-07-01T00:00:00Z");
+    let (status, _) =
+        send_json(&app, "DELETE", "/v1.0/subscriptions/mock-subscription-1", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn graph_mailfolder_crud_round_trip() {
     let app = router();
 

@@ -188,10 +188,14 @@ tentativelyAccept}` -> 202, accept-and-ignore) and GAL directory
 search (`GET /users` + `/me/users` with `startswith` filter over
 accounts) - `src/graph/calendar.rs` + `src/graph/profile.rs`.
 
+**DONE (accept-and-ignore stubs, `src/graph/settings.rs`):**
+`mailboxSettings` (vacation: GET disabled, PATCH echoes),
+`messageRules` (inbox filters: empty list + create/patch/delete
+stubs), `POST /subscriptions` + renew/delete (webhook push, opt-in).
+None durably stored - no fixture slot.
+
 Still open (the rest of the write tier): mail send/draft (`POST
-/me/messages`, `/sendMail`, drafts); `mailboxSettings` (vacation);
-`messageRules` (server-side filters); `POST /subscriptions` webhooks
-(opt-in push only).
+/me/messages`, `/sendMail`, drafts).
 
 ### Confirmed safe (do not flag)
 EWS, public folders, OneDrive/`host_attachment`, `attachment_upload`
