@@ -126,6 +126,27 @@ NOT advertised in v0:
 - `BODYSTRUCTURE` is not used; the client parses the raw RFC 822
   body itself via mail-parser.
 
+### bifrost note (the client we are migrating to)
+
+The sections above describe the OLD ratatoskr-direct IMAP client.
+bifrost's inventory FETCH is different and the mock must serve it:
+`UID FLAGS ENVELOPE RFC822.SIZE` plus `MODSEQ` whenever CONDSTORE is
+enabled (`research/bifrost/crates/imap/src/account/inventory.rs:225-231`,
+`get.rs:213-219`). Two consequences for the mock:
+
+- `ENVELOPE` (RFC 3501 7.4.2) must parse and emit - bifrost reads
+  sender/subject/date from it instead of the raw headers. `src/imap.rs`
+  serves it via `render_envelope`.
+- bifrost APPENDS `MODSEQ` to the attr list because we advertise
+  `CONDSTORE QRESYNC`, and rejects a value of 0
+  (`folder_registry.rs` "FETCH returned MODSEQ 0"). The mock emits
+  `MODSEQ (1)` per message, consistent with the pinned
+  `HIGHESTMODSEQ 1`.
+
+Before both were parsed, the unknown attr made `parse_fetch_attrs`
+return `None` and the whole `UID FETCH` replied `BAD`, breaking
+bifrost's initial mail sync right after SELECT.
+
 ## Message fetching - delta / CONDSTORE
 
 - New messages: `UID SEARCH (last_uid+1):*` to find new UIDs, then the

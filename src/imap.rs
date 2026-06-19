@@ -1811,6 +1811,16 @@ enum FetchAttr {
     Flags,
     InternalDate,
     Rfc822Size,
+    /// `ENVELOPE` - the RFC 3501 7.4.2 structured envelope (date,
+    /// subject, from / sender / reply-to / to / cc / bcc,
+    /// in-reply-to, message-id). bifrost requests this in every full
+    /// FETCH projection; without it the attr list parsed to `None`
+    /// and the whole `UID FETCH` replied `BAD`.
+    Envelope,
+    /// `MODSEQ` - RFC 4551 CONDSTORE per-message modseq. bifrost
+    /// appends it whenever CONDSTORE is enabled (we advertise
+    /// `CONDSTORE QRESYNC`), and rejects a value of 0.
+    ModSeq,
     /// `BODY[]` or `BODY.PEEK[]`. We treat them identically because
     /// v0 does not implement flag side-effects.
     BodyFull,
@@ -1845,6 +1855,8 @@ fn parse_fetch_attrs(s: &str) -> Option<Vec<FetchAttr>> {
             "FLAGS" => FetchAttr::Flags,
             "INTERNALDATE" => FetchAttr::InternalDate,
             "RFC822.SIZE" => FetchAttr::Rfc822Size,
+            "ENVELOPE" => FetchAttr::Envelope,
+            "MODSEQ" => FetchAttr::ModSeq,
             "RFC822" | "BODY[]" | "BODY.PEEK[]" => FetchAttr::BodyFull,
             "BODY[HEADER]" | "BODY.PEEK[HEADER]" | "RFC822.HEADER" => FetchAttr::BodyHeader,
             "BODY[TEXT]" | "BODY.PEEK[TEXT]" | "RFC822.TEXT" => FetchAttr::BodyText,
@@ -1871,6 +1883,8 @@ fn fetch_attr_name(attr: &FetchAttr) -> String {
         FetchAttr::Flags => "FLAGS".into(),
         FetchAttr::InternalDate => "INTERNALDATE".into(),
         FetchAttr::Rfc822Size => "RFC822.SIZE".into(),
+        FetchAttr::Envelope => "ENVELOPE".into(),
+        FetchAttr::ModSeq => "MODSEQ".into(),
         FetchAttr::BodyFull => "BODY[]".into(),
         FetchAttr::BodyHeader => "BODY[HEADER]".into(),
         FetchAttr::BodyText => "BODY[TEXT]".into(),
@@ -2000,6 +2014,16 @@ fn fetch_response_line(seq: u32, uid: u32, email: &Email, attrs: &[FetchAttr]) -
                 let r = rendered.get_or_insert_with(|| RenderedRfc822::for_email(email));
                 out.push_str(&format!("RFC822.SIZE {}", r.full.len()));
             }
+            FetchAttr::Envelope => {
+                out.push_str(&format!("ENVELOPE {}", render_envelope(email)));
+            }
+            FetchAttr::ModSeq => {
+                // CONDSTORE per-message modseq. HIGHESTMODSEQ is pinned
+                // at 1, so every message reports modseq 1 - non-zero
+                // (bifrost rejects 0) and consistent with the
+                // CHANGEDSINCE semantics (>= 1 matches nothing).
+                out.push_str("MODSEQ (1)");
+            }
             FetchAttr::BodyFull => {
                 let r = rendered.get_or_insert_with(|| RenderedRfc822::for_email(email));
                 out.push_str(&format!("BODY[] {{{}}}\r\n{}", r.full.len(), r.full));
@@ -2061,6 +2085,90 @@ fn flags_for(email: &Email) -> String {
         .collect();
     tokens.sort();
     tokens.join(" ")
+}
+
+// ── ENVELOPE emission (RFC 3501 7.4.2) ──────────────────────────────
+//
+// `ENVELOPE (date subject from sender reply-to to cc bcc in-reply-to
+// message-id)`. Address structures are `(name adl mailbox host)`;
+// we always emit NIL for the (source-route) adl field. Per RFC 3501,
+// when the message has no Sender / Reply-To the server defaults both
+// to the From value - bifrost relies on that to resolve a sender.
+// v0 fixtures are ASCII, so quoted strings (no RFC 2047 / literals)
+// suffice; we escape `"` and `\` for safety.
+
+fn render_envelope(email: &Email) -> String {
+    let date = imap_nstring(Some(&email.sent_at.to_rfc2822()));
+    let subject = imap_nstring(email.subject.as_deref());
+    let from = imap_addr_list(email.from.iter());
+    // Sender + Reply-To default to From when the message carries
+    // neither (RFC 3501 7.4.2).
+    let sender = from.clone();
+    let reply_to = if email.reply_to.is_empty() {
+        from.clone()
+    } else {
+        imap_addr_list(email.reply_to.iter())
+    };
+    let to = imap_addr_list(email.to.iter());
+    let cc = imap_addr_list(email.cc.iter());
+    let bcc = imap_addr_list(email.bcc.iter());
+    let in_reply_to = imap_nstring_join(&email.in_reply_to);
+    let message_id = imap_nstring_join(&email.message_id);
+    format!(
+        "({date} {subject} {from} {sender} {reply_to} {to} {cc} {bcc} {in_reply_to} {message_id})"
+    )
+}
+
+/// IMAP `nstring`: a quoted string, or the bare atom `NIL` for the
+/// absent value. Escapes `"` and `\` per RFC 3501 quoted-string
+/// rules.
+fn imap_nstring(s: Option<&str>) -> String {
+    match s {
+        None => "NIL".to_string(),
+        Some(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        }
+    }
+}
+
+/// Join a multi-value header (`References`-style) into a single
+/// nstring, or `NIL` when empty. ENVELOPE carries `in-reply-to` and
+/// `message-id` as single strings.
+fn imap_nstring_join(parts: &[String]) -> String {
+    if parts.is_empty() {
+        "NIL".to_string()
+    } else {
+        imap_nstring(Some(&parts.join(" ")))
+    }
+}
+
+/// An ENVELOPE address list: `NIL` when empty, else a parenthesised
+/// run of address structures with no separators between them.
+fn imap_addr_list<'a>(addrs: impl Iterator<Item = &'a Address>) -> String {
+    let mut peekable = addrs.peekable();
+    if peekable.peek().is_none() {
+        return "NIL".to_string();
+    }
+    let mut out = String::from("(");
+    for a in peekable {
+        out.push_str(&imap_addr(a));
+    }
+    out.push(')');
+    out
+}
+
+/// One ENVELOPE address structure `(name adl mailbox host)`. `adl`
+/// (source route) is always NIL. The address splits on the last `@`
+/// into mailbox + host; an address with no `@` keeps the whole thing
+/// as the mailbox and emits NIL host.
+fn imap_addr(a: &Address) -> String {
+    let name = imap_nstring(a.name.as_deref());
+    let (mailbox, host) = match a.email.rsplit_once('@') {
+        Some((m, h)) => (imap_nstring(Some(m)), imap_nstring(Some(h))),
+        None => (imap_nstring(Some(&a.email)), "NIL".to_string()),
+    };
+    format!("({name} NIL {mailbox} {host})")
 }
 
 // ── RFC 822 emission ────────────────────────────────────────────────

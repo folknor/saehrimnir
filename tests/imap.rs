@@ -30,6 +30,34 @@ async fn run_with_fixture(script: &[u8]) -> String {
     String::from_utf8(buf).unwrap()
 }
 
+/// bifrost's inventory FETCH is `(UID FLAGS ENVELOPE RFC822.SIZE
+/// MODSEQ)` - it always asks for ENVELOPE and appends MODSEQ because
+/// we advertise CONDSTORE. Before ENVELOPE/MODSEQ were parsed the
+/// whole UID FETCH replied BAD, breaking initial mail sync.
+#[tokio::test]
+async fn uid_fetch_envelope_and_modseq() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"hunter2\"\r\n\
+        a2 SELECT \"INBOX\"\r\n\
+        a3 UID FETCH 1 (UID FLAGS ENVELOPE RFC822.SIZE MODSEQ)\r\n\
+        a4 LOGOUT\r\n";
+    let out = run_with_fixture(script).await;
+
+    // The attr list parses (no BAD) and the fetch completes.
+    assert!(out.contains("a3 OK UID FETCH completed\r\n"), "got: {out}");
+
+    // ENVELOPE: quoted date, subject, from/to address structures
+    // `(name adl mailbox host)`, and message-id.
+    assert!(out.contains("ENVELOPE (\""), "envelope missing: {out}");
+    assert!(out.contains("\"Hello\""));
+    assert!(out.contains("((NIL NIL \"alice\" \"example.com\"))"));
+    assert!(out.contains("((NIL NIL \"bob\" \"example.com\"))"));
+    assert!(out.contains("\"<email-001@example.com>\""));
+
+    // CONDSTORE per-message modseq, non-zero (bifrost rejects 0).
+    assert!(out.contains("MODSEQ (1)"));
+}
+
 /// Mirrors ratatoskr's initial-sync command sequence end-to-end.
 #[tokio::test]
 async fn full_initial_sync_transcript() {

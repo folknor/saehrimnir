@@ -460,8 +460,15 @@ IMAP: complete for v0's read path (greeting, `CAPABILITY`, `LOGIN`/
 `AUTHENTICATE`, `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT`/`EXAMINE`/
 `CLOSE`, `UID SEARCH`, `UID FETCH` with full RFC 822 body emission
 including `multipart/mixed` for fixtures with attachments,
-`BODYSTRUCTURE`, `BODY[N]` and `BODY[N.MIME]` sub-part fetch,
-CONDSTORE `CHANGEDSINCE`). Single-part text emails stay byte-
+`ENVELOPE` (RFC 3501 7.4.2 structured envelope), `BODYSTRUCTURE`,
+`BODY[N]` and `BODY[N.MIME]` sub-part fetch, CONDSTORE `CHANGEDSINCE`
+plus per-message `MODSEQ` (pinned at 1, matching the pinned
+`HIGHESTMODSEQ`; non-zero so bifrost's modseq cache accepts it).
+bifrost's inventory FETCH is `(UID FLAGS ENVELOPE RFC822.SIZE
+MODSEQ)` - it always requests `ENVELOPE` and appends `MODSEQ`
+because we advertise `CONDSTORE QRESYNC`, so without those two the
+attr list parsed to nothing and the whole `UID FETCH` replied `BAD`,
+breaking initial mail sync. Single-part text emails stay byte-
 identical to the pre-attachment wire format; multipart kicks in only
 when `email.attachments` is non-empty (boundary is
 `=_saehrimnir_<email-id>_=`). Plus a persistent mutation surface:

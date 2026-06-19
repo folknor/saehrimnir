@@ -31,7 +31,7 @@ L = large (subsystem).
 | # | Gap | Protocol | Sev | Effort |
 |---|---|---|---|---|
 | 1 | ~~`GET /v1.0/me` (profile root) MISSING -> no Graph account opens at all~~ **DONE** (`src/graph/profile.rs`) | Graph | P0 | S |
-| 2 | IMAP `FETCH` parser rejects `ENVELOPE` + `MODSEQ` -> initial inventory FETCH returns `BAD` | IMAP | P0 (conditional) | M |
+| 2 | ~~IMAP `FETCH` parser rejects `ENVELOPE` + `MODSEQ` -> initial inventory FETCH returns `BAD`~~ **DONE** (`src/imap.rs`) | IMAP | P0 (conditional) | M |
 | 3 | `Thread/changes` MISSING -> first delta cycle after open fails | JMAP | P1 | S |
 | 4 | Graph `POST /$batch` MISSING -> all message hydration + writes fail | Graph | P0/P1 | L |
 | 5 | CalDAV `sync-collection` REPORT + `sync-token` PROPFIND prop MISSING (ship together) | CalDAV | P1 | M |
@@ -97,8 +97,8 @@ gated on our own advertisement - ENVELOPE breaks it regardless.
 
 | Item | bifrost evidence | sæhrimnir status | Effort |
 |---|---|---|---|
-| `FETCH ENVELOPE` | `inventory.rs:227`, `get.rs:215` (every full projection) | MISSING from `parse_fetch_attrs` -> `BAD` on the attr list | M - parse `ENVELOPE`, emit the RFC 3501 ENVELOPE structure (from/to/cc/subject/date/message-id) from fixture `Email` |
-| `FETCH MODSEQ` (CONDSTORE) | `inventory.rs:231`, `get.rs:207/219`; `folder_registry.rs` requires a real per-message MODSEQ (errors on "FETCH returned MODSEQ 0") | MISSING from `parse_fetch_attrs`; we pin `HIGHESTMODSEQ 1` but never emit per-message `MODSEQ (n)` | M - parse `MODSEQ`, emit a per-message modseq (state-derived); note bifrost rejects MODSEQ 0 |
+| `FETCH ENVELOPE` | `inventory.rs:227`, `get.rs:215` (every full projection) | **DONE** - `parse_fetch_attrs` parses `ENVELOPE`; `render_envelope` emits the RFC 3501 7.4.2 structure (date/subject/from/sender/reply-to/to/cc/bcc/in-reply-to/message-id) from fixture `Email` | M (shipped) |
+| `FETCH MODSEQ` (CONDSTORE) | `inventory.rs:231`, `get.rs:207/219`; `folder_registry.rs` requires a real per-message MODSEQ (errors on "FETCH returned MODSEQ 0") | **DONE** - emits `MODSEQ (1)` per message (non-zero, consistent with pinned `HIGHESTMODSEQ 1`) | M (shipped) |
 
 ### P1
 
