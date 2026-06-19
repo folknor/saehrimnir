@@ -1097,43 +1097,120 @@ async fn patch_message_impl(
     }) {
         return o;
     }
-    let exists = {
-        let fixture = state.fixture();
-        fixture.emails_for(account_id).any(|e| e.id == message_id)
+    let projected = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        patch_message_core(&mut fix, account_id, message_id, &body)
     };
-    if !exists {
-        return error(
+    match projected {
+        Some(v) => ok_json(v),
+        None => error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
             &format!("message {message_id:?} not found"),
-        );
+        ),
     }
+}
 
+// ── Message mutation cores ──────────────────────────────────────────
+//
+// Sync helpers operating on `&mut Fixture`, shared by the direct
+// PATCH/DELETE/move handlers and the `$batch` write path (bifrost
+// routes message writes through `$batch`, so the batch path is the
+// one it actually exercises). Each runs the mutation under
+// `Fixture::mutate` to record the change-log transition. Returning
+// the projection (or a found flag) lets the caller shape the wire
+// response (direct HTTP vs batch sub-response).
+
+/// Apply a Graph message PATCH; returns the projected message, or
+/// `None` when the id is not in the account.
+fn patch_message_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    message_id: &str,
+    body: &Value,
+) -> Option<Value> {
     let acct = account_id.to_string();
     let mid = message_id.to_string();
-    let mut projected = Value::Null;
-    {
-        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        let _ = fix.mutate(|f| {
-            let Some(idx) = f
-                .emails
-                .iter()
-                .position(|e| e.account_id == acct && e.id == mid)
-            else {
-                return MutationDiff::default();
-            };
-            let mut email = f.emails[idx].clone();
-            apply_graph_message_patch(&mut email, &body);
-            let parent = email.mailbox_ids.first().map(String::as_str).unwrap_or("");
-            projected = message_value(&email, parent, false);
-            f.emails[idx] = email;
-            MutationDiff {
-                email_updated: vec![mid.clone()],
-                ..Default::default()
-            }
-        });
-    }
-    ok_json(projected)
+    let mut projected = None;
+    let _ = fix.mutate(|f| {
+        let Some(idx) = f
+            .emails
+            .iter()
+            .position(|e| e.account_id == acct && e.id == mid)
+        else {
+            return MutationDiff::default();
+        };
+        let mut email = f.emails[idx].clone();
+        apply_graph_message_patch(&mut email, body);
+        let parent = email.mailbox_ids.first().cloned().unwrap_or_default();
+        projected = Some(message_value(&email, &parent, false));
+        f.emails[idx] = email;
+        MutationDiff {
+            email_updated: vec![mid.clone()],
+            ..Default::default()
+        }
+    });
+    projected
+}
+
+/// Permanently delete a message; returns `false` when not found.
+/// Retires the message's UID slots and records `email_destroyed`.
+fn delete_message_core(fix: &mut Fixture, account_id: &str, message_id: &str) -> bool {
+    let acct = account_id.to_string();
+    let mid = message_id.to_string();
+    let Some((mailboxes, owner)) = fix
+        .emails
+        .iter()
+        .find(|e| e.account_id == acct && e.id == mid)
+        .map(|e| (e.mailbox_ids.clone(), e.account_id.clone()))
+    else {
+        return false;
+    };
+    let _ = fix.mutate(move |f| {
+        f.emails.retain(|e| !(e.account_id == acct && e.id == mid));
+        for mb in &mailboxes {
+            f.retire_uid(mb, &mid);
+        }
+        MutationDiff {
+            email_destroyed: vec![mid.clone()],
+            email_destroyed_accounts: vec![owner.clone()],
+            ..Default::default()
+        }
+    });
+    true
+}
+
+/// Move a message to `dest` (single-folder membership replace);
+/// returns the projected moved message, or `None` when not found.
+fn move_message_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    message_id: &str,
+    dest: &str,
+) -> Option<Value> {
+    let acct = account_id.to_string();
+    let mid = message_id.to_string();
+    let dest = dest.to_string();
+    let mut projected = None;
+    let _ = fix.mutate(|f| {
+        let Some(idx) = f
+            .emails
+            .iter()
+            .position(|e| e.account_id == acct && e.id == mid)
+        else {
+            return MutationDiff::default();
+        };
+        let old = f.emails[idx].mailbox_ids.clone();
+        let new = vec![dest.clone()];
+        f.emails[idx].mailbox_ids = new.clone();
+        f.sync_mailbox_uids(&mid, &old, &new);
+        projected = Some(message_value(&f.emails[idx], &dest, false));
+        MutationDiff {
+            email_updated: vec![mid.clone()],
+            ..Default::default()
+        }
+    });
+    projected
 }
 
 /// Apply the Graph message-PATCH fields bifrost sends to a fixture
@@ -1192,45 +1269,19 @@ async fn delete_message_impl(state: AppState, account_id: &str, message_id: &str
     }) {
         return o;
     }
-    let exists = {
-        let fixture = state.fixture();
-        fixture.emails_for(account_id).any(|e| e.id == message_id)
+    let found = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        delete_message_core(&mut fix, account_id, message_id)
     };
-    if !exists {
-        return error(
+    if found {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
             &format!("message {message_id:?} not found"),
-        );
+        )
     }
-
-    let acct = account_id.to_string();
-    let mid = message_id.to_string();
-    {
-        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        // Snapshot membership + account before the retain so the UID
-        // retirement and the tombstone carry the right values.
-        let membership = fix
-            .emails
-            .iter()
-            .find(|e| e.account_id == acct && e.id == mid)
-            .map(|e| (e.mailbox_ids.clone(), e.account_id.clone()));
-        let _ = fix.mutate(|f| {
-            let Some((mailboxes, owner)) = &membership else {
-                return MutationDiff::default();
-            };
-            f.emails.retain(|e| !(e.account_id == acct && e.id == mid));
-            for mb in mailboxes {
-                f.retire_uid(mb, &mid);
-            }
-            MutationDiff {
-                email_destroyed: vec![mid.clone()],
-                email_destroyed_accounts: vec![owner.clone()],
-                ..Default::default()
-            }
-        });
-    }
-    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `POST /v1.0/me/messages/{id}/move` - moves the message to the
@@ -1265,44 +1316,18 @@ async fn move_message_impl(
             "move requires a non-empty destinationId",
         );
     };
-    let exists = {
-        let fixture = state.fixture();
-        fixture.emails_for(account_id).any(|e| e.id == message_id)
+    let projected = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        move_message_core(&mut fix, account_id, message_id, dest)
     };
-    if !exists {
-        return error(
+    match projected {
+        Some(v) => (StatusCode::CREATED, axum::Json(v)).into_response(),
+        None => error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
             &format!("message {message_id:?} not found"),
-        );
+        ),
     }
-
-    let acct = account_id.to_string();
-    let mid = message_id.to_string();
-    let dest = dest.to_string();
-    let mut projected = Value::Null;
-    {
-        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        let _ = fix.mutate(|f| {
-            let Some(idx) = f
-                .emails
-                .iter()
-                .position(|e| e.account_id == acct && e.id == mid)
-            else {
-                return MutationDiff::default();
-            };
-            let old_mailboxes = f.emails[idx].mailbox_ids.clone();
-            let new_mailboxes = vec![dest.clone()];
-            f.emails[idx].mailbox_ids = new_mailboxes.clone();
-            f.sync_mailbox_uids(&mid, &old_mailboxes, &new_mailboxes);
-            projected = message_value(&f.emails[idx], &dest, false);
-            MutationDiff {
-                email_updated: vec![mid.clone()],
-                ..Default::default()
-            }
-        });
-    }
-    (StatusCode::CREATED, axum::Json(projected)).into_response()
 }
 
 /// Find a message by id within the account and project it via
@@ -1336,16 +1361,21 @@ async fn batch(State(state): State<AppState>, Json(body): Json<Value>) -> Respon
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let fixture = state.fixture();
+    // One write guard for the whole batch: sub-requests are a mix of
+    // reads (hydration GETs) and writes (bifrost routes its message
+    // mutations through `$batch`), all processed synchronously against
+    // the same `&mut Fixture` - no await between them, so the guard is
+    // never held across a suspension point.
+    let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
     let responses: Vec<Value> = requests
         .iter()
-        .map(|r| batch_sub_response(&fixture, r))
+        .map(|r| batch_sub_response(&mut fix, r))
         .collect();
-    drop(fixture);
+    drop(fix);
     ok_json(json!({ "responses": responses }))
 }
 
-fn batch_sub_response(fixture: &Fixture, req: &Value) -> Value {
+fn batch_sub_response(fix: &mut Fixture, req: &Value) -> Value {
     let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let method = req
         .get("method")
@@ -1353,7 +1383,7 @@ fn batch_sub_response(fixture: &Fixture, req: &Value) -> Value {
         .unwrap_or("GET")
         .to_ascii_uppercase();
     let url = req.get("url").and_then(Value::as_str).unwrap_or("");
-    let (status, body) = dispatch_batch_request(fixture, &method, url);
+    let (status, body) = dispatch_batch_request(fix, &method, url, req.get("body"));
     json!({
         "id": id,
         "status": status,
@@ -1362,54 +1392,33 @@ fn batch_sub_response(fixture: &Fixture, req: &Value) -> Value {
     })
 }
 
-/// Route one `$batch` sub-request against the fixture. v0 services
-/// `GET /me/messages/{id}` and `GET /users/{u}/messages/{id}` (the
-/// hydration path). Sub-request URLs are relative (`/me/...`) and may
-/// or may not carry the `/v1.0` prefix.
-fn dispatch_batch_request(fixture: &Fixture, method: &str, url: &str) -> (u16, Value) {
+/// Route one `$batch` sub-request. v0 services message GET (the
+/// hydration path) and the message writes bifrost batches - PATCH,
+/// DELETE, and POST `.../move`. Sub-request URLs are relative
+/// (`/me/...` or `/users/{u}/...`) and may or may not carry the
+/// `/v1.0` prefix.
+fn dispatch_batch_request(
+    fix: &mut Fixture,
+    method: &str,
+    url: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (url, None),
     };
     let path = path.strip_prefix("/v1.0").unwrap_or(path);
 
-    let unsupported = || {
-        (
-            404,
-            batch_error(
-                "ResourceNotImplemented",
-                &format!("v0 $batch does not implement {method} {url}"),
-            ),
-        )
-    };
-
-    if method != "GET" {
-        return (
-            501,
-            batch_error(
-                "ResourceNotImplemented",
-                &format!("v0 $batch does not implement {method} {url}"),
-            ),
-        );
-    }
-
-    if let Some(id) = path.strip_prefix("/me/messages/") {
-        if id.is_empty() || id.contains('/') {
-            return unsupported();
-        }
-        let account_id = fixture.primary_account().id.clone();
-        return batch_message(fixture, &account_id, id, query);
-    }
-    if let Some(rest) = path.strip_prefix("/users/")
+    // Resolve the (account, "{id}" or "{id}/move") tail from the path.
+    let (account_id, tail) = if let Some(tail) = path.strip_prefix("/me/messages/") {
+        (fix.primary_account().id.clone(), tail)
+    } else if let Some(rest) = path.strip_prefix("/users/")
         && let Some((user, tail)) = rest.split_once("/messages/")
     {
-        if tail.is_empty() || tail.contains('/') {
-            return unsupported();
-        }
         let account_id = if user == "me" {
-            fixture.primary_account().id.clone()
+            fix.primary_account().id.clone()
         } else {
-            match fixture.account(user) {
+            match fix.account(user) {
                 Some(a) => a.id.clone(),
                 None => {
                     return (
@@ -1419,25 +1428,83 @@ fn dispatch_batch_request(fixture: &Fixture, method: &str, url: &str) -> (u16, V
                 }
             }
         };
-        return batch_message(fixture, &account_id, tail, query);
+        (account_id, tail)
+    } else {
+        return (
+            404,
+            batch_error(
+                "ResourceNotImplemented",
+                &format!("v0 $batch does not implement {method} {url}"),
+            ),
+        );
+    };
+
+    // The tail is `{id}` or `{id}/move`.
+    let (message_id, suffix) = match tail.split_once('/') {
+        Some((id, s)) => (id, Some(s)),
+        None => (tail, None),
+    };
+    if message_id.is_empty() {
+        return (
+            404,
+            batch_error(
+                "ResourceNotImplemented",
+                &format!("v0 $batch does not implement {method} {url}"),
+            ),
+        );
     }
 
-    unsupported()
-}
-
-fn batch_message(
-    fixture: &Fixture,
-    account_id: &str,
-    message_id: &str,
-    query: Option<&str>,
-) -> (u16, Value) {
-    let q = odata::OdataQuery::parse(query);
-    let expand = expand_attachments(q.expand.as_deref());
-    match message_get_value(fixture, account_id, message_id, expand) {
-        Some(v) => (200, v),
-        None => (
+    let not_found = || {
+        (
             404,
             batch_error("ErrorItemNotFound", &format!("message {message_id:?} not found")),
+        )
+    };
+
+    match (method, suffix) {
+        ("GET", None) => {
+            let expand = expand_attachments(odata::OdataQuery::parse(query).expand.as_deref());
+            match message_get_value(fix, &account_id, message_id, expand) {
+                Some(v) => (200, v),
+                None => not_found(),
+            }
+        }
+        ("PATCH", None) => {
+            let body = body.cloned().unwrap_or(Value::Null);
+            match patch_message_core(fix, &account_id, message_id, &body) {
+                Some(v) => (200, v),
+                None => not_found(),
+            }
+        }
+        ("DELETE", None) => {
+            if delete_message_core(fix, &account_id, message_id) {
+                (204, Value::Null)
+            } else {
+                not_found()
+            }
+        }
+        ("POST", Some("move")) => {
+            let dest = body
+                .and_then(|b| b.get("destinationId"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let Some(dest) = dest else {
+                return (
+                    400,
+                    batch_error("ErrorInvalidRequest", "move requires a non-empty destinationId"),
+                );
+            };
+            match move_message_core(fix, &account_id, message_id, dest) {
+                Some(v) => (201, v),
+                None => not_found(),
+            }
+        }
+        _ => (
+            501,
+            batch_error(
+                "ResourceNotImplemented",
+                &format!("v0 $batch does not implement {method} {url}"),
+            ),
         ),
     }
 }

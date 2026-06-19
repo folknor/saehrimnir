@@ -564,10 +564,11 @@ and `POST /v1.0/me/messages/{id}/move` (re-parents to the body's
 (assembled RFC 822 bytes - bifrost's `open_raw_rfc822` body-fetch
 path; reuses the IMAP module's `assembled_rfc822` so the two body
 surfaces agree byte-for-byte), `POST /v1.0/$batch` (Graph JSON
-batching: services `GET /me|users/{u}/messages/{id}` sub-requests -
-the metadata-hydration path - and returns a per-item error for
-sub-requests it doesn't model yet, so write batches degrade
-per-item rather than batch-wide; read-only in v0),
+batching: holds one write guard and routes each sub-request through
+the shared message cores - GET hydration plus the message writes
+bifrost batches: PATCH / DELETE / POST `.../move`; a sub-request it
+doesn't model gets a per-item error, so a batch degrades per-item
+rather than batch-wide),
 `/v1.0/me/messages` (account-wide collection honouring
 `$filter=conversationId eq '...'` for bifrost's thread fetch, with
 `$top` / `$skiptoken` paging; non-`conversationId` filters and

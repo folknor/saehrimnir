@@ -272,14 +272,17 @@ v0 serves:
   (`pim.rs::message_values_for_thread`); v0 maps `conversationId` to
   the email's `thread_id`. `$top`/`$skiptoken` paginate. Other
   filters and `$search` fall through to the full account list (P2).
-- `POST /v1.0/$batch` - `{ requests: [{id, method, url}] }` ->
-  `{ responses: [{id, status, headers, body}] }`. Services GET
-  message sub-requests (urls are relative, `/me/...` or
-  `/users/{u}/...`, with or without the `/v1.0` prefix); any other
-  sub-request returns a per-item error (404 for unknown route, 501
-  for non-GET) so a write batch degrades per-item, not batch-wide.
-  Read-only in v0 - write sub-requests (PATCH categories / isRead /
-  importance, move, destroy from `pim.rs`) are the P2 follow-up.
+- `POST /v1.0/$batch` - `{ requests: [{id, method, url, body?}] }` ->
+  `{ responses: [{id, status, headers, body}] }`. Holds one write
+  guard for the batch and routes each sub-request through the shared
+  message cores: GET (hydration) plus the writes bifrost batches -
+  PATCH (flags), DELETE, and POST `.../move`. URLs are relative
+  (`/me/...` or `/users/{u}/...`, with or without the `/v1.0`
+  prefix). A sub-request it doesn't model gets a per-item error (404
+  unknown route, 501 unmodelled method), so a batch degrades
+  per-item, not batch-wide. NOTE: bifrost routes its message writes
+  through `$batch`, so this - not the direct PATCH/DELETE/move
+  endpoints - is the path it actually exercises.
 
 ### Folder resolution
 

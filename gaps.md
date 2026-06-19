@@ -168,8 +168,13 @@ mail/calendar/contacts/categories delta, but the same single-message /
 `POST /me/messages/{id}/move` (`destinationId` re-parent + UID sync).
 `src/graph/mail.rs`.
 
-Still open (the rest of the write tier): PATCH/DELETE/move as
-`$batch` sub-requests (currently per-item error); mail send/draft (`POST
+**DONE:** PATCH/DELETE/move as `$batch` sub-requests - the batch
+handler holds one write guard and routes each sub-request through the
+shared message cores, so bifrost's batched writes (it routes message
+mutations through `$batch`, not the direct endpoints) work
+end-to-end.
+
+Still open (the rest of the write tier): mail send/draft (`POST
 /me/messages`, `/sendMail`, drafts); mailFolder CRUD + move;
 `mailboxSettings` (vacation); `messageRules` (server-side filters);
 GAL `/users?$filter=startswith`; contact `$filter` (route exists,

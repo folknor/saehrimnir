@@ -260,6 +260,48 @@ async fn graph_batch_hydrates_messages() {
 }
 
 #[tokio::test]
+async fn graph_batch_routes_writes() {
+    // bifrost routes its message writes (mark-read, delete, move)
+    // through $batch, not the direct endpoints.
+    let app = router();
+    let body = json!({
+        "requests": [
+            { "id": "1", "method": "PATCH", "url": "/me/messages/email-001", "body": { "isRead": true } },
+            { "id": "2", "method": "DELETE", "url": "/me/messages/email-002" },
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1.0/$batch")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let responses = v["responses"].as_array().unwrap();
+    let by_id = |id: &str| responses.iter().find(|r| r["id"] == id).unwrap();
+    assert_eq!(by_id("1")["status"], 200);
+    assert_eq!(by_id("1")["body"]["isRead"], true);
+    assert_eq!(by_id("2")["status"], 204);
+
+    // Persisted: email-001 is now read, email-002 is gone.
+    let (status, v) = get_json_with(app.clone(), "/v1.0/me/messages/email-001").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["isRead"], true);
+    let (status, _) = get_json_with(app, "/v1.0/me/messages/email-002").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn graph_me_profile_returns_account_identity() {
     // GraphAccountFactory::open's FIRST request. Without this route it
     // hit the catchall 404 and no Graph account could open.
