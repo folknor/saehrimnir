@@ -551,7 +551,9 @@ the catchall 404 and no Graph account could open. Mail:
 childFolders), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
 `$skip` / `$skiptoken` / `$filter`), `/v1.0/me/mailFolders/{id}/
 messages/delta` (initial dump, follow-up no-op, `$deltatoken=latest`
-shortcut). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
+shortcut), `/v1.0/me/messages/{id}` (single-message GET projecting
+the email - the per-id read bifrost hydrates through `$batch`; 404
+`ErrorItemNotFound` on unknown id). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
 alias + events list with `$top`/`$skiptoken` pagination + delta
 view), `/v1.0/me/events/{id}` GET / PATCH / DELETE, plus
 `POST /v1.0/me/calendars/{id}/events`. Calendar mutations are

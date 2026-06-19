@@ -68,6 +68,23 @@ fn attach_router() -> axum::Router {
 }
 
 #[tokio::test]
+async fn graph_get_single_message_projects_email() {
+    // bifrost hydrates message metadata via $batch of GET
+    // /me/messages/{id}; before this route existed it 404'd.
+    let (status, v) = get_json("/v1.0/me/messages/email-001?$select=subject,from").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "email-001");
+    assert_eq!(v["subject"], "Hello");
+    assert_eq!(v["conversationId"], "email-001");
+    assert_eq!(v["parentFolderId"], "mbx-inbox");
+    assert_eq!(v["from"]["emailAddress"]["address"], "alice@example.com");
+
+    let (status, v) = get_json("/v1.0/me/messages/no-such-message").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ErrorItemNotFound");
+}
+
+#[tokio::test]
 async fn graph_me_profile_returns_account_identity() {
     // GraphAccountFactory::open's FIRST request. Without this route it
     // hit the catchall 404 and no Graph account could open.

@@ -67,6 +67,7 @@ pub fn router() -> Router<AppState> {
             "/v1.0/me/messages/{message_id}/attachments/{attachment_id}/$value",
             get(get_message_attachment_value_me),
         )
+        .route("/v1.0/me/messages/{message_id}", get(get_message_me))
         // /v1.0/users/{userId}/...
         .route("/v1.0/users/{user}/mailFolders", get(list_folders_user))
         .route("/v1.0/users/{user}/mailFolders/{folder}", get(get_folder_user))
@@ -93,6 +94,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1.0/users/{user}/messages/{message_id}/attachments/{attachment_id}/$value",
             get(get_message_attachment_value_user),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{message_id}",
+            get(get_message_user),
         )
 }
 
@@ -164,6 +169,15 @@ async fn get_message_attachment_value_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_message_attachment_value_impl(state, &account_id, &message_id, &attachment_id).await
+}
+
+async fn get_message_me(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_message_impl(state, &account_id, &message_id, raw).await
 }
 
 // ── /users/{user}/ route wrappers ───────────────────────────────────
@@ -262,6 +276,18 @@ async fn get_message_attachment_value_user(
         Err(r) => return r,
     };
     get_message_attachment_value_impl(state, &account_id, &message_id, &attachment_id).await
+}
+
+async fn get_message_user(
+    State(state): State<AppState>,
+    Path((user, message_id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_message_impl(state, &account_id, &message_id, raw).await
 }
 
 // ── Inner handlers (account-scoped) ─────────────────────────────────
@@ -762,6 +788,62 @@ fn sorted_messages_in<'a>(
             .then_with(|| a.id.cmp(&b.id))
     });
     v
+}
+
+/// `GET /v1.0/me/messages/{id}` (and the `/users/{user}` twin).
+/// bifrost reads single messages here both directly and - via the
+/// `$batch` envelope - for metadata hydration of every id surfaced by
+/// `messages/delta`. Without it the bare `/me/messages/{id}` path
+/// fell to the catchall 404 and hydration could not complete.
+async fn get_message_impl(
+    state: AppState,
+    account_id: &str,
+    message_id: &str,
+    raw: Option<String>,
+) -> Response {
+    let message_owned = message_id.to_string();
+    if let Some(r) = super::maybe_override(&state, "get_message", move |s| {
+        crate::lua::req_set_str(s, "message_id", &message_owned)
+    }) {
+        return r;
+    }
+    let fixture = state.fixture();
+    let q = odata::OdataQuery::parse(raw.as_deref());
+    let expand = expand_attachments(q.expand.as_deref());
+    match message_get_value(&fixture, account_id, message_id, expand) {
+        Some(mut v) => {
+            if let Value::Object(ref mut m) = v {
+                m.insert(
+                    "@odata.context".to_string(),
+                    Value::String(
+                        "https://graph.microsoft.com/v1.0/$metadata#message/$entity".into(),
+                    ),
+                );
+            }
+            ok_json(v)
+        }
+        None => error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("message {message_id:?} not found"),
+        ),
+    }
+}
+
+/// Find a message by id within the account and project it via
+/// `message_value`. Shared by the single-message GET route and the
+/// `$batch` hydration path. `parentFolderId` is the message's first
+/// mailbox membership. Returns `None` when the id is not in the
+/// account.
+fn message_get_value(
+    fixture: &Fixture,
+    account_id: &str,
+    message_id: &str,
+    expand: bool,
+) -> Option<Value> {
+    let e = fixture.emails_for(account_id).find(|e| e.id == message_id)?;
+    let parent = e.mailbox_ids.first().map(String::as_str).unwrap_or("");
+    Some(message_value(e, parent, expand))
 }
 
 fn message_value(e: &Email, parent_folder_id: &str, expand_attachments: bool) -> Value {

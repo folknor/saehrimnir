@@ -150,7 +150,7 @@ client-side pre-wire.
 
 | METHOD path | bifrost evidence | sæhrimnir status | Effort |
 |---|---|---|---|
-| `GET /v1.0/me/messages/{id}?$select=...` (single message) | `get.rs:317-321` (inside $batch), `pim.rs:903-924` (read-modify-write) | MISSING (we have `/messages/{id}/attachments...` but not bare `/messages/{id}`) | M |
+| `GET /v1.0/me/messages/{id}?$select=...` (single message) | `get.rs:317-321` (inside $batch), `pim.rs:903-924` (read-modify-write) | **DONE** - `src/graph/mail.rs::get_message_impl` (+ `/users/{user}` twin), reuses `message_value`; shared `message_get_value` also feeds `$batch` | M (shipped) |
 | `GET /v1.0/me/messages?$select=...&$filter=conversationId eq '...'&$top=50` (collection + thread) | `pim.rs:932-944`, `search_url` `pim.rs:1487+` | MISSING (only folder-scoped `/mailFolders/{id}/messages` exists) | M |
 | `GET /v1.0/me/messages/{id}/$value` (assembled RFC822) | `blob.rs:198,259-266` (the only honest body path; metadata hydration defers real bytes here) | MISSING -> catchall 404 | M |
 | `GET /v1.0/me/calendars/{id}/calendarView?startDateTime=&endDateTime=...` (non-delta range) | `calendar.rs:75-80` (`events_in_range`) | MISSING (we mount `calendarView/delta` only) | S |
