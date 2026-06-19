@@ -57,6 +57,10 @@ pub fn router() -> Router<AppState> {
             get(delta_events_me),
         )
         .route(
+            "/v1.0/me/calendars/{calendar}/calendarView",
+            get(calendar_view_me),
+        )
+        .route(
             "/v1.0/me/events/{event}",
             get(get_event_me).patch(patch_event_me).delete(delete_event_me),
         )
@@ -73,6 +77,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1.0/users/{user}/calendars/{calendar}/calendarView/delta",
             get(delta_events_user),
+        )
+        .route(
+            "/v1.0/users/{user}/calendars/{calendar}/calendarView",
+            get(calendar_view_user),
         )
         .route(
             "/v1.0/users/{user}/events/{event}",
@@ -108,6 +116,15 @@ async fn list_events_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     list_events_impl(state, &account_id, &calendar, raw_query, true).await
+}
+
+async fn calendar_view_me(
+    State(state): State<AppState>,
+    Path(calendar): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    calendar_view_impl(state, &account_id, &calendar, raw_query, true).await
 }
 
 async fn delta_events_me(
@@ -190,6 +207,18 @@ async fn list_events_user(
         Err(r) => return r,
     };
     list_events_impl(state, &account_id, &calendar, raw_query, false).await
+}
+
+async fn calendar_view_user(
+    State(state): State<AppState>,
+    Path((user, calendar)): Path<(String, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    calendar_view_impl(state, &account_id, &calendar, raw_query, false).await
 }
 
 async fn delta_events_user(
@@ -363,6 +392,120 @@ async fn list_events_impl(
         envelope.insert("@odata.nextLink".to_string(), Value::String(link));
     }
     ok_json(Value::Object(envelope))
+}
+
+/// `GET /v1.0/me/calendars/{id}/calendarView` with `startDateTime` /
+/// `endDateTime` - the non-delta time-range read bifrost drives via
+/// `events_in_range`. Mirrors `list_events_impl` but filters the
+/// calendar's events to those overlapping `[startDateTime,
+/// endDateTime)`. The two bounds are non-`$` query params; an absent
+/// bound is open on that side. bifrost re-checks the range
+/// client-side, so the overlap test stays coarse.
+async fn calendar_view_impl(
+    state: AppState,
+    account_id: &str,
+    calendar: &str,
+    raw_query: Option<String>,
+    me_path: bool,
+) -> Response {
+    let cal_owned = calendar.to_string();
+    if let Some(o) = super::maybe_override(&state, "list_events", move |s| {
+        crate::lua::req_set_str(s, "calendar", &cal_owned)
+    }) {
+        return o;
+    }
+    let fixture = state.fixture();
+    if resolve_calendar(&fixture, calendar, account_id).is_none() {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("calendar {calendar:?} not declared in fixture"),
+        );
+    }
+    let q = odata::OdataQuery::parse(raw_query.as_deref());
+    let start =
+        odata::query_param(raw_query.as_deref(), "startDateTime").and_then(|s| parse_view_dt(&s));
+    let end =
+        odata::query_param(raw_query.as_deref(), "endDateTime").and_then(|s| parse_view_dt(&s));
+    let top = q
+        .top
+        .unwrap_or(EVENTS_DEFAULT_TOP)
+        .clamp(1, EVENTS_MAX_TOP);
+    let skip = parse_skiptoken(q.skiptoken.as_deref())
+        .or(q.skip)
+        .unwrap_or(0);
+
+    let matching: Vec<&Event> = fixture
+        .events_for(account_id)
+        .filter(|e| e.calendar_id == calendar)
+        .filter(|e| event_overlaps_range(e, start, end))
+        .collect();
+    let page: Vec<Value> = matching
+        .iter()
+        .skip(skip as usize)
+        .take(top as usize)
+        .map(|e| serialize_event(&fixture, e))
+        .collect();
+    let next_skip = (skip as usize) + page.len();
+    let next_link = if matching.len() > next_skip {
+        let base = if me_path {
+            format!("https://graph.microsoft.com/v1.0/me/calendars/{calendar}/calendarView")
+        } else {
+            format!(
+                "https://graph.microsoft.com/v1.0/users/{account_id}/calendars/{calendar}/calendarView"
+            )
+        };
+        Some(format!("{base}?$skiptoken=s.{next_skip}"))
+    } else {
+        None
+    };
+
+    let mut envelope = Map::new();
+    envelope.insert(
+        "@odata.context".to_string(),
+        Value::String(format!(
+            "https://graph.microsoft.com/v1.0/$metadata#me/calendars(\"{calendar}\")/calendarView"
+        )),
+    );
+    envelope.insert("value".to_string(), Value::Array(page));
+    if let Some(link) = next_link {
+        envelope.insert("@odata.nextLink".to_string(), Value::String(link));
+    }
+    ok_json(Value::Object(envelope))
+}
+
+/// Parse a Graph `calendarView` range bound: an RFC3339 instant
+/// (`2026-01-01T00:00:00Z`) or a naive local datetime
+/// (`2026-01-01T00:00:00`, treated as UTC, which is how Graph emits
+/// `startDateTime` / `endDateTime` without an offset).
+fn parse_view_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+        .ok()
+        .map(|n| n.and_utc())
+}
+
+/// An event overlaps `[start, end)` when it ends after `start` and
+/// begins before `end`; an absent bound is open on that side.
+fn event_overlaps_range(
+    e: &Event,
+    start: Option<chrono::DateTime<chrono::Utc>>,
+    end: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    if let Some(s) = start
+        && e.end <= s
+    {
+        return false;
+    }
+    if let Some(en) = end
+        && e.start >= en
+    {
+        return false;
+    }
+    true
 }
 
 async fn delta_events_impl(

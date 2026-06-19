@@ -76,6 +76,17 @@ impl OdataQuery {
     }
 }
 
+/// Look up a single non-`$` query parameter, url-decoded. Used for
+/// the calendar `calendarView` range params (`startDateTime` /
+/// `endDateTime`), which sit outside the OData `$` set `OdataQuery`
+/// captures.
+pub fn query_param(raw: Option<&str>, key: &str) -> Option<String> {
+    parse_query_pairs(raw?)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+}
+
 /// URL-decode a query string into `(key, value)` pairs without
 /// pulling in `url::form_urlencoded` for one call site.
 fn parse_query_pairs(s: &str) -> Vec<(String, String)> {

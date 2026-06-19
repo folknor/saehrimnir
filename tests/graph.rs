@@ -720,6 +720,32 @@ async fn graph_get_event_projects_fixture() {
 }
 
 #[tokio::test]
+async fn graph_calendar_view_filters_by_range() {
+    // No bounds: both cal-work events (the non-delta read bifrost's
+    // events_in_range drives).
+    let (status, v) =
+        get_json_with(calendar_router(), "/v1.0/me/calendars/cal-work/calendarView").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["value"].as_array().unwrap().len(), 2);
+
+    // A January window keeps only ev-001 (Jan 15); ev-002 is Feb 1.
+    let (status, v) = get_json_with(
+        calendar_router(),
+        "/v1.0/me/calendars/cal-work/calendarView?startDateTime=2026-01-01T00:00:00Z&endDateTime=2026-01-31T00:00:00Z",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = v["value"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], "ev-001");
+
+    // Unknown calendar 404s.
+    let (status, _) =
+        get_json_with(calendar_router(), "/v1.0/me/calendars/ghost/calendarView").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn graph_create_event_echoes_body_and_logs_request() {
     let log = saehrimnir::request_log::RequestLog::default();
     let fix = fixture::load(std::path::Path::new(

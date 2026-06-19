@@ -566,7 +566,9 @@ per-item rather than batch-wide; read-only in v0),
 `$top` / `$skiptoken` paging; non-`conversationId` filters and
 `$search` fall through to the full list). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
 alias + events list with `$top`/`$skiptoken` pagination + delta
-view), `/v1.0/me/events/{id}` GET / PATCH / DELETE, plus
+view + non-delta `calendarView?startDateTime=&endDateTime=` range
+read bifrost's `events_in_range` drives, coarse overlap filter),
+`/v1.0/me/events/{id}` GET / PATCH / DELETE, plus
 `POST /v1.0/me/calendars/{id}/events`. Calendar mutations are
 persistent: POST/PATCH/DELETE on `/v1.0/me/events` mutate the
 shared fixture, bump `Fixture::state`, and record `event_created`
