@@ -140,6 +140,10 @@ fn dispatch(
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
+        "ContactCard/get" => match contact_card_get(&fix, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
         "Mailbox/changes" => match mailbox_changes(&fix, args) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
@@ -1098,6 +1102,128 @@ fn serialize_thread(fixture: &Fixture, account_id: &str, thread_id: &str) -> Val
     let mut obj = Map::new();
     obj.insert("id".to_string(), Value::String(thread_id.to_string()));
     obj.insert("emailIds".to_string(), Value::Array(email_ids));
+    Value::Object(obj)
+}
+
+// ── ContactCard/get ─────────────────────────────────────────────────
+//
+// RFC 9610 (JMAP for Contacts) + RFC 9553 (JSContact). A ContactCard
+// is a JSContact Card object plus the server-set `addressBookIds`
+// membership map. bifrost's JMAP contacts sync reads cards back via
+// `contact_from_jmap`: it pulls `id`, the first key of
+// `addressBookIds`, `name.full`, and each `emails[*].address`. The
+// fixture `Contact` only carries a display name + emails, so the
+// projection emits those plus the JSContact envelope (`@type` /
+// `version` / `uid` / `kind`); phones / organizations / addresses /
+// notes / media have no fixture source yet and are omitted.
+//
+// Unlike `Thread/get`, this is NOT probed during bifrost's account
+// open (open only probes email / mailbox / thread state). It drives
+// the contacts sync flow (`AddressBook/get` -> `ContactCard/query`
+// -> `ContactCard/get`), which bifrost only enters when the session
+// advertises `urn:ietf:params:jmap:contacts`. That capability plus
+// the sibling read methods are the follow-up; until they exist the
+// session deliberately does NOT advertise contacts (same reasoning
+// as the principals gate - don't pull the client into a path the
+// mock can't finish). So `ContactCard/get` is reachable for a direct
+// harness probe today, but not yet wired into an end-to-end sync.
+
+/// RFC 9610 §2.3 (a JMAP `/get`). `ids = null` lists every contact in
+/// the account; an explicit id array returns matched cards with
+/// unknown ids in `notFound`. Reads scope by `accountId` via
+/// `contacts_for` so a multi-account fixture's secondary cards don't
+/// leak.
+fn contact_card_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = args.get("accountId").and_then(Value::as_str).ok_or_else(|| {
+        json!({
+            "type": "invalidArguments",
+            "description": "missing accountId",
+        })
+    })?;
+    if fixture.account(account_id).is_none() {
+        return Err(json!({
+            "type": "accountNotFound",
+            "description": format!("account {account_id:?} not found"),
+        }));
+    }
+
+    let (list, not_found) = match args.get("ids") {
+        None | Some(Value::Null) => {
+            let all = fixture
+                .contacts_for(account_id)
+                .map(serialize_contact_card)
+                .collect::<Vec<_>>();
+            (Value::Array(all), Value::Array(vec![]))
+        }
+        Some(Value::Array(requested)) => {
+            let mut list = Vec::with_capacity(requested.len());
+            let mut not_found = Vec::new();
+            for v in requested {
+                let Some(id) = v.as_str() else {
+                    return Err(json!({
+                        "type": "invalidArguments",
+                        "description": "ids must be an array of strings",
+                    }));
+                };
+                match fixture.contacts_for(account_id).find(|c| c.id == id) {
+                    Some(c) => list.push(serialize_contact_card(c)),
+                    None => not_found.push(Value::String(id.to_string())),
+                }
+            }
+            (Value::Array(list), Value::Array(not_found))
+        }
+        Some(_) => {
+            return Err(json!({
+                "type": "invalidArguments",
+                "description": "ids must be an array or null",
+            }));
+        }
+    };
+
+    let mut out = Map::new();
+    out.insert(
+        "accountId".to_string(),
+        Value::String(account_id.to_string()),
+    );
+    out.insert("state".to_string(), Value::String(fixture.state.clone()));
+    out.insert("list".to_string(), list);
+    out.insert("notFound".to_string(), not_found);
+    Ok(Value::Object(out))
+}
+
+/// Project one fixture `Contact` to a JSContact Card (RFC 9553). The
+/// JMAP `id` and JSContact `uid` both use the fixture contact id;
+/// `addressBookIds` maps the contact's folder (its JMAP AddressBook)
+/// to `true`. Emails key off a stable 1-based index so the wire bytes
+/// are deterministic.
+fn serialize_contact_card(c: &crate::fixture::Contact) -> Value {
+    let mut obj = Map::new();
+    obj.insert("@type".to_string(), Value::String("Card".to_string()));
+    obj.insert("version".to_string(), Value::String("1.0".to_string()));
+    obj.insert("id".to_string(), Value::String(c.id.clone()));
+    obj.insert("uid".to_string(), Value::String(c.id.clone()));
+
+    let mut books = Map::new();
+    books.insert(c.folder_id.clone(), Value::Bool(true));
+    obj.insert("addressBookIds".to_string(), Value::Object(books));
+
+    obj.insert("kind".to_string(), Value::String("individual".to_string()));
+
+    if let Some(name) = &c.display_name {
+        obj.insert("name".to_string(), json!({ "@type": "Name", "full": name }));
+    }
+
+    if !c.emails.is_empty() {
+        let mut emails = Map::new();
+        for (i, e) in c.emails.iter().enumerate() {
+            emails.insert(
+                format!("e{}", i + 1),
+                json!({ "@type": "EmailAddress", "address": e.address }),
+            );
+        }
+        obj.insert("emails".to_string(), Value::Object(emails));
+    }
+
     Value::Object(obj)
 }
 

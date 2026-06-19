@@ -304,6 +304,56 @@ What the mock serves:
 `Thread/changes` is still out of scope (`unknownMethod`); add it if
 a future bifrost path polls thread deltas.
 
+## `ContactCard/get`
+
+RFC 9610 (JMAP for Contacts) over RFC 9553 (JSContact). A
+`ContactCard` is a JSContact Card object plus a server-set
+`addressBookIds` membership map.
+
+Where it sits in the client flow (bifrost `crates/jmap/src/sync/
+contacts.rs`):
+
+- Account open does NOT touch contacts. `factory.rs::open` resolves
+  the contacts account with `client.primary_account::<Contacts>()
+  .ok()` and probes only email / mailbox / thread state. So unlike
+  `Thread/get`, a missing `ContactCard/get` does not block open.
+- The contacts sync path is `AddressBook/get` (all) ->
+  `ContactCard/query` (paged, `calculateTotal`, optional
+  `inAddressBook` / text filter) -> `ContactCard/get` (by ids) ->
+  upsert. Delta sync uses `ContactCard/changes`; write-back uses
+  `ContactCard/set`.
+- bifrost reaches the contacts account only when the session
+  advertises `urn:ietf:params:jmap:contacts` in both
+  `accounts[].accountCapabilities` and `primaryAccounts`.
+
+What bifrost reads off a card (`contact_from_jmap`):
+
+- `id` - the JMAP record id (string).
+- `addressBookIds` - object; bifrost takes the FIRST key as the
+  card's address book.
+- `name.full` - display name (falls back to `name.given`).
+- `emails` - object of `{ address, contexts, pref }`; bifrost reads
+  `address` (and `pref == 1` for primary, first `contexts` key for
+  kind). Other JSContact maps it can read when present: `phones`
+  (`number`), `organizations` (`name` / `title`), `addresses`,
+  `notes` (`note`), `media` (`kind == "photo"` -> `uri`).
+
+What the v0 mock serves: a Card per fixture `Contact` with `@type`
+`"Card"`, `version` `"1.0"`, `id` + `uid` (both the contact id),
+`addressBookIds: { <folder_id>: true }`, `kind: "individual"`,
+`name.full` when the contact has a display name, and `emails` keyed
+`e1`, `e2`, ... The fixture `Contact` has no phones / orgs /
+addresses / notes / media, so those are omitted. `ids = null` lists
+the account's contacts; an id array partitions `list` vs `notFound`.
+`state` reuses the fixture-level state token.
+
+Still out of scope (`unknownMethod`): `AddressBook/get`,
+`ContactCard/query`, `ContactCard/changes`, `ContactCard/set`, and
+the `urn:ietf:params:jmap:contacts` session advertisement. Those
+are the follow-up that wires contacts into an end-to-end sync; until
+then the capability is intentionally NOT advertised so bifrost never
+enters a contacts path the mock can't finish.
+
 ## Constants worth knowing
 
 - `BATCH_SIZE = 50` - `Email/query` limit, `Email/get` chunk size.

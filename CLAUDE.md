@@ -391,6 +391,25 @@ account-scoped); bifrost's JMAP `Account::open` probes it during
 discovery, so without it the account fails to open with
 `Wire(Jmap(UnknownMethod))`.
 
+JMAP contacts: `ContactCard/get` only (RFC 9610 + RFC 9553
+JSContact). Projects each fixture `Contact` to a JSContact Card -
+`@type` / `version` / `uid` / `kind`, `id`, `addressBookIds`
+(the contact's folder maps to its AddressBook), `name.full`, and
+`emails` (1-based `e<n>` keys, `{ @type: EmailAddress, address }`);
+phones / organizations / addresses / notes / media have no fixture
+source yet. Account-scoped via `contacts_for`. Unlike `Thread/get`
+this is NOT an account-open probe (open only probes email / mailbox
+/ thread state) - it drives the contacts sync flow
+(`AddressBook/get` -> `ContactCard/query` -> `ContactCard/get`),
+which bifrost only enters when the session advertises
+`urn:ietf:params:jmap:contacts`. The session deliberately does NOT
+advertise that capability yet (same gate reasoning as principals:
+advertising would pull bifrost into `AddressBook/get` /
+`ContactCard/query` / `ContactCard/changes`, which return
+`unknownMethod`). So `ContactCard/get` is reachable for a direct
+harness probe but not yet wired into an end-to-end sync; the
+capability advertisement + those sibling methods are the follow-up.
+
 JMAP calendars: complete for v0. Session advertises
 `urn:ietf:params:jmap:calendars` whenever the fixture has any
 `[[calendar]]` entry. Surface: `Calendar/get` (no-ids list +

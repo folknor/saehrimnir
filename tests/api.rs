@@ -338,6 +338,92 @@ async fn thread_get_explicit_ids_partitions_found_and_not_found() {
     assert_eq!(result["notFound"], json!(["no-such-thread"]));
 }
 
+fn contacts_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-contacts-small.toml")).unwrap();
+    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+async fn contacts_jmap_call(method: &str, args: Value, call_id: &str) -> Value {
+    let req_body = json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:contacts"],
+        "methodCalls": [[method, args, call_id]],
+    });
+    let resp = contacts_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/api")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn contact_card_get_null_ids_projects_jscontact_cards() {
+    // RFC 9610 / RFC 9553: every fixture contact projects to a
+    // JSContact Card. bifrost's contacts sync reads back id,
+    // addressBookIds (first key), name.full, and emails[*].address.
+    let v = contacts_jmap_call("ContactCard/get", json!({ "accountId": "account-1" }), "c0").await;
+    assert_eq!(v["methodResponses"][0][0], "ContactCard/get");
+    let result = &v["methodResponses"][0][1];
+    assert_eq!(result["accountId"], "account-1");
+    assert!(result["state"].is_string());
+    assert_eq!(result["notFound"], json!([]));
+
+    // All four declared contacts, in declaration order.
+    let list = result["list"].as_array().unwrap();
+    assert_eq!(list.len(), 4);
+
+    // contact-001: multi-address contact in the default folder.
+    let alice = &list[0];
+    assert_eq!(alice["@type"], "Card");
+    assert_eq!(alice["version"], "1.0");
+    assert_eq!(alice["id"], "contact-001");
+    assert_eq!(alice["uid"], "contact-001");
+    assert_eq!(alice["kind"], "individual");
+    assert_eq!(alice["addressBookIds"], json!({ "cf-default": true }));
+    assert_eq!(alice["name"], json!({ "@type": "Name", "full": "Alice Anderson" }));
+    assert_eq!(
+        alice["emails"],
+        json!({
+            "e1": { "@type": "EmailAddress", "address": "alice@example.com" },
+            "e2": { "@type": "EmailAddress", "address": "alice.anderson@example.org" },
+        }),
+    );
+
+    // contact-003: no display name, no emails - name/emails omitted,
+    // envelope still well-formed.
+    let bare = list.iter().find(|c| c["id"] == "contact-003").unwrap();
+    assert!(bare.get("name").is_none());
+    assert!(bare.get("emails").is_none());
+    assert_eq!(bare["addressBookIds"], json!({ "cf-default": true }));
+
+    // contact-100 lives in the sibling Vendors address book.
+    let acme = list.iter().find(|c| c["id"] == "contact-100").unwrap();
+    assert_eq!(acme["addressBookIds"], json!({ "cf-vendors": true }));
+}
+
+#[tokio::test]
+async fn contact_card_get_explicit_ids_partitions_found_and_not_found() {
+    let v = contacts_jmap_call(
+        "ContactCard/get",
+        json!({ "accountId": "account-1", "ids": ["contact-002", "no-such-contact"] }),
+        "c1",
+    )
+    .await;
+    let result = &v["methodResponses"][0][1];
+    let list = result["list"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], "contact-002");
+    assert_eq!(list[0]["name"]["full"], "Bob Bell");
+    assert_eq!(result["notFound"], json!(["no-such-contact"]));
+}
+
 fn attach_router() -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-attach.toml")).unwrap();
     routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))
