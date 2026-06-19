@@ -553,7 +553,10 @@ childFolders), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
 messages/delta` (initial dump, follow-up no-op, `$deltatoken=latest`
 shortcut), `/v1.0/me/messages/{id}` (single-message GET projecting
 the email - the per-id read bifrost hydrates through `$batch`; 404
-`ErrorItemNotFound` on unknown id), `POST /v1.0/$batch` (Graph JSON
+`ErrorItemNotFound` on unknown id), `/v1.0/me/messages/{id}/$value`
+(assembled RFC 822 bytes - bifrost's `open_raw_rfc822` body-fetch
+path; reuses the IMAP module's `assembled_rfc822` so the two body
+surfaces agree byte-for-byte), `POST /v1.0/$batch` (Graph JSON
 batching: services `GET /me|users/{u}/messages/{id}` sub-requests -
 the metadata-hydration path - and returns a per-item error for
 sub-requests it doesn't model yet, so write batches degrade

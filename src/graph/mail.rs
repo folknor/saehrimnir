@@ -67,6 +67,10 @@ pub fn router() -> Router<AppState> {
             "/v1.0/me/messages/{message_id}/attachments/{attachment_id}/$value",
             get(get_message_attachment_value_me),
         )
+        .route(
+            "/v1.0/me/messages/{message_id}/$value",
+            get(get_message_value_me),
+        )
         .route("/v1.0/me/messages/{message_id}", get(get_message_me))
         // JSON batching. bifrost hydrates message metadata by batching
         // per-id GET /me/messages/{id} sub-requests through here.
@@ -97,6 +101,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1.0/users/{user}/messages/{message_id}/attachments/{attachment_id}/$value",
             get(get_message_attachment_value_user),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{message_id}/$value",
+            get(get_message_value_user),
         )
         .route(
             "/v1.0/users/{user}/messages/{message_id}",
@@ -181,6 +189,14 @@ async fn get_message_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_message_impl(state, &account_id, &message_id, raw).await
+}
+
+async fn get_message_value_me(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_message_value_impl(state, &account_id, &message_id).await
 }
 
 // ── /users/{user}/ route wrappers ───────────────────────────────────
@@ -291,6 +307,17 @@ async fn get_message_user(
         Err(r) => return r,
     };
     get_message_impl(state, &account_id, &message_id, raw).await
+}
+
+async fn get_message_value_user(
+    State(state): State<AppState>,
+    Path((user, message_id)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_message_value_impl(state, &account_id, &message_id).await
 }
 
 // ── Inner handlers (account-scoped) ─────────────────────────────────
@@ -831,6 +858,36 @@ async fn get_message_impl(
             &format!("message {message_id:?} not found"),
         ),
     }
+}
+
+/// `GET /v1.0/me/messages/{id}/$value` - the assembled RFC 822
+/// message bytes. bifrost's `open_raw_rfc822` (blob.rs) defers real
+/// body bytes to this endpoint after metadata hydration. Reuses the
+/// IMAP module's `assembled_rfc822` so the Graph and IMAP body
+/// surfaces agree byte-for-byte (multipart/mixed when the email
+/// carries attachments).
+async fn get_message_value_impl(state: AppState, account_id: &str, message_id: &str) -> Response {
+    let message_owned = message_id.to_string();
+    if let Some(r) = super::maybe_override(&state, "get_message_value", move |s| {
+        crate::lua::req_set_str(s, "message_id", &message_owned)
+    }) {
+        return r;
+    }
+    let fixture = state.fixture();
+    let Some(e) = fixture.emails_for(account_id).find(|e| e.id == message_id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("message {message_id:?} not found"),
+        );
+    };
+    let bytes = crate::imap::assembled_rfc822(e);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain".to_string())],
+        AxumBody::from(bytes),
+    )
+        .into_response()
 }
 
 /// Find a message by id within the account and project it via

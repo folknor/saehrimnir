@@ -1985,6 +1985,15 @@ impl RenderedRfc822 {
     }
 }
 
+/// The full assembled RFC 822 message for `email` - headers + body,
+/// multipart/mixed when it carries attachments, or the verbatim
+/// `raw_bytes` when the fixture set them. Mirrors what `UID FETCH
+/// BODY[]` emits, and is shared with the Graph `$value` body-fetch
+/// path so the two surfaces agree byte-for-byte.
+pub(crate) fn assembled_rfc822(email: &Email) -> String {
+    RenderedRfc822::for_email(email).full
+}
+
 /// string already terminates with `\r\n` and may contain CRLFs inside
 /// an IMAP literal block.
 fn fetch_response_line(seq: u32, uid: u32, email: &Email, attrs: &[FetchAttr]) -> String {

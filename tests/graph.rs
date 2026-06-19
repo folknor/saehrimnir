@@ -85,6 +85,21 @@ async fn graph_get_single_message_projects_email() {
 }
 
 #[tokio::test]
+async fn graph_message_value_returns_assembled_rfc822() {
+    // bifrost's open_raw_rfc822 defers real body bytes to $value.
+    let (status, bytes, _headers) =
+        get_raw(router(), "/v1.0/me/messages/email-001/$value").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).unwrap();
+    assert!(body.contains("Subject: Hello"), "got: {body}");
+    assert!(body.contains("alice@example.com"), "from missing: {body}");
+    assert!(body.contains("First message body."));
+
+    let (status, _, _) = get_raw(router(), "/v1.0/me/messages/no-such-message/$value").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn graph_batch_hydrates_messages() {
     // bifrost batches per-id GET /me/messages/{id} to hydrate metadata.
     let body = json!({

@@ -242,6 +242,11 @@ v0 serves:
 - `GET /v1.0/me/messages/{id}` + `/v1.0/users/{u}/messages/{id}` -
   single-message projection (reuses `message_value`), 404
   `ErrorItemNotFound` on unknown id. `$select` parsed + ignored.
+- `GET /v1.0/me/messages/{id}/$value` (+ `/users/{u}` twin) -
+  assembled RFC 822 bytes (`text/plain`), bifrost's `open_raw_rfc822`
+  body-fetch path. Reuses `crate::imap::assembled_rfc822`, so the
+  Graph `$value` and IMAP `BODY[]` surfaces are byte-identical
+  (multipart/mixed when the email carries attachments).
 - `POST /v1.0/$batch` - `{ requests: [{id, method, url}] }` ->
   `{ responses: [{id, status, headers, body}] }`. Services GET
   message sub-requests (urls are relative, `/me/...` or
