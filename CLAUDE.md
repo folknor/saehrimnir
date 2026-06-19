@@ -560,7 +560,11 @@ surfaces agree byte-for-byte), `POST /v1.0/$batch` (Graph JSON
 batching: services `GET /me|users/{u}/messages/{id}` sub-requests -
 the metadata-hydration path - and returns a per-item error for
 sub-requests it doesn't model yet, so write batches degrade
-per-item rather than batch-wide; read-only in v0). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
+per-item rather than batch-wide; read-only in v0),
+`/v1.0/me/messages` (account-wide collection honouring
+`$filter=conversationId eq '...'` for bifrost's thread fetch, with
+`$top` / `$skiptoken` paging; non-`conversationId` filters and
+`$search` fall through to the full list). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
 alias + events list with `$top`/`$skiptoken` pagination + delta
 view), `/v1.0/me/events/{id}` GET / PATCH / DELETE, plus
 `POST /v1.0/me/calendars/{id}/events`. Calendar mutations are

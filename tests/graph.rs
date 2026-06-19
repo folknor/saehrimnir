@@ -100,6 +100,33 @@ async fn graph_message_value_returns_assembled_rfc822() {
 }
 
 #[tokio::test]
+async fn graph_messages_collection_filters_by_conversation() {
+    // No filter: all account messages, receivedAt descending.
+    let (status, v) = get_json("/v1.0/me/messages").await;
+    assert_eq!(status, StatusCode::OK);
+    let vals = v["value"].as_array().unwrap();
+    assert_eq!(vals.len(), 2);
+    assert_eq!(vals[0]["id"], "email-002"); // 11:00, newer
+    assert_eq!(vals[1]["id"], "email-001");
+
+    // conversationId filter narrows to that thread (bifrost's
+    // message_values_for_thread path).
+    let (status, v) =
+        get_json("/v1.0/me/messages?$filter=conversationId%20eq%20'email-002'").await;
+    assert_eq!(status, StatusCode::OK);
+    let vals = v["value"].as_array().unwrap();
+    assert_eq!(vals.len(), 1);
+    assert_eq!(vals[0]["id"], "email-002");
+    assert_eq!(vals[0]["conversationId"], "email-002");
+
+    // $top paginates with an @odata.nextLink.
+    let (status, v) = get_json("/v1.0/me/messages?$top=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["value"].as_array().unwrap().len(), 1);
+    assert!(v["@odata.nextLink"].is_string());
+}
+
+#[tokio::test]
 async fn graph_batch_hydrates_messages() {
     // bifrost batches per-id GET /me/messages/{id} to hydrate metadata.
     let body = json!({

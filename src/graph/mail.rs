@@ -72,6 +72,7 @@ pub fn router() -> Router<AppState> {
             get(get_message_value_me),
         )
         .route("/v1.0/me/messages/{message_id}", get(get_message_me))
+        .route("/v1.0/me/messages", get(list_messages_collection_me))
         // JSON batching. bifrost hydrates message metadata by batching
         // per-id GET /me/messages/{id} sub-requests through here.
         .route("/v1.0/$batch", post(batch))
@@ -109,6 +110,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1.0/users/{user}/messages/{message_id}",
             get(get_message_user),
+        )
+        .route(
+            "/v1.0/users/{user}/messages",
+            get(list_messages_collection_user),
         )
 }
 
@@ -197,6 +202,15 @@ async fn get_message_value_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_message_value_impl(state, &account_id, &message_id).await
+}
+
+async fn list_messages_collection_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    list_messages_collection_impl(state, &account_id, headers, raw, true).await
 }
 
 // ── /users/{user}/ route wrappers ───────────────────────────────────
@@ -318,6 +332,19 @@ async fn get_message_value_user(
         Err(r) => return r,
     };
     get_message_value_impl(state, &account_id, &message_id).await
+}
+
+async fn list_messages_collection_user(
+    State(state): State<AppState>,
+    Path(user): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    list_messages_collection_impl(state, &account_id, headers, raw, false).await
 }
 
 // ── Inner handlers (account-scoped) ─────────────────────────────────
@@ -544,6 +571,88 @@ async fn list_messages_impl(
         None,
         q.count.unwrap_or(false).then_some(total),
     ))
+}
+
+/// `GET /v1.0/me/messages` (account-wide, not folder-scoped). bifrost
+/// fetches a whole conversation here via `$filter=conversationId eq
+/// '<thread>'` (`pim.rs::message_values_for_thread`) and runs message
+/// search via `$search`. v0 honours the `conversationId` filter
+/// (mapped to the email's `thread_id`); other filters / `$search`
+/// fall through to the full account list. Paginates with `$top` /
+/// `$skiptoken` like the folder-scoped listing.
+async fn list_messages_collection_impl(
+    state: AppState,
+    account_id: &str,
+    headers: HeaderMap,
+    raw: Option<String>,
+    me_path: bool,
+) -> Response {
+    if let Some(r) = super::maybe_override(&state, "list_messages", |_| Ok(())) {
+        return r;
+    }
+    let fixture = state.fixture();
+    let q = odata::OdataQuery::parse(raw.as_deref());
+    let host = host_or_default(&headers);
+    let expand = expand_attachments(q.expand.as_deref());
+
+    let mut messages: Vec<&Email> = fixture.emails_for(account_id).collect();
+    if let Some(filter) = &q.filter
+        && let Some(conv) = parse_conversation_id_filter(filter)
+    {
+        messages.retain(|e| e.thread_id == conv);
+    }
+    messages.sort_by(|a, b| {
+        b.received_at
+            .cmp(&a.received_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let total = messages.len() as u64;
+    let top = q.page_size(MESSAGES_DEFAULT_TOP, MESSAGES_MAX_TOP);
+    let offset = match q.offset() {
+        Some(o) => o,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidQueryParameter",
+                "$skiptoken did not decode - reset pagination by retrying without it",
+            );
+        }
+    };
+    let page: Vec<Value> = messages
+        .iter()
+        .skip(offset as usize)
+        .take(top as usize)
+        .map(|e| {
+            let parent = e.mailbox_ids.first().map(String::as_str).unwrap_or("");
+            message_value(e, parent, expand)
+        })
+        .collect();
+
+    let path = if me_path {
+        "/v1.0/me/messages".to_string()
+    } else {
+        format!("/v1.0/users/{account_id}/messages")
+    };
+    let next_link = next_offset(offset, top, total)
+        .map(|next| odata::build_next_link(&host, &path, raw.as_deref(), next));
+
+    ok_json(odata::collection_envelope(
+        "https://graph.microsoft.com/v1.0/$metadata#message",
+        page,
+        next_link,
+        None,
+        q.count.unwrap_or(false).then_some(total),
+    ))
+}
+
+/// Extract the thread id from a `conversationId eq '<id>'` `$filter`.
+/// Returns `None` for any other filter shape (the caller then lists
+/// the full account set).
+fn parse_conversation_id_filter(filter: &str) -> Option<String> {
+    let rest = filter.trim().strip_prefix("conversationId eq ")?.trim();
+    let inner = rest.strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(inner.to_string())
 }
 
 async fn delta_messages_impl(

@@ -247,6 +247,12 @@ v0 serves:
   body-fetch path. Reuses `crate::imap::assembled_rfc822`, so the
   Graph `$value` and IMAP `BODY[]` surfaces are byte-identical
   (multipart/mixed when the email carries attachments).
+- `GET /v1.0/me/messages` (+ `/users/{u}` twin) - account-wide
+  message collection (not folder-scoped). bifrost fetches a whole
+  conversation here via `$filter=conversationId eq '<thread>'`
+  (`pim.rs::message_values_for_thread`); v0 maps `conversationId` to
+  the email's `thread_id`. `$top`/`$skiptoken` paginate. Other
+  filters and `$search` fall through to the full account list (P2).
 - `POST /v1.0/$batch` - `{ requests: [{id, method, url}] }` ->
   `{ responses: [{id, status, headers, body}] }`. Services GET
   message sub-requests (urls are relative, `/me/...` or
