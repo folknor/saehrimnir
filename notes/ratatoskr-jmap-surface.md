@@ -304,11 +304,13 @@ What the mock serves:
 `Thread/changes` is still out of scope (`unknownMethod`); add it if
 a future bifrost path polls thread deltas.
 
-## `ContactCard/get`
+## Contacts (`AddressBook/*` + `ContactCard/*`)
 
 RFC 9610 (JMAP for Contacts) over RFC 9553 (JSContact). A
 `ContactCard` is a JSContact Card object plus a server-set
-`addressBookIds` membership map.
+`addressBookIds` membership map; an `AddressBook` is the JMAP
+projection of a contact folder. Handlers live in
+`src/jmap_contacts.rs`.
 
 Where it sits in the client flow (bifrost `crates/jmap/src/sync/
 contacts.rs`):
@@ -316,15 +318,21 @@ contacts.rs`):
 - Account open does NOT touch contacts. `factory.rs::open` resolves
   the contacts account with `client.primary_account::<Contacts>()
   .ok()` and probes only email / mailbox / thread state. So unlike
-  `Thread/get`, a missing `ContactCard/get` does not block open.
-- The contacts sync path is `AddressBook/get` (all) ->
-  `ContactCard/query` (paged, `calculateTotal`, optional
-  `inAddressBook` / text filter) -> `ContactCard/get` (by ids) ->
-  upsert. Delta sync uses `ContactCard/changes`; write-back uses
-  `ContactCard/set`.
+  `Thread/get`, a missing contacts surface does not block open.
+- Initial sync: `AddressBook/get` (all) -> `ContactCard/query`
+  (paged, `calculateTotal`, optional `inAddressBook` / `text`
+  filter) -> `ContactCard/get` (by ids) -> upsert. Delta sync uses
+  `ContactCard/changes`; write-back uses `ContactCard/set`.
 - bifrost reaches the contacts account only when the session
   advertises `urn:ietf:params:jmap:contacts` in both
-  `accounts[].accountCapabilities` and `primaryAccounts`.
+  `accounts[].accountCapabilities` and `primaryAccounts`. The mock
+  advertises it whenever the fixture carries any
+  `[[contact_folder]]` (gated like `:calendars`).
+
+What bifrost reads off an AddressBook (`address_book_from_jmap`):
+`id`, `name` (defaults to "Address Book"), `isDefault`, and
+`myRights` (`mayWrite` / `mayDelete` gate create/update/delete). The
+mock emits all `myRights` true.
 
 What bifrost reads off a card (`contact_from_jmap`):
 
@@ -338,21 +346,41 @@ What bifrost reads off a card (`contact_from_jmap`):
   (`number`), `organizations` (`name` / `title`), `addresses`,
   `notes` (`note`), `media` (`kind == "photo"` -> `uri`).
 
-What the v0 mock serves: a Card per fixture `Contact` with `@type`
-`"Card"`, `version` `"1.0"`, `id` + `uid` (both the contact id),
-`addressBookIds: { <folder_id>: true }`, `kind: "individual"`,
-`name.full` when the contact has a display name, and `emails` keyed
-`e1`, `e2`, ... The fixture `Contact` has no phones / orgs /
-addresses / notes / media, so those are omitted. `ids = null` lists
-the account's contacts; an id array partitions `list` vs `notFound`.
-`state` reuses the fixture-level state token.
+What the v0 mock serves:
 
-Still out of scope (`unknownMethod`): `AddressBook/get`,
-`ContactCard/query`, `ContactCard/changes`, `ContactCard/set`, and
-the `urn:ietf:params:jmap:contacts` session advertisement. Those
-are the follow-up that wires contacts into an end-to-end sync; until
-then the capability is intentionally NOT advertised so bifrost never
-enters a contacts path the mock can't finish.
+- `AddressBook/get` - one AddressBook per fixture `ContactFolder`
+  (`id`, `name`, `isDefault`, `sortOrder: 0`, `isSubscribed: true`,
+  `myRights` all-true). `ids = null` lists; an id array partitions.
+- `ContactCard/get` - a Card per fixture `Contact` with `@type`
+  `"Card"`, `version` `"1.0"`, `id` + `uid` (both the contact id),
+  `addressBookIds: { <folder_id>: true }`, `kind: "individual"`,
+  `name.full` when the contact has a display name, and `emails`
+  keyed `e1`, `e2`, ... The fixture `Contact` has no phones / orgs /
+  addresses / notes / media, so those are omitted.
+- `ContactCard/query` - `Email/query`-shaped envelope. Supports
+  `inAddressBook` (folder membership) and `text` (case-insensitive
+  substring over display name + email address) filters, plus
+  `position` / `limit` / `calculateTotal`. Ids sort ascending for
+  byte-stable paging.
+- `ContactCard/changes` - account-scoped union of
+  `contact_delta_since` over the account's folders (JMAP has no
+  per-address-book filter on `/changes`). Unknown / evicted
+  `sinceState` returns `cannotCalculateChanges`.
+- `ContactCard/set` - create / update / destroy through
+  `Fixture::mutate`, recording `contact_*` transitions (so a JMAP
+  create surfaces in a follow-up Graph `contacts/delta`). Create
+  mints `mock-contact-<n>` and pins the card's account from its
+  `addressBookIds` folder. `name` / `emails` / `addressBookIds`
+  (full-replace or bifrost's `{old: null, new: true}` move shape)
+  apply; `phones` / `organizations` / `notes` / `media` are accepted
+  but not durably stored (the fixture `Contact` has no slots),
+  mirroring the People-API write-back.
+
+All reads scope by `accountId`. Still out of scope
+(`unknownMethod`): `AddressBook/set`, `AddressBook/changes`,
+`ContactCard/copy`, `ContactCard/queryChanges`, and the
+`ContactCard/query` sort comparators (the mock ignores `sort` and
+always orders by id).
 
 ## Constants worth knowing
 

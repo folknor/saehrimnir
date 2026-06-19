@@ -130,6 +130,9 @@ checking whether the fact is already in `notes/`.
 - The session advertises `urn:ietf:params:jmap:calendars` iff the
   fixture carries any `[[calendar]]` entries; this gates the JMAP
   `Calendar/*` and `CalendarEvent/*` surface.
+- The session advertises `urn:ietf:params:jmap:contacts` iff the
+  fixture carries any `[[contact_folder]]` entries; this gates the
+  JMAP `AddressBook/*` and `ContactCard/*` surface.
 
 ## Layout
 
@@ -241,6 +244,15 @@ checking whether the fact is already in `notes/`.
   Graph and CalDAV write. `CalendarEvent/changes` unions
   `event_delta_since` across every fixture calendar since JMAP
   carries no per-calendar filter on `/changes`.
+- `src/jmap_contacts.rs` - JMAP contacts surface (`AddressBook/get`
+  + `ContactCard/get` + `ContactCard/query` + `ContactCard/changes`
+  + `ContactCard/set`). Projects fixture `ContactFolder` / `Contact`
+  to RFC 9610 AddressBook + RFC 9553 JSContact Card objects;
+  mutations land via `Fixture::mutate` and append the same
+  `contact_*` transitions Graph `contacts/delta` and the People
+  listener observe. `ContactCard/changes` unions
+  `contact_delta_since` across the account's folders since JMAP
+  carries no address-book filter on `/changes`.
 - `src/imap.rs` - IMAP listener, connection state machine, command
   dispatcher, RFC 822 emit.
 - `src/smtp.rs` - SMTP submission listener + in-memory submission
@@ -391,24 +403,35 @@ account-scoped); bifrost's JMAP `Account::open` probes it during
 discovery, so without it the account fails to open with
 `Wire(Jmap(UnknownMethod))`.
 
-JMAP contacts: `ContactCard/get` only (RFC 9610 + RFC 9553
-JSContact). Projects each fixture `Contact` to a JSContact Card -
-`@type` / `version` / `uid` / `kind`, `id`, `addressBookIds`
-(the contact's folder maps to its AddressBook), `name.full`, and
-`emails` (1-based `e<n>` keys, `{ @type: EmailAddress, address }`);
-phones / organizations / addresses / notes / media have no fixture
-source yet. Account-scoped via `contacts_for`. Unlike `Thread/get`
-this is NOT an account-open probe (open only probes email / mailbox
-/ thread state) - it drives the contacts sync flow
-(`AddressBook/get` -> `ContactCard/query` -> `ContactCard/get`),
-which bifrost only enters when the session advertises
-`urn:ietf:params:jmap:contacts`. The session deliberately does NOT
-advertise that capability yet (same gate reasoning as principals:
-advertising would pull bifrost into `AddressBook/get` /
-`ContactCard/query` / `ContactCard/changes`, which return
-`unknownMethod`). So `ContactCard/get` is reachable for a direct
-harness probe but not yet wired into an end-to-end sync; the
-capability advertisement + those sibling methods are the follow-up.
+JMAP contacts: complete for v0 (RFC 9610 over RFC 9553 JSContact),
+in `src/jmap_contacts.rs`. Session advertises
+`urn:ietf:params:jmap:contacts` whenever the fixture carries any
+`[[contact_folder]]` (the JMAP AddressBook). Surface:
+`AddressBook/get` (projects each `ContactFolder` - `id` / `name` /
+`isDefault` / `myRights` all-true), `ContactCard/get` (no-ids list +
+filtered + notFound), `ContactCard/query` (`inAddressBook` + `text`
+filters, `position` / `limit` / `calculateTotal` paging, id-sorted),
+`ContactCard/changes` (account-scoped union of
+`contact_delta_since` across the account's folders; JMAP carries no
+address-book filter on `/changes`), and `ContactCard/set` create /
+update / destroy through `Fixture::mutate`. Each `Contact` projects
+to a JSContact Card - `@type` / `version` / `uid` / `kind`, `id`,
+`addressBookIds` (the contact's folder maps to its AddressBook),
+`name.full`, and `emails` (1-based `e<n>` keys, `{ @type:
+EmailAddress, address }`); the fixture `Contact` has no phones /
+organizations / addresses / notes / media, so those JSContact maps
+are omitted on read and accepted-but-not-stored on `ContactCard/set`
+(mirroring the People-API write-back). Mutations record the same
+`contact_*` transitions Graph `contacts/delta` and the People
+listener observe, so a JMAP write surfaces cross-protocol.
+`ContactCard/set` create mints `mock-contact-<n>` ids. All reads
+scope by `accountId`. Unlike `Thread/get` this is NOT an
+account-open probe (open only probes email / mailbox / thread
+state); it drives bifrost's contacts sync flow (`AddressBook/get`
+-> `ContactCard/query` -> `ContactCard/get`; delta via
+`ContactCard/changes`; write-back via `ContactCard/set`).
+`AddressBook/set` + `ContactCard/query` sort comparators +
+`ContactCard/copy` stay out of scope (`unknownMethod`).
 
 JMAP calendars: complete for v0. Session advertises
 `urn:ietf:params:jmap:calendars` whenever the fixture has any

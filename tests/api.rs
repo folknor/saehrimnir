@@ -66,6 +66,9 @@ async fn session_resource_advertises_core_and_mail_only() {
     // Plan: must NOT advertise principals or the client takes
     // shared-account / Principal/get paths the mock cannot satisfy.
     assert!(!caps.contains_key("urn:ietf:params:jmap:principals"));
+    // jmap-small carries no contact folders, so contacts must NOT be
+    // advertised - otherwise bifrost enters the contacts sync flow.
+    assert!(!caps.contains_key("urn:ietf:params:jmap:contacts"));
 
     let accounts = v.get("accounts").unwrap().as_object().unwrap();
     assert_eq!(accounts.len(), 1);
@@ -422,6 +425,198 @@ async fn contact_card_get_explicit_ids_partitions_found_and_not_found() {
     assert_eq!(list[0]["id"], "contact-002");
     assert_eq!(list[0]["name"]["full"], "Bob Bell");
     assert_eq!(result["notFound"], json!(["no-such-contact"]));
+}
+
+#[tokio::test]
+async fn session_advertises_contacts_when_fixture_has_address_books() {
+    let resp = contacts_router()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let caps = v["capabilities"].as_object().unwrap();
+    assert!(caps.contains_key("urn:ietf:params:jmap:contacts"));
+    let acct_caps = v["accounts"]["account-1"]["accountCapabilities"]
+        .as_object()
+        .unwrap();
+    assert!(acct_caps.contains_key("urn:ietf:params:jmap:contacts"));
+    assert_eq!(
+        v["primaryAccounts"]["urn:ietf:params:jmap:contacts"],
+        "account-1"
+    );
+}
+
+#[tokio::test]
+async fn address_book_get_projects_contact_folders() {
+    let v = contacts_jmap_call("AddressBook/get", json!({ "accountId": "account-1" }), "a0").await;
+    assert_eq!(v["methodResponses"][0][0], "AddressBook/get");
+    let result = &v["methodResponses"][0][1];
+    let list = result["list"].as_array().unwrap();
+    assert_eq!(list.len(), 2);
+
+    let default = list.iter().find(|b| b["id"] == "cf-default").unwrap();
+    assert_eq!(default["name"], "Contacts");
+    assert_eq!(default["isDefault"], true);
+    // myRights gates write capability in bifrost's address_book_from_jmap.
+    assert_eq!(default["myRights"]["mayWrite"], true);
+    assert_eq!(default["myRights"]["mayDelete"], true);
+
+    let vendors = list.iter().find(|b| b["id"] == "cf-vendors").unwrap();
+    assert_eq!(vendors["name"], "Vendors");
+    assert_eq!(vendors["isDefault"], false);
+}
+
+#[tokio::test]
+async fn contact_card_query_filters_and_paginates() {
+    // inAddressBook filter scopes to one folder; ids sort by id.
+    let v = contacts_jmap_call(
+        "ContactCard/query",
+        json!({
+            "accountId": "account-1",
+            "filter": { "inAddressBook": "cf-default" },
+            "calculateTotal": true,
+        }),
+        "q0",
+    )
+    .await;
+    let result = &v["methodResponses"][0][1];
+    assert_eq!(result["ids"], json!(["contact-001", "contact-002", "contact-003"]));
+    assert_eq!(result["total"], 3);
+
+    // text filter matches display name...
+    let v = contacts_jmap_call(
+        "ContactCard/query",
+        json!({ "accountId": "account-1", "filter": { "text": "acme" } }),
+        "q1",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["ids"], json!(["contact-100"]));
+
+    // ...and matches an email address.
+    let v = contacts_jmap_call(
+        "ContactCard/query",
+        json!({ "accountId": "account-1", "filter": { "text": "bob@example.com" } }),
+        "q2",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["ids"], json!(["contact-002"]));
+
+    // limit paginates the full (unfiltered) account set, id-sorted.
+    let v = contacts_jmap_call(
+        "ContactCard/query",
+        json!({ "accountId": "account-1", "limit": 2, "calculateTotal": true }),
+        "q3",
+    )
+    .await;
+    let result = &v["methodResponses"][0][1];
+    assert_eq!(result["ids"], json!(["contact-001", "contact-002"]));
+    assert_eq!(result["total"], 4);
+    assert_eq!(result["position"], 0);
+}
+
+#[tokio::test]
+async fn contact_card_set_and_changes_round_trip() {
+    let app = contacts_router();
+
+    // Create a card, capturing the pre/post state tokens.
+    let v = jmap_call_on(
+        &app,
+        "ContactCard/set",
+        json!({
+            "accountId": "account-1",
+            "create": {
+                "c1": {
+                    "@type": "Card",
+                    "addressBookIds": { "cf-default": true },
+                    "name": { "@type": "Name", "full": "New Person" },
+                    "emails": { "e1": { "@type": "EmailAddress", "address": "new@example.com" } },
+                },
+            },
+        }),
+        "s0",
+    )
+    .await;
+    let result = &v["methodResponses"][0][1];
+    let new_id = result["created"]["c1"]["id"].as_str().unwrap().to_string();
+    assert!(new_id.starts_with("mock-contact-"), "got {new_id}");
+    let base_state = result["oldState"].as_str().unwrap().to_string();
+    let after_create = result["newState"].as_str().unwrap().to_string();
+    assert_ne!(base_state, after_create);
+
+    // ContactCard/changes from the baseline surfaces the create.
+    let v = jmap_call_on(
+        &app,
+        "ContactCard/changes",
+        json!({ "accountId": "account-1", "sinceState": base_state }),
+        "s1",
+    )
+    .await;
+    let changes = &v["methodResponses"][0][1];
+    assert_eq!(changes["created"], json!([new_id]));
+    assert_eq!(changes["newState"], after_create);
+
+    // The created card reads back through ContactCard/get.
+    let v = jmap_call_on(
+        &app,
+        "ContactCard/get",
+        json!({ "accountId": "account-1", "ids": [new_id.clone()] }),
+        "s2",
+    )
+    .await;
+    let card = &v["methodResponses"][0][1]["list"][0];
+    assert_eq!(card["name"]["full"], "New Person");
+    assert_eq!(card["emails"]["e1"]["address"], "new@example.com");
+    assert_eq!(card["addressBookIds"], json!({ "cf-default": true }));
+
+    // Update the name.
+    let v = jmap_call_on(
+        &app,
+        "ContactCard/set",
+        json!({
+            "accountId": "account-1",
+            "update": { new_id.clone(): { "name": { "@type": "Name", "full": "Renamed" } } },
+        }),
+        "s3",
+    )
+    .await;
+    assert!(
+        v["methodResponses"][0][1]["updated"]
+            .as_object()
+            .unwrap()
+            .contains_key(&new_id)
+    );
+    let v = jmap_call_on(
+        &app,
+        "ContactCard/get",
+        json!({ "accountId": "account-1", "ids": [new_id.clone()] }),
+        "s4",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["list"][0]["name"]["full"], "Renamed");
+
+    // Destroy.
+    let v = jmap_call_on(
+        &app,
+        "ContactCard/set",
+        json!({ "accountId": "account-1", "destroy": [new_id.clone()] }),
+        "s5",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["destroyed"], json!([new_id]));
+    let v = jmap_call_on(
+        &app,
+        "ContactCard/get",
+        json!({ "accountId": "account-1", "ids": [new_id.clone()] }),
+        "s6",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["notFound"], json!([new_id]));
 }
 
 fn attach_router() -> axum::Router {

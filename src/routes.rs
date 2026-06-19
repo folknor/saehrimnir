@@ -204,6 +204,18 @@ async fn session(
                 "mayCreateCalendar": true,
             }));
         }
+        // Contacts advertise on accounts that own an address book
+        // (contact folder). Gates the JMAP `AddressBook/*` +
+        // `ContactCard/*` surface; bifrost resolves the contacts
+        // account from this capability, so a fixture without contact
+        // folders never enters the contacts sync flow.
+        let has_contacts = fixture.contact_folders_for(&acct.id).next().is_some();
+        if has_contacts {
+            caps.insert(
+                "urn:ietf:params:jmap:contacts".to_string(),
+                json!({ "mayCreateAddressBook": true }),
+            );
+        }
         accounts.insert(
             acct.id.clone(),
             json!({
@@ -238,7 +250,15 @@ async fn session(
             Value::String(primary_id.clone()),
         );
     }
+    let primary_has_contacts = fixture.contact_folders_for(&primary_id).next().is_some();
+    if primary_has_contacts {
+        primary.insert(
+            "urn:ietf:params:jmap:contacts".to_string(),
+            Value::String(primary_id.clone()),
+        );
+    }
     let advertise_calendars = !fixture.calendars.is_empty();
+    let advertise_contacts = !fixture.contact_folders.is_empty();
 
     let mut top_caps = serde_json::Map::new();
     top_caps.insert(
@@ -258,6 +278,12 @@ async fn session(
     if advertise_calendars {
         top_caps.insert(
             "urn:ietf:params:jmap:calendars".to_string(),
+            json!({}),
+        );
+    }
+    if advertise_contacts {
+        top_caps.insert(
+            "urn:ietf:params:jmap:contacts".to_string(),
             json!({}),
         );
     }

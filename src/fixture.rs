@@ -116,6 +116,10 @@ pub struct Fixture {
     /// the client omits the id. Same shape as
     /// `synthetic_event_seq`.
     pub synthetic_category_seq: u64,
+    /// Monotonic counter for synthesized `mock-contact-N` ids
+    /// produced by JMAP `ContactCard/set` create. Same shape as
+    /// `synthetic_event_seq`.
+    pub synthetic_contact_seq: u64,
 }
 
 /// Bounded ring of recent state transitions.
@@ -518,6 +522,13 @@ impl Fixture {
     pub fn mint_category_id(&mut self) -> String {
         self.synthetic_category_seq += 1;
         format!("mock-category-{}", self.synthetic_category_seq)
+    }
+
+    /// Contact-side analogue. Drives JMAP `ContactCard/set` create
+    /// when the client body omits an id.
+    pub fn mint_contact_id(&mut self) -> String {
+        self.synthetic_contact_seq += 1;
+        format!("mock-contact-{}", self.synthetic_contact_seq)
     }
 
     /// Apply a mutation, record its transition, and bump `state`.
@@ -2543,6 +2554,8 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     let synthetic_category_seq =
         max_mock_seq(categories.iter().map(|c| c.id.as_str()), "mock-category-")
             .max(categories.len() as u64);
+    let synthetic_contact_seq = max_mock_seq(contacts.iter().map(|c| c.id.as_str()), "mock-contact-")
+        .max(contacts.len() as u64);
     Ok(Fixture {
         name: raw.name,
         state,
@@ -2564,6 +2577,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         synthetic_event_seq,
         synthetic_email_seq,
         synthetic_category_seq,
+        synthetic_contact_seq,
     })
 }
 

@@ -2532,6 +2532,7 @@ mod tests {
             synthetic_event_seq: 0,
             synthetic_email_seq: 0,
             synthetic_category_seq: 0,
+            synthetic_contact_seq: 0,
         })
     }
 
@@ -2628,6 +2629,7 @@ mod tests {
             synthetic_event_seq: 0,
             synthetic_email_seq: 0,
             synthetic_category_seq: 0,
+            synthetic_contact_seq: 0,
         };
         // Test fixture - rebuild as if loaded.
         fix.rebuild_uid_history();
