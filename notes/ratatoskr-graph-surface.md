@@ -250,8 +250,7 @@ v0 serves:
   `Fixture::mutate`, recording an `email_updated` transition.
   `importance` is accepted but not durably stored (no fixture slot).
   `If-Match` not enforced in v0. bifrost drives this both directly
-  and as `$batch` sub-requests (the `$batch` write path is still a
-  P2 gap - see gaps.md).
+  and as `$batch` sub-requests (both wired through the shared cores).
 - `DELETE /v1.0/me/messages/{id}` (+ `/users/{u}` twin) - permanent
   delete. Retires the message's UID slots (IMAP stability) and
   records `email_destroyed` + the owning account, so the next
@@ -283,6 +282,20 @@ v0 serves:
   per-item, not batch-wide. NOTE: bifrost routes its message writes
   through `$batch`, so this - not the direct PATCH/DELETE/move
   endpoints - is the path it actually exercises.
+
+### Folder mutation (bifrost container pipeline)
+
+`src/graph/mail.rs` serves the mailFolder write surface
+(`pim.rs::container_*`): `POST .../mailFolders` (top-level) and
+`POST .../mailFolders/{parent}/childFolders` create
+(`{ displayName }` -> 201 folder); `PATCH .../mailFolders/{id}`
+rename (`{ displayName }`); `POST .../mailFolders/{id}/move`
+(`{ destinationId }`, the literal `msgfolderroot` re-parents to top);
+`DELETE .../mailFolders/{id}`. All mutate the shared `Mailbox` set
+through `Fixture::mutate` (`mailbox_*` transitions, observed by JMAP
+`Mailbox/changes`). New folder ids are `mock-mailbox-N`. Delete
+removes the folder only - it does not cascade to the messages that
+referenced it (v0 simplification).
 
 ### Folder resolution
 

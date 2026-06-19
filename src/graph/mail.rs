@@ -41,11 +41,23 @@ const FOLDERS_MAX_TOP: u32 = 250;
 pub fn router() -> Router<AppState> {
     Router::new()
         // /v1.0/me/...
-        .route("/v1.0/me/mailFolders", get(list_folders_me))
-        .route("/v1.0/me/mailFolders/{folder}", get(get_folder_me))
+        .route(
+            "/v1.0/me/mailFolders",
+            get(list_folders_me).post(create_folder_me),
+        )
+        .route(
+            "/v1.0/me/mailFolders/{folder}",
+            get(get_folder_me)
+                .patch(rename_folder_me)
+                .delete(delete_folder_me),
+        )
         .route(
             "/v1.0/me/mailFolders/{folder}/childFolders",
-            get(list_child_folders_me),
+            get(list_child_folders_me).post(create_child_folder_me),
+        )
+        .route(
+            "/v1.0/me/mailFolders/{folder}/move",
+            post(move_folder_me),
         )
         .route(
             "/v1.0/me/mailFolders/{folder}/messages",
@@ -86,11 +98,23 @@ pub fn router() -> Router<AppState> {
         // per-id GET /me/messages/{id} sub-requests through here.
         .route("/v1.0/$batch", post(batch))
         // /v1.0/users/{userId}/...
-        .route("/v1.0/users/{user}/mailFolders", get(list_folders_user))
-        .route("/v1.0/users/{user}/mailFolders/{folder}", get(get_folder_user))
+        .route(
+            "/v1.0/users/{user}/mailFolders",
+            get(list_folders_user).post(create_folder_user),
+        )
+        .route(
+            "/v1.0/users/{user}/mailFolders/{folder}",
+            get(get_folder_user)
+                .patch(rename_folder_user)
+                .delete(delete_folder_user),
+        )
         .route(
             "/v1.0/users/{user}/mailFolders/{folder}/childFolders",
-            get(list_child_folders_user),
+            get(list_child_folders_user).post(create_child_folder_user),
+        )
+        .route(
+            "/v1.0/users/{user}/mailFolders/{folder}/move",
+            post(move_folder_user),
         )
         .route(
             "/v1.0/users/{user}/mailFolders/{folder}/messages",
@@ -944,6 +968,366 @@ fn well_known_name_for(role: Option<Role>) -> Option<&'static str> {
         Role::Archive => "archive",
         Role::Important => return None,
     })
+}
+
+// ── mailFolder mutation (create / rename / move / delete) ───────────
+//
+// bifrost's container pipeline (pim.rs): create POST .../mailFolders
+// [/{parent}/childFolders] {displayName}; rename PATCH
+// .../mailFolders/{id} {displayName}; move POST .../mailFolders/{id}/
+// move {destinationId} (the literal `msgfolderroot` means top level);
+// delete DELETE .../mailFolders/{id}. Mutations land on the shared
+// `Mailbox` set through `Fixture::mutate`, recording `mailbox_*`
+// transitions so JMAP `Mailbox/changes` observes them. v0 folder
+// delete removes the folder only - it does not cascade to the
+// messages that referenced it.
+
+async fn create_folder_me(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    create_folder_impl(state, &account_id, None, body).await
+}
+
+async fn create_child_folder_me(
+    State(state): State<AppState>,
+    Path(folder): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    create_folder_impl(state, &account_id, Some(folder), body).await
+}
+
+async fn rename_folder_me(
+    State(state): State<AppState>,
+    Path(folder): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    rename_folder_impl(state, &account_id, &folder, body).await
+}
+
+async fn move_folder_me(
+    State(state): State<AppState>,
+    Path(folder): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    move_folder_impl(state, &account_id, &folder, body).await
+}
+
+async fn delete_folder_me(State(state): State<AppState>, Path(folder): Path<String>) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    delete_folder_impl(state, &account_id, &folder).await
+}
+
+async fn create_folder_user(
+    State(state): State<AppState>,
+    Path(user): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    create_folder_impl(state, &account_id, None, body).await
+}
+
+async fn create_child_folder_user(
+    State(state): State<AppState>,
+    Path((user, folder)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    create_folder_impl(state, &account_id, Some(folder), body).await
+}
+
+async fn rename_folder_user(
+    State(state): State<AppState>,
+    Path((user, folder)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    rename_folder_impl(state, &account_id, &folder, body).await
+}
+
+async fn move_folder_user(
+    State(state): State<AppState>,
+    Path((user, folder)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    move_folder_impl(state, &account_id, &folder, body).await
+}
+
+async fn delete_folder_user(
+    State(state): State<AppState>,
+    Path((user, folder)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    delete_folder_impl(state, &account_id, &folder).await
+}
+
+async fn create_folder_impl(
+    state: AppState,
+    account_id: &str,
+    parent: Option<String>,
+    body: Value,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "create_folder", |_| Ok(())) {
+        return o;
+    }
+    let Some(name) = body
+        .get("displayName")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "ErrorInvalidRequest",
+            "mailFolder create requires a non-empty displayName",
+        );
+    };
+    let name = name.to_string();
+    // Resolve the parent (childFolders) to its real id, or 404.
+    let parent_id = match &parent {
+        Some(p) => {
+            let fixture = state.fixture();
+            match resolve_folder(&fixture, p, account_id) {
+                Some(m) => Some(m.id.clone()),
+                None => {
+                    return error(
+                        StatusCode::NOT_FOUND,
+                        "ErrorItemNotFound",
+                        &format!("parent mailFolder {p:?} not found"),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    let folder = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        create_folder_core(&mut fix, account_id, parent_id, name)
+    };
+    (StatusCode::CREATED, axum::Json(folder)).into_response()
+}
+
+async fn rename_folder_impl(
+    state: AppState,
+    account_id: &str,
+    folder: &str,
+    body: Value,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "rename_folder", |_| Ok(())) {
+        return o;
+    }
+    let Some(name) = body.get("displayName").and_then(Value::as_str) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "ErrorInvalidRequest",
+            "mailFolder rename requires a displayName",
+        );
+    };
+    let Some(folder_id) = resolve_folder_id(&state, folder, account_id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("mailFolder {folder:?} not found"),
+        );
+    };
+    let projected = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        rename_folder_core(&mut fix, account_id, &folder_id, name)
+    };
+    match projected {
+        Some(v) => ok_json(v),
+        None => error(StatusCode::NOT_FOUND, "ErrorItemNotFound", "mailFolder vanished"),
+    }
+}
+
+async fn move_folder_impl(
+    state: AppState,
+    account_id: &str,
+    folder: &str,
+    body: Value,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "move_folder", |_| Ok(())) {
+        return o;
+    }
+    let Some(dest) = body
+        .get("destinationId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "ErrorInvalidRequest",
+            "move requires a non-empty destinationId",
+        );
+    };
+    // The well-known root sentinel re-parents to top level.
+    let new_parent = if dest.eq_ignore_ascii_case("msgfolderroot") {
+        None
+    } else {
+        Some(dest.to_string())
+    };
+    let Some(folder_id) = resolve_folder_id(&state, folder, account_id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("mailFolder {folder:?} not found"),
+        );
+    };
+    let projected = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        move_folder_core(&mut fix, account_id, &folder_id, new_parent.as_deref())
+    };
+    match projected {
+        Some(v) => ok_json(v),
+        None => error(StatusCode::NOT_FOUND, "ErrorItemNotFound", "mailFolder vanished"),
+    }
+}
+
+async fn delete_folder_impl(state: AppState, account_id: &str, folder: &str) -> Response {
+    if let Some(o) = super::maybe_override(&state, "delete_folder", |_| Ok(())) {
+        return o;
+    }
+    let Some(folder_id) = resolve_folder_id(&state, folder, account_id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("mailFolder {folder:?} not found"),
+        );
+    };
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        delete_folder_core(&mut fix, account_id, &folder_id);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Resolve a folder id-or-alias to its real mailbox id under a brief
+/// read guard (dropped before any subsequent write).
+fn resolve_folder_id(state: &AppState, folder: &str, account_id: &str) -> Option<String> {
+    let fixture = state.fixture();
+    resolve_folder(&fixture, folder, account_id).map(|m| m.id.clone())
+}
+
+fn create_folder_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    parent_id: Option<String>,
+    name: String,
+) -> Value {
+    let new_id = format!("mock-mailbox-{}", fix.mailboxes.len() + 1);
+    let mailbox = Mailbox {
+        id: new_id.clone(),
+        account_id: account_id.to_string(),
+        name,
+        role: None,
+        parent_id,
+        sort_order: None,
+        is_subscribed: true,
+    };
+    let mut projected = Value::Null;
+    let _ = fix.mutate(|f| {
+        f.mailboxes.push(mailbox.clone());
+        projected = folder_value(f, &mailbox);
+        MutationDiff {
+            mailbox_created: vec![new_id.clone()],
+            ..Default::default()
+        }
+    });
+    projected
+}
+
+fn rename_folder_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    folder_id: &str,
+    name: &str,
+) -> Option<Value> {
+    let acct = account_id.to_string();
+    let fid = folder_id.to_string();
+    let mut projected = None;
+    let _ = fix.mutate(|f| {
+        let Some(idx) = f
+            .mailboxes
+            .iter()
+            .position(|m| m.account_id == acct && m.id == fid)
+        else {
+            return MutationDiff::default();
+        };
+        f.mailboxes[idx].name = name.to_string();
+        let m = f.mailboxes[idx].clone();
+        projected = Some(folder_value(f, &m));
+        MutationDiff {
+            mailbox_updated: vec![fid.clone()],
+            ..Default::default()
+        }
+    });
+    projected
+}
+
+fn move_folder_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    folder_id: &str,
+    new_parent: Option<&str>,
+) -> Option<Value> {
+    let acct = account_id.to_string();
+    let fid = folder_id.to_string();
+    let mut projected = None;
+    let _ = fix.mutate(|f| {
+        let Some(idx) = f
+            .mailboxes
+            .iter()
+            .position(|m| m.account_id == acct && m.id == fid)
+        else {
+            return MutationDiff::default();
+        };
+        f.mailboxes[idx].parent_id = new_parent.map(str::to_string);
+        let m = f.mailboxes[idx].clone();
+        projected = Some(folder_value(f, &m));
+        MutationDiff {
+            mailbox_updated: vec![fid.clone()],
+            ..Default::default()
+        }
+    });
+    projected
+}
+
+fn delete_folder_core(fix: &mut Fixture, account_id: &str, folder_id: &str) -> bool {
+    let acct = account_id.to_string();
+    let fid = folder_id.to_string();
+    if !fix
+        .mailboxes
+        .iter()
+        .any(|m| m.account_id == acct && m.id == fid)
+    {
+        return false;
+    }
+    let _ = fix.mutate(move |f| {
+        f.mailboxes
+            .retain(|m| !(m.account_id == acct && m.id == fid));
+        MutationDiff {
+            mailbox_destroyed: vec![fid.clone()],
+            mailbox_destroyed_accounts: vec![acct.clone()],
+            ..Default::default()
+        }
+    });
+    true
 }
 
 fn folder_value(fixture: &Fixture, m: &Mailbox) -> Value {

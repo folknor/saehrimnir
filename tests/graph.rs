@@ -67,6 +67,101 @@ fn attach_router() -> axum::Router {
     graph::router(graph::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
+/// Send a request with an optional JSON body and return (status, body).
+/// Clones the router, so the same `app` can be reused across calls.
+async fn send_json(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, "127.0.0.1:9999")
+        .header(header::AUTHORIZATION, "Bearer doesnt-matter");
+    let body = match body {
+        Some(b) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(&b).unwrap())
+        }
+        None => Body::empty(),
+    };
+    let resp = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn graph_mailfolder_crud_round_trip() {
+    let app = router();
+
+    // Create a top-level folder.
+    let (status, v) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/mailFolders",
+        Some(json!({ "displayName": "Projects" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(v["displayName"], "Projects");
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // Create a child under the inbox.
+    let (status, v) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/mailFolders/mbx-inbox/childFolders",
+        Some(json!({ "displayName": "Sub" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(v["parentFolderId"], "mbx-inbox");
+
+    // Rename, then move under the inbox.
+    let (status, v) = send_json(
+        &app,
+        "PATCH",
+        &format!("/v1.0/me/mailFolders/{id}"),
+        Some(json!({ "displayName": "Work" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["displayName"], "Work");
+
+    let (status, v) = send_json(
+        &app,
+        "POST",
+        &format!("/v1.0/me/mailFolders/{id}/move"),
+        Some(json!({ "destinationId": "mbx-inbox" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["parentFolderId"], "mbx-inbox");
+
+    // Delete it; it disappears from the folder list.
+    let (status, _) =
+        send_json(&app, "DELETE", &format!("/v1.0/me/mailFolders/{id}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, v) = get_json_with(app, "/v1.0/me/mailFolders").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = v["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert!(!ids.contains(&id.as_str()), "deleted folder still listed");
+}
+
 #[tokio::test]
 async fn graph_get_single_message_projects_email() {
     // bifrost hydrates message metadata via $batch of GET

@@ -548,7 +548,10 @@ FIRST request `GraphAccountFactory::open` makes (to learn the
 account's own address); without it the bare `/v1.0/me` path fell to
 the catchall 404 and no Graph account could open. Mail:
 `/v1.0/me/mailFolders` (list, by-id, by-well-known-alias,
-childFolders), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
+childFolders; plus CRUD - POST create [top-level + childFolders],
+PATCH rename, POST `/move` re-parent [`msgfolderroot` = top], DELETE,
+all mutating the shared `Mailbox` set with `mailbox_*` transitions;
+folder delete does not cascade to messages in v0), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
 `$skip` / `$skiptoken` / `$filter`), `/v1.0/me/mailFolders/{id}/
 messages/delta` (initial dump, follow-up no-op, `$deltatoken=latest`
 shortcut), `/v1.0/me/messages/{id}` (single-message GET projecting

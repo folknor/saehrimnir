@@ -174,13 +174,16 @@ shared message cores, so bifrost's batched writes (it routes message
 mutations through `$batch`, not the direct endpoints) work
 end-to-end.
 
+**DONE:** mailFolder CRUD - `src/graph/mail.rs`: POST create
+(top-level + childFolders), PATCH rename, POST `/move`, DELETE,
+mutating the shared `Mailbox` set with `mailbox_*` transitions.
+
 Still open (the rest of the write tier): mail send/draft (`POST
-/me/messages`, `/sendMail`, drafts); mailFolder CRUD + move;
-`mailboxSettings` (vacation); `messageRules` (server-side filters);
-GAL `/users?$filter=startswith`; contact `$filter` (route exists,
-filter parsed-and-ignored -> returns unfiltered, not 404); contact
-write verbs; event RSVP actions; `POST /subscriptions` webhooks
-(opt-in push only).
+/me/messages`, `/sendMail`, drafts); `mailboxSettings` (vacation);
+`messageRules` (server-side filters); GAL `/users?$filter=startswith`;
+contact `$filter` (route exists, filter parsed-and-ignored -> returns
+unfiltered, not 404); contact write verbs; event RSVP actions;
+`POST /subscriptions` webhooks (opt-in push only).
 
 ### Confirmed safe (do not flag)
 EWS, public folders, OneDrive/`host_attachment`, `attachment_upload`
