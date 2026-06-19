@@ -21,16 +21,16 @@
 //! parentFolderId"`), so the v0 mock can omit the projection.
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, odata, ok_json};
-use crate::fixture::{Contact, ContactFolder, Fixture};
+use crate::fixture::{Contact, ContactEmail, ContactFolder, Fixture, MutationDiff};
 
 const CONTACTS_DEFAULT_TOP: u32 = 50;
 const CONTACTS_MAX_TOP: u32 = 999;
@@ -45,7 +45,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1.0/me/contactFolders/{folder}", get(get_folder_me))
         .route(
             "/v1.0/me/contactFolders/{folder}/contacts",
-            get(list_contacts_me),
+            get(list_contacts_me).post(create_contact_in_folder_me),
         )
         .route(
             "/v1.0/me/contactFolders/{folder}/contacts/delta",
@@ -55,8 +55,16 @@ pub fn router() -> Router<AppState> {
             "/v1.0/me/contactFolders/{folder}/contacts/{contact}",
             get(get_contact_in_folder_me),
         )
-        .route("/v1.0/me/contacts/{contact}", get(get_contact_me))
-        .route("/v1.0/me/contacts", get(list_all_contacts_me))
+        .route(
+            "/v1.0/me/contacts/{contact}",
+            get(get_contact_me)
+                .patch(update_contact_me)
+                .delete(delete_contact_me),
+        )
+        .route(
+            "/v1.0/me/contacts",
+            get(list_all_contacts_me).post(create_contact_default_me),
+        )
         // /users/{user}/...
         .route(
             "/v1.0/users/{user}/contactFolders",
@@ -68,7 +76,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/v1.0/users/{user}/contactFolders/{folder}/contacts",
-            get(list_contacts_user),
+            get(list_contacts_user).post(create_contact_in_folder_user),
         )
         .route(
             "/v1.0/users/{user}/contactFolders/{folder}/contacts/delta",
@@ -80,9 +88,14 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/v1.0/users/{user}/contacts/{contact}",
-            get(get_contact_user),
+            get(get_contact_user)
+                .patch(update_contact_user)
+                .delete(delete_contact_user),
         )
-        .route("/v1.0/users/{user}/contacts", get(list_all_contacts_user))
+        .route(
+            "/v1.0/users/{user}/contacts",
+            get(list_all_contacts_user).post(create_contact_default_user),
+        )
 }
 
 // ── /me/ wrappers ───────────────────────────────────────────────────
@@ -362,10 +375,12 @@ async fn list_contacts_impl(
     } else {
         format!("/v1.0/users/{account_id}/contactFolders/{folder}/contacts")
     };
+    let email = q.filter.as_deref().and_then(parse_contact_email_filter);
 
     let value: Vec<Value> = fixture
         .contacts_for(account_id)
         .filter(|c| c.folder_id == folder_id)
+        .filter(|c| contact_email_matches(c, email.as_deref()))
         .skip(offset as usize)
         .take(top as usize)
         .map(serialize_contact)
@@ -374,6 +389,7 @@ async fn list_contacts_impl(
     let has_more = fixture
         .contacts_for(account_id)
         .filter(|c| c.folder_id == folder_id)
+        .filter(|c| contact_email_matches(c, email.as_deref()))
         .nth(next_offset_val)
         .is_some();
 
@@ -437,9 +453,11 @@ async fn list_all_contacts_impl(
     } else {
         format!("/v1.0/users/{account_id}/contacts")
     };
+    let email = q.filter.as_deref().and_then(parse_contact_email_filter);
 
     let value: Vec<Value> = fixture
         .contacts_for(account_id)
+        .filter(|c| contact_email_matches(c, email.as_deref()))
         .skip(offset as usize)
         .take(top as usize)
         .map(serialize_contact)
@@ -447,6 +465,7 @@ async fn list_all_contacts_impl(
     let next_offset_val = (offset as usize) + value.len();
     let has_more = fixture
         .contacts_for(account_id)
+        .filter(|c| contact_email_matches(c, email.as_deref()))
         .nth(next_offset_val)
         .is_some();
 
@@ -669,6 +688,308 @@ fn serialize_folder(folder: &ContactFolder) -> Value {
         );
     }
     Value::Object(obj)
+}
+
+// ── Contact mutation (create / update / delete) ─────────────────────
+//
+// bifrost's contact pipeline: create POST .../contacts (default
+// folder) or .../contactFolders/{id}/contacts; update PATCH (sparse)
+// .../contacts/{id}; delete DELETE .../contacts/{id}. Mutations land
+// on the shared `Contact` set through `Fixture::mutate`, recording
+// `contact_*` transitions so `contacts/delta` and JMAP
+// `ContactCard/changes` observe them. The fixture `Contact` carries
+// only displayName + emails + folder, so other Graph contact fields
+// (phones / addresses / company / jobTitle / notes) are accepted but
+// not durably stored.
+
+async fn create_contact_default_me(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    create_contact_impl(state, &account_id, None, body).await
+}
+
+async fn create_contact_in_folder_me(
+    State(state): State<AppState>,
+    Path(folder): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    create_contact_impl(state, &account_id, Some(folder), body).await
+}
+
+async fn update_contact_me(
+    State(state): State<AppState>,
+    Path(contact): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    update_contact_impl(state, &account_id, &contact, body).await
+}
+
+async fn delete_contact_me(State(state): State<AppState>, Path(contact): Path<String>) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    delete_contact_impl(state, &account_id, &contact).await
+}
+
+async fn create_contact_default_user(
+    State(state): State<AppState>,
+    Path(user): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    create_contact_impl(state, &account_id, None, body).await
+}
+
+async fn create_contact_in_folder_user(
+    State(state): State<AppState>,
+    Path((user, folder)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    create_contact_impl(state, &account_id, Some(folder), body).await
+}
+
+async fn update_contact_user(
+    State(state): State<AppState>,
+    Path((user, contact)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    update_contact_impl(state, &account_id, &contact, body).await
+}
+
+async fn delete_contact_user(
+    State(state): State<AppState>,
+    Path((user, contact)): Path<(String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    delete_contact_impl(state, &account_id, &contact).await
+}
+
+async fn create_contact_impl(
+    state: AppState,
+    account_id: &str,
+    folder: Option<String>,
+    body: Value,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "create_contact", |_| Ok(())) {
+        return o;
+    }
+    let folder_id = {
+        let fixture = state.fixture();
+        match &folder {
+            Some(f) => match resolve_folder(&fixture, f, account_id) {
+                Some(cf) => cf.id.clone(),
+                None => {
+                    return error(
+                        StatusCode::NOT_FOUND,
+                        "ResourceNotFound",
+                        &format!("contact folder {f:?} not found"),
+                    );
+                }
+            },
+            // No folder named: the default Contacts folder (or the
+            // first declared one).
+            None => match fixture
+                .contact_folders_for(account_id)
+                .find(|cf| cf.is_default)
+                .or_else(|| fixture.contact_folders_for(account_id).next())
+            {
+                Some(cf) => cf.id.clone(),
+                None => {
+                    return error(
+                        StatusCode::NOT_FOUND,
+                        "ResourceNotFound",
+                        "account has no contact folder",
+                    );
+                }
+            },
+        }
+    };
+    let projected = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        create_contact_core(&mut fix, account_id, &folder_id, &body)
+    };
+    (StatusCode::CREATED, axum::Json(projected)).into_response()
+}
+
+async fn update_contact_impl(
+    state: AppState,
+    account_id: &str,
+    contact: &str,
+    body: Value,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "update_contact", |_| Ok(())) {
+        return o;
+    }
+    let projected = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        update_contact_core(&mut fix, account_id, contact, &body)
+    };
+    match projected {
+        Some(v) => ok_json(v),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("contact {contact:?} not found"),
+        ),
+    }
+}
+
+async fn delete_contact_impl(state: AppState, account_id: &str, contact: &str) -> Response {
+    if let Some(o) = super::maybe_override(&state, "delete_contact", |_| Ok(())) {
+        return o;
+    }
+    let found = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        delete_contact_core(&mut fix, account_id, contact)
+    };
+    if found {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("contact {contact:?} not found"),
+        )
+    }
+}
+
+fn create_contact_core(fix: &mut Fixture, account_id: &str, folder_id: &str, body: &Value) -> Value {
+    let display_name = body
+        .get("displayName")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let emails = parse_graph_emails(body.get("emailAddresses"));
+    let acct = account_id.to_string();
+    let fid = folder_id.to_string();
+    let mut projected = Value::Null;
+    let _ = fix.mutate(|f| {
+        let new_id = f.mint_contact_id();
+        let contact = Contact {
+            id: new_id.clone(),
+            account_id: acct.clone(),
+            folder_id: fid.clone(),
+            display_name,
+            emails,
+        };
+        f.contacts.push(contact.clone());
+        projected = serialize_contact(&contact);
+        MutationDiff {
+            contact_created: vec![new_id],
+            ..Default::default()
+        }
+    });
+    projected
+}
+
+fn update_contact_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    contact_id: &str,
+    body: &Value,
+) -> Option<Value> {
+    let acct = account_id.to_string();
+    let cid = contact_id.to_string();
+    let mut projected = None;
+    let _ = fix.mutate(|f| {
+        let Some(idx) = f
+            .contacts
+            .iter()
+            .position(|c| c.account_id == acct && c.id == cid)
+        else {
+            return MutationDiff::default();
+        };
+        let mut c = f.contacts[idx].clone();
+        // Sparse PATCH: omitted -> untouched; null -> clear.
+        if let Some(dn) = body.get("displayName") {
+            c.display_name = if dn.is_null() {
+                None
+            } else {
+                dn.as_str().map(str::to_string)
+            };
+        }
+        if let Some(ea) = body.get("emailAddresses") {
+            c.emails = parse_graph_emails(Some(ea));
+        }
+        f.contacts[idx] = c.clone();
+        projected = Some(serialize_contact(&c));
+        MutationDiff {
+            contact_updated: vec![cid.clone()],
+            ..Default::default()
+        }
+    });
+    projected
+}
+
+fn delete_contact_core(fix: &mut Fixture, account_id: &str, contact_id: &str) -> bool {
+    let acct = account_id.to_string();
+    let cid = contact_id.to_string();
+    let Some(folder) = fix
+        .contacts
+        .iter()
+        .find(|c| c.account_id == acct && c.id == cid)
+        .map(|c| c.folder_id.clone())
+    else {
+        return false;
+    };
+    let _ = fix.mutate(move |f| {
+        f.contacts.retain(|c| !(c.account_id == acct && c.id == cid));
+        MutationDiff {
+            contact_destroyed: vec![cid.clone()],
+            contact_destroyed_parents: vec![folder.clone()],
+            ..Default::default()
+        }
+    });
+    true
+}
+
+/// Graph `emailAddresses` (`[{ address, name? }]`) -> fixture
+/// `ContactEmail`s.
+fn parse_graph_emails(v: Option<&Value>) -> Vec<ContactEmail> {
+    let Some(arr) = v.and_then(Value::as_array) else {
+        return vec![];
+    };
+    arr.iter()
+        .filter_map(|e| {
+            let address = e.get("address").and_then(Value::as_str)?.to_string();
+            let name = e.get("name").and_then(Value::as_str).map(str::to_string);
+            Some(ContactEmail { address, name })
+        })
+        .collect()
+}
+
+/// Extract the address from a Graph contact `$filter` of the form
+/// `emailAddresses/any(a:a/address eq 'X')`. Returns `None` for any
+/// other shape (caller then lists unfiltered).
+fn parse_contact_email_filter(filter: &str) -> Option<String> {
+    let start = filter.find('\'')?;
+    let rest = &filter[start + 1..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+/// `true` when the contact matches the parsed email `$filter` (`None`
+/// = no filter, matches all). Address comparison is case-insensitive.
+fn contact_email_matches(c: &Contact, want: Option<&str>) -> bool {
+    match want {
+        None => true,
+        Some(addr) => c.emails.iter().any(|e| e.address.eq_ignore_ascii_case(addr)),
+    }
 }
 
 fn serialize_contact(contact: &Contact) -> Value {

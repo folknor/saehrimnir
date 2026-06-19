@@ -604,6 +604,13 @@ back to bootstrap). Mutations land via change-script ops
 (`contact_create` / `contact_update` / `contact_destroy` plus
 folder counterparts) routed through `Fixture::mutate`; tombstones
 use the Graph `{ id, "@removed": { reason: "deleted" } }` shape.
+Direct wire verbs too: `POST /me/contacts` (default folder) +
+`POST /me/contactFolders/{id}/contacts` create, `PATCH
+/me/contacts/{id}` sparse update (`displayName` / `emailAddresses`;
+other Graph contact fields accepted but not stored), `DELETE
+/me/contacts/{id}`, all through `Fixture::mutate` with `contact_*`
+transitions. The contact list `$filter=emailAddresses/any(a:a/address
+eq '...')` is now honoured (was parsed-and-ignored).
 Master categories: `/v1.0/me/outlook/masterCategories` GET (list +
 single) + POST / PATCH / DELETE. Flat per-account (no folder
 scope, mirroring real Graph). POST mints `mock-category-N` when

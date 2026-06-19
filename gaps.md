@@ -178,12 +178,15 @@ end-to-end.
 (top-level + childFolders), PATCH rename, POST `/move`, DELETE,
 mutating the shared `Mailbox` set with `mailbox_*` transitions.
 
+**DONE:** contact write verbs (`POST`/`PATCH`/`DELETE`, default +
+folder-scoped) + the contact list `$filter=emailAddresses/any(...)`
+- `src/graph/contacts.rs`, mutating the shared `Contact` set with
+`contact_*` transitions.
+
 Still open (the rest of the write tier): mail send/draft (`POST
 /me/messages`, `/sendMail`, drafts); `mailboxSettings` (vacation);
 `messageRules` (server-side filters); GAL `/users?$filter=startswith`;
-contact `$filter` (route exists, filter parsed-and-ignored -> returns
-unfiltered, not 404); contact write verbs; event RSVP actions;
-`POST /subscriptions` webhooks (opt-in push only).
+event RSVP actions; `POST /subscriptions` webhooks (opt-in push only).
 
 ### Confirmed safe (do not flag)
 EWS, public folders, OneDrive/`host_attachment`, `attachment_upload`

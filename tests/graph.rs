@@ -1460,6 +1460,59 @@ async fn graph_list_all_contacts_spans_folders() {
 }
 
 #[tokio::test]
+async fn graph_contact_crud_and_email_filter() {
+    let app = router_contacts();
+
+    // Create in the default folder.
+    let (status, v) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/contacts",
+        Some(json!({
+            "displayName": "New Person",
+            "emailAddresses": [{ "address": "new@example.com" }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(v["displayName"], "New Person");
+    assert_eq!(v["parentFolderId"], "cf-default");
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // Sparse update.
+    let (status, v) = send_json(
+        &app,
+        "PATCH",
+        &format!("/v1.0/me/contacts/{id}"),
+        Some(json!({ "displayName": "Renamed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["displayName"], "Renamed");
+
+    // $filter by email narrows the list to the matching contact.
+    let (status, v) = get_json_with(
+        app.clone(),
+        "/v1.0/me/contactFolders/cf-default/contacts?$filter=emailAddresses/any(a:a/address%20eq%20'bob@example.com')",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = v["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["contact-002"]);
+
+    // Delete; gone afterwards.
+    let (status, _) = send_json(&app, "DELETE", &format!("/v1.0/me/contacts/{id}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = get_json_with(app, &format!("/v1.0/me/contacts/{id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn graph_contacts_delta_initial_dump_then_latest_shortcut() {
     let app = router_contacts();
 
