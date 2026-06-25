@@ -157,16 +157,16 @@ async fn list_connections(
     //   `expired`-reason envelope. Real People API uses
     //   `EXPIRED_TOKEN`; ratatoskr matches on the `syncToken`
     //   substring + the 410 status, so this lands.
-    if params.sync_token.as_deref() == Some(fixture.state.as_str()) {
+    if params.sync_token.as_deref() == Some(fixture.state_for(&account_id)) {
         return ok_json(json!({
             "connections": [],
             "totalPeople": 0,
             "totalItems": 0,
-            "nextSyncToken": fixture.state,
+            "nextSyncToken": fixture.state_for(&account_id),
         }));
     }
     if let Some(token) = params.sync_token.as_deref() {
-        let Some(delta) = fixture.contact_delta_since_any(token) else {
+        let Some(delta) = fixture.contact_delta_since_any(token, &account_id) else {
             return error(
                 StatusCode::GONE,
                 "syncToken expired or not recognised",
@@ -190,7 +190,7 @@ async fn list_connections(
             "connections": connections,
             "totalPeople": connections.len(),
             "totalItems": connections.len(),
-            "nextSyncToken": fixture.state,
+            "nextSyncToken": fixture.state_for(&account_id),
         }));
     }
 
@@ -232,7 +232,7 @@ async fn list_connections(
         // (matches real People API).
         body.insert(
             "nextSyncToken".into(),
-            Value::String(fixture.state.clone()),
+            Value::String(fixture.state_for(&account_id).to_string()),
         );
     }
     ok_json(Value::Object(body))
@@ -240,6 +240,7 @@ async fn list_connections(
 
 async fn list_other_contacts(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> Response {
     if let Some(o) = super::maybe_override(&state, "list_other_contacts", |s| {
@@ -250,9 +251,10 @@ async fn list_other_contacts(
     }) {
         return o;
     }
+    let account_id = bearer_account(&state, &headers);
     let fixture = state.fixture();
     if let Some(token) = params.sync_token.as_deref()
-        && !is_known_state(&fixture, token)
+        && !is_known_state(&fixture, &account_id, token)
     {
         return error(
             StatusCode::GONE,
@@ -265,7 +267,7 @@ async fn list_other_contacts(
     ok_json(json!({
         "otherContacts": [],
         "totalSize": 0,
-        "nextSyncToken": fixture.state,
+        "nextSyncToken": fixture.state_for(&account_id),
     }))
 }
 
@@ -436,15 +438,15 @@ async fn parse_json_body(body: axum::body::Body) -> Result<Value, Response> {
 
 // ── Shape helpers ───────────────────────────────────────────────────
 
-fn is_known_state(fixture: &Fixture, state: &str) -> bool {
-    if state == fixture.state {
+fn is_known_state(fixture: &Fixture, account_id: &str, state: &str) -> bool {
+    if state == fixture.state_for(account_id) {
         return true;
     }
     if state == fixture.change_log_seed() {
         return true;
     }
     fixture
-        .change_log_transitions()
+        .change_log_transitions_for(account_id)
         .any(|t| t.from_state == state || t.to_state == state)
 }
 

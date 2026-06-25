@@ -1311,7 +1311,10 @@ async fn mkcalendar_visible_through_jmap_calendar_changes() {
     // call against the principal's account returns the new id.
     use saehrimnir::routes;
     let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
-    let seed_state = fix.state.clone();
+    // Pre-mutation every account's state is the bare seed, so the
+    // primary's token is the right sinceState for the principal's
+    // Calendar/changes call regardless of which account it resolves to.
+    let seed_state = fix.primary_state().to_string();
     let handle = saehrimnir::shared::handle(fix);
     let caldav_app = caldav::router(caldav::AppState {
         shared: saehrimnir::shared::SharedHandles::for_test(std::sync::Arc::clone(&handle)),

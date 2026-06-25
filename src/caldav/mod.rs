@@ -733,7 +733,20 @@ fn unquote_etag(s: &str) -> &str {
 /// the change-log seed when no transition has touched the event,
 /// which is the right answer for a freshly-loaded fixture.
 fn last_state_touching_event(fixture: &crate::fixture::Fixture, event_id: &str) -> String {
-    for t in fixture.change_log_transitions().rev() {
+    // Resolve the event's owning account (event -> calendar -> account)
+    // so we walk the right per-account log. A live event is required to
+    // derive its ETag, so the lookup succeeds on every real call site
+    // (GET / PUT / DELETE precondition); fall back to the seed if not.
+    let Some(account_id) = fixture
+        .events
+        .iter()
+        .find(|e| e.id == event_id)
+        .and_then(|e| fixture.calendars.iter().find(|c| c.id == e.calendar_id))
+        .map(|c| c.account_id.as_str())
+    else {
+        return fixture.change_log_seed().to_string();
+    };
+    for t in fixture.change_log_transitions_for(account_id).rev() {
         if t.event_created.iter().any(|id| id == event_id)
             || t.event_updated.iter().any(|id| id == event_id)
             || t.event_destroyed.iter().any(|id| id == event_id)
@@ -753,7 +766,16 @@ fn last_state_touching_calendar(
     fixture: &crate::fixture::Fixture,
     calendar_id: &str,
 ) -> String {
-    for t in fixture.change_log_transitions().rev() {
+    // The calendar's own account owns the transitions that touch it.
+    let Some(account_id) = fixture
+        .calendars
+        .iter()
+        .find(|c| c.id == calendar_id)
+        .map(|c| c.account_id.as_str())
+    else {
+        return fixture.change_log_seed().to_string();
+    };
+    for t in fixture.change_log_transitions_for(account_id).rev() {
         let touches_live = t
             .event_created
             .iter()

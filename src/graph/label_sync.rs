@@ -374,6 +374,7 @@ async fn delete_category_impl(
             if f.categories.len() < before {
                 MutationDiff {
                     category_destroyed: vec![id.clone()],
+                    category_destroyed_accounts: vec![acct.clone()],
                     ..Default::default()
                 }
             } else {

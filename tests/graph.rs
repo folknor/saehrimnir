@@ -1928,7 +1928,7 @@ async fn graph_category_mutation_records_change_log_transition() {
     ))
     .unwrap();
     let handle = saehrimnir::shared::handle(fix);
-    let initial_state = handle.read().unwrap().state.clone();
+    let initial_state = handle.read().unwrap().primary_state().to_string();
     let app = graph::router(graph::AppState::for_test(Arc::clone(&handle)));
 
     let body = serde_json::json!({ "id": "cat-new", "displayName": "New" });
@@ -1964,8 +1964,9 @@ async fn graph_category_mutation_records_change_log_transition() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let fix = handle.read().unwrap();
-    assert_ne!(fix.state, initial_state);
-    let trans: Vec<_> = fix.change_log_transitions().collect();
+    assert_ne!(fix.primary_state(), initial_state.as_str());
+    let account_id = fix.primary_account().id.clone();
+    let trans: Vec<_> = fix.change_log_transitions_for(&account_id).collect();
     assert_eq!(trans.len(), 3);
     assert_eq!(trans[0].category_created, vec!["cat-new".to_string()]);
     assert_eq!(trans[1].category_updated, vec!["cat-new".to_string()]);

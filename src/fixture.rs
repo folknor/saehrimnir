@@ -4,6 +4,7 @@
 //! enforces the invariants documented in `notes/fixture-format.md`. The
 //! returned [`Fixture`] is read-only and feeds every JMAP response.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -13,7 +14,16 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fixture {
     pub name: String,
-    pub state: String,
+    /// Shared state-token seed (e.g. `"fixture-state"`). Every
+    /// account's state string is `{seed}` at load and `{seed}.{N}`
+    /// after its Nth mutation; the seed is the same value for every
+    /// account so the primary's wire tokens stay byte-identical to
+    /// the pre-per-account-state format (~40 tests pin
+    /// `"fixture-state.N"`). Per-account independence comes from each
+    /// account owning its own counter inside [`Self::account_logs`],
+    /// not from a per-account seed string. See
+    /// `notes/per-account-state.md`.
+    pub state_seed: String,
     /// Declared accounts. v0 ships at least one and at most one is
     /// flagged `primary` (the v0 mail account every protocol surface
     /// scopes to today). Multi-account fixtures are accepted by the
@@ -67,12 +77,19 @@ pub struct Fixture {
     /// reuse the same address across accounts. Empty by default;
     /// fixtures that don't need sendAs coverage can omit the table.
     pub send_as: Vec<SendAs>,
-    /// Per-mutation transition log. Empty at load time (the seed
-    /// state is the only known state); each successful `Email/set`
-    /// or `Mailbox/set` envelope appends a transition and bumps
-    /// `state`. JMAP `Email/changes` / `Mailbox/changes` walk this
-    /// log to compute deltas between two known states.
-    pub change_log: ChangeLog,
+    /// Per-account mutation logs, keyed by `account_id`. Each log
+    /// tracks its own monotonic counter / current state token and its
+    /// own bounded ring of transitions, all sharing
+    /// [`Self::state_seed`]. A mutation advances only the logs of the
+    /// accounts it actually touched, so account B's churn never moves
+    /// account A's state token nor evicts A's `sinceState` boundary
+    /// (RFC 8620 §1.5.2). An account with no entry here has never been
+    /// mutated; its state is the bare seed. Empty at load time. JMAP
+    /// `Email/changes` / `Mailbox/changes` and the Graph / gcal /
+    /// People / CalDAV delta surfaces walk the requesting account's
+    /// log to compute deltas between two known states. See
+    /// `notes/per-account-state.md`.
+    pub account_logs: BTreeMap<String, ChangeLog>,
     /// Optional incremental-sync script. Populated by the Lua
     /// `change({...})` builder; empty for fixtures (TOML or Lua)
     /// that don't author any. The harness drives steps via
@@ -148,6 +165,11 @@ pub struct ChangeLog {
     transitions: std::collections::VecDeque<Transition>,
     counter: u64,
     seed: String,
+    /// Current state token for this account: the bare `seed` while
+    /// `counter == 0`, then `{seed}.{counter}` after the first
+    /// mutation. Cached here so `Fixture::state_for` is a plain
+    /// borrow rather than a re-format on every reporting site.
+    state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,9 +218,20 @@ pub struct Transition {
     pub contact_folder_created: Vec<String>,
     pub contact_folder_updated: Vec<String>,
     pub contact_folder_destroyed: Vec<String>,
+    /// Parallel to `contact_folder_destroyed`: the `account_id` each
+    /// destroyed contact folder belonged to. Contact folders are the
+    /// one folder-like resource that carries no surviving parent to
+    /// resolve an account from at destroy time, so the producer must
+    /// capture it here (same role as `email_destroyed_accounts`).
+    pub contact_folder_destroyed_accounts: Vec<String>,
     pub category_created: Vec<String>,
     pub category_updated: Vec<String>,
     pub category_destroyed: Vec<String>,
+    /// Parallel to `category_destroyed`: the `account_id` each
+    /// destroyed category belonged to. Categories are flat per-account
+    /// with no parent resource, so the producer captures the account
+    /// at destroy time.
+    pub category_destroyed_accounts: Vec<String>,
 }
 
 /// Resource-id deltas a single mutator pass produced. Returned by the
@@ -239,9 +272,15 @@ pub struct MutationDiff {
     pub contact_folder_created: Vec<String>,
     pub contact_folder_updated: Vec<String>,
     pub contact_folder_destroyed: Vec<String>,
+    /// Parallel to `contact_folder_destroyed`. Producers must push to
+    /// both vectors at the same time so the per-account splitter can
+    /// route the tombstone to the right log.
+    pub contact_folder_destroyed_accounts: Vec<String>,
     pub category_created: Vec<String>,
     pub category_updated: Vec<String>,
     pub category_destroyed: Vec<String>,
+    /// Parallel to `category_destroyed`.
+    pub category_destroyed_accounts: Vec<String>,
 }
 
 impl MutationDiff {
@@ -283,26 +322,175 @@ impl ChangeLog {
             transitions: std::collections::VecDeque::new(),
             counter: 0,
             seed: seed_state.to_string(),
+            state: seed_state.to_string(),
         }
+    }
+
+    /// Advance this account's state token by one and return the
+    /// `(from, to)` pair. The caller pushes the freshly-built
+    /// transition (whose `from_state` / `to_state` must equal this
+    /// pair) into the ring.
+    fn advance(&mut self) -> (String, String) {
+        let from = self.state.clone();
+        self.counter += 1;
+        self.state = format!("{}.{}", self.seed, self.counter);
+        (from, self.state.clone())
+    }
+
+    /// Push a freshly-recorded transition, evicting the oldest when
+    /// the ring is full. The seed is never part of the ring, so a
+    /// `sinceState == seed` always resolves to the full retained
+    /// delta regardless of eviction.
+    fn push(&mut self, trans: Transition) {
+        if self.transitions.len() >= ChangeLog::MAX_TRANSITIONS {
+            self.transitions.pop_front();
+        }
+        self.transitions.push_back(trans);
+    }
+
+    /// Walk this account's log for the unfiltered delta between
+    /// `since` and the current state. See [`Fixture::delta_since`]
+    /// for the resolution rules (`since == state` -> empty, seed or
+    /// any retained `from_state` -> walk, otherwise -> `None`).
+    fn delta_since<'a, F>(&'a self, since: &str, project: F) -> Option<DeltaSet>
+    where
+        F: Fn(&'a Transition) -> (&'a Vec<String>, &'a Vec<String>, &'a Vec<String>),
+    {
+        if since == self.state {
+            return Some(DeltaSet::default());
+        }
+        let seed_known = since == self.seed;
+        let head_known = self.transitions.iter().any(|t| t.from_state == since);
+        if !seed_known && !head_known {
+            return None;
+        }
+        let mut started = seed_known;
+        let mut created: Vec<String> = Vec::new();
+        let mut updated: Vec<String> = Vec::new();
+        let mut destroyed: Vec<String> = Vec::new();
+        for t in &self.transitions {
+            if !started {
+                if t.from_state == since {
+                    started = true;
+                } else {
+                    continue;
+                }
+            }
+            let (c, u, d) = project(t);
+            created.extend(c.iter().cloned());
+            updated.extend(u.iter().cloned());
+            destroyed.extend(d.iter().cloned());
+        }
+        apply_dominance_and_dedup(&mut created, &mut updated, &mut destroyed);
+        Some(DeltaSet {
+            created,
+            updated,
+            destroyed,
+        })
+    }
+
+    /// Like [`Self::delta_since`], but the destroyed walk is filtered
+    /// by a parent id (calendar / folder). For each transition the
+    /// `parents` projector returns a `Vec<String>` parallel to the
+    /// destroyed list; only destroyed ids whose corresponding parent
+    /// matches `parent_id` are accumulated. Created / updated are
+    /// unfiltered here - the caller filters those against the live
+    /// resource's parent.
+    fn delta_since_filtered_destroys<'a, F, G>(
+        &'a self,
+        since: &str,
+        project: F,
+        parents: G,
+        parent_id: &str,
+    ) -> Option<DeltaSet>
+    where
+        F: Fn(&'a Transition) -> (&'a Vec<String>, &'a Vec<String>, &'a Vec<String>),
+        G: Fn(&'a Transition) -> Option<&'a Vec<String>>,
+    {
+        if since == self.state {
+            return Some(DeltaSet::default());
+        }
+        let seed_known = since == self.seed;
+        let head_known = self.transitions.iter().any(|t| t.from_state == since);
+        if !seed_known && !head_known {
+            return None;
+        }
+        let mut started = seed_known;
+        let mut created: Vec<String> = Vec::new();
+        let mut updated: Vec<String> = Vec::new();
+        let mut destroyed: Vec<String> = Vec::new();
+        for t in &self.transitions {
+            if !started {
+                if t.from_state == since {
+                    started = true;
+                } else {
+                    continue;
+                }
+            }
+            let (c, u, d) = project(t);
+            created.extend(c.iter().cloned());
+            updated.extend(u.iter().cloned());
+            if let Some(p) = parents(t)
+                && p.len() == d.len()
+            {
+                for (id, parent) in d.iter().zip(p.iter()) {
+                    if parent == parent_id {
+                        destroyed.push(id.clone());
+                    }
+                }
+            }
+        }
+        apply_dominance_and_dedup(&mut created, &mut updated, &mut destroyed);
+        Some(DeltaSet {
+            created,
+            updated,
+            destroyed,
+        })
     }
 }
 
 impl Fixture {
-    /// Borrowing iterator over the retained transitions, oldest
-    /// first. CalDAV's per-resource ETag / CTag derivation walks
-    /// this in reverse to find the last transition that touched
-    /// a given event / calendar.
-    pub fn change_log_transitions(
+    /// Borrowing iterator over one account's retained transitions,
+    /// oldest first. CalDAV's per-resource ETag / CTag derivation
+    /// walks this in reverse to find the last transition that touched
+    /// a given event / calendar; the account is resolved from the
+    /// calendar / event's owning account. An account with no log yet
+    /// yields an empty iterator (the caller falls back to the seed).
+    pub fn change_log_transitions_for(
         &self,
+        account_id: &str,
     ) -> impl DoubleEndedIterator<Item = &Transition> {
-        self.change_log.transitions.iter()
+        self.account_logs
+            .get(account_id)
+            .into_iter()
+            .flat_map(|l| l.transitions.iter())
     }
 
-    /// The change-log seed - the state token a fixture has after
-    /// load, before any mutation. Used as the fallback CalDAV
-    /// state value when no transition has touched a resource yet.
+    /// The change-log seed - the state token every account has after
+    /// load, before any mutation. Used as the fallback CalDAV state
+    /// value when no transition has touched a resource yet.
     pub fn change_log_seed(&self) -> &str {
-        &self.change_log.seed
+        &self.state_seed
+    }
+
+    /// Current state token for `account_id`: the bare seed when the
+    /// account has never been mutated, else `{seed}.{counter}` from
+    /// its log. Every per-protocol reporting site resolves the state
+    /// it emits through here so a mutation on one account never moves
+    /// a sibling's wire token. See `notes/per-account-state.md`.
+    pub fn state_for(&self, account_id: &str) -> &str {
+        self.account_logs
+            .get(account_id)
+            .map(|l| l.state.as_str())
+            .unwrap_or(&self.state_seed)
+    }
+
+    /// Current state token for the primary account. The few genuinely
+    /// session-/process-wide reporting sites (JMAP `sessionState`, the
+    /// `/test/snapshot-state` + `/test/fixture/step` admin endpoints)
+    /// report this rather than any one resource account's token.
+    pub fn primary_state(&self) -> &str {
+        self.state_for(&self.primary_account().id)
     }
 
     /// The single account v0 protocol surfaces serve. Multi-account
@@ -565,224 +753,383 @@ impl Fixture {
     /// empty id sets so callers reporting `oldState` / `newState`
     /// see "nothing changed".
     pub fn record_transition(&mut self, diff: MutationDiff) -> Transition {
-        let from_state = self.state.clone();
+        // The aggregate (cross-account) transition we hand back keeps
+        // every id the mutation touched and reports the *primary*
+        // account's pre/post state. No caller reads the aggregate's
+        // from/to for a per-account `newState` (set handlers resolve
+        // that via `state_for`; the admin step path reports
+        // `primary_state`), but tying it to the primary keeps it
+        // meaningful for a single-account fixture (the common case).
+        let agg_from = self.primary_state().to_string();
         if diff.is_empty() {
-            return Transition {
-                from_state: from_state.clone(),
-                to_state: from_state,
-                email_created: vec![],
-                email_updated: vec![],
-                email_destroyed: vec![],
-                email_destroyed_accounts: vec![],
-                mailbox_created: vec![],
-                mailbox_updated: vec![],
-                mailbox_destroyed: vec![],
-                mailbox_destroyed_accounts: vec![],
-                event_created: vec![],
-                event_updated: vec![],
-                event_destroyed: vec![],
-                event_destroyed_parents: vec![],
-                calendar_created: vec![],
-                calendar_updated: vec![],
-                calendar_destroyed: vec![],
-                calendar_destroyed_accounts: vec![],
-                contact_created: vec![],
-                contact_updated: vec![],
-                contact_destroyed: vec![],
-                contact_destroyed_parents: vec![],
-                contact_folder_created: vec![],
-                contact_folder_updated: vec![],
-                contact_folder_destroyed: vec![],
-                category_created: vec![],
-                category_updated: vec![],
-                category_destroyed: vec![],
-            };
+            return transition_from_diff(agg_from.clone(), agg_from, MutationDiff::default());
         }
-        self.change_log.counter += 1;
-        let to_state = format!("{}.{}", self.change_log.seed, self.change_log.counter);
-        self.state = to_state.clone();
-        let trans = Transition {
-            from_state,
-            to_state,
-            email_created: diff.email_created,
-            email_updated: diff.email_updated,
-            email_destroyed: diff.email_destroyed,
-            email_destroyed_accounts: diff.email_destroyed_accounts,
-            mailbox_created: diff.mailbox_created,
-            mailbox_updated: diff.mailbox_updated,
-            mailbox_destroyed: diff.mailbox_destroyed,
-            mailbox_destroyed_accounts: diff.mailbox_destroyed_accounts,
-            event_created: diff.event_created,
-            event_updated: diff.event_updated,
-            event_destroyed: diff.event_destroyed,
-            event_destroyed_parents: diff.event_destroyed_parents,
-            calendar_created: diff.calendar_created,
-            calendar_updated: diff.calendar_updated,
-            calendar_destroyed: diff.calendar_destroyed,
-            calendar_destroyed_accounts: diff.calendar_destroyed_accounts,
-            contact_created: diff.contact_created,
-            contact_updated: diff.contact_updated,
-            contact_destroyed: diff.contact_destroyed,
-            contact_destroyed_parents: diff.contact_destroyed_parents,
-            contact_folder_created: diff.contact_folder_created,
-            contact_folder_updated: diff.contact_folder_updated,
-            contact_folder_destroyed: diff.contact_folder_destroyed,
-            category_created: diff.category_created,
-            category_updated: diff.category_updated,
-            category_destroyed: diff.category_destroyed,
+        // Partition the diff per owning account (lookups run against
+        // the just-mutated fixture, so created/updated resources are
+        // live; destroyed ids resolve through the parallel
+        // account/parent vectors captured at retire time).
+        let agg_diff = diff.clone();
+        let per_account = self.split_diff_by_account(diff);
+        let seed = self.state_seed.clone();
+        for (account_id, sub) in per_account {
+            let log = self
+                .account_logs
+                .entry(account_id)
+                .or_insert_with(|| ChangeLog::seed(&seed));
+            let (from, to) = log.advance();
+            let trans = transition_from_diff(from, to, sub);
+            log.push(trans);
+        }
+        let agg_to = self.primary_state().to_string();
+        transition_from_diff(agg_from, agg_to, agg_diff)
+    }
+
+    /// Split a `MutationDiff` into per-account sub-diffs. Each id is
+    /// routed to its owning account: created/updated resources resolve
+    /// through the live fixture (the closure has already applied the
+    /// mutation); destroyed resources resolve through the parallel
+    /// account vectors (`*_destroyed_accounts`) or, for events /
+    /// contacts whose parent still lives, the parent's account. An id
+    /// whose account cannot be resolved falls back to the primary
+    /// account (defensive; not reachable in v0 where deletes never
+    /// cascade across the parent that carries the account).
+    fn split_diff_by_account(&self, diff: MutationDiff) -> BTreeMap<String, MutationDiff> {
+        let primary = self.primary_account().id.clone();
+        let email_acct: HashMap<&str, &str> = self
+            .emails
+            .iter()
+            .map(|e| (e.id.as_str(), e.account_id.as_str()))
+            .collect();
+        let mailbox_acct: HashMap<&str, &str> = self
+            .mailboxes
+            .iter()
+            .map(|m| (m.id.as_str(), m.account_id.as_str()))
+            .collect();
+        let calendar_acct: HashMap<&str, &str> = self
+            .calendars
+            .iter()
+            .map(|c| (c.id.as_str(), c.account_id.as_str()))
+            .collect();
+        let event_cal: HashMap<&str, &str> = self
+            .events
+            .iter()
+            .map(|e| (e.id.as_str(), e.calendar_id.as_str()))
+            .collect();
+        let folder_acct: HashMap<&str, &str> = self
+            .contact_folders
+            .iter()
+            .map(|f| (f.id.as_str(), f.account_id.as_str()))
+            .collect();
+        let contact_folder_of: HashMap<&str, &str> = self
+            .contacts
+            .iter()
+            .map(|c| (c.id.as_str(), c.folder_id.as_str()))
+            .collect();
+        let category_acct: HashMap<&str, &str> = self
+            .categories
+            .iter()
+            .map(|c| (c.id.as_str(), c.account_id.as_str()))
+            .collect();
+
+        let resolve_email = |id: &str| {
+            email_acct
+                .get(id)
+                .copied()
+                .unwrap_or(primary.as_str())
+                .to_string()
         };
-        debug_assert_eq!(
-            trans.event_destroyed.len(),
-            trans.event_destroyed_parents.len(),
-            "event_destroyed_parents must be parallel to event_destroyed"
-        );
-        debug_assert_eq!(
-            trans.contact_destroyed.len(),
-            trans.contact_destroyed_parents.len(),
-            "contact_destroyed_parents must be parallel to contact_destroyed"
-        );
-        debug_assert_eq!(
-            trans.email_destroyed.len(),
-            trans.email_destroyed_accounts.len(),
-            "email_destroyed_accounts must be parallel to email_destroyed"
-        );
-        debug_assert_eq!(
-            trans.mailbox_destroyed.len(),
-            trans.mailbox_destroyed_accounts.len(),
-            "mailbox_destroyed_accounts must be parallel to mailbox_destroyed"
-        );
-        debug_assert_eq!(
-            trans.calendar_destroyed.len(),
-            trans.calendar_destroyed_accounts.len(),
-            "calendar_destroyed_accounts must be parallel to calendar_destroyed"
-        );
-        if self.change_log.transitions.len() >= ChangeLog::MAX_TRANSITIONS {
-            self.change_log.transitions.pop_front();
+        let resolve_mailbox = |id: &str| {
+            mailbox_acct
+                .get(id)
+                .copied()
+                .unwrap_or(primary.as_str())
+                .to_string()
+        };
+        let resolve_calendar = |id: &str| {
+            calendar_acct
+                .get(id)
+                .copied()
+                .unwrap_or(primary.as_str())
+                .to_string()
+        };
+        // Calendar id -> account (used both for live calendars and as
+        // the destroyed-event parent resolver).
+        let cal_to_acct = |cal: &str| {
+            calendar_acct
+                .get(cal)
+                .copied()
+                .unwrap_or(primary.as_str())
+                .to_string()
+        };
+        let resolve_event = |id: &str| match event_cal.get(id) {
+            Some(cal) => cal_to_acct(cal),
+            None => primary.clone(),
+        };
+        let folder_to_acct = |folder: &str| {
+            folder_acct
+                .get(folder)
+                .copied()
+                .unwrap_or(primary.as_str())
+                .to_string()
+        };
+        let resolve_contact = |id: &str| match contact_folder_of.get(id) {
+            Some(folder) => folder_to_acct(folder),
+            None => primary.clone(),
+        };
+        let resolve_folder = |id: &str| {
+            folder_acct
+                .get(id)
+                .copied()
+                .unwrap_or(primary.as_str())
+                .to_string()
+        };
+        let resolve_category = |id: &str| {
+            category_acct
+                .get(id)
+                .copied()
+                .unwrap_or(primary.as_str())
+                .to_string()
+        };
+
+        let mut out: BTreeMap<String, MutationDiff> = BTreeMap::new();
+
+        for id in diff.email_created {
+            let a = resolve_email(&id);
+            out.entry(a).or_default().email_created.push(id);
         }
-        self.change_log.transitions.push_back(trans.clone());
-        trans
+        for id in diff.email_updated {
+            let a = resolve_email(&id);
+            out.entry(a).or_default().email_updated.push(id);
+        }
+        for (id, acct) in diff
+            .email_destroyed
+            .into_iter()
+            .zip(diff.email_destroyed_accounts)
+        {
+            let sub = out.entry(acct.clone()).or_default();
+            sub.email_destroyed.push(id);
+            sub.email_destroyed_accounts.push(acct);
+        }
+        for id in diff.mailbox_created {
+            let a = resolve_mailbox(&id);
+            out.entry(a).or_default().mailbox_created.push(id);
+        }
+        for id in diff.mailbox_updated {
+            let a = resolve_mailbox(&id);
+            out.entry(a).or_default().mailbox_updated.push(id);
+        }
+        for (id, acct) in diff
+            .mailbox_destroyed
+            .into_iter()
+            .zip(diff.mailbox_destroyed_accounts)
+        {
+            let sub = out.entry(acct.clone()).or_default();
+            sub.mailbox_destroyed.push(id);
+            sub.mailbox_destroyed_accounts.push(acct);
+        }
+        for id in diff.event_created {
+            let a = resolve_event(&id);
+            out.entry(a).or_default().event_created.push(id);
+        }
+        for id in diff.event_updated {
+            let a = resolve_event(&id);
+            out.entry(a).or_default().event_updated.push(id);
+        }
+        for (id, parent) in diff
+            .event_destroyed
+            .into_iter()
+            .zip(diff.event_destroyed_parents)
+        {
+            let a = cal_to_acct(&parent);
+            let sub = out.entry(a).or_default();
+            sub.event_destroyed.push(id);
+            sub.event_destroyed_parents.push(parent);
+        }
+        for id in diff.calendar_created {
+            let a = resolve_calendar(&id);
+            out.entry(a).or_default().calendar_created.push(id);
+        }
+        for id in diff.calendar_updated {
+            let a = resolve_calendar(&id);
+            out.entry(a).or_default().calendar_updated.push(id);
+        }
+        for (id, acct) in diff
+            .calendar_destroyed
+            .into_iter()
+            .zip(diff.calendar_destroyed_accounts)
+        {
+            let sub = out.entry(acct.clone()).or_default();
+            sub.calendar_destroyed.push(id);
+            sub.calendar_destroyed_accounts.push(acct);
+        }
+        for id in diff.contact_created {
+            let a = resolve_contact(&id);
+            out.entry(a).or_default().contact_created.push(id);
+        }
+        for id in diff.contact_updated {
+            let a = resolve_contact(&id);
+            out.entry(a).or_default().contact_updated.push(id);
+        }
+        for (id, parent) in diff
+            .contact_destroyed
+            .into_iter()
+            .zip(diff.contact_destroyed_parents)
+        {
+            let a = folder_to_acct(&parent);
+            let sub = out.entry(a).or_default();
+            sub.contact_destroyed.push(id);
+            sub.contact_destroyed_parents.push(parent);
+        }
+        for id in diff.contact_folder_created {
+            let a = resolve_folder(&id);
+            out.entry(a).or_default().contact_folder_created.push(id);
+        }
+        for id in diff.contact_folder_updated {
+            let a = resolve_folder(&id);
+            out.entry(a).or_default().contact_folder_updated.push(id);
+        }
+        for (id, acct) in diff
+            .contact_folder_destroyed
+            .into_iter()
+            .zip(diff.contact_folder_destroyed_accounts)
+        {
+            let sub = out.entry(acct.clone()).or_default();
+            sub.contact_folder_destroyed.push(id);
+            sub.contact_folder_destroyed_accounts.push(acct);
+        }
+        for id in diff.category_created {
+            let a = resolve_category(&id);
+            out.entry(a).or_default().category_created.push(id);
+        }
+        for id in diff.category_updated {
+            let a = resolve_category(&id);
+            out.entry(a).or_default().category_updated.push(id);
+        }
+        for (id, acct) in diff
+            .category_destroyed
+            .into_iter()
+            .zip(diff.category_destroyed_accounts)
+        {
+            let sub = out.entry(acct.clone()).or_default();
+            sub.category_destroyed.push(id);
+            sub.category_destroyed_accounts.push(acct);
+        }
+
+        out
     }
 
-    /// Compute the email-side delta between two known states.
-    ///
-    /// - `sinceState == self.state`: empty delta.
-    /// - `sinceState` matches the seed or any retained transition's
-    ///   `from_state`: walk forward from there, unioning with RFC
-    ///   §5.2 dominance.
-    /// - `sinceState` is unknown (older than seed, or evicted from
-    ///   the bounded ring, or simply not a state we ever issued):
-    ///   returns `None`, which the caller maps to
-    ///   `cannotCalculateChanges`.
-    pub fn email_delta_since(&self, since: &str) -> Option<DeltaSet> {
-        self.delta_since(since, |t| {
-            (
-                &t.email_created,
-                &t.email_updated,
-                &t.email_destroyed,
-            )
-        })
+    /// Walk one account's log for an unfiltered delta. Folds the
+    /// "account never mutated" case (no log entry) into a seed-only
+    /// resolution: `since == seed` is the empty delta, anything else
+    /// is `cannotCalculateChanges`.
+    fn walk_account<'a, F>(
+        &'a self,
+        since: &str,
+        account_id: &str,
+        project: F,
+    ) -> Option<DeltaSet>
+    where
+        F: Fn(&'a Transition) -> (&'a Vec<String>, &'a Vec<String>, &'a Vec<String>),
+    {
+        match self.account_logs.get(account_id) {
+            Some(log) => log.delta_since(since, project),
+            None => self.seed_only_delta(since),
+        }
     }
 
-    /// Per-account email delta. Filters created / updated ids by the
-    /// live email's `account_id` and destroyed ids by the parallel
-    /// `email_destroyed_accounts` recorded at retire time. Drives the
-    /// JMAP `Email/changes` handler so a multi-account fixture's
-    /// mutations on the secondary do not surface in the primary's
-    /// delta walk. Pre-fix the walker was global, so `Email/changes`
-    /// against the primary reported every secondary mutation too -
-    /// invisible in single-account fixtures but a multi-account
-    /// scoping bug.
+    /// Parent-filtered analogue of [`Self::walk_account`].
+    fn walk_account_filtered<'a, F, G>(
+        &'a self,
+        since: &str,
+        account_id: &str,
+        project: F,
+        parents: G,
+        parent_id: &str,
+    ) -> Option<DeltaSet>
+    where
+        F: Fn(&'a Transition) -> (&'a Vec<String>, &'a Vec<String>, &'a Vec<String>),
+        G: Fn(&'a Transition) -> Option<&'a Vec<String>>,
+    {
+        match self.account_logs.get(account_id) {
+            Some(log) => log.delta_since_filtered_destroys(since, project, parents, parent_id),
+            None => self.seed_only_delta(since),
+        }
+    }
+
+    /// Resolution for an account with no log yet: the seed is the only
+    /// known state.
+    fn seed_only_delta(&self, since: &str) -> Option<DeltaSet> {
+        if since == self.state_seed {
+            Some(DeltaSet::default())
+        } else {
+            None
+        }
+    }
+
+    /// Per-account email delta. Walks the requesting account's own
+    /// log (created during its first mutation), so created / updated /
+    /// destroyed ids already belong to that account - no live-account
+    /// retain pass is needed. Drives the JMAP `Email/changes` handler.
+    /// A mutation on a multi-account fixture's secondary never touches
+    /// the primary's log, so the primary's walk returns the empty
+    /// delta and its state token does not move (RFC 8620 §1.5.2).
+    /// `since` older than the seed (or evicted from the account's
+    /// bounded ring) returns `None` -> `cannotCalculateChanges`.
     pub fn email_delta_since_account(
         &self,
         since: &str,
         account_id: &str,
     ) -> Option<DeltaSet> {
-        let mut delta = self.delta_since_filtered_destroys(
-            since,
-            |t| (&t.email_created, &t.email_updated, &t.email_destroyed),
-            |t| Some(&t.email_destroyed_accounts),
-            account_id,
-        )?;
-        let live: std::collections::HashMap<&str, &str> = self
-            .emails
-            .iter()
-            .map(|e| (e.id.as_str(), e.account_id.as_str()))
-            .collect();
-        delta
-            .created
-            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
-        delta
-            .updated
-            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
-        Some(delta)
-    }
-
-    /// Mailbox-side analogue of [`email_delta_since`].
-    pub fn mailbox_delta_since(&self, since: &str) -> Option<DeltaSet> {
-        self.delta_since(since, |t| {
-            (
-                &t.mailbox_created,
-                &t.mailbox_updated,
-                &t.mailbox_destroyed,
-            )
+        self.walk_account(since, account_id, |t| {
+            (&t.email_created, &t.email_updated, &t.email_destroyed)
         })
     }
 
     /// Per-account mailbox delta. Same shape as
-    /// [`email_delta_since_account`].
+    /// [`Self::email_delta_since_account`].
     pub fn mailbox_delta_since_account(
         &self,
         since: &str,
         account_id: &str,
     ) -> Option<DeltaSet> {
-        let mut delta = self.delta_since_filtered_destroys(
-            since,
-            |t| (&t.mailbox_created, &t.mailbox_updated, &t.mailbox_destroyed),
-            |t| Some(&t.mailbox_destroyed_accounts),
-            account_id,
-        )?;
-        let live: std::collections::HashMap<&str, &str> = self
-            .mailboxes
-            .iter()
-            .map(|m| (m.id.as_str(), m.account_id.as_str()))
-            .collect();
-        delta
-            .created
-            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
-        delta
-            .updated
-            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
-        Some(delta)
+        self.walk_account(since, account_id, |t| {
+            (&t.mailbox_created, &t.mailbox_updated, &t.mailbox_destroyed)
+        })
     }
 
-    /// Event-side analogue of [`email_delta_since`]. Drives the
-    /// Microsoft Graph `calendarView/delta` and `events/delta`
-    /// surfaces: a follow-up call with a known `$deltatoken` returns
-    /// only the events that changed since that token, plus a fresh
-    /// deltaLink. Tokens older than the seed (or evicted from the
-    /// bounded ring) return `None`; the Graph layer converts that to
-    /// a full re-bootstrap.
+    /// Per-calendar event delta. Drives the Microsoft Graph
+    /// `calendarView/delta` and `events/delta` surfaces: a follow-up
+    /// call with a known `$deltatoken` returns only the events that
+    /// changed since that token, plus a fresh deltaLink. Tokens older
+    /// than the seed (or evicted from the owning account's bounded
+    /// ring) return `None`; the Graph layer converts that to a full
+    /// re-bootstrap.
     ///
     /// All three sets are scoped to the named calendar:
     /// - Destroyed ids are filtered against `event_destroyed_parents`
     ///   recorded at retire time (the event is gone from the live
     ///   fixture by then).
     /// - Created / updated ids are filtered against the live event's
-    ///   current `calendar_id`. An event whose every transition in
-    ///   the window was on a sibling calendar is dropped here so
-    ///   the wire delta does not over-report. (Pre-fix this filter
-    ///   was the caller's responsibility, but the JMAP `Calendar
-    ///   Event/changes` cross-calendar union has no good way to
-    ///   apply it; folding the filter here keeps every consumer
-    ///   honest.)
+    ///   current `calendar_id`, since the account's log mixes ids
+    ///   across every calendar the account owns.
     pub fn event_delta_since(&self, since: &str, calendar_id: &str) -> Option<DeltaSet> {
-        let mut delta = self.delta_since_filtered_destroys(
+        // Resolve the calendar's owning account so we walk the right
+        // per-account log. An unknown calendar has no transitions of
+        // its own; seed-only resolution applies.
+        let account_id = match self.calendars.iter().find(|c| c.id == calendar_id) {
+            Some(c) => c.account_id.clone(),
+            None => return self.seed_only_delta(since),
+        };
+        let mut delta = self.walk_account_filtered(
             since,
+            &account_id,
             |t| (&t.event_created, &t.event_updated, &t.event_destroyed),
             |t| Some(&t.event_destroyed_parents),
             calendar_id,
         )?;
-        let live: std::collections::HashMap<&str, &str> = self
+        // The account may own several calendars; the log mixes their
+        // created / updated ids, so filter those down to this calendar.
+        let live: HashMap<&str, &str> = self
             .events
             .iter()
             .map(|e| (e.id.as_str(), e.calendar_id.as_str()))
@@ -797,208 +1144,139 @@ impl Fixture {
     }
 
     /// Per-account calendar delta. Drives the JMAP `Calendar/changes`
-    /// walker once MKCALENDAR / DELETE on calendar collections wire
-    /// transitions through. Pre-MKCALENDAR the change_log never
-    /// recorded calendar-side transitions, so the walk always
-    /// returns the empty delta.
+    /// walker (and the CalDAV MKCALENDAR / DELETE writes that feed it).
+    /// Walks the account's own log, so every calendar id in it already
+    /// belongs to the account.
     pub fn calendar_delta_since_account(
         &self,
         since: &str,
         account_id: &str,
     ) -> Option<DeltaSet> {
-        let mut delta = self.delta_since_filtered_destroys(
-            since,
-            |t| (&t.calendar_created, &t.calendar_updated, &t.calendar_destroyed),
-            |t| Some(&t.calendar_destroyed_accounts),
-            account_id,
-        )?;
-        let live: std::collections::HashMap<&str, &str> = self
-            .calendars
-            .iter()
-            .map(|c| (c.id.as_str(), c.account_id.as_str()))
-            .collect();
-        delta
-            .created
-            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
-        delta
-            .updated
-            .retain(|id| live.get(id.as_str()).copied() == Some(account_id));
-        Some(delta)
+        self.walk_account(since, account_id, |t| {
+            (&t.calendar_created, &t.calendar_updated, &t.calendar_destroyed)
+        })
     }
 
-    /// Cross-calendar event delta. Returns every event change since
-    /// `since` regardless of which calendar it lives in. Drives
-    /// JMAP `CalendarEvent/changes`, which carries no per-calendar
-    /// filter on the wire (the `calendarIds` map on each event in
-    /// the follow-up `CalendarEvent/get` is the per-resource scope).
-    pub fn event_delta_since_any(&self, since: &str) -> Option<DeltaSet> {
-        self.delta_since(since, |t| {
-            (
-                &t.event_created,
-                &t.event_updated,
-                &t.event_destroyed,
-            )
+    /// Cross-calendar event delta for one account. Returns every event
+    /// change since `since` regardless of which of the account's
+    /// calendars it lives in. Drives JMAP `CalendarEvent/changes`,
+    /// which carries no per-calendar filter on the wire (the
+    /// `calendarIds` map on each event in the follow-up
+    /// `CalendarEvent/get` is the per-resource scope).
+    pub fn event_delta_since_any(&self, since: &str, account_id: &str) -> Option<DeltaSet> {
+        self.walk_account(since, account_id, |t| {
+            (&t.event_created, &t.event_updated, &t.event_destroyed)
         })
     }
 
     /// Contact-side analogue. Drives the Graph
-    /// `/v1.0/me/contactFolders/{id}/contacts/delta` surface: a
-    /// follow-up call with a known `$deltatoken` returns only the
-    /// contacts that changed since that token. Tokens older than
-    /// the seed (or evicted from the bounded ring) return `None`;
-    /// the Graph layer translates that to a 410 Gone (which
-    /// ratatoskr handles by re-bootstrapping with a full sync).
-    ///
-    /// Same parent-filtering shape as `event_delta_since`: tombstones
-    /// are scoped to the named folder via `contact_destroyed_parents`.
+    /// `/v1.0/me/contactFolders/{id}/contacts/delta` surface. Resolves
+    /// the folder's owning account, then walks that account's log with
+    /// the tombstone set scoped to the named folder via
+    /// `contact_destroyed_parents`. (Created / updated stay
+    /// account-wide, matching the pre-per-account behaviour - the Graph
+    /// layer re-fetches per folder.) Tokens older than the seed (or
+    /// evicted from the account's bounded ring) return `None`; the
+    /// Graph layer translates that to a 410 Gone.
     pub fn contact_delta_since(&self, since: &str, folder_id: &str) -> Option<DeltaSet> {
-        self.delta_since_filtered_destroys(
+        let account_id = match self.contact_folders.iter().find(|f| f.id == folder_id) {
+            Some(f) => f.account_id.clone(),
+            None => return self.seed_only_delta(since),
+        };
+        self.walk_account_filtered(
             since,
-            |t| {
-                (
-                    &t.contact_created,
-                    &t.contact_updated,
-                    &t.contact_destroyed,
-                )
-            },
+            &account_id,
+            |t| (&t.contact_created, &t.contact_updated, &t.contact_destroyed),
             |t| Some(&t.contact_destroyed_parents),
             folder_id,
         )
     }
 
-    /// Cross-folder contact delta. Returns every contact change
-    /// since `since` regardless of folder. Drives the People API
-    /// listener, which has no folder concept (Google flattens
-    /// every account contact into one connections list).
-    pub fn contact_delta_since_any(&self, since: &str) -> Option<DeltaSet> {
-        self.delta_since(since, |t| {
-            (
-                &t.contact_created,
-                &t.contact_updated,
-                &t.contact_destroyed,
-            )
+    /// Cross-folder contact delta for one account. Returns every
+    /// contact change since `since` regardless of folder. Drives the
+    /// People API listener, which has no folder concept (Google
+    /// flattens every account contact into one connections list).
+    pub fn contact_delta_since_any(&self, since: &str, account_id: &str) -> Option<DeltaSet> {
+        self.walk_account(since, account_id, |t| {
+            (&t.contact_created, &t.contact_updated, &t.contact_destroyed)
         })
     }
+}
 
-    /// Contact-folder-side analogue.
-    pub fn contact_folder_delta_since(&self, since: &str) -> Option<DeltaSet> {
-        self.delta_since(since, |t| {
-            (
-                &t.contact_folder_created,
-                &t.contact_folder_updated,
-                &t.contact_folder_destroyed,
-            )
-        })
-    }
-
-    /// Like [`Self::delta_since`], but the destroyed walk is filtered
-    /// by a parent id (calendar / folder). For each transition the
-    /// `parents` projector returns a `Vec<String>` parallel to the
-    /// destroyed list; only destroyed ids whose corresponding parent
-    /// matches `parent_id` are accumulated.
-    fn delta_since_filtered_destroys<'a, F, G>(
-        &'a self,
-        since: &str,
-        project: F,
-        parents: G,
-        parent_id: &str,
-    ) -> Option<DeltaSet>
-    where
-        F: Fn(&'a Transition) -> (&'a Vec<String>, &'a Vec<String>, &'a Vec<String>),
-        G: Fn(&'a Transition) -> Option<&'a Vec<String>>,
-    {
-        if since == self.state {
-            return Some(DeltaSet::default());
-        }
-        let seed_known = since == self.change_log.seed;
-        let head_known = self
-            .change_log
-            .transitions
-            .iter()
-            .any(|t| t.from_state == since);
-        if !seed_known && !head_known {
-            return None;
-        }
-        let mut started = seed_known;
-        let mut created: Vec<String> = Vec::new();
-        let mut updated: Vec<String> = Vec::new();
-        let mut destroyed: Vec<String> = Vec::new();
-        for t in &self.change_log.transitions {
-            if !started {
-                if t.from_state == since {
-                    started = true;
-                } else {
-                    continue;
-                }
-            }
-            let (c, u, d) = project(t);
-            created.extend(c.iter().cloned());
-            updated.extend(u.iter().cloned());
-            // Only keep destroyed ids whose parent is the requested
-            // one. Producers must keep the parents vec parallel to
-            // the destroyed vec; if it's missing entirely (legacy /
-            // empty transition) skip.
-            if let Some(p) = parents(t)
-                && p.len() == d.len()
-            {
-                for (id, parent) in d.iter().zip(p.iter()) {
-                    if parent == parent_id {
-                        destroyed.push(id.clone());
-                    }
-                }
-            }
-        }
-        apply_dominance_and_dedup(&mut created, &mut updated, &mut destroyed);
-        Some(DeltaSet {
-            created,
-            updated,
-            destroyed,
-        })
-    }
-
-    fn delta_since<'a, F>(&'a self, since: &str, project: F) -> Option<DeltaSet>
-    where
-        F: Fn(&'a Transition) -> (&'a Vec<String>, &'a Vec<String>, &'a Vec<String>),
-    {
-        if since == self.state {
-            return Some(DeltaSet::default());
-        }
-        // The seed and every retained `from_state` count as "known".
-        // If `since` matches none of them, we can no longer reconstruct
-        // the delta and the caller returns `cannotCalculateChanges`.
-        let seed_known = since == self.change_log.seed;
-        let head_known = self
-            .change_log
-            .transitions
-            .iter()
-            .any(|t| t.from_state == since);
-        if !seed_known && !head_known {
-            return None;
-        }
-        let mut started = seed_known;
-        let mut created: Vec<String> = Vec::new();
-        let mut updated: Vec<String> = Vec::new();
-        let mut destroyed: Vec<String> = Vec::new();
-        for t in &self.change_log.transitions {
-            if !started {
-                if t.from_state == since {
-                    started = true;
-                } else {
-                    continue;
-                }
-            }
-            let (c, u, d) = project(t);
-            created.extend(c.iter().cloned());
-            updated.extend(u.iter().cloned());
-            destroyed.extend(d.iter().cloned());
-        }
-        apply_dominance_and_dedup(&mut created, &mut updated, &mut destroyed);
-        Some(DeltaSet {
-            created,
-            updated,
-            destroyed,
-        })
-    }
+/// Build a [`Transition`] from a `MutationDiff` and its
+/// `(from_state, to_state)` token pair, moving every id list across
+/// and asserting the parallel destroyed-vectors stay aligned. Used
+/// both for the per-account transitions pushed into each log and for
+/// the cross-account aggregate `record_transition` returns.
+fn transition_from_diff(from_state: String, to_state: String, diff: MutationDiff) -> Transition {
+    let trans = Transition {
+        from_state,
+        to_state,
+        email_created: diff.email_created,
+        email_updated: diff.email_updated,
+        email_destroyed: diff.email_destroyed,
+        email_destroyed_accounts: diff.email_destroyed_accounts,
+        mailbox_created: diff.mailbox_created,
+        mailbox_updated: diff.mailbox_updated,
+        mailbox_destroyed: diff.mailbox_destroyed,
+        mailbox_destroyed_accounts: diff.mailbox_destroyed_accounts,
+        event_created: diff.event_created,
+        event_updated: diff.event_updated,
+        event_destroyed: diff.event_destroyed,
+        event_destroyed_parents: diff.event_destroyed_parents,
+        calendar_created: diff.calendar_created,
+        calendar_updated: diff.calendar_updated,
+        calendar_destroyed: diff.calendar_destroyed,
+        calendar_destroyed_accounts: diff.calendar_destroyed_accounts,
+        contact_created: diff.contact_created,
+        contact_updated: diff.contact_updated,
+        contact_destroyed: diff.contact_destroyed,
+        contact_destroyed_parents: diff.contact_destroyed_parents,
+        contact_folder_created: diff.contact_folder_created,
+        contact_folder_updated: diff.contact_folder_updated,
+        contact_folder_destroyed: diff.contact_folder_destroyed,
+        contact_folder_destroyed_accounts: diff.contact_folder_destroyed_accounts,
+        category_created: diff.category_created,
+        category_updated: diff.category_updated,
+        category_destroyed: diff.category_destroyed,
+        category_destroyed_accounts: diff.category_destroyed_accounts,
+    };
+    debug_assert_eq!(
+        trans.event_destroyed.len(),
+        trans.event_destroyed_parents.len(),
+        "event_destroyed_parents must be parallel to event_destroyed"
+    );
+    debug_assert_eq!(
+        trans.contact_destroyed.len(),
+        trans.contact_destroyed_parents.len(),
+        "contact_destroyed_parents must be parallel to contact_destroyed"
+    );
+    debug_assert_eq!(
+        trans.email_destroyed.len(),
+        trans.email_destroyed_accounts.len(),
+        "email_destroyed_accounts must be parallel to email_destroyed"
+    );
+    debug_assert_eq!(
+        trans.mailbox_destroyed.len(),
+        trans.mailbox_destroyed_accounts.len(),
+        "mailbox_destroyed_accounts must be parallel to mailbox_destroyed"
+    );
+    debug_assert_eq!(
+        trans.calendar_destroyed.len(),
+        trans.calendar_destroyed_accounts.len(),
+        "calendar_destroyed_accounts must be parallel to calendar_destroyed"
+    );
+    debug_assert_eq!(
+        trans.contact_folder_destroyed.len(),
+        trans.contact_folder_destroyed_accounts.len(),
+        "contact_folder_destroyed_accounts must be parallel to contact_folder_destroyed"
+    );
+    debug_assert_eq!(
+        trans.category_destroyed.len(),
+        trans.category_destroyed_accounts.len(),
+        "category_destroyed_accounts must be parallel to category_destroyed"
+    );
+    trans
 }
 
 /// Apply RFC 8620 §5.2 dominance to a freshly-extended delta and
@@ -2537,8 +2815,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         }
     }
 
-    let state = raw.state.unwrap_or_else(|| "fixture-state".to_string());
-    let change_log = ChangeLog::seed(&state);
+    let state_seed = raw.state.unwrap_or_else(|| "fixture-state".to_string());
     // Seed the counter to the larger of (a) the highest declared
     // `mock-X-N` suffix and (b) the loaded resource count. (a) is
     // the strict collision-avoidance guarantee. (b) preserves the
@@ -2558,7 +2835,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         .max(contacts.len() as u64);
     Ok(Fixture {
         name: raw.name,
-        state,
+        state_seed,
         accounts,
         mailboxes,
         emails,
@@ -2571,7 +2848,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         categories,
         groups,
         send_as: send_as_entries,
-        change_log,
+        account_logs: BTreeMap::new(),
         change_script,
         mailbox_uid_history,
         synthetic_event_seq,
@@ -3499,7 +3776,8 @@ mod tests {
     #[test]
     fn defaults_state_token() {
         let fix = parse(MINIMAL).unwrap();
-        assert_eq!(fix.state, "fixture-state");
+        assert_eq!(fix.state_seed, "fixture-state");
+        assert_eq!(fix.primary_state(), "fixture-state");
     }
 
     #[test]

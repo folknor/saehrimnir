@@ -297,7 +297,7 @@ async fn session(
         "downloadUrl": format!("{base}/jmap/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}"),
         "uploadUrl": format!("{base}/jmap/upload/{{accountId}}"),
         "eventSourceUrl": format!("{base}/jmap/eventsource/?types={{types}}&closeafter={{closeafter}}&ping={{ping}}"),
-        "state": fixture.state
+        "state": fixture.primary_state()
     })))
 }
 

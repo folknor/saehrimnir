@@ -108,19 +108,27 @@ checking whether the fact is already in `notes/`.
   never held across `.await` or dispatcher callbacks.
 - Each protocol projects its own wire shape from the same canonical
   types in `src/fixture.rs`.
-- `Fixture::state` advances on every successful mutation; the
-  `change_log` (bounded at 256 transitions) records per-resource
-  ids per transition. `Email/changes` and `Mailbox/changes` walk
-  it via `email_delta_since_account` / `mailbox_delta_since_account`
-  to partition the wire delta by the request's `accountId`:
-  created / updated ids filter against the live resource's
-  `account_id`, and destroyed ids filter against the parallel
-  `email_destroyed_accounts` / `mailbox_destroyed_accounts`
-  recorded at retire time. Mutations on a multi-account fixture's
-  secondary do not leak into the primary's /changes walk. RFC 8620
-  §5.2 dominance applies after the filter (created+destroyed
-  cancels, created+updated collapses, etc.). Unknown / evicted
-  `sinceState` returns `cannotCalculateChanges`.
+- State is per-account (RFC 8620 §1.5.2). `Fixture` carries a shared
+  `state_seed` plus `account_logs: BTreeMap<accountId, ChangeLog>`;
+  each log owns its monotonic counter, current state token
+  (`{seed}.{N}`), and its own bounded transition ring (256). A
+  mutation advances only the logs of the accounts it touched
+  (`record_transition` splits the `MutationDiff` per owning account
+  via `split_diff_by_account`), so account B's churn never moves
+  account A's token nor evicts A's `sinceState` boundary. Every
+  reporting site reads `Fixture::state_for(accountId)`
+  (`primary_state()` for the session-/process-wide sites: JMAP
+  `sessionState`, `/test/snapshot-state`, `/test/fixture/step`).
+  `Email/changes` / `Mailbox/changes` walk the requesting account's
+  log via `email_delta_since_account` / `mailbox_delta_since_account`;
+  since the log already holds only that account's ids, no post-walk
+  live-account retain is needed. Destroyed-id account/parent
+  resolution rides parallel vectors captured at retire time
+  (`*_destroyed_accounts` for email / mailbox / calendar /
+  contact_folder / category, `*_destroyed_parents` for event /
+  contact). RFC 8620 §5.2 dominance applies after the walk
+  (created+destroyed cancels, created+updated collapses, etc.).
+  Unknown / evicted `sinceState` returns `cannotCalculateChanges`.
   Out-of-scope JMAP methods (`EmailSubmission/set`, push,
   `Email/copy`, etc.) still return `unknownMethod`. Out-of-scope
   IMAP commands (write paths, IDLE, NOTIFY, etc.) return `BAD`.

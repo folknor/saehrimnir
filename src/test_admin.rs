@@ -437,7 +437,7 @@ async fn snapshot_state(State(state): State<AppState>) -> Json<Value> {
         .collect();
     Json(json!({
         "name": fix.name,
-        "state": fix.state,
+        "state": fix.primary_state(),
         "mailboxes": mailboxes,
         "emails": emails,
         "events": events,
@@ -576,7 +576,7 @@ async fn step_fixture(
     let cursor_after = *cursor;
     drop(cursor);
 
-    let new_state = fix.state.clone();
+    let new_state = fix.primary_state().to_string();
     let fixture_name = fix.name.clone();
     drop(fix);
 
@@ -1087,6 +1087,11 @@ fn apply_change_step(
                         ),
                     ));
                 }
+                let destroyed_account = fix
+                    .contact_folders
+                    .iter()
+                    .find(|f| &f.id == id)
+                    .map(|f| f.account_id.clone());
                 let len_before = fix.contact_folders.len();
                 fix.contact_folders.retain(|f| &f.id != id);
                 if fix.contact_folders.len() == len_before {
@@ -1098,6 +1103,8 @@ fn apply_change_step(
                     ));
                 }
                 diff.contact_folder_destroyed.push(id.clone());
+                diff.contact_folder_destroyed_accounts
+                    .push(destroyed_account.expect("folder existed (retain removed it)"));
             }
             ChangeOp::ContactCreate(contact) => {
                 let mut contact = (**contact).clone();

@@ -68,7 +68,7 @@ pub(crate) fn address_book_get(fixture: &Fixture, args: &Value) -> Result<Value,
         Some(_) => return Err(invalid_args("ids must be an array or null")),
     };
 
-    Ok(get_response(account_id, &fixture.state, list, not_found))
+    Ok(get_response(account_id, fixture.state_for(account_id), list, not_found))
 }
 
 fn serialize_address_book(f: &ContactFolder) -> Value {
@@ -122,7 +122,7 @@ pub(crate) fn contact_card_get(fixture: &Fixture, args: &Value) -> Result<Value,
         Some(_) => return Err(invalid_args("ids must be an array or null")),
     };
 
-    Ok(get_response(account_id, &fixture.state, list, not_found))
+    Ok(get_response(account_id, fixture.state_for(account_id), list, not_found))
 }
 
 /// Project one fixture `Contact` to a JSContact Card (RFC 9553). The
@@ -225,7 +225,10 @@ pub(crate) fn contact_card_query(fixture: &Fixture, args: &Value) -> Result<Valu
 
     let mut out = Map::new();
     out.insert("accountId".into(), Value::String(account_id.to_string()));
-    out.insert("queryState".into(), Value::String(fixture.state.clone()));
+    out.insert(
+        "queryState".into(),
+        Value::String(fixture.state_for(account_id).to_string()),
+    );
     out.insert("canCalculateChanges".into(), Value::Bool(false));
     out.insert("position".into(), Value::Number(position.into()));
     out.insert("ids".into(), Value::Array(ids));
@@ -328,7 +331,7 @@ pub(crate) fn contact_card_changes(fixture: &Fixture, args: &Value) -> Result<Va
     Ok(json!({
         "accountId": account_id,
         "oldState": since_state,
-        "newState": fixture.state,
+        "newState": fixture.state_for(account_id),
         "hasMoreChanges": false,
         "created": delta.created,
         "updated": delta.updated,
@@ -348,7 +351,7 @@ fn account_contact_delta(fixture: &Fixture, since: &str, account_id: &str) -> Op
         .map(|f| f.id.clone())
         .collect();
     if folders.is_empty() {
-        return fixture.contact_delta_since_any(since);
+        return fixture.contact_delta_since_any(since, account_id);
     }
     let mut out = DeltaSet::default();
     for fid in &folders {
@@ -383,13 +386,13 @@ fn dedup_preserve_order(ids: &mut Vec<String>) {
 pub(crate) fn contact_card_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?.to_string();
     if let Some(if_in_state) = args.get("ifInState").and_then(Value::as_str)
-        && if_in_state != fixture.state
+        && if_in_state != fixture.state_for(&account_id)
     {
         return Err(json!({
             "type": "stateMismatch",
             "description": format!(
                 "ifInState {if_in_state:?} does not match current state {:?}",
-                fixture.state,
+                fixture.state_for(&account_id),
             ),
         }));
     }
@@ -421,7 +424,8 @@ pub(crate) fn contact_card_set(fixture: &mut Fixture, args: &Value) -> Result<Va
     let mut destroyed_out: Vec<String> = Vec::new();
     let mut not_destroyed = Map::new();
 
-    let trans = fixture.mutate(|fix| {
+    let old_state = fixture.state_for(&account_id).to_string();
+    fixture.mutate(|fix| {
         let mut diff = MutationDiff::default();
 
         for (client_id, body) in &creates {
@@ -472,11 +476,12 @@ pub(crate) fn contact_card_set(fixture: &mut Fixture, args: &Value) -> Result<Va
 
         diff
     });
+    let new_state = fixture.state_for(&account_id).to_string();
 
     Ok(json!({
         "accountId": account_id,
-        "oldState": trans.from_state,
-        "newState": trans.to_state,
+        "oldState": old_state,
+        "newState": new_state,
         "created": if created_out.is_empty() { Value::Null } else { Value::Object(created_out) },
         "notCreated": if not_created.is_empty() { Value::Null } else { Value::Object(not_created) },
         "updated": if updated_out.is_empty() { Value::Null } else { Value::Object(updated_out) },

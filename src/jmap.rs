@@ -53,8 +53,8 @@ pub fn handle(
     let session_state = fixture
         .read()
         .expect("fixture lock poisoned")
-        .state
-        .clone();
+        .primary_state()
+        .to_string();
     JmapResponse {
         method_responses: responses,
         session_state,
@@ -259,7 +259,10 @@ fn mailbox_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
         "accountId".to_string(),
         Value::String(account_id.to_string()),
     );
-    out.insert("state".to_string(), Value::String(fixture.state.clone()));
+    out.insert(
+        "state".to_string(),
+        Value::String(fixture.state_for(account_id).to_string()),
+    );
     out.insert("list".to_string(), list);
     out.insert("notFound".to_string(), not_found);
     Ok(Value::Object(out))
@@ -413,7 +416,7 @@ fn mailbox_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     Ok(changes_response(
         account_id,
         since_state,
-        &fixture.state,
+        fixture.state_for(account_id),
         delta,
         false,
     ))
@@ -436,7 +439,7 @@ fn email_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     Ok(changes_response(
         account_id,
         since_state,
-        &fixture.state,
+        fixture.state_for(account_id),
         delta,
         true,
     ))
@@ -604,7 +607,7 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     );
     out.insert(
         "queryState".to_string(),
-        Value::String(fixture.state.clone()),
+        Value::String(fixture.state_for(account_id).to_string()),
     );
     out.insert("canCalculateChanges".to_string(), Value::Bool(false));
     out.insert(
@@ -796,7 +799,10 @@ fn email_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
         "accountId".to_string(),
         Value::String(account_id.to_string()),
     );
-    out.insert("state".to_string(), Value::String(fixture.state.clone()));
+    out.insert(
+        "state".to_string(),
+        Value::String(fixture.state_for(account_id).to_string()),
+    );
     out.insert("list".to_string(), list);
     out.insert("notFound".to_string(), not_found);
     Ok(Value::Object(out))
@@ -1102,7 +1108,10 @@ fn thread_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
         "accountId".to_string(),
         Value::String(account_id.to_string()),
     );
-    out.insert("state".to_string(), Value::String(fixture.state.clone()));
+    out.insert(
+        "state".to_string(),
+        Value::String(fixture.state_for(account_id).to_string()),
+    );
     out.insert("list".to_string(), list);
     out.insert("notFound".to_string(), not_found);
     Ok(Value::Object(out))
@@ -1194,7 +1203,10 @@ fn thread_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let mut out = Map::new();
     out.insert("accountId".to_string(), Value::String(account_id.to_string()));
     out.insert("oldState".to_string(), Value::String(since_state.to_string()));
-    out.insert("newState".to_string(), Value::String(fixture.state.clone()));
+    out.insert(
+        "newState".to_string(),
+        Value::String(fixture.state_for(account_id).to_string()),
+    );
     out.insert("hasMoreChanges".to_string(), Value::Bool(false));
     out.insert(
         "created".to_string(),
@@ -1231,13 +1243,13 @@ fn thread_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
 fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?.to_string();
     if let Some(if_in_state) = args.get("ifInState").and_then(Value::as_str)
-        && if_in_state != fixture.state
+        && if_in_state != fixture.state_for(&account_id)
     {
         return Err(json!({
             "type": "stateMismatch",
             "description": format!(
                 "ifInState {if_in_state:?} does not match current state {:?}",
-                fixture.state,
+                fixture.state_for(&account_id),
             ),
         }));
     }
@@ -1264,7 +1276,12 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
     let mut destroyed_out: Vec<String> = Vec::new();
     let mut not_destroyed = Map::new();
 
-    let trans = fixture.mutate(|fix| {
+    // Capture this account's state token before and after the
+    // mutation: the aggregate `Transition` reports the *primary*
+    // account's tokens, so a write against a secondary account must
+    // read its own per-account token through `state_for`.
+    let old_state = fixture.state_for(&account_id).to_string();
+    fixture.mutate(|fix| {
         let mut diff = crate::fixture::MutationDiff::default();
 
         // Creates: assign a server id and append. Default field
@@ -1364,11 +1381,12 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
 
         diff
     });
+    let new_state = fixture.state_for(&account_id).to_string();
 
     Ok(set_response(
         &account_id,
-        &trans.from_state,
-        &trans.to_state,
+        &old_state,
+        &new_state,
         created_out,
         not_created,
         updated_out,
@@ -1524,13 +1542,13 @@ pub(crate) fn apply_email_patch(email: &mut Email, patch: &Value) -> Result<(), 
 fn mailbox_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?.to_string();
     if let Some(if_in_state) = args.get("ifInState").and_then(Value::as_str)
-        && if_in_state != fixture.state
+        && if_in_state != fixture.state_for(&account_id)
     {
         return Err(json!({
             "type": "stateMismatch",
             "description": format!(
                 "ifInState {if_in_state:?} does not match current state {:?}",
-                fixture.state,
+                fixture.state_for(&account_id),
             ),
         }));
     }
@@ -1557,7 +1575,10 @@ fn mailbox_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
     let mut destroyed_out: Vec<String> = Vec::new();
     let mut not_destroyed = Map::new();
 
-    let trans = fixture.mutate(|fix| {
+    // Per-account state token captured around the mutation; see the
+    // matching note in `email_set`.
+    let old_state = fixture.state_for(&account_id).to_string();
+    fixture.mutate(|fix| {
         let mut diff = crate::fixture::MutationDiff::default();
 
         for (client_id, body) in &creates {
@@ -1648,11 +1669,12 @@ fn mailbox_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
 
         diff
     });
+    let new_state = fixture.state_for(&account_id).to_string();
 
     Ok(set_response(
         &account_id,
-        &trans.from_state,
-        &trans.to_state,
+        &old_state,
+        &new_state,
         created_out,
         not_created,
         updated_out,
@@ -1879,7 +1901,7 @@ mod tests {
         let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         Fixture {
             name: "t".into(),
-            state: "s1".into(),
+            state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "acct".into(),
                 name: "a@b".into(),
@@ -1959,7 +1981,7 @@ mod tests {
             discovery: crate::fixture::DiscoveryConfig::default(),
             calendars: vec![],
             events: vec![],
-            change_log: crate::fixture::ChangeLog::default(),
+            account_logs: Default::default(),
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
@@ -2109,7 +2131,7 @@ mod tests {
         let mk = |y, m, d, hh| chrono::Utc.with_ymd_and_hms(y, m, d, hh, 0, 0).unwrap();
         Fixture {
             name: "q".into(),
-            state: "s1".into(),
+            state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "acct".into(),
                 name: "a@b".into(),
@@ -2149,7 +2171,7 @@ mod tests {
             discovery: crate::fixture::DiscoveryConfig::default(),
             calendars: vec![],
             events: vec![],
-            change_log: crate::fixture::ChangeLog::default(),
+            account_logs: Default::default(),
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
@@ -2391,7 +2413,7 @@ mod tests {
         let sent = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 9, 59, 50).unwrap();
         Fixture {
             name: "g".into(),
-            state: "s1".into(),
+            state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "acct".into(),
                 name: "a@b".into(),
@@ -2440,7 +2462,7 @@ mod tests {
             discovery: crate::fixture::DiscoveryConfig::default(),
             calendars: vec![],
             events: vec![],
-            change_log: crate::fixture::ChangeLog::default(),
+            account_logs: Default::default(),
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],

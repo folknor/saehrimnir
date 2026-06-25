@@ -802,7 +802,7 @@ async fn delta_messages_impl(
             "https://graph.microsoft.com/v1.0/$metadata#message",
             vec![],
             None,
-            Some(odata::build_delta_link(&host, &path, raw.as_deref(), &fixture.state)),
+            Some(odata::build_delta_link(&host, &path, raw.as_deref(), fixture.state_for(account_id))),
             None,
         ));
     }
@@ -812,7 +812,7 @@ async fn delta_messages_impl(
             "https://graph.microsoft.com/v1.0/$metadata#message",
             vec![],
             None,
-            Some(odata::build_delta_link(&host, &path, raw.as_deref(), &fixture.state)),
+            Some(odata::build_delta_link(&host, &path, raw.as_deref(), fixture.state_for(account_id))),
             None,
         ));
     }
@@ -844,7 +844,7 @@ async fn delta_messages_impl(
         ),
         None => (
             None,
-            Some(odata::build_delta_link(&host, &path, raw.as_deref(), &fixture.state)),
+            Some(odata::build_delta_link(&host, &path, raw.as_deref(), fixture.state_for(account_id))),
         ),
     };
 

@@ -97,7 +97,7 @@ async fn calendar_list(State(state): State<AppState>, headers: HeaderMap) -> Res
         .collect();
     ok_json(json!({
         "kind": "calendar#calendarList",
-        "etag": format!("etag-{}", fixture.state),
+        "etag": format!("etag-{}", fixture.state_for(&account_id)),
         "items": items,
     }))
 }
@@ -160,12 +160,12 @@ async fn list_events(
     //   `fullSyncRequired`. ratatoskr's recovery path matches on
     //   `"410"` or `"sync token"` substrings to drop the saved
     //   token and retry without it.
-    if params.sync_token.as_deref() == Some(fixture.state.as_str()) {
+    if params.sync_token.as_deref() == Some(fixture.state_for(&account_id)) {
         return ok_json(json!({
             "kind": "calendar#events",
             "summary": calendar,
             "items": [],
-            "nextSyncToken": fixture.state,
+            "nextSyncToken": fixture.state_for(&account_id),
         }));
     }
     if let Some(token) = params.sync_token.as_deref() {
@@ -194,7 +194,7 @@ async fn list_events(
             "kind": "calendar#events",
             "summary": calendar,
             "items": items,
-            "nextSyncToken": fixture.state,
+            "nextSyncToken": fixture.state_for(&account_id),
         }));
     }
 
@@ -231,7 +231,7 @@ async fn list_events(
     } else {
         body.insert(
             "nextSyncToken".into(),
-            Value::String(fixture.state.clone()),
+            Value::String(fixture.state_for(&account_id).to_string()),
         );
     }
     ok_json(Value::Object(body))

@@ -584,7 +584,7 @@ async fn delta_contacts_impl(
 
     if q.deltatoken.as_deref() == Some("latest") {
         let delta_link =
-            odata::build_delta_link(&host, &path, raw_query.as_deref(), &fixture.state);
+            odata::build_delta_link(&host, &path, raw_query.as_deref(), fixture.state_for(account_id));
         return ok_json(json!({
             "@odata.context": context,
             "value": [],
@@ -610,7 +610,7 @@ async fn delta_contacts_impl(
                 value.push(graph_contact_tombstone(id));
             }
             let delta_link =
-                odata::build_delta_link(&host, &path, raw_query.as_deref(), &fixture.state);
+                odata::build_delta_link(&host, &path, raw_query.as_deref(), fixture.state_for(account_id));
             return ok_json(json!({
                 "@odata.context": context,
                 "value": value,
@@ -665,7 +665,7 @@ async fn delta_contacts_impl(
                 &host,
                 &path,
                 raw_query.as_deref(),
-                &fixture.state,
+                fixture.state_for(account_id),
             )),
         );
     }

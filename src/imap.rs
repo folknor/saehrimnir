@@ -2626,7 +2626,7 @@ mod tests {
     fn fixture() -> crate::shared::FixtureHandle {
         crate::shared::handle(Fixture {
             name: "t".into(),
-            state: "s1".into(),
+            state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "a".into(),
                 name: "a@b".into(),
@@ -2638,7 +2638,7 @@ mod tests {
             discovery: crate::fixture::DiscoveryConfig::default(),
             calendars: vec![],
             events: vec![],
-            change_log: crate::fixture::ChangeLog::default(),
+            account_logs: Default::default(),
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],
@@ -2682,7 +2682,7 @@ mod tests {
         };
         let mut fix = Fixture {
             name: "f".into(),
-            state: "s1".into(),
+            state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "a".into(),
                 name: "a@b".into(),
@@ -2735,7 +2735,7 @@ mod tests {
             discovery: crate::fixture::DiscoveryConfig::default(),
             calendars: vec![],
             events: vec![],
-            change_log: crate::fixture::ChangeLog::default(),
+            account_logs: Default::default(),
             change_script: Vec::new(),
             contact_folders: vec![],
             contacts: vec![],

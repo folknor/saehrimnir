@@ -57,7 +57,10 @@ pub(crate) fn calendar_get(fixture: &Fixture, args: &Value) -> Result<Value, Val
 
     let mut out = Map::new();
     out.insert("accountId".into(), Value::String(account_id.to_string()));
-    out.insert("state".into(), Value::String(fixture.state.clone()));
+    out.insert(
+        "state".into(),
+        Value::String(fixture.state_for(account_id).to_string()),
+    );
     out.insert("list".into(), list);
     out.insert("notFound".into(), not_found);
     Ok(Value::Object(out))
@@ -123,7 +126,7 @@ pub(crate) fn calendar_changes(fixture: &Fixture, args: &Value) -> Result<Value,
     Ok(json!({
         "accountId": account_id,
         "oldState": since_state,
-        "newState": fixture.state,
+        "newState": fixture.state_for(account_id),
         "hasMoreChanges": false,
         "created": delta.created,
         "updated": delta.updated,
@@ -163,7 +166,10 @@ pub(crate) fn calendar_event_get(fixture: &Fixture, args: &Value) -> Result<Valu
 
     let mut out = Map::new();
     out.insert("accountId".into(), Value::String(account_id.to_string()));
-    out.insert("state".into(), Value::String(fixture.state.clone()));
+    out.insert(
+        "state".into(),
+        Value::String(fixture.state_for(account_id).to_string()),
+    );
     out.insert("list".into(), list);
     out.insert("notFound".into(), not_found);
     Ok(Value::Object(out))
@@ -416,7 +422,7 @@ pub(crate) fn calendar_event_changes(
     // so use the cross-calendar walker. Per-calendar dominance
     // (created+destroyed cancels) already applied by
     // `apply_dominance_and_dedup` inside `delta_since`.
-    let delta = fixture.event_delta_since_any(since_state).ok_or_else(|| {
+    let delta = fixture.event_delta_since_any(since_state, account_id).ok_or_else(|| {
         json!({
             "type": "cannotCalculateChanges",
             "description": format!(
@@ -429,7 +435,7 @@ pub(crate) fn calendar_event_changes(
     Ok(json!({
         "accountId": account_id,
         "oldState": since_state,
-        "newState": fixture.state,
+        "newState": fixture.state_for(account_id),
         "hasMoreChanges": false,
         "created": delta.created,
         "updated": delta.updated,
@@ -500,7 +506,10 @@ pub(crate) fn calendar_event_query(fixture: &Fixture, args: &Value) -> Result<Va
 
     let mut out = Map::new();
     out.insert("accountId".into(), Value::String(account_id.to_string()));
-    out.insert("queryState".into(), Value::String(fixture.state.clone()));
+    out.insert(
+        "queryState".into(),
+        Value::String(fixture.state_for(account_id).to_string()),
+    );
     out.insert("canCalculateChanges".into(), Value::Bool(false));
     out.insert("position".into(), Value::Number(position.into()));
     out.insert("ids".into(), Value::Array(ids));
@@ -637,13 +646,13 @@ pub(crate) fn calendar_event_set(
 ) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?.to_string();
     if let Some(if_in_state) = args.get("ifInState").and_then(Value::as_str)
-        && if_in_state != fixture.state
+        && if_in_state != fixture.state_for(&account_id)
     {
         return Err(json!({
             "type": "stateMismatch",
             "description": format!(
                 "ifInState {if_in_state:?} does not match current state {:?}",
-                fixture.state,
+                fixture.state_for(&account_id),
             ),
         }));
     }
@@ -675,7 +684,8 @@ pub(crate) fn calendar_event_set(
     let mut destroyed_out: Vec<String> = Vec::new();
     let mut not_destroyed = Map::new();
 
-    let trans = fixture.mutate(|fix| {
+    let old_state = fixture.state_for(&account_id).to_string();
+    fixture.mutate(|fix| {
         let mut diff = MutationDiff::default();
 
         for (client_id, body) in &creates {
@@ -726,11 +736,12 @@ pub(crate) fn calendar_event_set(
 
         diff
     });
+    let new_state = fixture.state_for(&account_id).to_string();
 
     Ok(json!({
         "accountId": account_id,
-        "oldState": trans.from_state,
-        "newState": trans.to_state,
+        "oldState": old_state,
+        "newState": new_state,
         "created": if created_out.is_empty() { Value::Null } else { Value::Object(created_out) },
         "notCreated": if not_created.is_empty() { Value::Null } else { Value::Object(not_created) },
         "updated": if updated_out.is_empty() { Value::Null } else { Value::Object(updated_out) },
