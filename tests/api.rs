@@ -2733,6 +2733,100 @@ async fn multi_account_mailbox_changes_partition_by_account() {
 }
 
 #[tokio::test]
+async fn multi_account_secondary_write_does_not_move_primary_state() {
+    // Faithful mirror of the ratatoskr `mutate_other_account`
+    // scenario, the regression notes/per-account-state.md targets:
+    //   1. Initial sync of primary -> persist primary's Email state
+    //      token S_p (the value Email/get returns).
+    //   2. Raw Email/set on the SECONDARY flips $seen. Its own
+    //      newState must advance (oldState != newState) ...
+    //   3. ... but primary's Email/changes(sinceState = S_p) must
+    //      report newState == S_p with empty arrays, so ratatoskr
+    //      issues zero Email/get. The pre-per-account-state mock
+    //      bumped one global counter on step 2 and reported
+    //      primary's whole object set as `updated` in step 3.
+    let app = multi_account_router();
+
+    // Step 1: primary's baseline Email state token.
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({ "accountId": "account-primary", "ids": [] }),
+        "c0",
+    )
+    .await;
+    let s_p = v["methodResponses"][0][1]["state"].as_str().unwrap().to_string();
+
+    // Step 2: secondary write advances the SECONDARY's token only.
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-secondary",
+            "update": { "email-secondary-001": { "keywords/$seen": true } },
+        }),
+        "c1",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["updated"], json!({ "email-secondary-001": null }));
+    assert_ne!(
+        body["oldState"], body["newState"],
+        "secondary write must advance the secondary's own state token: {body}"
+    );
+
+    // Step 3: primary's delta is a no-op. newState == S_p, no objects.
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({ "accountId": "account-primary", "sinceState": s_p }),
+        "c2",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(
+        body["newState"],
+        json!(s_p),
+        "secondary write moved primary's Email state token: {body}"
+    );
+    assert_eq!(body["created"], json!([]), "primary leaked a created: {body}");
+    assert_eq!(body["updated"], json!([]), "primary leaked an updated: {body}");
+    assert_eq!(body["destroyed"], json!([]), "primary leaked a destroyed: {body}");
+
+    // Mailbox mirror: the same isolation for Mailbox/changes.
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/get",
+        json!({ "accountId": "account-primary", "ids": [] }),
+        "c3",
+    )
+    .await;
+    let mb_s_p = v["methodResponses"][0][1]["state"].as_str().unwrap().to_string();
+    jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({
+            "accountId": "account-secondary",
+            "create": { "scratch": { "name": "Scratch" } },
+        }),
+        "c4",
+    )
+    .await;
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/changes",
+        json!({ "accountId": "account-primary", "sinceState": mb_s_p }),
+        "c5",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["newState"], json!(mb_s_p), "secondary write moved primary's Mailbox state: {body}");
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["updated"], json!([]));
+    assert_eq!(body["destroyed"], json!([]));
+}
+
+#[tokio::test]
 async fn multi_account_email_query_scopes_by_accountid() {
     // The query path is Email/query with a filter; assert that
     // primary's filter sees only primary's emails.
