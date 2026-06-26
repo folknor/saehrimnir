@@ -259,6 +259,112 @@ async fn history_endpoint_is_stable_no_op() {
     assert_eq!(v["historyId"], "1");
 }
 
+// ── Messages (bifrost's message-centric backfill) ──────────────────
+//
+// bifrost lists `messages` (not `threads`) and hydrates each via
+// `messages.get`. These routes are what unblock its backfill.
+
+#[tokio::test]
+async fn list_messages_returns_messages_in_recent_order() {
+    let (status, v) = get_json("/gmail/v1/users/me/messages").await;
+    assert_eq!(status, StatusCode::OK);
+    let messages = v["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    // email-002 is newer (11:00), so it sorts first.
+    assert_eq!(messages[0]["id"], "email-002");
+    assert_eq!(messages[0]["threadId"], "email-002");
+    assert_eq!(messages[1]["id"], "email-001");
+    assert!(v.get("nextPageToken").is_none());
+    assert_eq!(v["resultSizeEstimate"], 2);
+}
+
+#[tokio::test]
+async fn list_messages_paginates_via_next_page_token() {
+    let (_status, v) = get_json("/gmail/v1/users/me/messages?maxResults=1").await;
+    let messages = v["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["id"], "email-002");
+    let token = v["nextPageToken"].as_str().unwrap();
+    let (_status, v2) =
+        get_json(&format!("/gmail/v1/users/me/messages?maxResults=1&pageToken={token}")).await;
+    let messages = v2["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["id"], "email-001");
+    assert!(v2.get("nextPageToken").is_none());
+}
+
+#[tokio::test]
+async fn list_messages_filter_after_drops_older() {
+    let (_status, v) = get_json("/gmail/v1/users/me/messages?q=after%3A2026%2F1%2F16").await;
+    assert_eq!(v["messages"].as_array().unwrap().len(), 0);
+
+    let (_status, v) = get_json("/gmail/v1/users/me/messages?q=after%3A2026%2F1%2F1").await;
+    assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn list_messages_unparseable_q_returns_400() {
+    // Same strict contract as `list_threads`: an unsupported query
+    // operator is a hard 400, never a silent full-list dump.
+    let (status, v) = get_json("/gmail/v1/users/me/messages?q=is%3Aunread").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["errors"][0]["reason"], "invalidQuery");
+}
+
+#[tokio::test]
+async fn get_message_full_returns_payload_and_labels() {
+    let (status, v) = get_json("/gmail/v1/users/me/messages/email-001?format=full").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "email-001");
+    assert_eq!(v["threadId"], "email-001");
+    let label_ids: Vec<&str> = v["labelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(label_ids.contains(&"INBOX"));
+    assert!(label_ids.contains(&"UNREAD"));
+    let id = v["internalDate"].as_str().unwrap();
+    assert!(id.parse::<i64>().is_ok(), "got: {id:?}");
+    // Same payload projection as the thread surface emits per message.
+    assert_eq!(v["payload"]["mimeType"], "text/plain");
+    assert_eq!(v["payload"]["body"]["data"], "Rmlyc3QgbWVzc2FnZSBib2R5Lg");
+}
+
+#[tokio::test]
+async fn get_message_default_format_emits_payload() {
+    // No `format=` defaults to `full`, so the structured payload is
+    // present.
+    let (status, v) = get_json("/gmail/v1/users/me/messages/email-001").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v["payload"].is_object());
+}
+
+#[tokio::test]
+async fn get_message_raw_emits_top_level_raw_and_drops_payload() {
+    // bifrost's `raw_bytes()` reads a top-level base64url `raw` field
+    // and errors `ParseFailed` without it; `format=raw` swaps the
+    // structured payload for the assembled RFC 822 bytes.
+    let (status, v) = get_json("/gmail/v1/users/me/messages/email-001?format=raw").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "email-001");
+    assert!(v.get("payload").is_none(), "raw format must drop payload");
+    let raw = v["raw"].as_str().unwrap();
+    assert!(!raw.is_empty());
+    // base64url, no padding.
+    assert!(!raw.contains('='));
+    assert!(!raw.contains('+'));
+    assert!(!raw.contains('/'));
+}
+
+#[tokio::test]
+async fn get_message_unknown_returns_404_with_gmail_envelope() {
+    let (status, v) = get_json("/gmail/v1/users/me/messages/ghost").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], 404);
+    assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
+}
+
 #[tokio::test]
 async fn attachment_fetch_returns_404_for_missing_blobs() {
     // v0 fixtures have no attachments; any call gets the canonical
@@ -517,6 +623,27 @@ async fn get_thread_callback_passes_thread_id_to_script() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
     assert_eq!(v["error"]["message"], "asked for abc-123");
+}
+
+#[tokio::test]
+async fn get_message_callback_passes_message_id_to_script() {
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        on("gmail", "get_message", function(req)
+            return { status = "notFound", message = "asked for " .. req.message_id }
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let (status, v) = get_json_via(
+        router,
+        "/gmail/v1/users/me/messages/msg-xyz?format=full",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
+    assert_eq!(v["error"]["message"], "asked for msg-xyz");
 }
 
 /// HTTP middleware records `(protocol="gmail", command="GET <path>",

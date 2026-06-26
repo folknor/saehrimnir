@@ -40,6 +40,8 @@ pub fn router() -> Router<AppState> {
         .route("/gmail/v1/users/me/labels", get(list_labels))
         .route("/gmail/v1/users/me/threads", get(list_threads))
         .route("/gmail/v1/users/me/threads/{thread_id}", get(get_thread))
+        .route("/gmail/v1/users/me/messages", get(list_messages))
+        .route("/gmail/v1/users/me/messages/{message_id}", get(get_message))
         .route("/gmail/v1/users/me/history", get(history))
         .route(
             "/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}",
@@ -555,6 +557,134 @@ fn format_address_list(xs: &[Address]) -> String {
         .join(", ")
 }
 
+// ── Messages ────────────────────────────────────────────────────────
+//
+// bifrost's GoogleAccount is message-centric: it backfills via
+// `messages.list` (page 1 of which is the very first backfill call)
+// and hydrates each result through `messages.get`. The legacy
+// thread-centric surface above does not satisfy it, so these two
+// routes are required for the Gmail sync gates to pass.
+
+async fn list_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Some(r) = super::maybe_override(&state, "list_messages", |_s| Ok(())) {
+        return r;
+    }
+    let account_id = bearer_account(&state, &headers);
+    let q = parse_query(raw.as_deref());
+    let max = q
+        .max_results
+        .unwrap_or(THREADS_DEFAULT_MAX)
+        .clamp(1, THREADS_HARD_MAX);
+    let offset = q.offset();
+
+    let fixture = state.fixture();
+    let mut messages: Vec<&Email> = fixture.emails_for(&account_id).collect();
+    if let Some(after_q) = &q.q {
+        // Same `after:YYYY/M/D`-only contract as `list_threads`: any
+        // other query shape is a hard 400 rather than a silent
+        // full-list bleed-through. See `list_threads` for the rationale.
+        let Some(date) = parse_after_query(after_q) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                &format!("v0 mock only supports q=after:YYYY/M/D (got {after_q:?})"),
+                "invalidQuery",
+            );
+        };
+        let cutoff = chrono::Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default());
+        messages.retain(|e| e.received_at >= cutoff);
+    }
+    // Most-recent message first; id-lex tiebreak for byte determinism.
+    messages.sort_by(|a, b| {
+        b.received_at
+            .cmp(&a.received_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let total = messages.len();
+    let page: Vec<Value> = messages
+        .iter()
+        .skip(offset as usize)
+        .take(max as usize)
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "threadId": e.thread_id,
+            })
+        })
+        .collect();
+
+    let next_page_token = if (offset as usize) + page.len() < total {
+        Some(encode_token((offset as usize) + page.len()))
+    } else {
+        None
+    };
+
+    let mut body = serde_json::Map::new();
+    body.insert("messages".to_string(), Value::Array(page));
+    if let Some(t) = next_page_token {
+        body.insert("nextPageToken".to_string(), Value::String(t));
+    }
+    body.insert(
+        "resultSizeEstimate".to_string(),
+        Value::Number((total as u64).into()),
+    );
+    ok_json(Value::Object(body))
+}
+
+async fn get_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(message_id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let message_id_lua = message_id.clone();
+    if let Some(r) = super::maybe_override(&state, "get_message", move |s| {
+        crate::lua::req_set_str(s, "message_id", &message_id_lua)
+    }) {
+        return r;
+    }
+    let account_id = bearer_account(&state, &headers);
+    let q = parse_query(raw.as_deref());
+    let fixture = state.fixture();
+    let Some(e) = fixture.emails_for(&account_id).find(|e| e.id == message_id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("message {message_id:?} not found"),
+            "notFound",
+        );
+    };
+
+    // `metadata` / `full` / `minimal` all share the structured
+    // `message_value` projection - bifrost reads the same camelCase
+    // shape for each (it parses leniently, ignoring the payload it
+    // doesn't need for the lighter formats). `raw` is the exception:
+    // bifrost's `raw_bytes()` reads a top-level base64url `raw` field
+    // and errors `ParseFailed` without it, so that format drops the
+    // structured `payload` and emits the assembled RFC 822 bytes
+    // instead - matching real Gmail's `format=raw` shape.
+    let format = q.format.as_deref().unwrap_or("full");
+    if format == "raw" {
+        let mut obj = match message_value(e, &fixture) {
+            Value::Object(m) => m,
+            // message_value always builds an object; the arm is
+            // structural, not reachable.
+            other => return ok_json(other),
+        };
+        obj.remove("payload");
+        let bytes = crate::imap::assembled_rfc822(e);
+        obj.insert(
+            "raw".to_string(),
+            Value::String(base64url_no_pad(bytes.as_bytes())),
+        );
+        return ok_json(Value::Object(obj));
+    }
+    ok_json(message_value(e, &fixture))
+}
+
 // ── History ─────────────────────────────────────────────────────────
 
 async fn history(State(state): State<AppState>) -> Response {
@@ -740,9 +870,9 @@ struct GmailQuery {
     q: Option<String>,
     max_results: Option<u32>,
     page_token: Option<String>,
-    /// `format` parameter on thread/message GETs - tracked for
-    /// completeness but the mock always emits the full shape.
-    #[allow(dead_code)]
+    /// `format` parameter on message GETs (`metadata` / `full` /
+    /// `minimal` / `raw`). Drives the `messages.get` projection;
+    /// `raw` swaps the structured payload for assembled RFC 822 bytes.
     format: Option<String>,
 }
 

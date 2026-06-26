@@ -708,6 +708,14 @@ Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`
 + `/labels` + `/threads` (list paginated by `nextPageToken`, with
 `q=after:YYYY/M/D` filtering) + `/threads/{id}` (full MIME payload
 projection of fixture emails into Gmail's nested mimePart shape) +
+`/messages` (message-centric list - bifrost's `GoogleAccount`
+backfills via `messages.list`, not `threads`; same `q=after:` /
+`t.<offset>` paging contract, `{id, threadId}` entries) +
+`/messages/{id}?format=metadata|full|minimal|raw` (per-message
+hydration; `metadata`/`full`/`minimal` reuse the thread surface's
+`message_value` projection, `raw` drops `payload` for a top-level
+base64url `raw` of the assembled RFC 822 bytes that bifrost's
+`raw_bytes()` requires) +
 `/history` (read-only no-op since fixtures don't change) +
 `/messages/{id}/attachments/{aid}` (404 stub) + `/settings/sendAs`
 (list + per-address GET + PATCH). SendAs identities project from

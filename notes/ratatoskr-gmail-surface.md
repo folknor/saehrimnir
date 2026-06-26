@@ -126,6 +126,53 @@ Returns a `GmailThread` with nested `messages[]`. Each message has
 the wire shape described under "Message model" below
 (`api.rs:103-111`, `storage.rs:25`).
 
+### Message list (bifrost's message-centric backfill)
+
+```
+GET /gmail/v1/users/me/messages
+    ?q=after:YYYY/M/D
+    &maxResults=100
+    &pageToken=<token>
+```
+
+bifrost's `GoogleAccount` is message-centric, not thread-centric: it
+backfills via `messages.list` (page 1 is the first backfill call) and
+hydrates each result through `messages.get`. The legacy `threads`
+surface does not satisfy it.
+
+Response:
+
+```json
+{
+  "messages": [
+    {"id": "<message-id>", "threadId": "<thread-id>"},
+    ...
+  ],
+  "nextPageToken": "<opaque>",
+  "resultSizeEstimate": 42
+}
+```
+
+Same `q=after:YYYY/M/D`-only / `t.<offset>` paging contract as the
+thread list. Most-recent message first, id-lex tiebreak. An
+unsupported `q=` shape is a hard 400 (`reason: invalidQuery`), never
+a silent full-list dump.
+
+### Message fetch (per-message hydration)
+
+```
+GET /gmail/v1/users/me/messages/{messageId}?format=metadata|full|minimal|raw
+```
+
+`metadata` / `full` / `minimal` share the structured `message_value`
+projection (the "Message model" shape below); bifrost parses each
+leniently. `raw` is the exception: it drops the structured `payload`
+and emits a top-level base64url `raw` field carrying the assembled
+RFC 822 bytes (the same `assembled_rfc822` the IMAP `BODY[]` and
+Graph `$value` paths use). bifrost's `raw_bytes()` reads that field
+and errors `ParseFailed` without it. Default format is `full`.
+Unknown id -> 404 (`reason: notFound`).
+
 ### Message attachment fetch
 
 ```
