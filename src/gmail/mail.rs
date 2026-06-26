@@ -759,6 +759,14 @@ async fn get_attachment(
     headers: HeaderMap,
     Path((message_id, attachment_id)): Path<(String, String)>,
 ) -> Response {
+    let message_id_lua = message_id.clone();
+    let attachment_id_lua = attachment_id.clone();
+    if let Some(r) = super::maybe_override(&state, "get_attachment", move |s| {
+        crate::lua::req_set_str(s, "message_id", &message_id_lua)?;
+        crate::lua::req_set_str(s, "attachment_id", &attachment_id_lua)
+    }) {
+        return r;
+    }
     let account_id = bearer_account(&state, &headers);
     state
         .shared

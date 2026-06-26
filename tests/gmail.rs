@@ -646,6 +646,30 @@ async fn get_message_callback_passes_message_id_to_script() {
     assert_eq!(v["error"]["message"], "asked for msg-xyz");
 }
 
+#[tokio::test]
+async fn get_attachment_callback_passes_both_path_segments_to_script() {
+    let scenario = r#"
+        fixture({ name = "cb" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        on("gmail", "get_attachment", function(req)
+            return {
+                status = "notFound",
+                message = "asked for " .. req.message_id .. "/" .. req.attachment_id,
+            }
+        end)
+    "#;
+    let router = router_with_lua_scenario(scenario);
+    let (status, v) = get_json_via(
+        router,
+        "/gmail/v1/users/me/messages/msg-xyz/attachments/blob-abc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
+    assert_eq!(v["error"]["message"], "asked for msg-xyz/blob-abc");
+}
+
 /// HTTP middleware records `(protocol="gmail", command="GET <path>",
 /// detail.query)` per request. Mirrors the Graph version.
 #[tokio::test]
