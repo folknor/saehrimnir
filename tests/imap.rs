@@ -821,6 +821,84 @@ async fn uid_expunge_without_deleted_flag_is_noop() {
     assert!(post.contains("* 2 FETCH (UID 2)"));
 }
 
+// ── CONDSTORE / QRESYNC (RFC 7162) ─────────────────────────────────
+
+/// bifrost opens folders with `SELECT INBOX (CONDSTORE)` (RFC 7162
+/// 3.1.1). The mock must accept the select-parameter group instead of
+/// rejecting the trailing parens as junk (which used to reply BAD and
+/// is the gap codex shimmed around with an MITM proxy). QRESYNC's
+/// `(QRESYNC (<uidvalidity> <modseq>))` form is accepted too.
+#[tokio::test]
+async fn select_accepts_condstore_and_qresync_select_parameters() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\" (CONDSTORE)\r\n\
+        c EXAMINE \"INBOX\" (QRESYNC (1 1))\r\n\
+        d LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+    assert!(out.contains("b OK [READ-WRITE] SELECT completed"), "got: {out}");
+    assert!(out.contains("c OK [READ-ONLY] EXAMINE completed"), "got: {out}");
+    // A baseline (never-mutated) fixture reports HIGHESTMODSEQ 1.
+    assert!(out.contains("* OK [HIGHESTMODSEQ 1] modseq"), "got: {out}");
+    // No expunges on a fresh fixture: QRESYNC emits no VANISHED.
+    assert!(!out.contains("VANISHED"), "unexpected VANISHED: {out}");
+}
+
+/// The real CONDSTORE delta path the cut exists to prove: a flag write
+/// advances the account modseq, so a follow-up `FETCH (CHANGEDSINCE
+/// <old>)` returns only the mutated message (carrying its new MODSEQ),
+/// and SELECT reports the advanced HIGHESTMODSEQ.
+#[tokio::test]
+async fn condstore_changedsince_returns_only_mutated_message() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\" (CONDSTORE)\r\n\
+        c UID STORE 2 +FLAGS (\\Answered)\r\n\
+        d SELECT \"INBOX\" (CONDSTORE)\r\n\
+        e UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE 1)\r\n\
+        f LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+
+    // Before the write, HIGHESTMODSEQ is the baseline 1. After the
+    // write bumps the account counter, the re-SELECT reports 2.
+    let post_store = out.split("c OK UID STORE completed").nth(1).expect("post-store");
+    assert!(
+        post_store.contains("* OK [HIGHESTMODSEQ 2] modseq"),
+        "highestmodseq did not advance: {out}"
+    );
+
+    // CHANGEDSINCE 1 returns ONLY uid 2 (modseq 2 > 1); uid 1 is
+    // untouched (modseq 1, not > 1) and is filtered out.
+    let delta = out.split("d OK [READ-WRITE] SELECT completed").nth(1).expect("post-reselect");
+    let delta = delta.split("e OK UID FETCH completed").next().expect("delta window");
+    assert!(delta.contains("UID 2"), "mutated message missing: {delta}");
+    assert!(delta.contains("MODSEQ (2)"), "advanced modseq missing: {delta}");
+    assert!(!delta.contains("UID 1 "), "untouched message leaked into delta: {delta}");
+    assert!(!delta.contains("* 1 FETCH"), "untouched message leaked into delta: {delta}");
+}
+
+/// QRESYNC expunge-delta: after a message is expunged its UID-history
+/// slot retires to `None`. Re-opening with `SELECT (QRESYNC (... <known
+/// uids>))` reports it via `* VANISHED (EARLIER) <uid>`, bounded to the
+/// client's known-UID set.
+#[tokio::test]
+async fn qresync_select_emits_vanished_for_expunged_uid() {
+    let script = b"\
+        a LOGIN \"u\" \"p\"\r\n\
+        b SELECT \"INBOX\"\r\n\
+        c UID STORE 1 +FLAGS (\\Deleted)\r\n\
+        d UID EXPUNGE 1\r\n\
+        e SELECT \"INBOX\" (QRESYNC (1 1 1:2))\r\n\
+        f LOGOUT\r\n";
+    let out = run_with_imap_small(script).await;
+    assert!(out.contains("d OK UID EXPUNGE completed"), "expunge failed: {out}");
+    let reopen = out.split("d OK UID EXPUNGE completed").nth(1).expect("post-expunge");
+    assert!(
+        reopen.contains("* VANISHED (EARLIER) 1\r\n"),
+        "VANISHED missing for expunged uid: {reopen}"
+    );
+}
+
 // ── Multi-account (Stage 4: AUTH-driven account binding) ────────────
 
 async fn run_with_multi_account(

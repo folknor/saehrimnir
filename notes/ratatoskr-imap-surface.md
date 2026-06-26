@@ -96,7 +96,17 @@ NOT advertised in v0:
 ## SELECT / EXAMINE / folder state
 
 - Command: `SELECT folder` (read-write) before any UID FETCH or UID
-  SEARCH. `client/sync.rs:34`.
+  SEARCH. `client/sync.rs:34`. bifrost opens with the RFC 7162
+  CONDSTORE select-parameter: `SELECT INBOX (CONDSTORE)`. The mock
+  parses the `(...)` select-parameter group (`parse_select_args`):
+  `CONDSTORE` is accepted, and `QRESYNC (<uidvalidity> <modseq>
+  [<known-uids> [<seq-match-data>]])` is accepted too (the
+  `uidvalidity` / `modseq` / seq-match elements are parsed for syntax
+  but not acted on - UIDVALIDITY is pinned and VANISHED is resolved
+  from UID history; the optional known-UID set bounds VANISHED output).
+  An unknown select-param or any trailing junk replies `BAD`. Before
+  this, the name-only astring parser rejected the trailing parens and
+  replied `BAD` to bifrost's real SELECT.
 - Untagged responses parsed, in any order, until the tagged OK:
   - `* <n> EXISTS` - total messages.
   - `* OK [UIDVALIDITY <u32>]` - folder identity. Cached per-folder;
@@ -105,7 +115,17 @@ NOT advertised in v0:
   - `* OK [UIDNEXT <u32>]` - predicted next UID.
   - `* <n> RECENT` - parsed by async_imap, not actively used.
   - `* OK [HIGHESTMODSEQ <u64>]` - required for CONDSTORE/QRESYNC
-    paths. Cached per-folder.
+    paths. Cached per-folder. Real value: `Fixture::imap_highestmodseq`
+    = the per-account change counter plus one, so it is `1` on a
+    never-mutated fixture and advances on every mutation.
+  - `* VANISHED (EARLIER) <uids>` - emitted only when the client
+    opened with a `(QRESYNC (...))` parameter. Lists UIDs whose
+    history slot has retired to `None` (expunged / moved out /
+    destroyed), bounded to the client's known-UID set when supplied.
+    Lets a QRESYNC client prune expunged messages without the
+    `UID SEARCH ALL` diff. bifrost itself opens with CONDSTORE (not
+    QRESYNC), so it uses the SEARCH-diff path; VANISHED is available
+    for any QRESYNC-capable client.
   - `* FLAGS (\Seen \Flagged \Draft ...)` - supported flags.
   - `* OK [PERMANENTFLAGS (\Seen \Flagged \* ...)]` - flags clients
     can set/create. The `\*` token signals custom-keyword support
@@ -139,9 +159,15 @@ enabled (`research/bifrost/crates/imap/src/account/inventory.rs:225-231`,
   serves it via `render_envelope`.
 - bifrost APPENDS `MODSEQ` to the attr list because we advertise
   `CONDSTORE QRESYNC`, and rejects a value of 0
-  (`folder_registry.rs` "FETCH returned MODSEQ 0"). The mock emits
-  `MODSEQ (1)` per message, consistent with the pinned
-  `HIGHESTMODSEQ 1`.
+  (`folder_registry.rs` "FETCH returned MODSEQ 0"). The mock emits a
+  real per-message `MODSEQ (<n>)`: `Fixture::email_modseq` resolves to
+  the change-log counter of the email's last create/update plus one
+  (baseline 1 for an email untouched since load). On a never-mutated
+  fixture every message reports `MODSEQ (1)`, matching the baseline
+  `HIGHESTMODSEQ 1`; after a mutation the touched message's modseq
+  advances. When `CHANGEDSINCE` is present the mock also auto-appends
+  `MODSEQ` to the response even if the client did not list it
+  (RFC 7162 3.1.4.1).
 
 Before both were parsed, the unknown attr made `parse_fetch_attrs`
 return `None` and the whole `UID FETCH` replied `BAD`, breaking
@@ -154,7 +180,10 @@ bifrost's initial mail sync right after SELECT.
   `client/commands.rs:9-33`.
 - Flag changes (CONDSTORE): `UID FETCH 1:* (FLAGS) (CHANGEDSINCE
   <modseq>)`. Returns only flags for messages changed since cached
-  HIGHESTMODSEQ. `client/commands.rs:293-320`.
+  HIGHESTMODSEQ. `client/commands.rs:293-320`. The mock honours this
+  per-message: it keeps only emails whose `email_modseq` exceeds the
+  given value, so a message touched since the client's cached modseq
+  surfaces while untouched ones are filtered out.
 - Flag changes (no CONDSTORE): `UID FETCH 1:* (FLAGS)` - full sweep,
   diffed client-side. `client/commands.rs:366-393`.
 - Deletion detection: `UID SEARCH ALL` to enumerate live UIDs; client
@@ -189,10 +218,15 @@ sync run:
   non-CONDSTORE flag syncs (10-5 min intervals).
   `imap_delta_janitor.rs:16-21`.
 
-These must remain stable across runs. v0 mock pins UIDVALIDITY to 1
-and derives HIGHESTMODSEQ from `Fixture::state`, so each mutation
-that bumps state (JMAP `Email/set`, IMAP `UID STORE`/`COPY`/
-`EXPUNGE`, change-script `email_*` ops) advances HIGHESTMODSEQ.
+These must remain stable across runs. The mock pins UIDVALIDITY to 1
+and derives HIGHESTMODSEQ from the per-account change counter
+(`Fixture::imap_highestmodseq` = counter + 1), so each mutation that
+bumps the account's log (JMAP `Email/set`, IMAP `UID STORE`/`COPY`/
+`EXPUNGE`, change-script `email_*` ops) advances HIGHESTMODSEQ, and
+the per-message `MODSEQ` (`Fixture::email_modseq`) reflects each
+email's own last-change counter. A never-mutated fixture still
+reports `HIGHESTMODSEQ 1` / `MODSEQ (1)`, so byte-stable baseline
+snapshots are unchanged.
 
 UID stability (RFC 3501 §2.3.1.1): once assigned, a UID never
 refers to a different message in the same `(UIDVALIDITY, mailbox)`

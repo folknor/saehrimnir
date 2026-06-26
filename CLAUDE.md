@@ -494,9 +494,24 @@ IMAP: complete for v0's read path (greeting, `CAPABILITY`, `LOGIN`/
 `CLOSE`, `UID SEARCH`, `UID FETCH` with full RFC 822 body emission
 including `multipart/mixed` for fixtures with attachments,
 `ENVELOPE` (RFC 3501 7.4.2 structured envelope), `BODYSTRUCTURE`,
-`BODY[N]` and `BODY[N.MIME]` sub-part fetch, CONDSTORE `CHANGEDSINCE`
-plus per-message `MODSEQ` (pinned at 1, matching the pinned
-`HIGHESTMODSEQ`; non-zero so bifrost's modseq cache accepts it).
+`BODY[N]` and `BODY[N.MIME]` sub-part fetch, the RFC 7162 CONDSTORE /
+QRESYNC delta surface: `SELECT`/`EXAMINE` parse the `(CONDSTORE)` and
+`(QRESYNC (<uidvalidity> <modseq> [<known-uids>]))` select-parameters
+(`parse_select_args`; an unknown param or trailing junk replies
+`BAD`); `HIGHESTMODSEQ` is real (`Fixture::imap_highestmodseq` =
+per-account change counter + 1, so `1` on a never-mutated fixture and
+advancing on every mutation); per-message `MODSEQ`
+(`Fixture::email_modseq`) is the email's own last-change counter + 1;
+`UID FETCH ... (CHANGEDSINCE <n>)` filters per-message on that real
+modseq (and auto-appends `MODSEQ` to the response per RFC 7162
+3.1.4.1) so a mutated message surfaces in the next delta FETCH while
+untouched ones are skipped; and a `(QRESYNC ...)` `SELECT` emits
+`* VANISHED (EARLIER) <uids>` for expunged UID-history slots, bounded
+to the client's known-UID set. A never-mutated fixture still reports
+`HIGHESTMODSEQ 1` / `MODSEQ (1)`, so baseline snapshots stay
+byte-stable. This closed the gap that made bifrost's real
+`SELECT INBOX (CONDSTORE)` reply `BAD` (the reason an MITM proxy was
+shimmed in upstream; it can now be deleted).
 bifrost's inventory FETCH is `(UID FLAGS ENVELOPE RFC822.SIZE
 MODSEQ)` - it always requests `ENVELOPE` and appends `MODSEQ`
 because we advertise `CONDSTORE QRESYNC`, so without those two the

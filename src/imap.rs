@@ -597,7 +597,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 "RECENT" => "RECENT 0".to_string(),
                 "UIDNEXT" => format!("UIDNEXT {}", counts.uidnext),
                 "UIDVALIDITY" => "UIDVALIDITY 1".to_string(),
-                "HIGHESTMODSEQ" => "HIGHESTMODSEQ 1".to_string(),
+                "HIGHESTMODSEQ" => {
+                    let hms = self.fix_read().imap_highestmodseq(&self.account_id);
+                    format!("HIGHESTMODSEQ {hms}")
+                }
                 _ => continue,
             };
             items.push(pair);
@@ -626,14 +629,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 .write_line(&format!("{tag} BAD SELECT requires authentication"))
                 .await;
         }
-        let name = match parse_one_astring(args) {
-            Some(n) => n,
+        // RFC 7162 select-parameters ride after the mailbox name:
+        // bifrost sends `SELECT INBOX (CONDSTORE)`, and a QRESYNC-capable
+        // client may send `SELECT INBOX (QRESYNC (<uidvalidity> <modseq>
+        // [<known-uids>]))`. Parsing them (vs. the old name-only astring,
+        // which rejected the trailing paren group as junk and replied
+        // BAD) is what lets bifrost's real CONDSTORE SELECT land.
+        let select = match parse_select_args(args) {
+            Some(s) => s,
             None => {
                 return self
-                    .write_line(&format!("{tag} BAD SELECT expects \"name\""))
+                    .write_line(&format!("{tag} BAD SELECT expects \"name\" [(modifiers)]"))
                     .await;
             }
         };
+        let name = select.name.clone();
         let entries = list_mailboxes(&self.fix_read(), &self.account_id);
         let entry = entries.iter().find(|e| e.path.eq_ignore_ascii_case(&name));
         let Some(entry) = entry else {
@@ -677,7 +687,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .await?;
         self.write_line(&format!("* OK [UIDNEXT {}] predicted next UID", counts.uidnext))
             .await?;
-        self.write_line("* OK [HIGHESTMODSEQ 1] modseq pinned").await?;
+        let highestmodseq = self.fix_read().imap_highestmodseq(&self.account_id);
+        self.write_line(&format!("* OK [HIGHESTMODSEQ {highestmodseq}] modseq"))
+            .await?;
+
+        // RFC 7162 QRESYNC: when the client opened with a
+        // `(QRESYNC (...))` parameter, report the UIDs that have been
+        // expunged so it can prune its cache without a full `UID SEARCH
+        // ALL` diff. We resolve "gone" straight from the mailbox's UID
+        // history (a retired slot is `None`), bounded to the client's
+        // known-UID set when it supplied one (the optional 3rd QRESYNC
+        // element). No known set -> report every gone slot; the client
+        // ignores UIDs it never knew.
+        if let Some(qr) = &select.qresync {
+            let gone = expunged_uids(&self.fix_read(), &entry_id, qr.known_uids.as_ref());
+            if !gone.is_empty() {
+                self.write_line(&format!("* VANISHED (EARLIER) {}", format_uid_ranges(&gone)))
+                    .await?;
+            }
+        }
 
         let access = if read_write { "READ-WRITE" } else { "READ-ONLY" };
         let verb = if read_write { "SELECT" } else { "EXAMINE" };
@@ -724,11 +752,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     async fn cmd_uid_fetch(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
         // Args: "<uid-set> (<attr>...)" or "<uid-set> <attr>" or
-        // "<uid-set> (<attrs>) (CHANGEDSINCE <modseq>)" - the
-        // CHANGEDSINCE modifier lands in step 6 but we accept the
-        // syntax now and ignore the modseq because HIGHESTMODSEQ is
-        // pinned at 1 (so CHANGEDSINCE 0 returns everything,
-        // CHANGEDSINCE 1+ returns nothing).
+        // "<uid-set> (<attrs>) (CHANGEDSINCE <modseq>)". CHANGEDSINCE is
+        // honoured per-message against the real per-email modseq (see
+        // the snapshot filter below), so a mutated message surfaces in
+        // the next delta FETCH while an untouched one is skipped.
         let (uid_set_str, after_set) = match split_after_set(args) {
             Some(p) => p,
             None => {
@@ -746,7 +773,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
         };
         let (attrs_str, modifiers_str) = split_attrs_and_modifiers(after_set);
-        let attrs = match parse_fetch_attrs(attrs_str) {
+        let mut attrs = match parse_fetch_attrs(attrs_str) {
             Some(a) => a,
             None => {
                 return self
@@ -762,6 +789,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     .await;
             }
         };
+        // RFC 7162 3.1.4.1: when CHANGEDSINCE is present the server MUST
+        // include MODSEQ in every FETCH response, even if the client did
+        // not list it. bifrost asks for `(FLAGS) (CHANGEDSINCE n)` and
+        // relies on the SELECT-level HIGHESTMODSEQ, but emitting the
+        // per-message MODSEQ keeps the wire RFC-correct for any client
+        // that advances a per-message cache.
+        if changedsince.is_some() && !attrs.contains(&FetchAttr::ModSeq) {
+            attrs.push(FetchAttr::ModSeq);
+        }
 
         let selected_id = self
             .selected
@@ -806,19 +842,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // mailbox view (1-based), not the UID. UIDs can have gaps
         // after EXPUNGE / mailboxIds-removal; sequence numbers
         // never do.
-        let snapshot: Vec<(u32, u32, Email)> = if changedsince_matches(changedsince) {
+        let snapshot: Vec<(u32, u32, u64, Email)> = {
             let fix = self.fix_read();
             mailbox_messages(&fix, &self.account_id, &selected_id)
                 .into_iter()
                 .enumerate()
                 .filter(|(_, (uid, _))| set.matches(*uid))
-                .map(|(live_idx, (uid, email))| {
+                .filter_map(|(live_idx, (uid, email))| {
+                    // Per-message CONDSTORE modseq drives both the
+                    // emitted `MODSEQ (...)` attr and the CHANGEDSINCE
+                    // filter (RFC 7162 3.1.5): keep only messages whose
+                    // modseq exceeds the client's cached value. A
+                    // baseline-modseq message (1, untouched since load)
+                    // survives `CHANGEDSINCE 0` but not `CHANGEDSINCE
+                    // 1+`; a message last touched at counter N (modseq
+                    // N+1) survives any `CHANGEDSINCE < N+1`, so a
+                    // mutation surfaces in the next delta FETCH.
+                    let modseq = fix.email_modseq(&self.account_id, &email.id);
+                    if let Some(since) = changedsince
+                        && modseq <= since
+                    {
+                        return None;
+                    }
                     let seq = u32::try_from(live_idx + 1).expect("seq fits in u32");
-                    (seq, uid, email.clone())
+                    Some((seq, uid, modseq, email.clone()))
                 })
                 .collect()
-        } else {
-            Vec::new()
         };
 
         // Per-attachment-byte sleep. Walk requested BODY[N] attrs
@@ -827,7 +876,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // attachment on this email, sleep with the per-blob_id
         // override so a script can stage one slow attachment among
         // several fast ones.
-        for (seq, uid, email) in snapshot {
+        for (seq, uid, modseq, email) in snapshot {
             for attr in &attrs {
                 if let FetchAttr::BodyPart(n) = attr
                     && *n >= 2
@@ -836,7 +885,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     self.latency.sleep_for_attachment(&att.blob_id).await;
                 }
             }
-            let line = fetch_response_line(seq, uid, &email, &attrs);
+            let line = fetch_response_line(seq, uid, modseq, &email, &attrs);
             self.write_response(&line).await?;
         }
         self.write_line(&format!("{tag} OK UID FETCH completed"))
@@ -1503,6 +1552,39 @@ impl<'a> AstringParser<'a> {
             false
         }
     }
+    /// Non-consuming lookahead: does the next non-space char equal `c`?
+    fn peek(&mut self, c: char) -> bool {
+        self.skip_spaces();
+        self.s[self.i..].starts_with(c)
+    }
+    /// Skip a balanced `(...)` group starting at the cursor (which must
+    /// sit on the opening paren). Returns `None` if the parens are
+    /// unbalanced before end-of-input. Used to discard the QRESYNC
+    /// seq-match-data the mock does not act on.
+    fn skip_balanced_parens(&mut self) -> Option<()> {
+        self.skip_spaces();
+        if !self.consume('(') {
+            return None;
+        }
+        let mut depth = 1usize;
+        let bytes = self.s.as_bytes();
+        while self.i < bytes.len() {
+            match bytes[self.i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    self.i += 1;
+                    if depth == 0 {
+                        return Some(());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            self.i += 1;
+        }
+        None
+    }
     fn next_astring(&mut self) -> Option<String> {
         self.skip_spaces();
         if self.eof() {
@@ -1938,14 +2020,137 @@ fn parse_changedsince(modifiers: &str) -> Result<Option<u64>, ()> {
     Ok(Some(val))
 }
 
-/// With `HIGHESTMODSEQ` pinned at 1, `CHANGEDSINCE 0` returns
-/// everything (modseq strictly greater than 0 includes our 1) and
-/// `CHANGEDSINCE 1+` returns nothing.
-fn changedsince_matches(modseq: Option<u64>) -> bool {
-    match modseq {
-        None => true,
-        Some(n) => n < 1,
+/// Parsed `SELECT`/`EXAMINE` arguments: the mailbox name plus the
+/// optional RFC 7162 select-parameter list. bifrost sends
+/// `SELECT INBOX (CONDSTORE)`; a QRESYNC-capable client may send
+/// `SELECT INBOX (QRESYNC (<uidvalidity> <modseq> [<known-uids>]))`.
+#[derive(Debug)]
+struct SelectArgs {
+    name: String,
+    /// QRESYNC parameter when present. Carries the client's last-known
+    /// view so the SELECT response can emit `VANISHED (EARLIER)`.
+    qresync: Option<QResync>,
+}
+
+/// The RFC 7162 QRESYNC select-parameter contents the mock acts on.
+#[derive(Debug)]
+struct QResync {
+    /// 3rd element (optional): the UID set the client still believes is
+    /// live. When present, `VANISHED (EARLIER)` is bounded to it; when
+    /// absent the mock reports every expunged slot.
+    known_uids: Option<UidSet>,
+}
+
+/// Parse `SELECT`/`EXAMINE` arguments: a mailbox astring optionally
+/// followed by a `(select-param ...)` group. Recognised params are
+/// `CONDSTORE` and `QRESYNC (<uidvalidity> <modseq> [<known-uids>
+/// [<seq-match-data>]])`. The `uidvalidity` / `modseq` / seq-match
+/// elements are parsed for syntax but not acted on - the mock pins
+/// UIDVALIDITY and resolves VANISHED straight from UID history - while
+/// the optional known-UID set is retained to bound VANISHED output.
+/// Returns `None` on any syntax error so the caller replies `BAD`.
+fn parse_select_args(args: &str) -> Option<SelectArgs> {
+    let mut p = AstringParser { s: args, i: 0 };
+    let name = p.next_astring()?;
+    p.skip_spaces();
+    let mut out = SelectArgs { name, qresync: None };
+    if p.eof() {
+        return Some(out);
     }
+    if !p.consume('(') {
+        return None;
+    }
+    while !p.consume(')') {
+        let key = p.next_atom()?;
+        if key.eq_ignore_ascii_case("CONDSTORE") {
+            // CONDSTORE-only: HIGHESTMODSEQ is always reported, so the
+            // flag needs no state beyond being accepted.
+        } else if key.eq_ignore_ascii_case("QRESYNC") {
+            if !p.consume('(') {
+                return None;
+            }
+            // uidvalidity + modseq: required, parsed for syntax only.
+            let _uidvalidity: u32 = p.next_atom()?.parse().ok()?;
+            let _modseq: u64 = p.next_atom()?.parse().ok()?;
+            // Optional known-UID set (3rd element). Absent when the next
+            // token closes the QRESYNC group or opens the seq-match
+            // parens.
+            let known_uids = if p.peek(')') || p.peek('(') {
+                None
+            } else {
+                Some(parse_uid_set(&p.next_atom()?)?)
+            };
+            // Optional 4th element: seq-match-data `(known-seqs
+            // known-uids)`. Parsed-and-skipped: the mock derives
+            // VANISHED from its own UID history, so the client's
+            // seq<->uid map is moot.
+            if p.peek('(') {
+                p.skip_balanced_parens()?;
+            }
+            if !p.consume(')') {
+                return None;
+            }
+            out.qresync = Some(QResync { known_uids });
+        } else {
+            // Unknown select-param: reject rather than silently mislead.
+            return None;
+        }
+        p.skip_spaces();
+        if p.eof() {
+            return None;
+        }
+    }
+    p.skip_spaces();
+    if !p.eof() {
+        return None;
+    }
+    Some(out)
+}
+
+/// UIDs expunged from `mailbox_id` (slots retired to `None` in the UID
+/// history), bounded to `known` when the client supplied a QRESYNC
+/// known-UID set. Ascending. Drives `VANISHED (EARLIER)`.
+fn expunged_uids(fixture: &Fixture, mailbox_id: &str, known: Option<&UidSet>) -> Vec<u32> {
+    fixture
+        .uid_history(mailbox_id)
+        .iter()
+        .enumerate()
+        .filter_map(|(i, slot)| {
+            if slot.is_some() {
+                return None;
+            }
+            let uid = u32::try_from(i + 1).expect("uid fits in u32");
+            if known.is_none_or(|k| k.matches(uid)) {
+                Some(uid)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Compress an ascending UID list into an IMAP sequence-set string,
+/// collapsing runs into `lo:hi` and joining with commas
+/// (`[1,2,3,7] -> "1:3,7"`). Input must be sorted ascending and
+/// non-empty.
+fn format_uid_ranges(uids: &[u32]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < uids.len() {
+        let lo = uids[i];
+        let mut hi = lo;
+        while i + 1 < uids.len() && uids[i + 1] == hi + 1 {
+            hi = uids[i + 1];
+            i += 1;
+        }
+        if lo == hi {
+            parts.push(lo.to_string());
+        } else {
+            parts.push(format!("{lo}:{hi}"));
+        }
+        i += 1;
+    }
+    parts.join(",")
 }
 
 /// Render a single `* <seq> FETCH (...)` response line. The returned
@@ -1996,7 +2201,13 @@ pub(crate) fn assembled_rfc822(email: &Email) -> String {
 
 /// string already terminates with `\r\n` and may contain CRLFs inside
 /// an IMAP literal block.
-fn fetch_response_line(seq: u32, uid: u32, email: &Email, attrs: &[FetchAttr]) -> String {
+fn fetch_response_line(
+    seq: u32,
+    uid: u32,
+    modseq: u64,
+    email: &Email,
+    attrs: &[FetchAttr],
+) -> String {
     let mut out = format!("* {seq} FETCH (");
     let mut first = true;
     // Lazy: render only if a body-shaped attr asks for it.
@@ -2027,11 +2238,13 @@ fn fetch_response_line(seq: u32, uid: u32, email: &Email, attrs: &[FetchAttr]) -
                 out.push_str(&format!("ENVELOPE {}", render_envelope(email)));
             }
             FetchAttr::ModSeq => {
-                // CONDSTORE per-message modseq. HIGHESTMODSEQ is pinned
-                // at 1, so every message reports modseq 1 - non-zero
-                // (bifrost rejects 0) and consistent with the
-                // CHANGEDSINCE semantics (>= 1 matches nothing).
-                out.push_str("MODSEQ (1)");
+                // CONDSTORE per-message modseq: the change counter of
+                // this email's last create/update, plus one (see
+                // `Fixture::email_modseq`). Always >= 1 (bifrost rejects
+                // 0); a baseline message reports `MODSEQ (1)`, a mutated
+                // one reports its higher modseq so bifrost's CHANGEDSINCE
+                // cache advances.
+                out.push_str(&format!("MODSEQ ({modseq})"));
             }
             FetchAttr::BodyFull => {
                 let r = rendered.get_or_insert_with(|| RenderedRfc822::for_email(email));
@@ -3457,6 +3670,58 @@ mod tests {
         let (a, m) = split_attrs_and_modifiers("(UID)");
         assert_eq!(a, "(UID)");
         assert_eq!(m, "");
+    }
+
+    #[test]
+    fn parse_select_args_plain_and_condstore() {
+        // Bare name, no params.
+        let s = parse_select_args("\"INBOX\"").unwrap();
+        assert_eq!(s.name, "INBOX");
+        assert!(s.qresync.is_none());
+        // CONDSTORE select-param accepted, no QRESYNC.
+        let s = parse_select_args("\"INBOX\" (CONDSTORE)").unwrap();
+        assert_eq!(s.name, "INBOX");
+        assert!(s.qresync.is_none());
+        // Atom (unquoted) name works too.
+        assert_eq!(parse_select_args("Archive (CONDSTORE)").unwrap().name, "Archive");
+    }
+
+    #[test]
+    fn parse_select_args_qresync_variants() {
+        // uidvalidity + modseq only: no known-UID set.
+        let s = parse_select_args("\"INBOX\" (QRESYNC (1 42))").unwrap();
+        let qr = s.qresync.unwrap();
+        assert!(qr.known_uids.is_none());
+        // With a known-UID set the matcher is populated.
+        let s = parse_select_args("\"INBOX\" (QRESYNC (1 42 1:3,7))").unwrap();
+        let known = s.qresync.unwrap().known_uids.unwrap();
+        assert!(known.matches(2));
+        assert!(known.matches(7));
+        assert!(!known.matches(4));
+        // Optional 4th seq-match-data element is skipped, not an error.
+        let s = parse_select_args("\"INBOX\" (QRESYNC (1 42 1:3 (1,2,3 1:3)))").unwrap();
+        assert!(s.qresync.unwrap().known_uids.is_some());
+    }
+
+    #[test]
+    fn parse_select_args_rejects_junk() {
+        // Unknown select-param.
+        assert!(parse_select_args("\"INBOX\" (BOGUS)").is_none());
+        // Unbalanced parens.
+        assert!(parse_select_args("\"INBOX\" (CONDSTORE").is_none());
+        // Trailing junk after the param group.
+        assert!(parse_select_args("\"INBOX\" (CONDSTORE) extra").is_none());
+        // Non-numeric QRESYNC modseq.
+        assert!(parse_select_args("\"INBOX\" (QRESYNC (1 x))").is_none());
+    }
+
+    #[test]
+    fn format_uid_ranges_collapses_runs() {
+        assert_eq!(format_uid_ranges(&[1]), "1");
+        assert_eq!(format_uid_ranges(&[1, 2, 3]), "1:3");
+        assert_eq!(format_uid_ranges(&[1, 2, 3, 7]), "1:3,7");
+        assert_eq!(format_uid_ranges(&[2, 4, 6]), "2,4,6");
+        assert_eq!(format_uid_ranges(&[1, 2, 4, 5, 9]), "1:2,4:5,9");
     }
 
     #[test]

@@ -337,6 +337,17 @@ impl MutationDiff {
     }
 }
 
+/// Extract the trailing counter from a `{seed}.{counter}` state token.
+/// The bare seed (no trailing `.<n>`, counter 0) yields `0`. Splits on
+/// the last `.` so a seed string that itself contains dots still
+/// resolves correctly.
+fn counter_of_state(state: &str) -> u64 {
+    state
+        .rsplit_once('.')
+        .and_then(|(_, n)| n.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 impl ChangeLog {
     /// Bounded retention. Set to comfortably exceed the longest test
     /// scripts we run (the `lifecycle` and `scale` tests stay below
@@ -374,6 +385,24 @@ impl ChangeLog {
             self.transitions.pop_front();
         }
         self.transitions.push_back(trans);
+    }
+
+    /// Counter of the most recent retained transition that created or
+    /// updated `email_id`, or `0` (the seed baseline) when none is
+    /// retained. The wire MODSEQ is this value plus one; see
+    /// [`Fixture::email_modseq`]. Transitions are appended in counter
+    /// order so the last match carries the highest counter, but the
+    /// running `max` keeps the result correct regardless of order.
+    fn modseq_for_email(&self, email_id: &str) -> u64 {
+        let mut best = 0u64;
+        for t in &self.transitions {
+            if t.email_created.iter().any(|e| e == email_id)
+                || t.email_updated.iter().any(|e| e == email_id)
+            {
+                best = counter_of_state(&t.to_state).max(best);
+            }
+        }
+        best + 1
     }
 
     /// Walk this account's log for the unfiltered delta between
@@ -519,6 +548,36 @@ impl Fixture {
     /// report this rather than any one resource account's token.
     pub fn primary_state(&self) -> &str {
         self.state_for(&self.primary_account().id)
+    }
+
+    /// CONDSTORE `HIGHESTMODSEQ` for an account: the per-account change
+    /// counter plus one. The `+ 1` keeps it `>= 1` (bifrost rejects a
+    /// MODSEQ of 0, `folder_registry.rs` "FETCH returned MODSEQ 0") and
+    /// matches the Gmail `historyId` convention (`counter + 1`), so a
+    /// never-mutated account reports `HIGHESTMODSEQ 1`. Every mutation
+    /// that advances the account's log advances this value, which is
+    /// what lets bifrost's `FETCH (CHANGEDSINCE <modseq>)` see a delta.
+    pub fn imap_highestmodseq(&self, account_id: &str) -> u64 {
+        self.account_logs
+            .get(account_id)
+            .map(|l| l.counter)
+            .unwrap_or(0)
+            + 1
+    }
+
+    /// Per-message CONDSTORE `MODSEQ` for an email: the change counter
+    /// of the most recent transition that created or updated it, plus
+    /// one (same `+ 1` baseline as [`Self::imap_highestmodseq`]). An
+    /// email untouched since load resolves to `1`. A change evicted
+    /// from the bounded ring also falls back to `1`, which is safe: an
+    /// evicted change is necessarily older than any modseq a client
+    /// could still be holding, so under-reporting it only means the
+    /// already-synced message is correctly skipped by `CHANGEDSINCE`.
+    pub fn email_modseq(&self, account_id: &str, email_id: &str) -> u64 {
+        self.account_logs
+            .get(account_id)
+            .map(|l| l.modseq_for_email(email_id))
+            .unwrap_or(1)
     }
 
     /// The single account v0 protocol surfaces serve. Multi-account
