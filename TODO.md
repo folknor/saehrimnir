@@ -8,14 +8,6 @@ tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
 Concrete next-up items lifted above the per-protocol backlogs.
 
-- **Lua Gmail attachment + sendAs hooks.** Wire `on("gmail",
-  "get_attachment", fn)` through the dispatcher so fault-injection
-  works against the attachment route the same way it does for
-  `list_threads` etc. The sendAs handlers (`list_send_as` /
-  `get_send_as` / `patch_send_as`) already consult `maybe_override`
-  on `"send_as"`; remaining work is the attachment route in
-  `src/gmail/mail.rs`.
-
 ## From the 2026-05-10 multi-agent review (today's slice)
 
 Findings from a four-agent (bugs / security / perf / arch) sweep of
@@ -257,8 +249,9 @@ five protocols, mapped via `Override::Tagged { status, message }`.
 The Gmail `send_as` hook is wired alongside the SendAs handlers
 (`list_send_as` / `get_send_as` / `patch_send_as` consult
 `maybe_override` with command `"send_as"`). The Gmail
-`get_attachment` hook is tracked under "Priority" above. What's
-left:
+`get_attachment` hook is wired too (`maybe_override` with command
+`"get_attachment"`, surfacing `req.message_id` + `req.attachment_id`).
+What's left:
 
 - Per-protocol callbacks for the new gcal and People listeners
   (`list_events`, `calendar_list`, `list_connections`,
