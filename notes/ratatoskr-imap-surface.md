@@ -65,9 +65,17 @@ The mock advertises:
 - Optional but recognized: `NAMESPACE`, `MYRIGHTS`, `MOVE`. Used if
   present, graceful fallback otherwise.
 
+Advertised in v0:
+
+- `IDLE` (RFC 2177) - advertised in CAPABILITY and implemented. The
+  test-admin state-mutation trigger (`POST /test/fixture/step` ->
+  `PushHub::emit_state_advance`) wakes an idling connection so it emits
+  the unsolicited `* n EXISTS` / `* n EXPUNGE` / `* n RECENT` for the
+  selected mailbox. See "IDLE" below and `src/imap.rs::cmd_idle`.
+
 NOT advertised in v0:
 
-- `IDLE`, `NOTIFY`, `COMPRESS`, `STARTTLS`, `APPEND` (write paths),
+- `NOTIFY`, `COMPRESS`, `STARTTLS`, `APPEND` (write paths),
   `XLIST` (Google extension; client falls back to LIST + attributes).
 - `SPECIAL-USE` is fine to advertise or omit; only the per-folder
   attribute flags matter (`\Sent`, `\Trash`, etc.) and those are
@@ -290,7 +298,8 @@ delta on the same fixture.
 
 - APPEND, MOVE, DELETE - destructive write paths not driven by
   ratatoskr's writeback flow.
-- IDLE, NOTIFY, COMPRESS - push and bandwidth optimisations.
+- NOTIFY, COMPRESS - bandwidth / push-refinement optimisations
+  (`IDLE` itself is implemented; see above).
 - ACL / MYRIGHTS - attempted but failures are soft
   (`connection.rs:712-755`).
 - NAMESPACE / shared folders - personal-mailbox-only is enough.

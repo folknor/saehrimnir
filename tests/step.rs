@@ -471,9 +471,18 @@ async fn change_script_destroy_then_create_does_not_reuse_imap_uid() {
         b"a LOGIN \"u\" \"p\"\r\nb SELECT \"INBOX\"\r\nc UID FETCH 1:* (UID)\r\nd STATUS \"INBOX\" (UIDNEXT)\r\ne LOGOUT\r\n",
     )
     .await;
-    assert!(baseline.contains("* 1 FETCH (UID 1)"), "baseline: {baseline:?}");
-    assert!(baseline.contains("* 2 FETCH (UID 2)"), "baseline: {baseline:?}");
-    assert!(baseline.contains("UIDNEXT 3"), "baseline UIDNEXT: {baseline:?}");
+    assert!(
+        baseline.contains("* 1 FETCH (UID 1)"),
+        "baseline: {baseline:?}"
+    );
+    assert!(
+        baseline.contains("* 2 FETCH (UID 2)"),
+        "baseline: {baseline:?}"
+    );
+    assert!(
+        baseline.contains("UIDNEXT 3"),
+        "baseline UIDNEXT: {baseline:?}"
+    );
 
     // Step "destroy": email-001 (UID 1) goes away.
     let (status, _) = step(&app, json!({ "expect": "destroy" })).await;
@@ -521,6 +530,7 @@ async fn run_imap(handle: &saehrimnir::shared::FixtureHandle, script: &[u8]) -> 
             saehrimnir::oauth::TokenStore::default(),
             saehrimnir::request_log::RequestLog::default(),
             saehrimnir::latency::LatencyKnob::default(),
+            saehrimnir::push::PushHub::new(),
             &mut rx,
         )
         .await
@@ -594,6 +604,86 @@ async fn fixture_step_mutations_visible_through_graph_contacts_delta() {
         .iter()
         .find(|e| e["id"] == "contact-001")
         .unwrap();
+    assert_eq!(tombstone["@removed"]["reason"], "deleted");
+}
+
+/// End-to-end Graph mail observation: bootstrap a `messages/delta`
+/// dump on INBOX, capture its deltaLink, then drive the change script
+/// and assert each mutation surfaces by *walking the change log* on the
+/// follow-up delta call (the gap this fix closes: the old handler
+/// no-op'd on any `$deltatoken`). A create surfaces as a full message
+/// body; a destroy surfaces as a Graph `@removed` tombstone.
+#[tokio::test]
+async fn fixture_step_mutations_visible_through_graph_messages_delta() {
+    use saehrimnir::graph;
+
+    let path = std::path::Path::new("fixtures/jmap-incremental.lua");
+    let source = std::fs::read_to_string(path).unwrap();
+    let chunk = format!("@{}", path.display());
+    let fix = lua::load_source_with_dir(&source, &chunk, path.parent().unwrap()).unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let route_state = routes::AppState::for_test(std::sync::Arc::clone(&handle));
+    let graph_state = graph::AppState {
+        shared: route_state.shared.clone(),
+    };
+    let app = routes::router(route_state);
+    let graph_app = graph::router(graph_state);
+
+    // Helper: pull the relative path out of an absolute deltaLink.
+    fn delta_path(link: &str) -> String {
+        link.split_once("/v1.0/")
+            .map(|(_, p)| format!("/v1.0/{p}"))
+            .unwrap()
+    }
+
+    // Bootstrap: the initial dump returns the 2 baseline inbox emails +
+    // a deltaLink pinned to the current (pre-mutation) state.
+    let baseline = graph_get_json(&graph_app, "/v1.0/me/mailFolders/mb-inbox/messages/delta").await;
+    assert_eq!(baseline["value"].as_array().unwrap().len(), 2);
+    let baseline_path = delta_path(baseline["@odata.deltaLink"].as_str().unwrap());
+
+    // Step "new": email-003 arrives in the inbox.
+    let (status, _) = step(&app, json!({ "expect": "new" })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Following the baseline deltaLink now walks the log: just the
+    // created email-003, projected as a full message body (not a bare
+    // id). The old no-op handler returned an empty value here.
+    let v = graph_get_json(&graph_app, &baseline_path).await;
+    let value = v["value"].as_array().unwrap();
+    assert_eq!(
+        value.len(),
+        1,
+        "delta should surface the one created email: {v:?}"
+    );
+    assert_eq!(value[0]["id"], "email-003");
+    assert_eq!(value[0]["subject"], "Lunch?", "full body, not a bare id");
+    assert!(value[0].get("@removed").is_none());
+    let after_new_path = delta_path(v["@odata.deltaLink"].as_str().unwrap());
+
+    // Steps "change" (email-002 flags) and "delete" (email-001 gone).
+    for expect in ["change", "delete"] {
+        let (status, _) = step(&app, json!({ "expect": expect })).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // Walking from the post-"new" deltaLink: email-002 updated (full
+    // body, still in inbox) and email-001 destroyed (a tombstone).
+    let v2 = graph_get_json(&graph_app, &after_new_path).await;
+    let value2 = v2["value"].as_array().unwrap();
+    let updated = value2
+        .iter()
+        .find(|e| e["id"] == "email-002")
+        .expect("updated email-002 present");
+    assert!(updated.get("@removed").is_none());
+    assert!(
+        updated.get("body").is_some(),
+        "updated email is a full body"
+    );
+    let tombstone = value2
+        .iter()
+        .find(|e| e["id"] == "email-001")
+        .expect("destroyed email-001 present");
     assert_eq!(tombstone["@removed"]["reason"], "deleted");
 }
 

@@ -29,7 +29,9 @@ use axum::http::header;
 use axum::response::IntoResponse;
 
 use super::{AppState, error, odata, ok_json};
-use crate::fixture::{Address, Attachment, Body, Disposition, Email, Fixture, Mailbox, MutationDiff, Role};
+use crate::fixture::{
+    Address, Attachment, Body, Disposition, Email, Fixture, Mailbox, MutationDiff, Role,
+};
 
 /// Default page size for messages, matching ratatoskr's BATCH_SIZE.
 const MESSAGES_DEFAULT_TOP: u32 = 50;
@@ -55,10 +57,7 @@ pub fn router() -> Router<AppState> {
             "/v1.0/me/mailFolders/{folder}/childFolders",
             get(list_child_folders_me).post(create_child_folder_me),
         )
-        .route(
-            "/v1.0/me/mailFolders/{folder}/move",
-            post(move_folder_me),
-        )
+        .route("/v1.0/me/mailFolders/{folder}/move", post(move_folder_me))
         .route(
             "/v1.0/me/mailFolders/{folder}/messages",
             get(list_messages_me),
@@ -89,10 +88,7 @@ pub fn router() -> Router<AppState> {
                 .patch(patch_message_me)
                 .delete(delete_message_me),
         )
-        .route(
-            "/v1.0/me/messages/{message_id}/move",
-            post(move_message_me),
-        )
+        .route("/v1.0/me/messages/{message_id}/move", post(move_message_me))
         .route("/v1.0/me/messages/{message_id}/send", post(send_message_me))
         .route(
             "/v1.0/me/messages",
@@ -802,19 +798,61 @@ async fn delta_messages_impl(
             "https://graph.microsoft.com/v1.0/$metadata#message",
             vec![],
             None,
-            Some(odata::build_delta_link(&host, &path, raw.as_deref(), fixture.state_for(account_id))),
+            Some(odata::build_delta_link(
+                &host,
+                &path,
+                raw.as_deref(),
+                fixture.state_for(account_id),
+            )),
             None,
         ));
     }
 
-    if q.deltatoken.is_some() {
-        return ok_json(odata::collection_envelope(
-            "https://graph.microsoft.com/v1.0/$metadata#message",
-            vec![],
-            None,
-            Some(odata::build_delta_link(&host, &path, raw.as_deref(), fixture.state_for(account_id))),
-            None,
-        ));
+    // Follow-up delta: walk the account's change log between the
+    // client-supplied `$deltatoken` and the current state (the same
+    // walk `calendarView/delta` does). Created / updated ids whose live
+    // email currently lives in this folder project as full message
+    // bodies; destroyed ids become Graph `@removed` tombstones. An
+    // unknown / evicted token (`email_delta_since_account` -> `None`)
+    // falls through to a full bootstrap dump below.
+    //
+    // Note: an email update that *moved* the message out of this folder
+    // is not surfaced as an `@removed` here - the change log records no
+    // per-mailbox parent for email updates (only for destroys), so the
+    // walker can only filter created / updated against the live folder
+    // membership. A move shows up as the message appearing in the
+    // destination folder's delta; the source folder's delta drops it
+    // silently. JMAP `Email/changes` has the same coarseness.
+    if let Some(token) = q.deltatoken.as_deref() {
+        let since = odata::decode_deltatoken(token).unwrap_or("");
+        if let Some(delta) = fixture.email_delta_since_account(since, account_id) {
+            let by_id: std::collections::HashMap<&str, &Email> = fixture
+                .emails_for(account_id)
+                .filter(|e| e.mailbox_ids.iter().any(|id| id == &m.id))
+                .map(|e| (e.id.as_str(), e))
+                .collect();
+            let mut value: Vec<Value> = Vec::new();
+            for id in delta.created.iter().chain(delta.updated.iter()) {
+                if let Some(e) = by_id.get(id.as_str()) {
+                    value.push(message_value(e, &m.id, expand));
+                }
+            }
+            for id in &delta.destroyed {
+                value.push(graph_message_tombstone(id));
+            }
+            return ok_json(odata::collection_envelope(
+                "https://graph.microsoft.com/v1.0/$metadata#message",
+                value,
+                None,
+                Some(odata::build_delta_link(
+                    &host,
+                    &path,
+                    raw.as_deref(),
+                    fixture.state_for(account_id),
+                )),
+                None,
+            ));
+        }
     }
 
     let messages = sorted_messages_in(&fixture, account_id, &m.id);
@@ -844,7 +882,12 @@ async fn delta_messages_impl(
         ),
         None => (
             None,
-            Some(odata::build_delta_link(&host, &path, raw.as_deref(), fixture.state_for(account_id))),
+            Some(odata::build_delta_link(
+                &host,
+                &path,
+                raw.as_deref(),
+                fixture.state_for(account_id),
+            )),
         ),
     };
 
@@ -896,7 +939,8 @@ async fn get_message_attachment_impl(
         .sleep_for_attachment(attachment_id)
         .await;
     let fixture = state.fixture();
-    let Some((email, att)) = find_email_with_attachment(&fixture, account_id, message_id, attachment_id)
+    let Some((email, att)) =
+        find_email_with_attachment(&fixture, account_id, message_id, attachment_id)
     else {
         return error(
             StatusCode::NOT_FOUND,
@@ -919,7 +963,8 @@ async fn get_message_attachment_value_impl(
         .sleep_for_attachment(attachment_id)
         .await;
     let fixture = state.fixture();
-    let Some((_, att)) = find_email_with_attachment(&fixture, account_id, message_id, attachment_id)
+    let Some((_, att)) =
+        find_email_with_attachment(&fixture, account_id, message_id, attachment_id)
     else {
         return error(
             StatusCode::NOT_FOUND,
@@ -951,7 +996,9 @@ fn resolve_folder<'a>(
         return Some(m);
     }
     let role = role_from_alias(folder)?;
-    fixture.mailboxes_for(account_id).find(|m| m.role == Some(role))
+    fixture
+        .mailboxes_for(account_id)
+        .find(|m| m.role == Some(role))
 }
 
 fn role_from_alias(alias: &str) -> Option<Role> {
@@ -1160,7 +1207,11 @@ async fn rename_folder_impl(
     };
     match projected {
         Some(v) => ok_json(v),
-        None => error(StatusCode::NOT_FOUND, "ErrorItemNotFound", "mailFolder vanished"),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            "mailFolder vanished",
+        ),
     }
 }
 
@@ -1203,7 +1254,11 @@ async fn move_folder_impl(
     };
     match projected {
         Some(v) => ok_json(v),
-        None => error(StatusCode::NOT_FOUND, "ErrorItemNotFound", "mailFolder vanished"),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            "mailFolder vanished",
+        ),
     }
 }
 
@@ -1377,6 +1432,17 @@ fn folder_value(fixture: &Fixture, m: &Mailbox) -> Value {
 }
 
 // ── Message projection ──────────────────────────────────────────────
+
+/// Graph-style deletion stub for `messages/delta`. Mirrors the
+/// `events/delta` tombstone shape (`graph_event_tombstone`): a bare
+/// `{ id, @removed }` so a delta consumer prunes the message from its
+/// cache.
+fn graph_message_tombstone(id: &str) -> Value {
+    json!({
+        "id": id,
+        "@removed": { "reason": "deleted" },
+    })
+}
 
 fn sorted_messages_in<'a>(
     fixture: &'a Fixture,
@@ -1750,7 +1816,10 @@ async fn create_draft_user(
     create_draft_impl(state, &account_id, body).await
 }
 
-async fn send_message_me(State(state): State<AppState>, Path(message_id): Path<String>) -> Response {
+async fn send_message_me(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     send_message_impl(state, &account_id, &message_id).await
 }
@@ -1818,7 +1887,10 @@ async fn send_message_impl(state: AppState, account_id: &str, message_id: &str) 
 }
 
 fn create_draft_core(fix: &mut Fixture, account_id: &str, folder_id: &str, body: &Value) -> Value {
-    let subject = body.get("subject").and_then(Value::as_str).map(str::to_string);
+    let subject = body
+        .get("subject")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let from = parse_graph_recipient(body.get("from"));
     let to = parse_graph_recipients(body.get("toRecipients"));
     let cc = parse_graph_recipients(body.get("ccRecipients"));
@@ -1836,11 +1908,16 @@ fn create_draft_core(fix: &mut Fixture, account_id: &str, folder_id: &str, body:
         let id = f.mint_email_id();
         // Determinism: anchor to the newest existing message, or a
         // fixed epoch in an empty fixture (mirrors JMAP Email/set).
-        let received_at = f.emails.iter().map(|e| e.received_at).max().unwrap_or_else(|| {
-            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-                .expect("hardcoded RFC3339")
-                .with_timezone(&chrono::Utc)
-        });
+        let received_at = f
+            .emails
+            .iter()
+            .map(|e| e.received_at)
+            .max()
+            .unwrap_or_else(|| {
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                    .expect("hardcoded RFC3339")
+                    .with_timezone(&chrono::Utc)
+            });
         let size = i64::try_from(body_text.len()).unwrap_or(i64::MAX);
         let email = Email {
             id: id.clone(),
@@ -1891,7 +1968,9 @@ fn parse_graph_recipients(v: Option<&Value>) -> Vec<Address> {
     let Some(arr) = v.and_then(Value::as_array) else {
         return vec![];
     };
-    arr.iter().filter_map(|r| parse_graph_recipient(Some(r))).collect()
+    arr.iter()
+        .filter_map(|r| parse_graph_recipient(Some(r)))
+        .collect()
 }
 
 /// Find a message by id within the account and project it via
@@ -1905,7 +1984,9 @@ fn message_get_value(
     message_id: &str,
     expand: bool,
 ) -> Option<Value> {
-    let e = fixture.emails_for(account_id).find(|e| e.id == message_id)?;
+    let e = fixture
+        .emails_for(account_id)
+        .find(|e| e.id == message_id)?;
     let parent = e.mailbox_ids.first().map(String::as_str).unwrap_or("");
     Some(message_value(e, parent, expand))
 }
@@ -1940,7 +2021,11 @@ async fn batch(State(state): State<AppState>, Json(body): Json<Value>) -> Respon
 }
 
 fn batch_sub_response(fix: &mut Fixture, req: &Value) -> Value {
-    let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let id = req
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let method = req
         .get("method")
         .and_then(Value::as_str)
@@ -2021,7 +2106,10 @@ fn dispatch_batch_request(
     let not_found = || {
         (
             404,
-            batch_error("ErrorItemNotFound", &format!("message {message_id:?} not found")),
+            batch_error(
+                "ErrorItemNotFound",
+                &format!("message {message_id:?} not found"),
+            ),
         )
     };
 
@@ -2055,7 +2143,10 @@ fn dispatch_batch_request(
             let Some(dest) = dest else {
                 return (
                     400,
-                    batch_error("ErrorInvalidRequest", "move requires a non-empty destinationId"),
+                    batch_error(
+                        "ErrorInvalidRequest",
+                        "move requires a non-empty destinationId",
+                    ),
                 );
             };
             match move_message_core(fix, &account_id, message_id, dest) {
@@ -2126,10 +2217,7 @@ fn message_value(e: &Email, parent_folder_id: &str, expand_attachments: bool) ->
         "isDraft".to_string(),
         Value::Bool(e.keywords.iter().any(|k| k == "$draft")),
     );
-    obj.insert(
-        "hasAttachments".to_string(),
-        Value::Bool(e.has_attachment),
-    );
+    obj.insert("hasAttachments".to_string(), Value::Bool(e.has_attachment));
     obj.insert("importance".to_string(), Value::String("normal".into()));
     obj.insert(
         "parentFolderId".to_string(),
@@ -2264,10 +2352,16 @@ fn graph_attachment_value(message_id: &str, a: &Attachment, include_bytes: bool)
         "@odata.type".to_string(),
         Value::String("#microsoft.graph.fileAttachment".to_string()),
     );
-    obj.insert("@odata.mediaContentType".to_string(), Value::String(a.content_type.clone()));
+    obj.insert(
+        "@odata.mediaContentType".to_string(),
+        Value::String(a.content_type.clone()),
+    );
     obj.insert("id".to_string(), Value::String(a.blob_id.clone()));
     obj.insert("name".to_string(), Value::String(a.name.clone()));
-    obj.insert("contentType".to_string(), Value::String(a.content_type.clone()));
+    obj.insert(
+        "contentType".to_string(),
+        Value::String(a.content_type.clone()),
+    );
     obj.insert("size".to_string(), Value::Number(a.size.into()));
     obj.insert(
         "isInline".to_string(),
@@ -2302,16 +2396,20 @@ fn find_email_with_attachment<'a>(
     message_id: &str,
     attachment_id: &str,
 ) -> Option<(&'a Email, &'a Attachment)> {
-    let email = fixture.emails_for(account_id).find(|e| e.id == message_id)?;
-    let att = email.attachments.iter().find(|a| a.blob_id == attachment_id)?;
+    let email = fixture
+        .emails_for(account_id)
+        .find(|e| e.id == message_id)?;
+    let att = email
+        .attachments
+        .iter()
+        .find(|a| a.blob_id == attachment_id)?;
     Some((email, att))
 }
 
 /// Standard (`+`/`/`) base64 with padding. Avoids pulling in the
 /// `base64` crate for one call site.
 fn base64_standard(input: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);
     for c in chunks.by_ref() {

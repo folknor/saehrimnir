@@ -23,7 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 use saehrimnir::shared::SharedHandles;
-use saehrimnir::{gmail, graph, lua, routes, shared, smtp};
+use saehrimnir::{gmail, graph, imap, lua, routes, shared, smtp};
+use tokio::sync::watch;
 
 /// Build the JMAP / Gmail / Graph routers over one shared handle bag so
 /// a watch / subscription registered on one and a step driven on
@@ -347,7 +348,102 @@ async fn graph_webhook_delivers_to_loopback_endpoint() {
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Read from the duplex client until `needle` appears in the
+/// accumulated bytes (or a timeout fires), returning everything read.
+async fn read_until(client: &mut tokio::io::DuplexStream, needle: &str) -> String {
+    let mut acc = String::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        if acc.contains(needle) {
+            break;
+        }
+        let r =
+            tokio::time::timeout(std::time::Duration::from_secs(3), client.read(&mut buf)).await;
+        let n = match r {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => panic!("read error: {e}"),
+            Err(_) => panic!("timed out waiting for {needle:?}; got so far: {acc:?}"),
+        };
+        if n == 0 {
+            break;
+        }
+        acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    acc
+}
+
+/// IMAP `IDLE` observes a state mutation driven through the *same*
+/// test-admin step trigger that fires the other push surfaces: the
+/// IMAP connection and the JMAP step router share one `PushHub`. After
+/// `SELECT INBOX` + `IDLE`, stepping the change script makes the idling
+/// client see `* n EXISTS` for an arriving message and `* n EXPUNGE`
+/// for a deleted one, then `DONE` ends the idle.
+#[tokio::test]
+async fn imap_idle_observes_exists_and_expunge_on_step() {
+    let (jmap, _gmail, _graph, shared) = routers();
+
+    let (server, mut client) = tokio::io::duplex(32 * 1024);
+    let (_tx, rx) = watch::channel(false);
+    let fix = std::sync::Arc::clone(&shared.fixture);
+    let push = shared.push.clone();
+    let task = tokio::spawn(async move {
+        let mut rx = rx;
+        imap::serve_connection(
+            server,
+            fix,
+            None,
+            saehrimnir::oauth::TokenStore::default(),
+            saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
+            push,
+            &mut rx,
+        )
+        .await
+    });
+
+    // LOGIN, SELECT INBOX (2 baseline emails), enter IDLE.
+    client
+        .write_all(b"a1 LOGIN \"u\" \"p\"\r\na2 SELECT \"INBOX\"\r\na3 IDLE\r\n")
+        .await
+        .unwrap();
+    let pre = read_until(&mut client, "+ idling").await;
+    assert!(pre.contains("a2 OK"), "SELECT should complete: {pre:?}");
+    assert!(pre.contains("* 2 EXISTS"), "baseline INBOX has 2: {pre:?}");
+
+    // Step "new" creates email-003 in INBOX -> the idler reports the
+    // new total via EXISTS and a RECENT count for the arrival.
+    step(&jmap, "new").await;
+    let after_new = read_until(&mut client, "RECENT").await;
+    assert!(
+        after_new.contains("* 3 EXISTS"),
+        "expected EXISTS 3: {after_new:?}"
+    );
+    assert!(
+        after_new.contains("* 1 RECENT"),
+        "expected RECENT 1: {after_new:?}"
+    );
+
+    // Step "change" (flag-only, no membership change -> no EXISTS /
+    // EXPUNGE) then "delete" (removes email-001, UID 1 / seq 1).
+    step(&jmap, "change").await;
+    step(&jmap, "delete").await;
+    let after_delete = read_until(&mut client, "EXPUNGE").await;
+    assert!(
+        after_delete.contains("* 1 EXPUNGE"),
+        "expected EXPUNGE 1: {after_delete:?}"
+    );
+
+    // DONE ends the idle with a tagged OK.
+    client.write_all(b"DONE\r\n").await.unwrap();
+    let done = read_until(&mut client, "a3 OK").await;
+    assert!(
+        done.contains("a3 OK IDLE terminated"),
+        "idle should terminate: {done:?}"
+    );
+
+    drop(client);
+    let _ = task.await;
 }

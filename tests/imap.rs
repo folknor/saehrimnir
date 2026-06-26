@@ -18,7 +18,17 @@ async fn run_with_fixture(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(
+            server,
+            fix,
+            None,
+            saehrimnir::oauth::TokenStore::default(),
+            saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
+            saehrimnir::push::PushHub::new(),
+            &mut rx,
+        )
+        .await
     });
 
     client.write_all(script).await.unwrap();
@@ -81,9 +91,11 @@ async fn full_initial_sync_transcript() {
     assert!(out.starts_with("* OK saehrimnir IMAP4rev1 ready\r\n"));
 
     // Capability + auth.
-    assert!(out.contains("* CAPABILITY IMAP4REV1 CONDSTORE QRESYNC\r\n"));
+    assert!(out.contains("* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC\r\n"));
     assert!(out.contains("a1 OK CAPABILITY completed\r\n"));
-    assert!(out.contains("a2 OK [CAPABILITY IMAP4REV1 CONDSTORE QRESYNC] LOGIN completed\r\n"));
+    assert!(
+        out.contains("a2 OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC] LOGIN completed\r\n")
+    );
     assert!(out.contains("* ENABLED QRESYNC\r\n"));
     assert!(out.contains("a3 OK ENABLE completed\r\n"));
 
@@ -94,16 +106,12 @@ async fn full_initial_sync_transcript() {
 
     // STATUS for both. The canonical fixture has 2 emails in inbox,
     // 0 in archive.
-    assert!(
-        out.contains(
-            "* STATUS \"INBOX\" (MESSAGES 2 UNSEEN 2 UIDNEXT 3 UIDVALIDITY 1 HIGHESTMODSEQ 1)\r\n"
-        )
-    );
-    assert!(
-        out.contains(
-            "* STATUS \"Archive\" (MESSAGES 0 UNSEEN 0 UIDNEXT 1 UIDVALIDITY 1 HIGHESTMODSEQ 1)\r\n"
-        )
-    );
+    assert!(out.contains(
+        "* STATUS \"INBOX\" (MESSAGES 2 UNSEEN 2 UIDNEXT 3 UIDVALIDITY 1 HIGHESTMODSEQ 1)\r\n"
+    ));
+    assert!(out.contains(
+        "* STATUS \"Archive\" (MESSAGES 0 UNSEEN 0 UIDNEXT 1 UIDVALIDITY 1 HIGHESTMODSEQ 1)\r\n"
+    ));
 
     // SELECT INBOX.
     assert!(out.contains("* 2 EXISTS\r\n"));
@@ -138,6 +146,26 @@ async fn full_initial_sync_transcript() {
     assert!(out.contains("a12 OK CLOSE completed\r\n"));
     assert!(out.contains("* BYE saehrimnir signing off\r\n"));
     assert!(out.contains("a13 OK LOGOUT completed\r\n"));
+}
+
+/// IDLE is advertised in CAPABILITY and rejected outside the Selected
+/// state. The mutation-driven IDLE round-trip (an idling client
+/// observing EXISTS / EXPUNGE on a state advance) lives in
+/// `tests/push.rs`, where the IMAP connection can share a `PushHub`
+/// with the test-admin step trigger.
+#[tokio::test]
+async fn idle_advertised_and_requires_select() {
+    let out =
+        run_with_fixture(b"a1 CAPABILITY\r\na2 LOGIN \"u\" \"p\"\r\na3 IDLE\r\na4 LOGOUT\r\n")
+            .await;
+    assert!(
+        out.contains(" IDLE "),
+        "IDLE advertised in CAPABILITY: {out:?}"
+    );
+    assert!(
+        out.contains("a3 BAD IDLE requires SELECT first"),
+        "IDLE before SELECT must be rejected: {out:?}"
+    );
 }
 
 /// Verifies the BODY[] literal block byte count is correct - if the
@@ -179,7 +207,17 @@ async fn run_with_attach_fixture(script: &[u8]) -> String {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(
+            server,
+            fix,
+            None,
+            saehrimnir::oauth::TokenStore::default(),
+            saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
+            saehrimnir::push::PushHub::new(),
+            &mut rx,
+        )
+        .await
     });
 
     client.write_all(script).await.unwrap();
@@ -242,15 +280,24 @@ async fn deterministic_two_runs_emit_identical_bytes() {
 // ── Reactive-callback tests ────────────────────────────────────────
 
 async fn run_with_lua_scenario(scenario: &str, imap_script: &[u8]) -> String {
-    let (fix, dispatcher) =
-        lua::load_source_with_dispatcher(scenario, "@cb-test").unwrap();
+    let (fix, dispatcher) = lua::load_source_with_dispatcher(scenario, "@cb-test").unwrap();
     let fix = saehrimnir::shared::handle(fix);
     let dispatcher = Some(Arc::new(dispatcher));
     let (server, mut client) = tokio::io::duplex(64 * 1024);
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, dispatcher, saehrimnir::oauth::TokenStore::default(), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(
+            server,
+            fix,
+            dispatcher,
+            saehrimnir::oauth::TokenStore::default(),
+            saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
+            saehrimnir::push::PushHub::new(),
+            &mut rx,
+        )
+        .await
     });
     client.write_all(imap_script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -395,12 +442,24 @@ async fn uid_fetch_no_handler_passes_through_silently() {
 }
 
 async fn run_with_imap_small(script: &[u8]) -> String {
-    let fix = saehrimnir::shared::handle(fixture::load(std::path::Path::new("fixtures/imap-small.toml")).unwrap());
+    let fix = saehrimnir::shared::handle(
+        fixture::load(std::path::Path::new("fixtures/imap-small.toml")).unwrap(),
+    );
     let (server, mut client) = tokio::io::duplex(32 * 1024);
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(
+            server,
+            fix,
+            None,
+            saehrimnir::oauth::TokenStore::default(),
+            saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
+            saehrimnir::push::PushHub::new(),
+            &mut rx,
+        )
+        .await
     });
 
     client.write_all(script).await.unwrap();
@@ -454,7 +513,17 @@ async fn imap_dispatch_records_request_log_entries() {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(
+            server,
+            fix,
+            None,
+            saehrimnir::oauth::TokenStore::default(),
+            log_clone,
+            saehrimnir::latency::LatencyKnob::default(),
+            saehrimnir::push::PushHub::new(),
+            &mut rx,
+        )
+        .await
     });
 
     let script = b"\
@@ -501,7 +570,17 @@ async fn imap_uid_fetch_log_distinguishes_body_from_metadata() {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        imap::serve_connection(server, fix, None, saehrimnir::oauth::TokenStore::default(), log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        imap::serve_connection(
+            server,
+            fix,
+            None,
+            saehrimnir::oauth::TokenStore::default(),
+            log_clone,
+            saehrimnir::latency::LatencyKnob::default(),
+            saehrimnir::push::PushHub::new(),
+            &mut rx,
+        )
+        .await
     });
 
     let script = b"\
@@ -601,7 +680,10 @@ async fn uid_copy_makes_email_visible_in_target_mailbox() {
     // Archive's first SELECT now reports EXISTS 1 (was 0); FETCH
     // returns the copied email.
     assert!(out.contains("d OK [READ-WRITE] SELECT completed"));
-    let post_select = out.split("d OK").nth(1).expect("post-Archive SELECT transcript");
+    let post_select = out
+        .split("d OK")
+        .nth(1)
+        .expect("post-Archive SELECT transcript");
     assert!(
         post_select.contains("* 1 FETCH (UID 1)"),
         "Archive missing copied email after UID COPY: {post_select:?}"
@@ -644,12 +726,18 @@ async fn uid_expunge_drops_only_deleted_flagged_messages() {
     // RFC 3501 §2.3.1.1 (UIDs must never be reused). The surviving
     // message takes sequence number 1 (only live message in the
     // mailbox) but its UID stays 2.
-    let post = out.split("d OK UID EXPUNGE completed").nth(1).expect("post-expunge");
+    let post = out
+        .split("d OK UID EXPUNGE completed")
+        .nth(1)
+        .expect("post-expunge");
     assert!(
         post.contains("* 1 FETCH (UID 2)"),
         "surviving message missing post-expunge or UID was reassigned: {post:?}"
     );
-    assert!(!post.contains("UID 1)"), "UID 1 should not have been reused: {post:?}");
+    assert!(
+        !post.contains("UID 1)"),
+        "UID 1 should not have been reused: {post:?}"
+    );
 }
 
 #[tokio::test]
@@ -836,8 +924,14 @@ async fn select_accepts_condstore_and_qresync_select_parameters() {
         c EXAMINE \"INBOX\" (QRESYNC (1 1))\r\n\
         d LOGOUT\r\n";
     let out = run_with_imap_small(script).await;
-    assert!(out.contains("b OK [READ-WRITE] SELECT completed"), "got: {out}");
-    assert!(out.contains("c OK [READ-ONLY] EXAMINE completed"), "got: {out}");
+    assert!(
+        out.contains("b OK [READ-WRITE] SELECT completed"),
+        "got: {out}"
+    );
+    assert!(
+        out.contains("c OK [READ-ONLY] EXAMINE completed"),
+        "got: {out}"
+    );
     // A baseline (never-mutated) fixture reports HIGHESTMODSEQ 1.
     assert!(out.contains("* OK [HIGHESTMODSEQ 1] modseq"), "got: {out}");
     // No expunges on a fresh fixture: QRESYNC emits no VANISHED.
@@ -861,7 +955,10 @@ async fn condstore_changedsince_returns_only_mutated_message() {
 
     // Before the write, HIGHESTMODSEQ is the baseline 1. After the
     // write bumps the account counter, the re-SELECT reports 2.
-    let post_store = out.split("c OK UID STORE completed").nth(1).expect("post-store");
+    let post_store = out
+        .split("c OK UID STORE completed")
+        .nth(1)
+        .expect("post-store");
     assert!(
         post_store.contains("* OK [HIGHESTMODSEQ 2] modseq"),
         "highestmodseq did not advance: {out}"
@@ -869,12 +966,27 @@ async fn condstore_changedsince_returns_only_mutated_message() {
 
     // CHANGEDSINCE 1 returns ONLY uid 2 (modseq 2 > 1); uid 1 is
     // untouched (modseq 1, not > 1) and is filtered out.
-    let delta = out.split("d OK [READ-WRITE] SELECT completed").nth(1).expect("post-reselect");
-    let delta = delta.split("e OK UID FETCH completed").next().expect("delta window");
+    let delta = out
+        .split("d OK [READ-WRITE] SELECT completed")
+        .nth(1)
+        .expect("post-reselect");
+    let delta = delta
+        .split("e OK UID FETCH completed")
+        .next()
+        .expect("delta window");
     assert!(delta.contains("UID 2"), "mutated message missing: {delta}");
-    assert!(delta.contains("MODSEQ (2)"), "advanced modseq missing: {delta}");
-    assert!(!delta.contains("UID 1 "), "untouched message leaked into delta: {delta}");
-    assert!(!delta.contains("* 1 FETCH"), "untouched message leaked into delta: {delta}");
+    assert!(
+        delta.contains("MODSEQ (2)"),
+        "advanced modseq missing: {delta}"
+    );
+    assert!(
+        !delta.contains("UID 1 "),
+        "untouched message leaked into delta: {delta}"
+    );
+    assert!(
+        !delta.contains("* 1 FETCH"),
+        "untouched message leaked into delta: {delta}"
+    );
 }
 
 /// QRESYNC expunge-delta: after a message is expunged its UID-history
@@ -891,8 +1003,14 @@ async fn qresync_select_emits_vanished_for_expunged_uid() {
         e SELECT \"INBOX\" (QRESYNC (1 1 1:2))\r\n\
         f LOGOUT\r\n";
     let out = run_with_imap_small(script).await;
-    assert!(out.contains("d OK UID EXPUNGE completed"), "expunge failed: {out}");
-    let reopen = out.split("d OK UID EXPUNGE completed").nth(1).expect("post-expunge");
+    assert!(
+        out.contains("d OK UID EXPUNGE completed"),
+        "expunge failed: {out}"
+    );
+    let reopen = out
+        .split("d OK UID EXPUNGE completed")
+        .nth(1)
+        .expect("post-expunge");
     assert!(
         reopen.contains("* VANISHED (EARLIER) 1\r\n"),
         "VANISHED missing for expunged uid: {reopen}"
@@ -901,10 +1019,7 @@ async fn qresync_select_emits_vanished_for_expunged_uid() {
 
 // ── Multi-account (Stage 4: AUTH-driven account binding) ────────────
 
-async fn run_with_multi_account(
-    script: &[u8],
-    store: saehrimnir::oauth::TokenStore,
-) -> String {
+async fn run_with_multi_account(script: &[u8], store: saehrimnir::oauth::TokenStore) -> String {
     let fix = saehrimnir::shared::handle(
         fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap(),
     );
@@ -919,6 +1034,7 @@ async fn run_with_multi_account(
             store,
             saehrimnir::request_log::RequestLog::default(),
             saehrimnir::latency::LatencyKnob::default(),
+            saehrimnir::push::PushHub::new(),
             &mut rx,
         )
         .await
@@ -940,7 +1056,10 @@ async fn imap_login_binds_to_matching_account_and_lists_its_mailboxes() {
         a2 LIST \"\" \"*\"\r\n\
         a3 LOGOUT\r\n";
     let out = run_with_multi_account(script, saehrimnir::oauth::TokenStore::default()).await;
-    let lists: Vec<&str> = out.split("\r\n").filter(|l| l.starts_with("* LIST")).collect();
+    let lists: Vec<&str> = out
+        .split("\r\n")
+        .filter(|l| l.starts_with("* LIST"))
+        .collect();
     assert_eq!(lists.len(), 1);
     assert!(
         lists[0].contains("INBOX") && !lists[0].contains("mbx-primary-inbox"),
@@ -967,9 +1086,7 @@ async fn imap_authenticate_xoauth2_resolves_via_token_store() {
     let token = store.mint("authorization_code", "account-secondary", 1);
     // SASL XOAUTH2 initial response: base64 of
     // `user=secondary@example.com\x01auth=Bearer <token>\x01\x01`.
-    let payload = format!(
-        "user=secondary@example.com\x01auth=Bearer {token}\x01\x01"
-    );
+    let payload = format!("user=secondary@example.com\x01auth=Bearer {token}\x01\x01");
     let encoded = base64_encode(payload.as_bytes());
     let script = format!(
         "a1 AUTHENTICATE XOAUTH2 {encoded}\r\n\
@@ -977,9 +1094,15 @@ async fn imap_authenticate_xoauth2_resolves_via_token_store() {
          a3 LOGOUT\r\n"
     );
     let out = run_with_multi_account(script.as_bytes(), store).await;
-    let lists: Vec<&str> = out.split("\r\n").filter(|l| l.starts_with("* LIST")).collect();
+    let lists: Vec<&str> = out
+        .split("\r\n")
+        .filter(|l| l.starts_with("* LIST"))
+        .collect();
     assert_eq!(lists.len(), 1);
-    assert!(lists[0].contains("INBOX"), "expected an inbox; got {lists:?}");
+    assert!(
+        lists[0].contains("INBOX"),
+        "expected an inbox; got {lists:?}"
+    );
     // Secondary's inbox-role mailbox is `mbx-secondary-inbox`; LIST
     // serializes it as "INBOX" (the IMAP convention for role=inbox).
     // The primary's `mbx-primary-inbox` would also render as
@@ -1017,6 +1140,7 @@ async fn per_connection_id_groups_request_log_entries() {
                 saehrimnir::oauth::TokenStore::default(),
                 log,
                 saehrimnir::latency::LatencyKnob::default(),
+                saehrimnir::push::PushHub::new(),
                 &mut rx,
             )
             .await
@@ -1067,8 +1191,7 @@ async fn per_connection_id_groups_request_log_entries() {
 
 fn base64_encode(bytes: &[u8]) -> String {
     // Standard base64 with `=` padding.
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0];
@@ -1090,4 +1213,3 @@ fn base64_encode(bytes: &[u8]) -> String {
     }
     out
 }
-

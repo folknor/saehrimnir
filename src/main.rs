@@ -6,7 +6,9 @@ use saehrimnir::lua::MockExit;
 use saehrimnir::oauth::TokenStore;
 use saehrimnir::request_log::RequestLog;
 use saehrimnir::sentinel::ProtocolPort;
-use saehrimnir::{caldav, cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp, tls};
+use saehrimnir::{
+    caldav, cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp, tls,
+};
 use tokio::sync::watch;
 
 /// Hard budget on graceful drain after SIGTERM. Plan-2 acceptance #6
@@ -25,7 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             f.name,
             f.mailboxes.len(),
             f.emails.len(),
-            if scenario.dispatcher.is_some() { "yes" } else { "no" },
+            if scenario.dispatcher.is_some() {
+                "yes"
+            } else {
+                "no"
+            },
         );
     }
     let fixture = Arc::clone(&scenario.fixture);
@@ -150,12 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Post-load baseline used by `POST /test/fixture/reset` to
     // rewind the fixture image. Cloned once before any handler
     // can mutate. The Arc keeps SharedHandles cheap to clone.
-    let baseline = Arc::new(
-        fixture
-            .read()
-            .expect("fixture lock poisoned")
-            .clone(),
-    );
+    let baseline = Arc::new(fixture.read().expect("fixture lock poisoned").clone());
     let shared = saehrimnir::shared::SharedHandles {
         fixture: Arc::clone(&fixture),
         baseline,
@@ -181,15 +182,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             jmap_listener,
             app.into_make_service_with_connect_info::<saehrimnir::connection_id::ConnInfo>(),
         )
-            .with_graceful_shutdown(async move {
-                let mut rx = jmap_shutdown_rx;
-                while rx.changed().await.is_ok() {
-                    if *rx.borrow() {
-                        return;
-                    }
+        .with_graceful_shutdown(async move {
+            let mut rx = jmap_shutdown_rx;
+            while rx.changed().await.is_ok() {
+                if *rx.borrow() {
+                    return;
                 }
-            })
-            .into_future(),
+            }
+        })
+        .into_future(),
     );
 
     // IMAP server. Threads the optional Lua dispatcher so reactive
@@ -200,6 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let imap_request_log = request_log.clone();
     let imap_latency = shared.latency.clone();
     let imap_token_store = shared.token_store.clone();
+    let imap_push = shared.push.clone();
     let imap_task = tokio::spawn(async move {
         imap::serve(
             imap_listener,
@@ -208,6 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             imap_token_store,
             imap_request_log,
             imap_latency,
+            imap_push,
             imap_shutdown_rx,
         )
         .await
@@ -254,15 +257,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             graph_listener,
             graph_app.into_make_service_with_connect_info::<saehrimnir::connection_id::ConnInfo>(),
         )
-            .with_graceful_shutdown(async move {
-                let mut rx = graph_shutdown_rx;
-                while rx.changed().await.is_ok() {
-                    if *rx.borrow() {
-                        return;
-                    }
+        .with_graceful_shutdown(async move {
+            let mut rx = graph_shutdown_rx;
+            while rx.changed().await.is_ok() {
+                if *rx.borrow() {
+                    return;
                 }
-            })
-            .into_future(),
+            }
+        })
+        .into_future(),
     );
 
     // Gmail server.
@@ -275,15 +278,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gmail_listener,
             gmail_app.into_make_service_with_connect_info::<saehrimnir::connection_id::ConnInfo>(),
         )
-            .with_graceful_shutdown(async move {
-                let mut rx = gmail_shutdown_rx;
-                while rx.changed().await.is_ok() {
-                    if *rx.borrow() {
-                        return;
-                    }
+        .with_graceful_shutdown(async move {
+            let mut rx = gmail_shutdown_rx;
+            while rx.changed().await.is_ok() {
+                if *rx.borrow() {
+                    return;
                 }
-            })
-            .into_future(),
+            }
+        })
+        .into_future(),
     );
 
     // CalDAV server. Reuses the same `SharedHandles` so the
@@ -293,8 +296,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared: shared.clone(),
     };
     let caldav_shutdown_rx = shutdown_rx.clone();
-    let caldav_task =
-        tokio::spawn(async move { caldav::serve(caldav_listener, caldav_state, caldav_shutdown_rx).await });
+    let caldav_task = tokio::spawn(async move {
+        caldav::serve(caldav_listener, caldav_state, caldav_shutdown_rx).await
+    });
 
     // Google People API server.
     let people_state = saehrimnir::people::AppState {

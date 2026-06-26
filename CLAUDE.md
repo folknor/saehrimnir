@@ -137,7 +137,8 @@ checking whether the fact is already in `notes/`.
   Unknown / evicted `sinceState` returns `cannotCalculateChanges`.
   Out-of-scope JMAP methods (`EmailSubmission/set`, push,
   `Email/copy`, etc.) still return `unknownMethod`. Out-of-scope
-  IMAP commands (write paths, IDLE, NOTIFY, etc.) return `BAD`.
+  IMAP commands (NOTIFY, COMPRESS, etc.) return `BAD`. (`IDLE` is
+  implemented - see the IMAP status section.)
 - The session must NOT advertise `urn:ietf:params:jmap:principals`.
   It would pull the client into `Principal/get` and
   `ShareNotification` paths the mock cannot satisfy.
@@ -593,8 +594,12 @@ PATCH rename, POST `/move` re-parent [`msgfolderroot` = top], DELETE,
 all mutating the shared `Mailbox` set with `mailbox_*` transitions;
 folder delete does not cascade to messages in v0), `/v1.0/me/mailFolders/{id}/messages` (with `$top` /
 `$skip` / `$skiptoken` / `$filter`), `/v1.0/me/mailFolders/{id}/
-messages/delta` (initial dump, follow-up no-op, `$deltatoken=latest`
-shortcut), `/v1.0/me/messages/{id}` (single-message GET projecting
+messages/delta` (initial dump; follow-up `$deltatoken` calls walk the
+account's change log between the supplied state and the current state -
+created/updated messages currently in the folder as full bodies,
+destroyed ones as Graph `@removed` tombstones - ending on a fresh
+deltaLink; `$deltatoken=latest` shortcut; unknown/evicted token falls
+back to a full dump), `/v1.0/me/messages/{id}` (single-message GET projecting
 the email - the per-id read bifrost hydrates through `$batch`; 404
 `ErrorItemNotFound` on unknown id - plus PATCH writeback mapping
 `isRead` <-> `$seen`, `flag.flagStatus` <-> `$flagged`, `categories`
@@ -798,6 +803,17 @@ Per protocol:
   loopback notificationUrl. Subscriptions are process-volatile (cleared
   by `POST /test/fixture/reset`), not fixture-backed, so they record no
   change-log transition.
+- IMAP IDLE: `IDLE` is advertised in CAPABILITY and implemented
+  (`src/imap.rs::cmd_idle`). A connection in the Selected state parks
+  on `IDLE` and registers a waiter on the shared `PushHub`. On state
+  advance, every idling connection on the touched account recomputes
+  its selected mailbox's live message set and emits the unsolicited
+  untagged responses (`* n EXPUNGE` highest-seq-first, `* n EXISTS` +
+  `* n RECENT` for arrivals). `DONE` ends the idle. The waiter carries
+  no payload - the connection diffs against its own last-emitted view,
+  so coalesced wakes still produce one correct diff. No observability
+  log of its own (it is live wire transport only); assert via a live
+  IMAP connection in tests.
 Observability: every emitted JMAP frame and Graph notification is
 logged and every Pub/Sub message kept in a sink, exposed over
 `GET /test/push/jmap`, `GET /test/push/graph`,

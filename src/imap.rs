@@ -36,7 +36,7 @@ pub const GREETING: &str = "* OK saehrimnir IMAP4rev1 ready\r\n";
 /// `OK [CAPABILITY ...]` resp-text. Authenticated set; the
 /// pre-auth set adds `LOGINDISABLED`-equivalents only if we ever grow
 /// real auth, which v0 does not.
-pub const CAPABILITIES: &str = "IMAP4REV1 CONDSTORE QRESYNC";
+pub const CAPABILITIES: &str = "IMAP4REV1 IDLE CONDSTORE QRESYNC";
 
 /// Per-connection state machine, RFC 3501 sec 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,7 @@ enum State {
 /// Run the accept loop until `shutdown` flips. Each accepted connection
 /// runs in its own task; in-flight connections drop when their socket
 /// is closed or when the shutdown signal interrupts a read.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: TcpListener,
     fixture: crate::shared::FixtureHandle,
@@ -57,6 +58,7 @@ pub async fn serve(
     token_store: crate::oauth::TokenStore,
     request_log: crate::request_log::RequestLog,
     latency: crate::latency::LatencyKnob,
+    push: crate::push::PushHub,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
@@ -75,9 +77,10 @@ pub async fn serve(
                         let store = token_store.clone();
                         let log = request_log.clone();
                         let lat = latency.clone();
+                        let push = push.clone();
                         let mut sd = shutdown.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, fix, disp, store, log, lat, &mut sd).await {
+                            if let Err(e) = serve_connection(stream, fix, disp, store, log, lat, push, &mut sd).await {
                                 eprintln!("saehrimnir: imap connection {peer}: {e}");
                             }
                         });
@@ -95,6 +98,7 @@ pub async fn serve(
 /// callback-free scenarios (TOML fixtures or Lua scenarios that
 /// registered no `on()` handlers); when present, protocol commands
 /// consult it before generating their default responses.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_connection<S>(
     stream: S,
     fixture: crate::shared::FixtureHandle,
@@ -102,6 +106,7 @@ pub async fn serve_connection<S>(
     token_store: crate::oauth::TokenStore,
     request_log: crate::request_log::RequestLog,
     latency: crate::latency::LatencyKnob,
+    push: crate::push::PushHub,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -126,6 +131,7 @@ where
         selected: None,
         account_id: primary_account_id,
         connection_id: crate::connection_id::next(),
+        push,
     };
 
     conn.write_line(GREETING.trim_end_matches("\r\n")).await?;
@@ -140,7 +146,7 @@ where
             }
         };
         conn.latency.sleep_for("imap").await;
-        conn.dispatch(&line).await?;
+        conn.dispatch(&line, shutdown).await?;
         if conn.state == State::Logout {
             return Ok(());
         }
@@ -183,6 +189,12 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     /// harness scripts group entries by session (one LOGIN +
     /// N SELECTs vs N LOGINs + N SELECTs).
     connection_id: u64,
+    /// Provider push hub. An `IDLE` command registers a waiter here for
+    /// the connection's account; the test-admin state-mutation trigger
+    /// (`POST /test/fixture/step` -> `PushHub::emit_state_advance`) wakes
+    /// it so the idling client observes the change. Shared with the
+    /// JMAP WebSocket / Gmail Pub/Sub / Graph webhook surfaces.
+    push: crate::push::PushHub,
 }
 
 enum ReadOutcome {
@@ -252,7 +264,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
     }
 
-    async fn dispatch(&mut self, line: &str) -> std::io::Result<()> {
+    async fn dispatch(
+        &mut self,
+        line: &str,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> std::io::Result<()> {
         let parsed = match parse_command_line(line) {
             Some(p) => p,
             None => {
@@ -354,13 +370,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "SELECT" => self.cmd_select(parsed.tag, parsed.args, true).await,
             "EXAMINE" => self.cmd_select(parsed.tag, parsed.args, false).await,
             "UID" => self.cmd_uid(parsed.tag, parsed.args).await,
+            "IDLE" => self.cmd_idle(parsed.tag, shutdown).await,
             "CLOSE" => self.cmd_close(parsed.tag).await,
             other => {
-                self.write_line(&format!(
-                    "{} BAD {other} not implemented in v0",
-                    parsed.tag
-                ))
-                .await
+                self.write_line(&format!("{} BAD {other} not implemented in v0", parsed.tag))
+                    .await
             }
         }
     }
@@ -493,10 +507,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     .await
             }
             other => {
-                self.write_line(&format!(
-                    "{tag} NO unsupported SASL mechanism {other:?}"
-                ))
-                .await
+                self.write_line(&format!("{tag} NO unsupported SASL mechanism {other:?}"))
+                    .await
             }
         }
     }
@@ -543,9 +555,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // for the hierarchy delimiter only.
         if pattern.is_empty() {
             self.write_line("* LIST (\\Noselect) \"/\" \"\"").await?;
-            return self
-                .write_line(&format!("{tag} OK LIST completed"))
-                .await;
+            return self.write_line(&format!("{tag} OK LIST completed")).await;
         }
         // We accept both `*` and exact-name patterns; everything else
         // falls back to substring matching, which is enough for
@@ -582,7 +592,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
         };
         let entries = list_mailboxes(&self.fix_read(), &self.account_id);
-        let entry = entries.iter().find(|e| e.path.eq_ignore_ascii_case(&parsed.name));
+        let entry = entries
+            .iter()
+            .find(|e| e.path.eq_ignore_ascii_case(&parsed.name));
         let Some(entry) = entry else {
             return self
                 .write_line(&format!("{tag} NO STATUS unknown mailbox"))
@@ -618,12 +630,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         matches!(self.state, State::Authenticated | State::Selected)
     }
 
-    async fn cmd_select(
-        &mut self,
-        tag: &str,
-        args: &str,
-        read_write: bool,
-    ) -> std::io::Result<()> {
+    async fn cmd_select(&mut self, tag: &str, args: &str, read_write: bool) -> std::io::Result<()> {
         if !self.is_authenticated() {
             return self
                 .write_line(&format!("{tag} BAD SELECT requires authentication"))
@@ -671,7 +678,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
         // Untagged responses, RFC 3501 sec 6.3.1. Order does not
         // matter, but we emit a stable order for byte-determinism.
-        self.write_line(&format!("* {} EXISTS", counts.exists)).await?;
+        self.write_line(&format!("* {} EXISTS", counts.exists))
+            .await?;
         self.write_line("* 0 RECENT").await?;
         self.write_line("* FLAGS (\\Seen \\Flagged \\Draft \\Answered \\Deleted)")
             .await?;
@@ -685,8 +693,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
         self.write_line("* OK [UIDVALIDITY 1] folder identity")
             .await?;
-        self.write_line(&format!("* OK [UIDNEXT {}] predicted next UID", counts.uidnext))
-            .await?;
+        self.write_line(&format!(
+            "* OK [UIDNEXT {}] predicted next UID",
+            counts.uidnext
+        ))
+        .await?;
         let highestmodseq = self.fix_read().imap_highestmodseq(&self.account_id);
         self.write_line(&format!("* OK [HIGHESTMODSEQ {highestmodseq}] modseq"))
             .await?;
@@ -702,12 +713,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         if let Some(qr) = &select.qresync {
             let gone = expunged_uids(&self.fix_read(), &entry_id, qr.known_uids.as_ref());
             if !gone.is_empty() {
-                self.write_line(&format!("* VANISHED (EARLIER) {}", format_uid_ranges(&gone)))
-                    .await?;
+                self.write_line(&format!(
+                    "* VANISHED (EARLIER) {}",
+                    format_uid_ranges(&gone)
+                ))
+                .await?;
             }
         }
 
-        let access = if read_write { "READ-WRITE" } else { "READ-ONLY" };
+        let access = if read_write {
+            "READ-WRITE"
+        } else {
+            "READ-ONLY"
+        };
         let verb = if read_write { "SELECT" } else { "EXAMINE" };
         self.state = State::Selected;
         self.selected = Some(entry_id);
@@ -726,6 +744,120 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         self.write_line(&format!("{tag} OK CLOSE completed")).await
     }
 
+    /// `IDLE` (RFC 2177). Valid only in the Selected state. Replies
+    /// `+ idling`, then parks: a wake from the shared push hub (driven
+    /// by the test-admin state-mutation trigger, the same path that
+    /// fires the JMAP WebSocket / Gmail Pub/Sub / Graph webhook
+    /// surfaces) makes the connection recompute the selected mailbox's
+    /// live message set and emit the unsolicited untagged responses a
+    /// real server sends - `* n EXPUNGE` for vanished messages (highest
+    /// sequence first per RFC 3501 so no renumbering is needed) and
+    /// `* n EXISTS` + `* n RECENT` when messages arrive. `DONE` ends the
+    /// idle with a tagged OK; a SIGTERM-driven shutdown emits `* BYE`
+    /// and closes.
+    async fn cmd_idle(
+        &mut self,
+        tag: &str,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> std::io::Result<()> {
+        if self.state != State::Selected {
+            return self
+                .write_line(&format!("{tag} BAD IDLE requires SELECT first"))
+                .await;
+        }
+        let selected_id = self
+            .selected
+            .clone()
+            .expect("Selected state requires selected mailbox");
+        // Register a waiter on the shared push hub for this connection's
+        // account, and snapshot the mailbox's current live-UID view so
+        // the first wake diffs against the pre-IDLE state. The receiver
+        // drops when this method returns (DONE / shutdown / peer close);
+        // the hub prunes the stale registration on its next emit.
+        let mut idle_rx = self.push.register_imap_idle(self.account_id.clone());
+        let mut last_uids: Vec<u32> = {
+            let fix = self.fix_read();
+            live_uids(&fix, &self.account_id, &selected_id)
+        };
+        self.write_line("+ idling").await?;
+        loop {
+            let mut line = String::new();
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        let _ = self.write_line("* BYE saehrimnir shutting down").await;
+                        self.state = State::Logout;
+                        return Ok(());
+                    }
+                }
+                r = self.reader.read_line(&mut line) => {
+                    let n = r?;
+                    if n == 0 {
+                        // Peer closed mid-idle; end the connection.
+                        self.state = State::Logout;
+                        return Ok(());
+                    }
+                    if strip_crlf(&line).trim().eq_ignore_ascii_case("DONE") {
+                        return self
+                            .write_line(&format!("{tag} OK IDLE terminated"))
+                            .await;
+                    }
+                    // RFC 2177: only DONE is valid while idling. Anything
+                    // else is ignored (we keep idling) rather than
+                    // desynchronising the connection.
+                }
+                _ = idle_rx.recv() => {
+                    self.emit_idle_updates(&selected_id, &mut last_uids).await?;
+                }
+            }
+        }
+    }
+
+    /// Recompute the selected mailbox's live message set and emit the
+    /// untagged responses for whatever changed since `last_uids`, then
+    /// update `last_uids`. Diffing against the last-emitted view (rather
+    /// than acting on a wake payload) keeps the output correct even if
+    /// several mutations coalesced into one wake.
+    async fn emit_idle_updates(
+        &mut self,
+        selected_id: &str,
+        last_uids: &mut Vec<u32>,
+    ) -> std::io::Result<()> {
+        let new_uids: Vec<u32> = {
+            let fix = self.fix_read();
+            live_uids(&fix, &self.account_id, selected_id)
+        };
+        // Expunged: UIDs present before but gone now. The IMAP sequence
+        // number is the 1-based position in the *old* live view; emit
+        // highest-first so earlier emissions don't renumber later ones
+        // (matches `cmd_uid_expunge`).
+        let mut expunged_seqs: Vec<u32> = last_uids
+            .iter()
+            .enumerate()
+            .filter(|(_, uid)| !new_uids.contains(uid))
+            .map(|(i, _)| u32::try_from(i + 1).expect("seq fits in u32"))
+            .collect();
+        expunged_seqs.sort_unstable_by_key(|s| std::cmp::Reverse(*s));
+        for seq in &expunged_seqs {
+            self.write_line(&format!("* {seq} EXPUNGE")).await?;
+        }
+        // Arrivals: UIDs new since the last view. A real server reports
+        // the new mailbox total via EXISTS plus a RECENT count for the
+        // freshly-arrived messages.
+        let arrivals = new_uids
+            .iter()
+            .filter(|uid| !last_uids.contains(uid))
+            .count();
+        if arrivals > 0 {
+            self.write_line(&format!("* {} EXISTS", new_uids.len()))
+                .await?;
+            self.write_line(&format!("* {arrivals} RECENT")).await?;
+        }
+        *last_uids = new_uids;
+        Ok(())
+    }
+
     async fn cmd_uid(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
         if self.state != State::Selected {
             return self
@@ -742,10 +874,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "COPY" => self.cmd_uid_copy(tag, rest).await,
             "EXPUNGE" => self.cmd_uid_expunge(tag, rest).await,
             other => {
-                self.write_line(&format!(
-                    "{tag} BAD UID {other} not implemented in v0"
-                ))
-                .await
+                self.write_line(&format!("{tag} BAD UID {other} not implemented in v0"))
+                    .await
             }
         }
     }
@@ -820,9 +950,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 Ok(())
             });
             if let crate::lua::Override::Tagged { status, message } = result {
-                return self
-                    .write_line(&format!("{tag} {status} {message}"))
-                    .await;
+                return self.write_line(&format!("{tag} {status} {message}")).await;
             }
         }
 
@@ -913,7 +1041,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             Some(p) => p,
             None => {
                 return self
-                    .write_line(&format!("{tag} BAD UID STORE expects <set> <flag-op> <flags>"))
+                    .write_line(&format!(
+                        "{tag} BAD UID STORE expects <set> <flag-op> <flags>"
+                    ))
                     .await;
             }
         };
@@ -967,9 +1097,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     }
                     if !store_op.silent {
                         let flags = flags_for(email);
-                        emitted.push(format!(
-                            "* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n"
-                        ));
+                        emitted.push(format!("* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n"));
                     }
                 }
                 diff
@@ -1049,8 +1177,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                             .enumerate()
                             .filter_map(|(i, slot)| {
                                 slot.as_ref().map(|id| {
-                                    let uid = u32::try_from(i + 1)
-                                        .expect("uid fits in u32");
+                                    let uid = u32::try_from(i + 1).expect("uid fits in u32");
                                     (uid, id.clone())
                                 })
                             })
@@ -1059,9 +1186,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                             if !set.matches(uid) {
                                 continue;
                             }
-                            let Some(idx) =
-                                f.emails.iter().position(|e| e.id == email_id)
-                            else {
+                            let Some(idx) = f.emails.iter().position(|e| e.id == email_id) else {
                                 continue;
                             };
                             let email = &mut f.emails[idx];
@@ -1136,15 +1261,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     .enumerate()
                     .filter_map(|(i, slot)| {
                         slot.as_ref().map(|id| {
-                            let uid = u32::try_from(i + 1)
-                                .expect("uid fits in u32");
+                            let uid = u32::try_from(i + 1).expect("uid fits in u32");
                             (uid, id.clone())
                         })
                     })
                     .enumerate()
                     .map(|(seq, (uid, id))| {
-                        let seq = u32::try_from(seq + 1)
-                            .expect("seq fits in u32");
+                        let seq = u32::try_from(seq + 1).expect("seq fits in u32");
                         (seq, uid, id)
                     })
                     .collect();
@@ -1157,17 +1280,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                         f.emails
                             .iter()
                             .find(|e| &e.id == id)
-                            .is_some_and(|e| {
-                                e.keywords.iter().any(|k| k == "$deleted")
-                            })
+                            .is_some_and(|e| e.keywords.iter().any(|k| k == "$deleted"))
                     })
                     .map(|(seq, _, id)| (*seq, id.clone()))
                     .collect();
                 victims.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
                 seqs = victims.iter().map(|(seq, _)| *seq).collect();
                 for (_seq, id) in &victims {
-                    let Some(idx) = f.emails.iter().position(|e| &e.id == id)
-                    else {
+                    let Some(idx) = f.emails.iter().position(|e| &e.id == id) else {
                         continue;
                     };
                     f.emails[idx].mailbox_ids.retain(|m| m != &selected_id);
@@ -1194,7 +1314,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     }
 
     async fn cmd_uid_search(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
-        let selected_id = self.selected.clone().expect("Selected state requires selected mailbox");
+        let selected_id = self
+            .selected
+            .clone()
+            .expect("Selected state requires selected mailbox");
         // Parse first (no fixture access); the BAD-criteria branch
         // returns through `.await` and we must not hold the read
         // guard across that.
@@ -1340,6 +1463,16 @@ fn mailbox_messages<'a>(
         .collect()
 }
 
+/// Live IMAP UIDs for `mailbox_id`, in sequence order. A thin wrapper
+/// over [`mailbox_messages`] that drops the email payload - the IDLE
+/// diff only needs the UID set to detect arrivals and expunges.
+fn live_uids(fixture: &Fixture, account_id: &str, mailbox_id: &str) -> Vec<u32> {
+    mailbox_messages(fixture, account_id, mailbox_id)
+        .iter()
+        .map(|(uid, _)| *uid)
+        .collect()
+}
+
 fn mailbox_counts(fixture: &Fixture, account_id: &str, mailbox_id: &str) -> Counts {
     let by_id: HashMap<&str, &Email> = fixture
         .emails_for(account_id)
@@ -1466,7 +1599,8 @@ pub(crate) fn sasl_decode_b64(s: &str) -> Option<Vec<u8>> {
 pub(crate) fn sasl_extract_bearer(decoded: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(decoded).ok()?;
     for field in s.split('\x01') {
-        if let Some(rest) = field.strip_prefix("auth=Bearer ")
+        if let Some(rest) = field
+            .strip_prefix("auth=Bearer ")
             .or_else(|| field.strip_prefix("auth=bearer "))
         {
             let token = rest.trim();
@@ -1493,7 +1627,11 @@ pub(crate) fn sasl_extract_username(mech: &str, decoded: &[u8]) -> Option<String
             let parts: Vec<&[u8]> = decoded.split(|b| *b == 0).collect();
             if parts.len() >= 3 {
                 let user = std::str::from_utf8(parts[1]).ok()?;
-                if user.is_empty() { None } else { Some(user.to_string()) }
+                if user.is_empty() {
+                    None
+                } else {
+                    Some(user.to_string())
+                }
             } else {
                 None
             }
@@ -1523,7 +1661,11 @@ pub(crate) fn sasl_extract_username(mech: &str, decoded: &[u8]) -> Option<String
             // The (single) continuation in our implementation IS the
             // base64-encoded username. Drop trailing whitespace.
             let t = s.trim();
-            if t.is_empty() { None } else { Some(t.to_string()) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
         }
         _ => None,
     }
@@ -1773,11 +1915,7 @@ impl StoreOp {
     /// changed at least one keyword (caller uses the bit to decide
     /// whether to bump fixture state).
     fn apply_in_place(&self, email: &mut Email) -> bool {
-        let requested: Vec<String> = self
-            .flags
-            .iter()
-            .map(|f| imap_flag_to_keyword(f))
-            .collect();
+        let requested: Vec<String> = self.flags.iter().map(|f| imap_flag_to_keyword(f)).collect();
         let before = email.keywords.clone();
         match self.kind {
             StoreKind::Add => {
@@ -1837,7 +1975,11 @@ fn parse_store_op(s: &str) -> Option<StoreOp> {
         _ => return None,
     };
     let flags = parse_flag_list(rest.trim())?;
-    Some(StoreOp { kind, flags, silent })
+    Some(StoreOp {
+        kind,
+        flags,
+        silent,
+    })
 }
 
 /// Parse a flag list in either `(\Seen \Flagged)` or
@@ -1949,11 +2091,7 @@ fn parse_fetch_attrs(s: &str) -> Option<Vec<FetchAttr>> {
             out.push(attr);
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Stable string label for a `FetchAttr`. Used by the request-log
@@ -2007,7 +2145,10 @@ fn parse_changedsince(modifiers: &str) -> Result<Option<u64>, ()> {
     if m.is_empty() {
         return Ok(None);
     }
-    let inner = m.strip_prefix('(').and_then(|s| s.strip_suffix(')')).ok_or(())?;
+    let inner = m
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or(())?;
     let mut it = inner.split_whitespace();
     let key = it.next().ok_or(())?;
     if !key.eq_ignore_ascii_case("CHANGEDSINCE") {
@@ -2053,7 +2194,10 @@ fn parse_select_args(args: &str) -> Option<SelectArgs> {
     let mut p = AstringParser { s: args, i: 0 };
     let name = p.next_astring()?;
     p.skip_spaces();
-    let mut out = SelectArgs { name, qresync: None };
+    let mut out = SelectArgs {
+        name,
+        qresync: None,
+    };
     if p.eof() {
         return Some(out);
     }
@@ -2260,27 +2404,19 @@ fn fetch_response_line(
             }
             FetchAttr::BodyText => {
                 let r = rendered.get_or_insert_with(|| RenderedRfc822::for_email(email));
-                out.push_str(&format!(
-                    "BODY[TEXT] {{{}}}\r\n{}",
-                    r.text.len(),
-                    r.text
-                ));
+                out.push_str(&format!("BODY[TEXT] {{{}}}\r\n{}", r.text.len(), r.text));
             }
             FetchAttr::BodyStructure => {
                 out.push_str(&format!("BODYSTRUCTURE {}", render_bodystructure(email)));
             }
             FetchAttr::BodyPart(n) => match render_part_n(email, *n) {
-                Some(bytes) => out.push_str(&format!(
-                    "BODY[{n}] {{{}}}\r\n{bytes}",
-                    bytes.len()
-                )),
+                Some(bytes) => out.push_str(&format!("BODY[{n}] {{{}}}\r\n{bytes}", bytes.len())),
                 None => out.push_str(&format!("BODY[{n}] NIL")),
             },
             FetchAttr::BodyPartMime(n) => match render_part_n_mime(email, *n) {
-                Some(bytes) => out.push_str(&format!(
-                    "BODY[{n}.MIME] {{{}}}\r\n{bytes}",
-                    bytes.len()
-                )),
+                Some(bytes) => {
+                    out.push_str(&format!("BODY[{n}.MIME] {{{}}}\r\n{bytes}", bytes.len()));
+                }
                 None => out.push_str(&format!("BODY[{n}.MIME] NIL")),
             },
         }
@@ -2444,11 +2580,7 @@ fn render_rfc822_headers(email: &Email) -> String {
     if !email.reply_to.is_empty() {
         push_header(&mut out, "Reply-To", &format_address_list(&email.reply_to));
     }
-    push_header(
-        &mut out,
-        "Date",
-        &email.sent_at.to_rfc2822(),
-    );
+    push_header(&mut out, "Date", &email.sent_at.to_rfc2822());
     if let Some(subject) = &email.subject {
         push_header(&mut out, "Subject", subject);
     }
@@ -2463,11 +2595,7 @@ fn render_rfc822_headers(email: &Email) -> String {
     }
     push_header(&mut out, "MIME-Version", "1.0");
     if email.attachments.is_empty() {
-        push_header(
-            &mut out,
-            "Content-Type",
-            "text/plain; charset=utf-8",
-        );
+        push_header(&mut out, "Content-Type", "text/plain; charset=utf-8");
         push_header(&mut out, "Content-Transfer-Encoding", "8bit");
     } else {
         push_header(
@@ -2551,8 +2679,7 @@ fn part_mime_attachment(a: &crate::fixture::Attachment) -> String {
 /// separated. Final line gets a trailing CRLF so the next boundary sits
 /// on its own line.
 fn base64_wrapped(input: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);
     for c in chunks.by_ref() {
@@ -2627,7 +2754,8 @@ fn render_bodystructure(email: &Email) -> String {
 
 fn body_structure_text_leaf(body: &str, encoding: &str, params: &[(&str, &str)]) -> String {
     let octets = body.len();
-    let lines = body.matches("\r\n").count() + usize::from(!body.is_empty() && !body.ends_with("\r\n"));
+    let lines =
+        body.matches("\r\n").count() + usize::from(!body.is_empty() && !body.ends_with("\r\n"));
     format!(
         "(\"TEXT\" \"PLAIN\" {} NIL NIL \"{encoding}\" {octets} {lines})",
         format_params(params)
@@ -2751,10 +2879,7 @@ fn format_address(a: &Address) -> String {
 }
 
 fn format_address_list(xs: &[Address]) -> String {
-    xs.iter()
-        .map(format_address)
-        .collect::<Vec<_>>()
-        .join(", ")
+    xs.iter().map(format_address).collect::<Vec<_>>().join(", ")
 }
 
 /// Force every `\n` to `\r\n` so the RFC 822 wire body has consistent
@@ -3001,7 +3126,17 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, crate::oauth::TokenStore::default(), crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
+            serve_connection(
+                server,
+                fix,
+                None,
+                crate::oauth::TokenStore::default(),
+                crate::request_log::RequestLog::default(),
+                crate::latency::LatencyKnob::default(),
+                crate::push::PushHub::new(),
+                &mut rx,
+            )
+            .await
         });
 
         client.write_all(script).await.unwrap();
@@ -3024,12 +3159,15 @@ mod tests {
         let out = run_script(b"a1 CAPABILITY\r\n").await;
         assert!(out.contains(GREETING));
         assert!(
-            out.contains("* CAPABILITY IMAP4REV1 CONDSTORE QRESYNC\r\n"),
+            out.contains("* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC\r\n"),
             "got: {out:?}"
         );
         assert!(out.contains("a1 OK CAPABILITY completed\r\n"));
-        for k in ["STARTTLS", "IDLE", "COMPRESS", "NOTIFY", "APPEND", "NAMESPACE"] {
-            assert!(!out.contains(k), "advertised banned capability {k}: {out:?}");
+        for k in ["STARTTLS", "COMPRESS", "NOTIFY", "APPEND", "NAMESPACE"] {
+            assert!(
+                !out.contains(k),
+                "advertised banned capability {k}: {out:?}"
+            );
         }
     }
 
@@ -3072,7 +3210,7 @@ mod tests {
     async fn login_accepts_any_credential() {
         let out = run_script(b"a LOGIN \"alice\" \"hunter2\"\r\n").await;
         assert!(
-            out.contains("a OK [CAPABILITY IMAP4REV1 CONDSTORE QRESYNC] LOGIN completed"),
+            out.contains("a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC] LOGIN completed"),
             "got: {out:?}"
         );
     }
@@ -3090,7 +3228,9 @@ mod tests {
         // same line, so the server should not prompt.
         let out = run_script(b"a AUTHENTICATE PLAIN AGFsaWNlAGh1bnRlcg==\r\n").await;
         assert!(
-            out.contains("a OK [CAPABILITY IMAP4REV1 CONDSTORE QRESYNC] PLAIN authentication accepted"),
+            out.contains(
+                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC] PLAIN authentication accepted"
+            ),
             "got: {out:?}"
         );
         // No `+` prompt expected.
@@ -3102,7 +3242,10 @@ mod tests {
         // Client uses the two-step flow: AUTHENTICATE alone, then sends
         // the base64 in a follow-up line.
         let out = run_script(b"a AUTHENTICATE PLAIN\r\nAGFsaWNlAGh1bnRlcg==\r\n").await;
-        assert!(out.contains("+\r\n"), "expected continuation prompt: {out:?}");
+        assert!(
+            out.contains("+\r\n"),
+            "expected continuation prompt: {out:?}"
+        );
         assert!(out.contains("a OK") && out.contains("PLAIN authentication accepted"));
     }
 
@@ -3120,25 +3263,16 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_xoauth2_and_oauthbearer_accepted() {
-        let out = run_script(
-            b"a AUTHENTICATE XOAUTH2 dXNlcj1hbGljZQ==\r\n",
-        )
-        .await;
+        let out = run_script(b"a AUTHENTICATE XOAUTH2 dXNlcj1hbGljZQ==\r\n").await;
         assert!(out.contains("a OK") && out.contains("XOAUTH2"));
 
-        let out = run_script(
-            b"a AUTHENTICATE OAUTHBEARER bjpob3N0PWE=\r\n",
-        )
-        .await;
+        let out = run_script(b"a AUTHENTICATE OAUTHBEARER bjpob3N0PWE=\r\n").await;
         assert!(out.contains("a OK") && out.contains("OAUTHBEARER"));
     }
 
     #[tokio::test]
     async fn enable_qresync_echoes_back() {
-        let out = run_script(
-            b"a LOGIN \"u\" \"p\"\r\nb ENABLE QRESYNC\r\n",
-        )
-        .await;
+        let out = run_script(b"a LOGIN \"u\" \"p\"\r\nb ENABLE QRESYNC\r\n").await;
         assert!(out.contains("* ENABLED QRESYNC\r\n"), "got: {out:?}");
         assert!(out.contains("b OK ENABLE completed"));
     }
@@ -3147,10 +3281,7 @@ mod tests {
     async fn enable_unknown_extension_silently_dropped_but_command_succeeds() {
         // Per RFC 5161 the server must not list unknown extensions in
         // the * ENABLED response. The OK still completes.
-        let out = run_script(
-            b"a LOGIN \"u\" \"p\"\r\nb ENABLE WAFFLE\r\n",
-        )
-        .await;
+        let out = run_script(b"a LOGIN \"u\" \"p\"\r\nb ENABLE WAFFLE\r\n").await;
         assert!(!out.contains("WAFFLE"));
         assert!(out.contains("b OK ENABLE completed"));
     }
@@ -3219,7 +3350,9 @@ mod tests {
         .await;
         // Inbox has two emails (one $seen, one not). UIDNEXT = exists+1.
         assert!(
-            out.contains("* STATUS \"INBOX\" (MESSAGES 2 UNSEEN 1 UIDNEXT 3 UIDVALIDITY 1 HIGHESTMODSEQ 1)"),
+            out.contains(
+                "* STATUS \"INBOX\" (MESSAGES 2 UNSEEN 1 UIDNEXT 3 UIDVALIDITY 1 HIGHESTMODSEQ 1)"
+            ),
             "got: {out:?}"
         );
         assert!(out.contains("b OK STATUS completed"));
@@ -3386,10 +3519,7 @@ mod tests {
 
     #[test]
     fn parse_uid_search_recognises_all_range_and_since() {
-        assert!(matches!(
-            parse_uid_search("ALL"),
-            Some(SearchCriteria::All)
-        ));
+        assert!(matches!(parse_uid_search("ALL"), Some(SearchCriteria::All)));
         assert!(matches!(
             parse_uid_search("1:*"),
             Some(SearchCriteria::UidRange { lo: 1, hi: None })
@@ -3535,10 +3665,7 @@ mod tests {
             fixture_with_folders(),
         )
         .await;
-        assert!(
-            out.contains("* 1 FETCH (UID 1 FLAGS ())"),
-            "got: {out:?}"
-        );
+        assert!(out.contains("* 1 FETCH (UID 1 FLAGS ())"), "got: {out:?}");
     }
 
     #[tokio::test]
@@ -3683,7 +3810,10 @@ mod tests {
         assert_eq!(s.name, "INBOX");
         assert!(s.qresync.is_none());
         // Atom (unquoted) name works too.
-        assert_eq!(parse_select_args("Archive (CONDSTORE)").unwrap().name, "Archive");
+        assert_eq!(
+            parse_select_args("Archive (CONDSTORE)").unwrap().name,
+            "Archive"
+        );
     }
 
     #[test]
@@ -3776,7 +3906,17 @@ mod tests {
         let fix = fixture();
         let server_task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, fix, None, crate::oauth::TokenStore::default(), crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
+            serve_connection(
+                server,
+                fix,
+                None,
+                crate::oauth::TokenStore::default(),
+                crate::request_log::RequestLog::default(),
+                crate::latency::LatencyKnob::default(),
+                crate::push::PushHub::new(),
+                &mut rx,
+            )
+            .await
         });
 
         // Read greeting first so the server is parked on the read.

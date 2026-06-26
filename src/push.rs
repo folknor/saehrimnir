@@ -91,6 +91,20 @@ struct JmapListener {
     tx: mpsc::UnboundedSender<String>,
 }
 
+/// A live IMAP `IDLE` registration. The IMAP connection parks in
+/// `IDLE` on a selected mailbox and waits for a wake; on each wake it
+/// re-reads the fixture and emits the unsolicited untagged responses
+/// (`* n EXISTS` / `* n EXPUNGE` / `* n RECENT`) for whatever moved.
+/// The wake carries no payload - the idling connection already knows
+/// its selected mailbox and recomputes the diff itself, which keeps
+/// this hub free of any IMAP wire knowledge and robust to coalesced
+/// wakes (two mutations before the connection drains the channel still
+/// produce one correct diff).
+struct ImapIdleListener {
+    account_id: String,
+    tx: mpsc::UnboundedSender<()>,
+}
+
 /// A Gmail `users.watch` registration. Stored per account.
 #[derive(Debug, Clone)]
 pub struct GmailWatch {
@@ -116,6 +130,7 @@ struct Inner {
     /// subscription id). Process-scoped; deterministic per call order.
     seq: AtomicU64,
     jmap_ws: Mutex<Vec<JmapListener>>,
+    imap_idle: Mutex<Vec<ImapIdleListener>>,
     jmap_log: Mutex<Vec<Value>>,
     gmail_watches: Mutex<HashMap<String, GmailWatch>>,
     /// account_id -> loopback URL a Pub/Sub push is delivered to (real
@@ -145,6 +160,7 @@ impl PushHub {
             inner: Arc::new(Inner {
                 seq: AtomicU64::new(1),
                 jmap_ws: Mutex::new(Vec::new()),
+                imap_idle: Mutex::new(Vec::new()),
                 jmap_log: Mutex::new(Vec::new()),
                 gmail_watches: Mutex::new(HashMap::new()),
                 gmail_push_endpoints: Mutex::new(HashMap::new()),
@@ -177,7 +193,28 @@ impl PushHub {
 
     /// Snapshot of every JMAP `StateChange` frame emitted so far.
     pub fn jmap_log(&self) -> Vec<Value> {
-        self.inner.jmap_log.lock().expect("jmap_log lock poisoned").clone()
+        self.inner
+            .jmap_log
+            .lock()
+            .expect("jmap_log lock poisoned")
+            .clone()
+    }
+
+    // ── IMAP IDLE registry ──────────────────────────────────────────
+
+    /// Register an IMAP `IDLE` waiter for `account_id`. Returns the
+    /// receiver end; the idling connection awaits it and emits the
+    /// unsolicited untagged responses on each wake. A closed receiver
+    /// (the connection left `IDLE` / dropped) is pruned lazily on the
+    /// next emit.
+    pub fn register_imap_idle(&self, account_id: String) -> mpsc::UnboundedReceiver<()> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner
+            .imap_idle
+            .lock()
+            .expect("imap_idle lock poisoned")
+            .push(ImapIdleListener { account_id, tx });
+        rx
     }
 
     // ── Gmail watch + Pub/Sub registry ──────────────────────────────
@@ -222,11 +259,19 @@ impl PushHub {
 
     /// Snapshot of every Pub/Sub envelope published so far.
     pub fn pubsub_messages(&self) -> Vec<Value> {
-        self.inner.pubsub.lock().expect("pubsub lock poisoned").clone()
+        self.inner
+            .pubsub
+            .lock()
+            .expect("pubsub lock poisoned")
+            .clone()
     }
 
     pub fn pubsub_clear(&self) {
-        self.inner.pubsub.lock().expect("pubsub lock poisoned").clear();
+        self.inner
+            .pubsub
+            .lock()
+            .expect("pubsub lock poisoned")
+            .clear();
     }
 
     /// Publish a `{ emailAddress, historyId }` Gmail notification onto
@@ -261,8 +306,16 @@ impl PushHub {
 
     /// Renew a subscription's expiration. Returns the updated record, or
     /// `None` if no such subscription is registered.
-    pub fn graph_renew_subscription(&self, id: &str, expiration: String) -> Option<GraphSubscription> {
-        let mut subs = self.inner.graph_subs.lock().expect("graph_subs lock poisoned");
+    pub fn graph_renew_subscription(
+        &self,
+        id: &str,
+        expiration: String,
+    ) -> Option<GraphSubscription> {
+        let mut subs = self
+            .inner
+            .graph_subs
+            .lock()
+            .expect("graph_subs lock poisoned");
         let sub = subs.get_mut(id)?;
         sub.expiration = expiration;
         Some(sub.clone())
@@ -281,7 +334,11 @@ impl PushHub {
     /// Snapshot of every Graph notification emitted so far. Each entry
     /// is `{ "notification_url": <url>, "body": <notification> }`.
     pub fn graph_log(&self) -> Vec<Value> {
-        self.inner.graph_log.lock().expect("graph_log lock poisoned").clone()
+        self.inner
+            .graph_log
+            .lock()
+            .expect("graph_log lock poisoned")
+            .clone()
     }
 
     // ── Reset ───────────────────────────────────────────────────────
@@ -292,16 +349,36 @@ impl PushHub {
     /// not yank a connected client's socket. Mirrors the rest of the
     /// reset surface (request log, token store, latency).
     pub fn clear(&self) {
-        self.inner.jmap_log.lock().expect("jmap_log lock poisoned").clear();
-        self.inner.gmail_watches.lock().expect("gmail_watches lock poisoned").clear();
+        self.inner
+            .jmap_log
+            .lock()
+            .expect("jmap_log lock poisoned")
+            .clear();
+        self.inner
+            .gmail_watches
+            .lock()
+            .expect("gmail_watches lock poisoned")
+            .clear();
         self.inner
             .gmail_push_endpoints
             .lock()
             .expect("gmail_push_endpoints lock poisoned")
             .clear();
-        self.inner.pubsub.lock().expect("pubsub lock poisoned").clear();
-        self.inner.graph_subs.lock().expect("graph_subs lock poisoned").clear();
-        self.inner.graph_log.lock().expect("graph_log lock poisoned").clear();
+        self.inner
+            .pubsub
+            .lock()
+            .expect("pubsub lock poisoned")
+            .clear();
+        self.inner
+            .graph_subs
+            .lock()
+            .expect("graph_subs lock poisoned")
+            .clear();
+        self.inner
+            .graph_log
+            .lock()
+            .expect("graph_log lock poisoned")
+            .clear();
     }
 
     // ── Emission ────────────────────────────────────────────────────
@@ -314,9 +391,29 @@ impl PushHub {
     pub fn emit_state_advance(&self, pushes: &[AccountPush]) {
         for p in pushes {
             self.emit_jmap(p);
+            self.emit_imap(p);
             self.emit_gmail(p);
             self.emit_graph(p);
         }
+    }
+
+    /// Wake every IMAP `IDLE` waiter registered for this account, so an
+    /// idling connection selected on a mailbox in the account recomputes
+    /// and emits its unsolicited untagged responses. Prunes any waiter
+    /// whose receiver was dropped (the connection left `IDLE`).
+    fn emit_imap(&self, p: &AccountPush) {
+        let mut waiters = self
+            .inner
+            .imap_idle
+            .lock()
+            .expect("imap_idle lock poisoned");
+        waiters.retain(|w| {
+            if w.account_id == p.account_id {
+                w.tx.send(()).is_ok()
+            } else {
+                true
+            }
+        });
     }
 
     fn emit_jmap(&self, p: &AccountPush) {
@@ -334,7 +431,11 @@ impl PushHub {
                 }
             });
         }
-        self.inner.jmap_log.lock().expect("jmap_log lock poisoned").push(frame);
+        self.inner
+            .jmap_log
+            .lock()
+            .expect("jmap_log lock poisoned")
+            .push(frame);
     }
 
     fn emit_gmail(&self, p: &AccountPush) {
@@ -358,10 +459,14 @@ impl PushHub {
             .collect();
         for sub in subs {
             let note = graph_notification(&sub, p);
-            self.inner.graph_log.lock().expect("graph_log lock poisoned").push(json!({
-                "notification_url": sub.notification_url,
-                "body": note.clone(),
-            }));
+            self.inner
+                .graph_log
+                .lock()
+                .expect("graph_log lock poisoned")
+                .push(json!({
+                    "notification_url": sub.notification_url,
+                    "body": note.clone(),
+                }));
             let url = sub.notification_url.clone();
             let body = serde_json::to_vec(&note).unwrap_or_default();
             tokio::spawn(async move {
@@ -411,7 +516,11 @@ impl PushHub {
                 }
             });
         }
-        self.inner.pubsub.lock().expect("pubsub lock poisoned").push(env);
+        self.inner
+            .pubsub
+            .lock()
+            .expect("pubsub lock poisoned")
+            .push(env);
     }
 }
 
@@ -511,8 +620,7 @@ async fn deliver_post(url: &str, content_type: &str, body: Vec<u8>) -> Result<()
 /// REST surface's base64*url* (used for raw message bytes); a Pub/Sub
 /// consumer decodes this with a standard-alphabet decoder.
 fn base64_standard(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = u32::from(chunk[0]);
