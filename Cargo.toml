@@ -1,3 +1,8 @@
+# Standalone workspace root. This is its own project; the empty table stops
+# cargo from walking up the directory tree and adopting an unrelated parent
+# manifest as its workspace.
+[workspace]
+
 [package]
 name = "saehrimnir"
 version = "0.0.0"

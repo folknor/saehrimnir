@@ -54,8 +54,18 @@ fn unique_scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
+fn fixture_dir() -> PathBuf {
+    // Resolve fixtures against the runtime working directory (the crate
+    // root under both `cargo test` and `brokkr`) rather than the
+    // compile-time CARGO_MANIFEST_DIR. brokkr builds this nested
+    // workspace with a manifest dir anchored under its own install path,
+    // so the baked CARGO_MANIFEST_DIR points at a path that does not
+    // exist and the spawned binary cannot find the fixture.
+    std::env::current_dir().expect("cwd").join("fixtures")
+}
+
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/jmap-small.toml")
+    fixture_dir().join("jmap-small.toml")
 }
 
 fn wait_for_file(path: &Path, timeout: Duration) -> bool {
@@ -181,7 +191,7 @@ fn binary_serves_lua_fixture_identically() {
     // path breaks the boot sequence.
     let scratch = unique_scratch_dir("lua");
     let ready = scratch.join("ready");
-    let lua_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/jmap-small.lua");
+    let lua_fixture = fixture_dir().join("jmap-small.lua");
 
     let child = Command::new(binary())
         .args(["--readiness-file"])
