@@ -755,6 +755,7 @@ fn apply_change_step(
                     }
                 };
                 let old_mailboxes = fix.emails[idx].mailbox_ids.clone();
+                let old_labels = fix.gmail_label_ids(&fix.emails[idx]);
                 let mut clone = fix.emails[idx].clone();
                 if let Err(err) = crate::jmap::apply_email_patch(&mut clone, patch) {
                     return Err(step_apply_error(
@@ -765,9 +766,13 @@ fn apply_change_step(
                     ));
                 }
                 let new_mailboxes = clone.mailbox_ids.clone();
+                let new_labels = fix.gmail_label_ids(&clone);
                 fix.emails[idx] = clone;
                 fix.sync_mailbox_uids(id, &old_mailboxes, &new_mailboxes);
                 diff.email_updated.push(id.clone());
+                if let Some(c) = crate::fixture::gmail_label_change(id, &old_labels, &new_labels) {
+                    diff.email_label_changes.push(c);
+                }
             }
             ChangeOp::EmailMove { id, mailbox_ids } => {
                 for mid in mailbox_ids {
@@ -792,10 +797,15 @@ fn apply_change_step(
                     }
                 };
                 let old_mailboxes = fix.emails[idx].mailbox_ids.clone();
+                let old_labels = fix.gmail_label_ids(&fix.emails[idx]);
                 fix.emails[idx].mailbox_ids = mailbox_ids.clone();
+                let new_labels = fix.gmail_label_ids(&fix.emails[idx]);
                 fix.sync_mailbox_uids(id, &old_mailboxes, mailbox_ids);
                 diff.email_updated.push(id.clone());
                 moved.push(id.clone());
+                if let Some(c) = crate::fixture::gmail_label_change(id, &old_labels, &new_labels) {
+                    diff.email_label_changes.push(c);
+                }
             }
             ChangeOp::EmailDestroy { id } => {
                 let Some(idx) = fix.emails.iter().position(|e| &e.id == id) else {

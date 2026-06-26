@@ -88,7 +88,13 @@ checking whether the fact is already in `notes/`.
   optional form field on `/oauth/token`); the Google-family
   listeners (Gmail, gcal, People) scope reads to the bearer
   token's account via `oauth::account_from_bearer`, falling
-  back to primary for missing / unknown tokens. IMAP `LOGIN`
+  back to primary for missing / unknown tokens. The
+  `refresh_token` grant (which ratatoskr sends with no
+  `account_id`) resolves the account by looking the presented
+  refresh token up in the store and mints an access token bound
+  to that account, so a secondary account's refresh doesn't
+  silently mint a primary-bound token; the `account_id` form
+  field still wins when present. IMAP `LOGIN`
   and `AUTHENTICATE PLAIN` / `LOGIN` / `XOAUTH2` / `OAUTHBEARER`
   parse the SASL response and rebind the connection's
   `account_id` (case-insensitive match against `account.name`,
@@ -400,6 +406,10 @@ checking whether the fact is already in `notes/`.
 - `fixtures/graph-contacts-incremental.lua` - 3-step contact
   change script (new + change + delete) driving the
   `contacts/delta` round-trip in `tests/step.rs`.
+- `fixtures/gmail-incremental.lua` - baseline (incl. a
+  two-message thread) plus a 4-step change script (new + delete
+  + label swap + star-one-message-of-a-thread) driving the Gmail
+  `history.list` record-type projection in `tests/step.rs`.
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status
@@ -716,7 +726,16 @@ hydration; `metadata`/`full`/`minimal` reuse the thread surface's
 `message_value` projection, `raw` drops `payload` for a top-level
 base64url `raw` of the assembled RFC 822 bytes that bifrost's
 `raw_bytes()` requires) +
-`/history` (read-only no-op since fixtures don't change) +
+`/history` (real incremental projection - `historyId` is the
+per-account change-log counter + 1; the handler walks the account's
+log and emits one record per transition newer than `startHistoryId`:
+`email_created` -> `messagesAdded`, `email_destroyed` ->
+`messagesDeleted`, and an updated email's label-set delta ->
+`labelsAdded` / `labelsRemoved` with the precise moved labels. The
+label delta is captured at mutation time into the change log's
+`email_label_changes` sidecar by the change-script step applier; v0
+surfaces it for change-script-driven mutations. An evicted
+`startHistoryId` 404s with `historyId` to trigger a full resync) +
 `/messages/{id}/attachments/{aid}` (404 stub) + `/settings/sendAs`
 (list + per-address GET + PATCH). SendAs identities project from
 fixture `[[send_as]]` rows (TOML) or Lua `send_as({...})` builder,

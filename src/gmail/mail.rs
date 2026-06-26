@@ -15,7 +15,7 @@ use axum::{
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
-use crate::fixture::{Address, Attachment, Body, Email, Fixture, Mailbox, Role};
+use crate::fixture::{Address, Attachment, Body, Email, Fixture};
 
 /// Resolve the request's bearer to the account it authorizes.
 /// Falls back to the fixture's primary account when no bearer is
@@ -24,10 +24,6 @@ use crate::fixture::{Address, Attachment, Body, Email, Fixture, Mailbox, Role};
 fn bearer_account(state: &AppState, headers: &HeaderMap) -> String {
     crate::oauth::account_from_bearer(&state.fixture(), &state.shared.token_store, headers)
 }
-
-/// Pinned historyId for the lifetime of a fixture - matches the
-/// determinism contract (read-only fixtures, no real changes).
-const HISTORY_ID: &str = "1";
 
 /// Default page size for thread list. Real Gmail defaults to 100;
 /// we match that.
@@ -68,7 +64,7 @@ async fn profile(State(state): State<AppState>, headers: HeaderMap) -> Response 
         "emailAddress": acct.name,
         "messagesTotal": messages_total,
         "threadsTotal": unique_thread_count(&f, &account_id),
-        "historyId": HISTORY_ID,
+        "historyId": f.gmail_history_id(&account_id).to_string(),
     }))
 }
 
@@ -171,50 +167,12 @@ fn email_carries_label(email: &Email, fixture: &Fixture, label_id: &str) -> bool
     label_ids_for(email, fixture).iter().any(|id| id == label_id)
 }
 
-/// Compute the full label set for a fixture email, matching the
-/// projection rules in `notes/ratatoskr-gmail-surface.md`.
+/// Compute the full label set for a fixture email. The projection
+/// rules live on `Fixture::gmail_label_ids` so the read path and the
+/// `history.list` label-delta capture share one source of truth; see
+/// `notes/ratatoskr-gmail-surface.md`.
 fn label_ids_for(email: &Email, fixture: &Fixture) -> Vec<String> {
-    let mut out = Vec::new();
-    let by_id: std::collections::HashMap<&str, &Mailbox> = fixture
-        .mailboxes
-        .iter()
-        .map(|m| (m.id.as_str(), m))
-        .collect();
-    for mb_id in &email.mailbox_ids {
-        let Some(m) = by_id.get(mb_id.as_str()) else {
-            continue;
-        };
-        match m.role {
-            Some(Role::Inbox) => out.push("INBOX".to_string()),
-            Some(Role::Sent) => out.push("SENT".to_string()),
-            Some(Role::Drafts) => out.push("DRAFT".to_string()),
-            Some(Role::Trash) => out.push("TRASH".to_string()),
-            Some(Role::Junk) => out.push("SPAM".to_string()),
-            Some(Role::Important) => out.push("IMPORTANT".to_string()),
-            Some(Role::Archive) => {
-                // Gmail's "archive" is the absence of INBOX, not a
-                // distinct label.
-            }
-            None => out.push(format!("Label_{}", m.id)),
-        }
-    }
-    if !email.keywords.iter().any(|k| k == "$seen") {
-        out.push("UNREAD".to_string());
-    }
-    if email.keywords.iter().any(|k| k == "$flagged") {
-        out.push("STARRED".to_string());
-    }
-    if email.keywords.iter().any(|k| k == "$draft") {
-        out.push("DRAFT".to_string());
-    }
-    for keyword in &email.keywords {
-        if !keyword.starts_with('$') {
-            out.push(format!("Label_{keyword}"));
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
+    fixture.gmail_label_ids(email)
 }
 
 // ── Threads ─────────────────────────────────────────────────────────
@@ -235,6 +193,7 @@ async fn list_threads(
         .clamp(1, THREADS_HARD_MAX);
     let offset = q.offset();
 
+    let history_id = state.fixture().gmail_history_id(&account_id).to_string();
     let mut threads = thread_summaries(&state.fixture(), &account_id);
     if let Some(after_q) = &q.q {
         // v0 only knows the `after:YYYY/M/D` shape ratatoskr's
@@ -263,7 +222,7 @@ async fn list_threads(
             json!({
                 "id": t.id,
                 "snippet": t.snippet,
-                "historyId": HISTORY_ID,
+                "historyId": history_id,
             })
         })
         .collect();
@@ -375,7 +334,7 @@ async fn get_thread(
 
     ok_json(json!({
         "id": thread_id,
-        "historyId": HISTORY_ID,
+        "historyId": fixture.gmail_history_id(&account_id).to_string(),
         "snippet": snippet,
         "messages": messages_json,
     }))
@@ -397,7 +356,7 @@ fn message_value(e: &Email, fixture: &Fixture) -> Value {
         "threadId": e.thread_id,
         "labelIds": label_ids,
         "snippet": snippet,
-        "historyId": HISTORY_ID,
+        "historyId": fixture.gmail_history_id(&e.account_id).to_string(),
         "internalDate": e.received_at.timestamp_millis().to_string(),
         "sizeEstimate": body_size,
         "payload": payload,
@@ -687,18 +646,110 @@ async fn get_message(
 
 // ── History ─────────────────────────────────────────────────────────
 
-async fn history(State(state): State<AppState>) -> Response {
+async fn history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
     if let Some(r) = super::maybe_override(&state, "history", |_s| Ok(())) {
         return r;
     }
-    // v0 fixtures are read-only; the History endpoint always returns
-    // an empty change list paired with the same historyId. The
-    // request's startHistoryId is intentionally ignored - any value
-    // is "current" because the state never advances.
-    ok_json(json!({
-        "history": [],
-        "historyId": HISTORY_ID,
-    }))
+    let account_id = bearer_account(&state, &headers);
+    let q = parse_query(raw.as_deref());
+    // `startHistoryId` is the client's cursor. Absent (or 0) means
+    // "from the seed", same as the load-time historyId of 1.
+    let start = q.start_history_id.unwrap_or(0);
+    let fixture = state.fixture();
+    match fixture.gmail_history_since(&account_id, start) {
+        crate::fixture::GmailHistory::Unknown => {
+            // The cursor predates the retained change log. Real Gmail
+            // 404s here (with `historyId` in the message), which drives
+            // ratatoskr's full re-sync fallback.
+            error(
+                StatusCode::NOT_FOUND,
+                &format!(
+                    "startHistoryId {start} is too old; a full sync is required (historyId)"
+                ),
+                "notFound",
+            )
+        }
+        crate::fixture::GmailHistory::Delta {
+            records,
+            history_id,
+        } => {
+            let history: Vec<Value> = records
+                .iter()
+                .map(|r| history_record_json(r, &fixture))
+                .collect();
+            ok_json(json!({
+                "history": history,
+                "historyId": history_id.to_string(),
+            }))
+        }
+    }
+}
+
+/// Project one [`crate::fixture::GmailHistoryRecord`] into the Gmail
+/// `history.list` wire shape. Keys are omitted when empty so a record
+/// carries only the change types it actually represents.
+fn history_record_json(r: &crate::fixture::GmailHistoryRecord, fixture: &Fixture) -> Value {
+    let mut obj = Map::new();
+    obj.insert("id".to_string(), Value::String(r.id.to_string()));
+    if !r.messages_added.is_empty() {
+        let arr: Vec<Value> = r
+            .messages_added
+            .iter()
+            .filter_map(|id| fixture.emails.iter().find(|e| &e.id == id))
+            .map(|e| json!({ "message": message_value(e, fixture) }))
+            .collect();
+        obj.insert("messagesAdded".to_string(), Value::Array(arr));
+    }
+    if !r.messages_deleted.is_empty() {
+        // The email is gone by now, so only its id is recoverable.
+        // `threadId` is required for the wire shape to deserialize but
+        // ratatoskr ignores it on a tombstone (it keys the delete on
+        // the message id alone), so the id stands in as a stable
+        // placeholder.
+        let arr: Vec<Value> = r
+            .messages_deleted
+            .iter()
+            .map(|id| json!({ "message": { "id": id, "threadId": id } }))
+            .collect();
+        obj.insert("messagesDeleted".to_string(), Value::Array(arr));
+    }
+    if !r.labels_added.is_empty() {
+        obj.insert(
+            "labelsAdded".to_string(),
+            Value::Array(label_wrappers(&r.labels_added, fixture)),
+        );
+    }
+    if !r.labels_removed.is_empty() {
+        obj.insert(
+            "labelsRemoved".to_string(),
+            Value::Array(label_wrappers(&r.labels_removed, fixture)),
+        );
+    }
+    Value::Object(obj)
+}
+
+/// Build the `{ message: { id, threadId }, labelIds }` wrappers for a
+/// `labelsAdded` / `labelsRemoved` array. The email is still live (a
+/// label change, not a delete), so its real `threadId` is available.
+fn label_wrappers(items: &[(String, Vec<String>)], fixture: &Fixture) -> Vec<Value> {
+    items
+        .iter()
+        .map(|(id, labels)| {
+            let thread_id = fixture
+                .emails
+                .iter()
+                .find(|e| &e.id == id)
+                .map_or_else(|| id.clone(), |e| e.thread_id.clone());
+            json!({
+                "message": { "id": id, "threadId": thread_id },
+                "labelIds": labels,
+            })
+        })
+        .collect()
 }
 
 // ── Attachments ─────────────────────────────────────────────────────
@@ -874,6 +925,9 @@ struct GmailQuery {
     /// `minimal` / `raw`). Drives the `messages.get` projection;
     /// `raw` swaps the structured payload for assembled RFC 822 bytes.
     format: Option<String>,
+    /// `startHistoryId` cursor on the `history.list` endpoint, in the
+    /// reported `historyId` space (the change-log counter + 1).
+    start_history_id: Option<u64>,
 }
 
 impl GmailQuery {
@@ -899,6 +953,7 @@ fn parse_query(raw: Option<&str>) -> GmailQuery {
             "maxResults" => out.max_results = v.parse().ok(),
             "pageToken" => out.page_token = Some(v),
             "format" => out.format = Some(v),
+            "startHistoryId" => out.start_history_id = v.parse().ok(),
             _ => {}
         }
     }

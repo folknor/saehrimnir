@@ -185,6 +185,17 @@ pub struct Transition {
     /// per-account delta walker reads it. Length must equal
     /// `email_destroyed`. Same role as `event_destroyed_parents`.
     pub email_destroyed_accounts: Vec<String>,
+    /// Gmail-specific sidecar to `email_updated`: the per-email label-set
+    /// delta (Gmail labels added / removed) for each updated email whose
+    /// label set actually moved. The generic change log records only
+    /// that an email was updated, not which labels changed; the Gmail
+    /// `history.list` `labelsAdded` / `labelsRemoved` projection needs
+    /// the precise delta (bifrost applies each label add / remove as a
+    /// `ScopeChange`). Captured at mutation time by the change-script
+    /// step applier; empty for other producers in v0 (incremental Gmail
+    /// sync is change-script-driven). See
+    /// `notes/ratatoskr-gmail-surface.md`.
+    pub email_label_changes: Vec<EmailLabelChange>,
     pub mailbox_created: Vec<String>,
     pub mailbox_updated: Vec<String>,
     pub mailbox_destroyed: Vec<String>,
@@ -234,6 +245,19 @@ pub struct Transition {
     pub category_destroyed_accounts: Vec<String>,
 }
 
+/// One updated email's Gmail label-set delta. `id` is the email id;
+/// `added` / `removed` are Gmail label ids (the `label_ids_for`
+/// projection: `INBOX`, `UNREAD`, `STARRED`, `Label_<...>`, ...).
+/// Carried alongside `email_updated` so the Gmail `history.list`
+/// projection can emit `labelsAdded` / `labelsRemoved` records;
+/// every other protocol's `/changes` walker ignores it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmailLabelChange {
+    pub id: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
 /// Resource-id deltas a single mutator pass produced. Returned by the
 /// closure passed to [`Fixture::mutate`]; the caller never constructs
 /// transitions directly. An all-empty `MutationDiff` is treated as a
@@ -252,6 +276,10 @@ pub struct MutationDiff {
     /// email. Producers must push to both vectors at the same time
     /// so the per-account delta walker can filter tombstones.
     pub email_destroyed_accounts: Vec<String>,
+    /// Gmail label deltas for updated emails. Sidecar to
+    /// `email_updated` (see [`Transition::email_label_changes`]).
+    /// Routed per-account by email id in `split_diff_by_account`.
+    pub email_label_changes: Vec<EmailLabelChange>,
     pub mailbox_created: Vec<String>,
     pub mailbox_updated: Vec<String>,
     pub mailbox_destroyed: Vec<String>,
@@ -901,6 +929,10 @@ impl Fixture {
             let a = resolve_email(&id);
             out.entry(a).or_default().email_updated.push(id);
         }
+        for change in diff.email_label_changes {
+            let a = resolve_email(&change.id);
+            out.entry(a).or_default().email_label_changes.push(change);
+        }
         for (id, acct) in diff
             .email_destroyed
             .into_iter()
@@ -1201,6 +1233,183 @@ impl Fixture {
             (&t.contact_created, &t.contact_updated, &t.contact_destroyed)
         })
     }
+
+    /// Compute the full Gmail label set for an email: mailbox roles map
+    /// to system labels (`INBOX` / `SENT` / `DRAFT` / `TRASH` / `SPAM`
+    /// / `IMPORTANT`; `archive` is the absence of `INBOX`, not a
+    /// label), `$seen`-absence -> `UNREAD`, `$flagged` -> `STARRED`,
+    /// `$draft` -> `DRAFT`, and every non-`$` keyword -> `Label_<kw>`;
+    /// a roleless mailbox contributes `Label_<mailbox-id>`. Sorted +
+    /// deduped for determinism. The Gmail listener's `label_ids_for`
+    /// delegates here so the read projection and the `history.list`
+    /// label-delta capture agree byte-for-byte.
+    pub fn gmail_label_ids(&self, email: &Email) -> Vec<String> {
+        let by_id: HashMap<&str, &Mailbox> =
+            self.mailboxes.iter().map(|m| (m.id.as_str(), m)).collect();
+        let mut out = Vec::new();
+        for mb_id in &email.mailbox_ids {
+            let Some(m) = by_id.get(mb_id.as_str()) else {
+                continue;
+            };
+            match m.role {
+                Some(Role::Inbox) => out.push("INBOX".to_string()),
+                Some(Role::Sent) => out.push("SENT".to_string()),
+                Some(Role::Drafts) => out.push("DRAFT".to_string()),
+                Some(Role::Trash) => out.push("TRASH".to_string()),
+                Some(Role::Junk) => out.push("SPAM".to_string()),
+                Some(Role::Important) => out.push("IMPORTANT".to_string()),
+                Some(Role::Archive) => {}
+                None => out.push(format!("Label_{}", m.id)),
+            }
+        }
+        if !email.keywords.iter().any(|k| k == "$seen") {
+            out.push("UNREAD".to_string());
+        }
+        if email.keywords.iter().any(|k| k == "$flagged") {
+            out.push("STARRED".to_string());
+        }
+        if email.keywords.iter().any(|k| k == "$draft") {
+            out.push("DRAFT".to_string());
+        }
+        for keyword in &email.keywords {
+            if !keyword.starts_with('$') {
+                out.push(format!("Label_{keyword}"));
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Current Gmail `historyId` for `account_id`, as a `u64`. Mapped
+    /// from the per-account change-log counter as `counter + 1` so a
+    /// freshly-loaded fixture reports `1` (never `0`; real Gmail
+    /// history ids are never zero and several tests pin the load-time
+    /// value at `1`). Every `historyId` the Gmail listener emits
+    /// (profile, thread / message bodies, the `history.list` top-level
+    /// cursor) resolves through here, so a mutation on one account
+    /// never moves a sibling account's Gmail cursor.
+    pub fn gmail_history_id(&self, account_id: &str) -> u64 {
+        self.account_logs
+            .get(account_id)
+            .map(|l| l.counter)
+            .unwrap_or(0)
+            + 1
+    }
+
+    /// Walk `account_id`'s change log for the Gmail `history.list`
+    /// projection: one [`GmailHistoryRecord`] per transition newer than
+    /// `start` (the client's `startHistoryId`, in the reported
+    /// `counter + 1` space). Returns [`GmailHistory::Unknown`] when
+    /// `start` predates the oldest retained transition (the bounded
+    /// ring evicted it) so the caller can 404 and trigger a full
+    /// re-sync, matching real Gmail. `start` at or past the current id
+    /// yields an empty delta paired with the current id.
+    pub fn gmail_history_since(&self, account_id: &str, start: u64) -> GmailHistory {
+        // Map the reported id back to counter space (`reported =
+        // counter + 1`). `start == 0` and `start == 1` both mean "from
+        // the seed" (counter 0).
+        let start = start.saturating_sub(1);
+        let Some(log) = self.account_logs.get(account_id) else {
+            // Never mutated: the seed (counter 0) is the only known
+            // point. Anything newer can't be reconstructed.
+            return if start == 0 {
+                GmailHistory::Delta {
+                    records: Vec::new(),
+                    history_id: 1,
+                }
+            } else {
+                GmailHistory::Unknown
+            };
+        };
+        let current = log.counter;
+        if start >= current {
+            return GmailHistory::Delta {
+                records: Vec::new(),
+                history_id: current + 1,
+            };
+        }
+        // `front_from` is the `from` counter of the oldest retained
+        // transition; a `start` below it fell off the ring.
+        let front_from = current - log.transitions.len() as u64;
+        if start < front_from {
+            return GmailHistory::Unknown;
+        }
+        let mut records = Vec::new();
+        for (j, t) in log.transitions.iter().enumerate() {
+            let to_counter = front_from + 1 + j as u64;
+            if to_counter <= start {
+                continue;
+            }
+            let labels_added = t
+                .email_label_changes
+                .iter()
+                .filter(|c| !c.added.is_empty())
+                .map(|c| (c.id.clone(), c.added.clone()))
+                .collect();
+            let labels_removed = t
+                .email_label_changes
+                .iter()
+                .filter(|c| !c.removed.is_empty())
+                .map(|c| (c.id.clone(), c.removed.clone()))
+                .collect();
+            records.push(GmailHistoryRecord {
+                id: to_counter + 1,
+                messages_added: t.email_created.clone(),
+                messages_deleted: t.email_destroyed.clone(),
+                labels_added,
+                labels_removed,
+            });
+        }
+        GmailHistory::Delta {
+            records,
+            history_id: current + 1,
+        }
+    }
+}
+
+/// Compute one email's Gmail label-set delta from its before / after
+/// label sets. Returns `None` when nothing moved (so a body-only
+/// update records no spurious `labelsAdded` / `labelsRemoved`).
+pub fn gmail_label_change(id: &str, old: &[String], new: &[String]) -> Option<EmailLabelChange> {
+    let added: Vec<String> = new.iter().filter(|l| !old.contains(l)).cloned().collect();
+    let removed: Vec<String> = old.iter().filter(|l| !new.contains(l)).cloned().collect();
+    if added.is_empty() && removed.is_empty() {
+        None
+    } else {
+        Some(EmailLabelChange {
+            id: id.to_string(),
+            added,
+            removed,
+        })
+    }
+}
+
+/// Result of [`Fixture::gmail_history_since`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GmailHistory {
+    /// `start` predates the retained log; the caller must 404 so the
+    /// client falls back to a full re-sync.
+    Unknown,
+    /// Records newer than `start` (possibly empty) plus the current
+    /// top-level `historyId` to echo back.
+    Delta {
+        records: Vec<GmailHistoryRecord>,
+        history_id: u64,
+    },
+}
+
+/// One Gmail `history.list` record, projected from a single change-log
+/// transition. `messages_added` / `messages_deleted` are email ids;
+/// `labels_added` / `labels_removed` pair an email id with the Gmail
+/// label ids that moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmailHistoryRecord {
+    pub id: u64,
+    pub messages_added: Vec<String>,
+    pub messages_deleted: Vec<String>,
+    pub labels_added: Vec<(String, Vec<String>)>,
+    pub labels_removed: Vec<(String, Vec<String>)>,
 }
 
 /// Build a [`Transition`] from a `MutationDiff` and its
@@ -1216,6 +1425,7 @@ fn transition_from_diff(from_state: String, to_state: String, diff: MutationDiff
         email_updated: diff.email_updated,
         email_destroyed: diff.email_destroyed,
         email_destroyed_accounts: diff.email_destroyed_accounts,
+        email_label_changes: diff.email_label_changes,
         mailbox_created: diff.mailbox_created,
         mailbox_updated: diff.mailbox_updated,
         mailbox_destroyed: diff.mailbox_destroyed,

@@ -14,7 +14,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use saehrimnir::{imap, lua, routes};
+use saehrimnir::{gmail, imap, lua, routes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
@@ -690,4 +690,140 @@ async fn fixture_step_request_log_records_step_endpoint_separately() {
         !cmd_after.iter().any(|c| c.contains("fixture/step")),
         "step endpoint must not pollute the protocol-level request log"
     );
+}
+
+// ── Gmail history.list incremental projection ───────────────────────
+
+/// Build a JMAP/admin router (for `/test/fixture/step`) and a Gmail
+/// router (for `/gmail/v1/users/me/...`) sharing one fixture handle,
+/// loaded from `fixtures/gmail-incremental.lua`. The step path mutates
+/// the shared fixture; the Gmail path reads it.
+fn gmail_routers() -> (axum::Router, axum::Router) {
+    let path = std::path::Path::new("fixtures/gmail-incremental.lua");
+    let source = std::fs::read_to_string(path).unwrap();
+    let chunk = format!("@{}", path.display());
+    let fix = lua::load_source_with_dir(&source, &chunk, path.parent().unwrap()).unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let admin = routes::router(routes::AppState::for_test(std::sync::Arc::clone(&handle)));
+    let mail = gmail::router(gmail::AppState::for_test(std::sync::Arc::clone(&handle)));
+    (admin, mail)
+}
+
+async fn gmail_get(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+/// Find a history record by its numeric id in a `history.list` body.
+fn record(history: &Value, id: u64) -> &Value {
+    let needle = id.to_string();
+    history["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"].as_str() == Some(needle.as_str()))
+        .unwrap_or_else(|| panic!("no history record with id {id}"))
+}
+
+#[tokio::test]
+async fn gmail_history_projects_each_step_into_records() {
+    let (admin, mail) = gmail_routers();
+
+    // Load-time historyId is the seeded 1, on profile and bodies.
+    let (status, profile) = gmail_get(&mail, "/gmail/v1/users/me/profile").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(profile["historyId"], "1");
+
+    // A poll before any mutation: empty delta, same id.
+    let (_, h0) = gmail_get(&mail, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    assert_eq!(h0["history"].as_array().unwrap().len(), 0);
+    assert_eq!(h0["historyId"], "1");
+
+    // Apply all four steps.
+    for id in ["new", "delete", "label", "thread-label"] {
+        let (status, _) = step(&admin, json!({ "expect": id })).await;
+        assert_eq!(status, StatusCode::OK, "step {id} should apply");
+    }
+
+    // historyId advanced by four (counter 4 -> reported 5).
+    let (_, profile_after) = gmail_get(&mail, "/gmail/v1/users/me/profile").await;
+    assert_eq!(profile_after["historyId"], "5");
+
+    // Replay every record from the seed cursor.
+    let (status, hist) = gmail_get(&mail, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(hist["historyId"], "5");
+    assert_eq!(hist["history"].as_array().unwrap().len(), 4);
+
+    // Step "new" (id 2): messagesAdded carries the new message with
+    // its derived label set (INBOX + UNREAD).
+    let r_new = record(&hist, 2);
+    let added = r_new["messagesAdded"].as_array().unwrap();
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0]["message"]["id"], "email-100");
+    assert_eq!(added[0]["message"]["threadId"], "thread-100");
+    let labels: Vec<&str> = added[0]["message"]["labelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"INBOX"));
+    assert!(labels.contains(&"UNREAD"));
+
+    // Step "delete" (id 3): messagesDeleted keys on the message id.
+    let r_del = record(&hist, 3);
+    let deleted = r_del["messagesDeleted"].as_array().unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0]["message"]["id"], "email-001");
+
+    // Step "label" (id 4): one label swapped out for another.
+    let r_label = record(&hist, 4);
+    let la = r_label["labelsAdded"].as_array().unwrap();
+    assert_eq!(la.len(), 1);
+    assert_eq!(la[0]["message"]["id"], "email-002");
+    assert_eq!(la[0]["labelIds"], json!(["Label_new"]));
+    let lr = r_label["labelsRemoved"].as_array().unwrap();
+    assert_eq!(lr.len(), 1);
+    assert_eq!(lr[0]["message"]["id"], "email-002");
+    assert_eq!(lr[0]["labelIds"], json!(["Label_old"]));
+
+    // Step "thread-label" (id 5): STARRED added to ONE message of the
+    // two-message thread - the record names email-003a alone.
+    let r_thread = record(&hist, 5);
+    let ta = r_thread["labelsAdded"].as_array().unwrap();
+    assert_eq!(ta.len(), 1);
+    assert_eq!(ta[0]["message"]["id"], "email-003a");
+    assert_eq!(ta[0]["message"]["threadId"], "thread-003");
+    assert_eq!(ta[0]["labelIds"], json!(["STARRED"]));
+}
+
+#[tokio::test]
+async fn gmail_history_partial_cursor_and_unknown() {
+    let (admin, mail) = gmail_routers();
+    for id in ["new", "delete", "label", "thread-label"] {
+        let (status, _) = step(&admin, json!({ "expect": id })).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // A mid-stream cursor returns only records strictly newer than it.
+    let (_, hist) = gmail_get(&mail, "/gmail/v1/users/me/history?startHistoryId=3").await;
+    let ids: Vec<&str> = hist["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["4", "5"]);
+    assert_eq!(hist["historyId"], "5");
+
+    // The current cursor: caught up, empty delta.
+    let (_, caught_up) = gmail_get(&mail, "/gmail/v1/users/me/history?startHistoryId=5").await;
+    assert_eq!(caught_up["history"].as_array().unwrap().len(), 0);
+    assert_eq!(caught_up["historyId"], "5");
 }

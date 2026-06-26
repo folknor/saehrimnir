@@ -216,8 +216,32 @@ Response (`types.rs:101-124`):
 
 The client persists `historyId` between cycles. A 404 on this
 endpoint (or an error mentioning `historyId`) triggers a full
-re-sync (`sync/delta.rs:180-182`). v0 fixtures are read-only, so the
-mock returns an empty `history[]` and the same `historyId`.
+re-sync (`sync/delta.rs:180-182`).
+
+`historyId` is the per-account change-log counter mapped to the
+reported space as `counter + 1`, so a freshly-loaded fixture reports
+`1` and each applied change-script step advances it by one. The mock
+walks the requesting account's change log and projects one history
+record per transition newer than `startHistoryId`:
+
+- `email_created` -> `messagesAdded` (full `message` body, so
+  bifrost's `changes_from_history` reads `labelIds` and emits a
+  `ScopeChange::Added` per label).
+- `email_destroyed` -> `messagesDeleted` (keyed on `message.id`;
+  the email is gone so `threadId` echoes the id as a placeholder -
+  bifrost ignores it on a tombstone).
+- a label-set delta on an updated email -> `labelsAdded` /
+  `labelsRemoved` with the precise `labelIds` that moved (bifrost
+  applies each as a `ScopeChange::Added` / `Removed`).
+
+The label delta is captured at mutation time by the change-script
+step applier (`src/test_admin.rs`) into the change log's
+`email_label_changes` sidecar; v0 only surfaces it for
+change-script-driven mutations (incremental Gmail sync is
+step-driven). A `startHistoryId` older than the bounded ring can
+reconstruct returns a 404 mentioning `historyId`, driving the
+full-resync fallback. `startHistoryId` at or past the current id
+returns an empty `history[]` paired with the current id.
 
 ### SendAs / signatures (out of scope for read-only mail sync)
 

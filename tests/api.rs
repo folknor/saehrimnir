@@ -1877,6 +1877,70 @@ async fn oauth_token_refresh_grant_works_via_json_body() {
 }
 
 #[tokio::test]
+async fn oauth_refresh_grant_resolves_account_from_refresh_token() {
+    // A refresh on a multi-account fixture: ratatoskr's refresh request
+    // carries only refresh_token + client_id + grant_type (no
+    // account_id), so the secondary account's refresh must mint a
+    // secondary-bound access token by looking the refresh token up in
+    // the store - not silently fall back to primary (which would let
+    // the secondary read the primary's mailbox).
+    let store = saehrimnir::oauth::TokenStore::default();
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let app = routes::router(
+        routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store.clone()),
+    );
+
+    // Mint the initial token pair bound to the secondary account (the
+    // authorization_code leg, which still accepts the account_id knob).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "grant_type=authorization_code\
+                    &code=fixture-code\
+                    &client_id=test\
+                    &account_id=account-secondary",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let refresh = v["refresh_token"].as_str().unwrap().to_string();
+
+    // Refresh with ONLY the refresh token + client_id.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=refresh_token&refresh_token={refresh}&client_id=test"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let access = v["access_token"].as_str().unwrap();
+
+    // The minted access token is bound to the secondary, not primary.
+    let bound = store
+        .snapshot()
+        .into_iter()
+        .find(|t| t.token == access)
+        .expect("minted access token present in store");
+    assert_eq!(bound.account_id, "account-secondary");
+}
+
+#[tokio::test]
 async fn oauth_token_rejects_unsupported_grant_type() {
     let store = saehrimnir::oauth::TokenStore::default();
     let app = router_with_token_store(store);

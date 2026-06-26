@@ -233,17 +233,25 @@ pub async fn token_endpoint(
             .into_response();
     }
 
-    // Resolve the account the token is for. Optional `account_id`
-    // (form or JSON) selects a non-primary account; absent means
-    // primary. Unknown account_id rejects with 400. Real OAuth
-    // providers don't expose an `account_id` knob on the token
-    // endpoint, but the wire shape is invisible to clients that
-    // don't set it - matching the no-arg flow ratatoskr uses
-    // today for single-account fixtures.
+    // Resolve the account the token is for. An explicit `account_id`
+    // (form or JSON) wins and selects a non-primary account; unknown
+    // account_id rejects with 400. Real OAuth providers don't expose
+    // an `account_id` knob on the token endpoint, but the wire shape
+    // is invisible to clients that don't set it.
+    //
+    // Without an explicit account_id, a `refresh_token` grant resolves
+    // the account from the *presented refresh token*: at mint time the
+    // refresh token was bound to its account, and real Google likewise
+    // derives the account from the refresh token, not a side channel.
+    // ratatoskr's refresh request carries only refresh_token +
+    // client_id + grant_type, so this lookup is the only way a
+    // secondary account's refresh mints a secondary-bound access token
+    // rather than falling back to primary (which would let the
+    // secondary read the primary's mailbox). Missing / unknown refresh
+    // tokens fall back to primary, matching the no-auth baseline.
     let fixture = state.fixture.read().expect("fixture lock poisoned");
     let account_id = match form.get("account_id").map(String::as_str) {
-        None | Some("") => fixture.primary_account().id.clone(),
-        Some(id) => match fixture.account(id) {
+        Some(id) if !id.is_empty() => match fixture.account(id) {
             Some(a) => a.id.clone(),
             None => {
                 return (
@@ -258,6 +266,11 @@ pub async fn token_endpoint(
                     .into_response();
             }
         },
+        _ => form
+            .get("refresh_token")
+            .and_then(|rt| state.store.account_for_token(rt))
+            .filter(|id| fixture.account(id).is_some())
+            .unwrap_or_else(|| fixture.primary_account().id.clone()),
     };
     drop(fixture);
 
