@@ -10,17 +10,15 @@ use rand::RngExt;
 use rand::rngs::SmallRng;
 
 pub const FIRST_NAMES: &[&str] = &[
-    "Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Heidi", "Ivan",
-    "Judy", "Kris", "Liam", "Mallory", "Noor", "Olivia", "Peggy", "Quinn",
-    "Rupert", "Sybil", "Trent", "Uma", "Victor", "Wendy", "Xander", "Yael",
-    "Zara",
+    "Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Heidi", "Ivan", "Judy", "Kris",
+    "Liam", "Mallory", "Noor", "Olivia", "Peggy", "Quinn", "Rupert", "Sybil", "Trent", "Uma",
+    "Victor", "Wendy", "Xander", "Yael", "Zara",
 ];
 
 pub const LAST_NAMES: &[&str] = &[
-    "Anderson", "Bennett", "Castro", "Diaz", "Edwards", "Fischer", "Garcia",
-    "Hansen", "Iversen", "Johansen", "Kowalski", "Larsen", "Mendez", "Nakamura",
-    "Olsen", "Petrov", "Quinn", "Roberts", "Singh", "Tanaka", "Ueda", "Vega",
-    "Watanabe", "Xu", "Yamamoto", "Zhao",
+    "Anderson", "Bennett", "Castro", "Diaz", "Edwards", "Fischer", "Garcia", "Hansen", "Iversen",
+    "Johansen", "Kowalski", "Larsen", "Mendez", "Nakamura", "Olsen", "Petrov", "Quinn", "Roberts",
+    "Singh", "Tanaka", "Ueda", "Vega", "Watanabe", "Xu", "Yamamoto", "Zhao",
 ];
 
 pub const DOMAINS: &[&str] = &[
@@ -32,21 +30,61 @@ pub const DOMAINS: &[&str] = &[
 ];
 
 pub const PROJECTS: &[&str] = &[
-    "Atlas", "Beacon", "Compass", "Delta", "Echo", "Forge", "Granite",
-    "Horizon", "Iris", "Jetstream", "Keystone", "Lighthouse", "Mercury",
-    "Nexus", "Orbit", "Pinnacle", "Quantum", "Relay", "Spectrum", "Titan",
+    "Atlas",
+    "Beacon",
+    "Compass",
+    "Delta",
+    "Echo",
+    "Forge",
+    "Granite",
+    "Horizon",
+    "Iris",
+    "Jetstream",
+    "Keystone",
+    "Lighthouse",
+    "Mercury",
+    "Nexus",
+    "Orbit",
+    "Pinnacle",
+    "Quantum",
+    "Relay",
+    "Spectrum",
+    "Titan",
 ];
 
 pub const TEAMS: &[&str] = &[
-    "engineering", "platform", "product", "design", "infrastructure", "data",
-    "security", "mobile", "frontend", "backend", "devops", "growth",
+    "engineering",
+    "platform",
+    "product",
+    "design",
+    "infrastructure",
+    "data",
+    "security",
+    "mobile",
+    "frontend",
+    "backend",
+    "devops",
+    "growth",
 ];
 
 pub const TOPICS: &[&str] = &[
-    "microservices", "GraphQL", "Rust", "WebAssembly", "machine learning",
-    "edge computing", "observability", "TypeScript", "Kubernetes", "CI/CD",
-    "database sharding", "caching strategy", "API versioning", "OAuth 2.0",
-    "event sourcing", "container security", "performance tuning",
+    "microservices",
+    "GraphQL",
+    "Rust",
+    "WebAssembly",
+    "machine learning",
+    "edge computing",
+    "observability",
+    "TypeScript",
+    "Kubernetes",
+    "CI/CD",
+    "database sharding",
+    "caching strategy",
+    "API versioning",
+    "OAuth 2.0",
+    "event sourcing",
+    "container security",
+    "performance tuning",
 ];
 
 pub const SUBJECT_TEMPLATES: &[&str] = &[
@@ -111,7 +149,11 @@ pub fn pick_address(rng: &mut SmallRng) -> (String, String) {
     let last = pick(rng, LAST_NAMES);
     let domain = pick(rng, DOMAINS);
     let display = format!("{first} {last}");
-    let local = format!("{}.{}", first.to_ascii_lowercase(), last.to_ascii_lowercase());
+    let local = format!(
+        "{}.{}",
+        first.to_ascii_lowercase(),
+        last.to_ascii_lowercase()
+    );
     (display, format!("{local}@{domain}"))
 }
 

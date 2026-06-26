@@ -30,8 +30,8 @@ pub struct Scenario {
 /// dispatcher is `None`.
 pub fn load(path: &Path) -> Result<Scenario, String> {
     if path.extension().is_some_and(|e| e == "lua") {
-        let source = std::fs::read_to_string(path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let source =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let chunk_name = format!("@{}", path.display());
         let dir = path.parent().unwrap_or(Path::new("."));
         let (fixture, dispatcher) =

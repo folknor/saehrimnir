@@ -313,13 +313,8 @@ async fn report_calendar_multiget_returns_ical_for_each_href() {
   <D:href>/calendars/account-1/cal-work/ev-002.ics</D:href>
   <D:href>/calendars/account-1/cal-work/ev-bogus.ics</D:href>
 </C:calendar-multiget>"#;
-    let (status, response) = send(
-        "REPORT",
-        "/calendars/account-1/cal-work/",
-        Some("1"),
-        body,
-    )
-    .await;
+    let (status, response) =
+        send("REPORT", "/calendars/account-1/cal-work/", Some("1"), body).await;
     assert_eq!(status, StatusCode::MULTI_STATUS);
     // Each known event surfaces with a getetag and a calendar-data
     // payload.
@@ -356,16 +351,14 @@ async fn report_calendar_query_filters_by_time_range() {
     </C:comp-filter>
   </C:filter>
 </C:calendar-query>"#;
-    let (status, response) = send(
-        "REPORT",
-        "/calendars/account-1/cal-work/",
-        Some("1"),
-        body,
-    )
-    .await;
+    let (status, response) =
+        send("REPORT", "/calendars/account-1/cal-work/", Some("1"), body).await;
     assert_eq!(status, StatusCode::MULTI_STATUS);
     assert!(response.contains("ev-001.ics"));
-    assert!(!response.contains("ev-002.ics"), "out-of-range event leaked: {response}");
+    assert!(
+        !response.contains("ev-002.ics"),
+        "out-of-range event leaked: {response}"
+    );
 }
 
 #[tokio::test]
@@ -382,13 +375,8 @@ async fn report_calendar_query_with_no_range_returns_all_events() {
     </C:comp-filter>
   </C:filter>
 </C:calendar-query>"#;
-    let (status, response) = send(
-        "REPORT",
-        "/calendars/account-1/cal-work/",
-        Some("1"),
-        body,
-    )
-    .await;
+    let (status, response) =
+        send("REPORT", "/calendars/account-1/cal-work/", Some("1"), body).await;
     assert_eq!(status, StatusCode::MULTI_STATUS);
     assert!(response.contains("ev-001.ics"));
     assert!(response.contains("ev-002.ics"));
@@ -456,7 +444,13 @@ async fn put_updates_existing_event_and_etag_changes() {
         )
         .await
         .unwrap();
-    let baseline_etag = resp.headers().get("ETag").unwrap().to_str().unwrap().to_string();
+    let baseline_etag = resp
+        .headers()
+        .get("ETag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
 
     // Update via PUT.
     let body = "BEGIN:VCALENDAR\r\n\
@@ -495,7 +489,12 @@ async fn put_updates_existing_event_and_etag_changes() {
         .await
         .unwrap();
     let body = String::from_utf8(
-        resp.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
     )
     .unwrap();
     assert!(body.contains("DTSTART:20260115T100000Z"));
@@ -1041,8 +1040,14 @@ async fn caldav_get_event_emits_rrule_and_exdate() {
     // Both exdates round-trip in fixture-declaration order, one per
     // line. (Real clients would also accept a single comma-joined
     // line; v0 picks one-line-per-date for stable snapshots.)
-    assert!(body.contains("EXDATE:20260315T170000Z"), "missing first exdate: {body}");
-    assert!(body.contains("EXDATE:20260715T170000Z"), "missing second exdate: {body}");
+    assert!(
+        body.contains("EXDATE:20260315T170000Z"),
+        "missing first exdate: {body}"
+    );
+    assert!(
+        body.contains("EXDATE:20260715T170000Z"),
+        "missing second exdate: {body}"
+    );
 }
 
 #[tokio::test]
@@ -1056,8 +1061,14 @@ async fn caldav_single_instance_event_omits_rrule_and_exdate() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!body.contains("RRULE"), "single instance leaked RRULE: {body}");
-    assert!(!body.contains("EXDATE"), "single instance leaked EXDATE: {body}");
+    assert!(
+        !body.contains("RRULE"),
+        "single instance leaked RRULE: {body}"
+    );
+    assert!(
+        !body.contains("EXDATE"),
+        "single instance leaked EXDATE: {body}"
+    );
 }
 
 #[tokio::test]
@@ -1207,7 +1218,10 @@ async fn options_advertises_mkcalendar_verb() {
         .await
         .unwrap();
     let allow = resp.headers().get("Allow").unwrap().to_str().unwrap();
-    assert!(allow.contains("MKCALENDAR"), "Allow missing MKCALENDAR: {allow}");
+    assert!(
+        allow.contains("MKCALENDAR"),
+        "Allow missing MKCALENDAR: {allow}"
+    );
 }
 
 #[tokio::test]
@@ -1290,7 +1304,8 @@ async fn mkcalendar_on_existing_calendar_returns_405() {
 
 #[tokio::test]
 async fn mkcalendar_under_unknown_principal_returns_404() {
-    let body = "<C:mkcalendar xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"></C:mkcalendar>";
+    let body =
+        "<C:mkcalendar xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"></C:mkcalendar>";
     let resp = router()
         .oneshot(
             Request::builder()

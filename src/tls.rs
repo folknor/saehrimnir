@@ -23,13 +23,13 @@ pub fn make_acceptor() -> Result<TlsAcceptor, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let subjects = vec!["localhost".to_string(), "saehrimnir.test".to_string()];
-    let certified = rcgen::generate_simple_self_signed(subjects)
-        .map_err(|e| format!("rcgen: {e}"))?;
+    let certified =
+        rcgen::generate_simple_self_signed(subjects).map_err(|e| format!("rcgen: {e}"))?;
 
-    let cert_der: CertificateDer<'static> =
-        CertificateDer::from(certified.cert.der().to_vec());
-    let key_der: PrivateKeyDer<'static> =
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()));
+    let cert_der: CertificateDer<'static> = CertificateDer::from(certified.cert.der().to_vec());
+    let key_der: PrivateKeyDer<'static> = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.signing_key.serialize_der(),
+    ));
 
     let config = ServerConfig::builder()
         .with_no_client_auth()

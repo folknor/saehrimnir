@@ -172,11 +172,8 @@ async fn session(
     // pinned to the fixture primary - and ratatoskr's JMAP client
     // then routes every subsequent method call under the wrong
     // accountId.
-    let caller_id = crate::oauth::account_from_bearer(
-        &fixture,
-        &state.shared.token_store,
-        &headers,
-    );
+    let caller_id =
+        crate::oauth::account_from_bearer(&fixture, &state.shared.token_store, &headers);
     let caller_account = fixture
         .account(&caller_id)
         .unwrap_or_else(|| fixture.primary_account());
@@ -197,13 +194,16 @@ async fn session(
         caps.insert("urn:ietf:params:jmap:mail".to_string(), json!({}));
         let has_calendars = fixture.calendars_for(&acct.id).next().is_some();
         if has_calendars {
-            caps.insert("urn:ietf:params:jmap:calendars".to_string(), json!({
-                "minDateTime": "1970-01-01T00:00:00",
-                "maxDateTime": "2099-12-31T23:59:59",
-                "maxExpandedQueryDuration": "P1Y",
-                "maxParticipantsPerEvent": 256,
-                "mayCreateCalendar": true,
-            }));
+            caps.insert(
+                "urn:ietf:params:jmap:calendars".to_string(),
+                json!({
+                    "minDateTime": "1970-01-01T00:00:00",
+                    "maxDateTime": "2099-12-31T23:59:59",
+                    "maxExpandedQueryDuration": "P1Y",
+                    "maxParticipantsPerEvent": 256,
+                    "mayCreateCalendar": true,
+                }),
+            );
         }
         // Contacts advertise on accounts that own an address book
         // (contact folder). Gates the JMAP `AddressBook/*` +
@@ -285,7 +285,10 @@ async fn session(
     let ws_base = base
         .strip_prefix("https://")
         .map(|rest| format!("wss://{rest}"))
-        .or_else(|| base.strip_prefix("http://").map(|rest| format!("ws://{rest}")))
+        .or_else(|| {
+            base.strip_prefix("http://")
+                .map(|rest| format!("ws://{rest}"))
+        })
         .unwrap_or_else(|| base.to_string());
     top_caps.insert(
         "urn:ietf:params:jmap:websocket".to_string(),
@@ -295,16 +298,10 @@ async fn session(
         }),
     );
     if advertise_calendars {
-        top_caps.insert(
-            "urn:ietf:params:jmap:calendars".to_string(),
-            json!({}),
-        );
+        top_caps.insert("urn:ietf:params:jmap:calendars".to_string(), json!({}));
     }
     if advertise_contacts {
-        top_caps.insert(
-            "urn:ietf:params:jmap:contacts".to_string(),
-            json!({}),
-        );
+        top_caps.insert("urn:ietf:params:jmap:contacts".to_string(), json!({}));
     }
 
     Ok(Json(json!({
@@ -556,17 +553,7 @@ fn rfc5987_encode(s: &str) -> String {
         let pass_through = b.is_ascii_alphanumeric()
             || matches!(
                 b,
-                b'!' | b'#'
-                    | b'$'
-                    | b'&'
-                    | b'+'
-                    | b'-'
-                    | b'.'
-                    | b'^'
-                    | b'_'
-                    | b'`'
-                    | b'|'
-                    | b'~'
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
             );
         if pass_through {
             out.push(b as char);

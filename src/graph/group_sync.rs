@@ -55,10 +55,7 @@ async fn list_groups(State(state): State<AppState>) -> Response {
     }))
 }
 
-async fn get_group(
-    State(state): State<AppState>,
-    Path(group): Path<String>,
-) -> Response {
+async fn get_group(State(state): State<AppState>, Path(group): Path<String>) -> Response {
     let group_owned = group.clone();
     if let Some(o) = super::maybe_override(&state, "get_group", move |s| {
         crate::lua::req_set_str(s, "group", &group_owned)
@@ -76,10 +73,7 @@ async fn get_group(
     }
 }
 
-async fn list_group_members(
-    State(state): State<AppState>,
-    Path(group): Path<String>,
-) -> Response {
+async fn list_group_members(State(state): State<AppState>, Path(group): Path<String>) -> Response {
     let group_owned = group.clone();
     if let Some(o) = super::maybe_override(&state, "list_group_members", move |s| {
         crate::lua::req_set_str(s, "group", &group_owned)
@@ -112,10 +106,7 @@ async fn member_of_me(State(state): State<AppState>, headers: HeaderMap) -> Resp
     member_of_impl(state, &account_id).await
 }
 
-async fn member_of_user(
-    State(state): State<AppState>,
-    Path(user): Path<String>,
-) -> Response {
+async fn member_of_user(State(state): State<AppState>, Path(user): Path<String>) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
@@ -178,4 +169,3 @@ fn serialize_user_member(a: &Account) -> Value {
     obj.insert("userPrincipalName".into(), Value::String(a.name.clone()));
     Value::Object(obj)
 }
-

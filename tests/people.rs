@@ -55,12 +55,7 @@ async fn body_json(resp: axum::response::Response) -> Value {
 async fn get(r: &axum::Router, uri: &str) -> (StatusCode, Value) {
     let resp = r
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = resp.status();
@@ -74,7 +69,11 @@ async fn get_single_person_returns_projection_and_404s_unknown() {
 
     // bifrost's get_person drives this for contact_get AND the
     // etag-prefetch before updateContact; without it both 404.
-    let (status, v) = get(&r, "/v1/people/contact-001?personFields=names,emailAddresses").await;
+    let (status, v) = get(
+        &r,
+        "/v1/people/contact-001?personFields=names,emailAddresses",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["resourceName"], "people/contact-001");
     assert_eq!(v["etag"], "etag-contact-001");
@@ -102,10 +101,12 @@ async fn connections_initial_listing_returns_full_set_with_sync_token() {
 
     // Spot-check a contact projection.
     let first = &conns[0];
-    assert!(first["resourceName"]
-        .as_str()
-        .unwrap()
-        .starts_with("people/"));
+    assert!(
+        first["resourceName"]
+            .as_str()
+            .unwrap()
+            .starts_with("people/")
+    );
     assert_eq!(first["metadata"]["deleted"], false);
     let emails = first["emailAddresses"].as_array().unwrap();
     assert!(!emails.is_empty());
@@ -221,8 +222,7 @@ async fn connections_emits_metadata_deleted_tombstone_after_destroy() {
     // `metadata.deleted: true` Persons for `contact_destroyed`
     // ids; ratatoskr's PersonMetadata reader routes those to
     // delete-the-row.
-    let (people_r, routes_r) =
-        cross_protocol_routers("fixtures/graph-contacts-incremental.lua");
+    let (people_r, routes_r) = cross_protocol_routers("fixtures/graph-contacts-incremental.lua");
 
     // Bootstrap: token-less call returns the seed three contacts
     // (the fixture's two declared contacts; step 1 is `new` which

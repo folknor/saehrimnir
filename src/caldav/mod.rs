@@ -150,7 +150,9 @@ fn account_from_basic_auth(
     headers: &HeaderMap,
 ) -> Option<String> {
     let value = headers.get("authorization")?.to_str().ok()?;
-    let b64 = value.strip_prefix("Basic ").or_else(|| value.strip_prefix("basic "))?;
+    let b64 = value
+        .strip_prefix("Basic ")
+        .or_else(|| value.strip_prefix("basic "))?;
     let decoded = crate::imap::sasl_decode_b64(b64.trim())?;
     let creds = std::str::from_utf8(&decoded).ok()?;
     let (user, _pass) = creds.split_once(':')?;
@@ -217,18 +219,18 @@ async fn handle_propfind(
     match parse_path(&fixture, path) {
         ResourcePath::Root => propfind_root(&fixture, auth_user.as_deref(), body_str),
         ResourcePath::WellKnown => propfind_root(&fixture, auth_user.as_deref(), body_str),
-        ResourcePath::Principal { user } => {
-            propfind_principal(&fixture, &user, body_str)
-        }
+        ResourcePath::Principal { user } => propfind_principal(&fixture, &user, body_str),
         ResourcePath::CalendarHome { user } => {
             propfind_calendar_home(&fixture, &user, body_str, depth)
         }
         ResourcePath::Calendar { user, calendar_id } => {
             propfind_calendar(&fixture, &user, &calendar_id, body_str, depth)
         }
-        ResourcePath::Event { user, calendar_id, event_id } => {
-            propfind_event(&fixture, &user, &calendar_id, &event_id, body_str)
-        }
+        ResourcePath::Event {
+            user,
+            calendar_id,
+            event_id,
+        } => propfind_event(&fixture, &user, &calendar_id, &event_id, body_str),
         ResourcePath::Unknown => not_found(path),
     }
 }
@@ -240,10 +242,21 @@ async fn handle_propfind(
 enum ResourcePath {
     Root,
     WellKnown,
-    Principal { user: String },
-    CalendarHome { user: String },
-    Calendar { user: String, calendar_id: String },
-    Event { user: String, calendar_id: String, event_id: String },
+    Principal {
+        user: String,
+    },
+    CalendarHome {
+        user: String,
+    },
+    Calendar {
+        user: String,
+        calendar_id: String,
+    },
+    Event {
+        user: String,
+        calendar_id: String,
+        event_id: String,
+    },
     Unknown,
 }
 
@@ -472,7 +485,11 @@ fn propfind_calendar(
     let mut event_hrefs = Vec::new();
     let mut event_props = Vec::new();
     if depth >= 1 {
-        for ev in fixture.events.iter().filter(|e| e.calendar_id == calendar_id) {
+        for ev in fixture
+            .events
+            .iter()
+            .filter(|e| e.calendar_id == calendar_id)
+        {
             event_hrefs.push(format!("/calendars/{user}/{calendar_id}/{}.ics", ev.id));
             event_props.push(event_resource_props(fixture, ev, &requested));
         }
@@ -498,9 +515,7 @@ fn propfind_event(
     body: &str,
 ) -> Response {
     let requested = xml::requested_props(body);
-    let calendar_in_account = fixture
-        .calendars_for(user)
-        .any(|c| c.id == calendar_id);
+    let calendar_in_account = fixture.calendars_for(user).any(|c| c.id == calendar_id);
     if !calendar_in_account {
         return not_found(&format!("/calendars/{user}/{calendar_id}/{event_id}.ics"));
     }
@@ -762,10 +777,7 @@ fn last_state_touching_event(fixture: &crate::fixture::Fixture, event_id: &str) 
 /// still in the fixture so we look up the parent there. For
 /// destroyed, the parent comes from `event_destroyed_parents`
 /// (parallel to `event_destroyed`).
-fn last_state_touching_calendar(
-    fixture: &crate::fixture::Fixture,
-    calendar_id: &str,
-) -> String {
+fn last_state_touching_calendar(fixture: &crate::fixture::Fixture, calendar_id: &str) -> String {
     // The calendar's own account owns the transitions that touch it.
     let Some(account_id) = fixture
         .calendars
@@ -789,10 +801,7 @@ fn last_state_touching_calendar(
         if touches_live {
             return t.to_state.clone();
         }
-        if t.event_destroyed_parents
-            .iter()
-            .any(|p| p == calendar_id)
-        {
+        if t.event_destroyed_parents.iter().any(|p| p == calendar_id) {
             return t.to_state.clone();
         }
     }
@@ -861,9 +870,12 @@ fn report_multiget(
             } if u == user && c == calendar_id => Some(event_id),
             _ => None,
         };
-        let event = resolved
-            .as_deref()
-            .and_then(|id| fixture.events.iter().find(|e| e.id == id && e.calendar_id == calendar_id));
+        let event = resolved.as_deref().and_then(|id| {
+            fixture
+                .events
+                .iter()
+                .find(|e| e.id == id && e.calendar_id == calendar_id)
+        });
         match event {
             Some(ev) => {
                 let etag = event_etag(fixture, &ev.id);
@@ -911,7 +923,11 @@ fn report_calendar_query(
     out.push('\n');
     out.push_str(r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">"#);
 
-    for ev in fixture.events.iter().filter(|e| e.calendar_id == calendar_id) {
+    for ev in fixture
+        .events
+        .iter()
+        .filter(|e| e.calendar_id == calendar_id)
+    {
         if let Some((start, end)) = range
             && !overlaps(ev, start, end)
         {
@@ -939,7 +955,9 @@ fn report_calendar_query(
 /// REPORT body. Returns `(start, end)` as parsed UTC datetimes,
 /// or None if the element isn't present (or one of the attributes
 /// fails to parse).
-fn parse_time_range(body: &str) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+fn parse_time_range(
+    body: &str,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
     let idx = body.find("time-range")?;
     let tail = &body[idx..];
     let start = extract_attr(tail, "start").and_then(|s| ical::parse_dt(&s))?;
@@ -1009,12 +1027,7 @@ async fn handle_get(state: &AppState, path: &str, _headers: &HeaderMap) -> Respo
     }
 }
 
-async fn handle_put(
-    state: &AppState,
-    path: &str,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Response {
+async fn handle_put(state: &AppState, path: &str, headers: &HeaderMap, body: &[u8]) -> Response {
     let body_str = match body_to_str(body) {
         Ok(s) => s,
         Err(r) => return r,
@@ -1125,21 +1138,19 @@ async fn handle_put(
         recurrence_exdates: parsed.recurrence_exdates,
     };
     let was_create = existing_idx.is_none();
-    fixture.mutate(|f| {
-        match existing_idx {
-            Some(idx) => {
-                f.events[idx] = new_event.clone();
-                crate::fixture::MutationDiff {
-                    event_updated: vec![id.clone()],
-                    ..Default::default()
-                }
+    fixture.mutate(|f| match existing_idx {
+        Some(idx) => {
+            f.events[idx] = new_event.clone();
+            crate::fixture::MutationDiff {
+                event_updated: vec![id.clone()],
+                ..Default::default()
             }
-            None => {
-                f.events.push(new_event.clone());
-                crate::fixture::MutationDiff {
-                    event_created: vec![id.clone()],
-                    ..Default::default()
-                }
+        }
+        None => {
+            f.events.push(new_event.clone());
+            crate::fixture::MutationDiff {
+                event_created: vec![id.clone()],
+                ..Default::default()
             }
         }
     });
@@ -1257,7 +1268,8 @@ async fn handle_mkcalendar(state: &AppState, path: &str, body: &[u8]) -> Respons
         }
     };
 
-    let display_name = xml::text_value(body_str, "displayname").unwrap_or_else(|| calendar_id.clone());
+    let display_name =
+        xml::text_value(body_str, "displayname").unwrap_or_else(|| calendar_id.clone());
     let color = xml::text_value(body_str, "calendar-color");
 
     let mut fixture = state.shared.fixture.write().expect("fixture lock poisoned");

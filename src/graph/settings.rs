@@ -83,7 +83,10 @@ async fn mailbox_settings() -> Response {
 
 /// Accept the auto-reply patch and echo it back (not durably stored).
 async fn patch_mailbox_settings(Json(body): Json<Value>) -> Response {
-    let setting = body.get("automaticRepliesSetting").cloned().unwrap_or(Value::Null);
+    let setting = body
+        .get("automaticRepliesSetting")
+        .cloned()
+        .unwrap_or(Value::Null);
     ok_json(json!({
         "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('me')/mailboxSettings",
         "automaticRepliesSetting": setting,
@@ -118,7 +121,10 @@ async fn get_rule(Path((_folder, _rule)): Path<(String, String)>) -> Response {
     )
 }
 
-async fn patch_rule(Path((_folder, _rule)): Path<(String, String)>, Json(body): Json<Value>) -> Response {
+async fn patch_rule(
+    Path((_folder, _rule)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
     ok_json(body)
 }
 
@@ -191,15 +197,18 @@ async fn create_subscription(
         .unwrap_or(SUBSCRIPTION_EXPIRATION)
         .to_string();
     let id = format!("mock-subscription-{}", state.shared.push.next_seq());
-    state.shared.push.graph_create_subscription(GraphSubscription {
-        id: id.clone(),
-        account_id,
-        resource: resource.clone(),
-        change_type: change_type.clone(),
-        client_state: client_state.clone(),
-        notification_url: notification_url.clone(),
-        expiration: expiration.clone(),
-    });
+    state
+        .shared
+        .push
+        .graph_create_subscription(GraphSubscription {
+            id: id.clone(),
+            account_id,
+            resource: resource.clone(),
+            change_type: change_type.clone(),
+            client_state: client_state.clone(),
+            notification_url: notification_url.clone(),
+            expiration: expiration.clone(),
+        });
     (
         StatusCode::CREATED,
         axum::Json(json!({

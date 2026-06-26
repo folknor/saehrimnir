@@ -95,7 +95,10 @@ fn send_sigterm(pid: u32) {
     unsafe { libc::kill(pid, libc::SIGTERM) };
 }
 
-fn wait_with_timeout(mut child: Child, timeout: Duration) -> std::io::Result<std::process::ExitStatus> {
+fn wait_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait()? {
@@ -118,20 +121,21 @@ fn binary_boots_writes_sentinel_serves_jmap_and_exits_on_sigterm() {
     let ready = scratch.join("ready");
 
     let child = Command::new(binary())
-        .args([
-            "--readiness-file",
-        ])
+        .args(["--readiness-file"])
         .arg(&ready)
-        .args([
-            "--fixture",
-        ])
+        .args(["--fixture"])
         .arg(fixture_path())
         .args([
-            "--jmap-port", "0",
-            "--imap-port", "0",
-            "--smtp-port", "0",
-            "--graph-port", "0",
-            "--gmail-port", "0",
+            "--jmap-port",
+            "0",
+            "--imap-port",
+            "0",
+            "--smtp-port",
+            "0",
+            "--graph-port",
+            "0",
+            "--gmail-port",
+            "0",
         ])
         .spawn()
         .expect("spawn saehrimnir");
@@ -148,11 +152,31 @@ fn binary_boots_writes_sentinel_serves_jmap_and_exits_on_sigterm() {
     let jmap_port = parse_jmap_port(&body);
     // All five protocol lines should be present, in order.
     let lines: Vec<&str> = body.lines().collect();
-    assert!(lines[0].starts_with("JMAP "), "wrong line 0: {:?}", lines[0]);
-    assert!(lines[1].starts_with("IMAP "), "wrong line 1: {:?}", lines[1]);
-    assert!(lines[2].starts_with("SMTP "), "wrong line 2: {:?}", lines[2]);
-    assert!(lines[3].starts_with("GRAPH "), "wrong line 3: {:?}", lines[3]);
-    assert!(lines[4].starts_with("GMAIL "), "wrong line 4: {:?}", lines[4]);
+    assert!(
+        lines[0].starts_with("JMAP "),
+        "wrong line 0: {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("IMAP "),
+        "wrong line 1: {:?}",
+        lines[1]
+    );
+    assert!(
+        lines[2].starts_with("SMTP "),
+        "wrong line 2: {:?}",
+        lines[2]
+    );
+    assert!(
+        lines[3].starts_with("GRAPH "),
+        "wrong line 3: {:?}",
+        lines[3]
+    );
+    assert!(
+        lines[4].starts_with("GMAIL "),
+        "wrong line 4: {:?}",
+        lines[4]
+    );
 
     // Hit a real network endpoint to confirm the JMAP listener is
     // actually accepting connections (sentinel only proves bind, not
@@ -199,11 +223,16 @@ fn binary_serves_lua_fixture_identically() {
         .args(["--fixture"])
         .arg(&lua_fixture)
         .args([
-            "--jmap-port", "0",
-            "--imap-port", "0",
-            "--smtp-port", "0",
-            "--graph-port", "0",
-            "--gmail-port", "0",
+            "--jmap-port",
+            "0",
+            "--imap-port",
+            "0",
+            "--smtp-port",
+            "0",
+            "--graph-port",
+            "0",
+            "--gmail-port",
+            "0",
         ])
         .spawn()
         .expect("spawn saehrimnir");

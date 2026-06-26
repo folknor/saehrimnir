@@ -66,7 +66,9 @@ async fn profile(State(state): State<AppState>, headers: HeaderMap) -> Response 
     }
     let account_id = bearer_account(&state, &headers);
     let f = state.fixture();
-    let acct = f.account(&account_id).unwrap_or_else(|| f.primary_account());
+    let acct = f
+        .account(&account_id)
+        .unwrap_or_else(|| f.primary_account());
     let messages_total = f.emails_for(&account_id).count();
     ok_json(json!({
         "emailAddress": acct.name,
@@ -77,7 +79,10 @@ async fn profile(State(state): State<AppState>, headers: HeaderMap) -> Response 
 }
 
 fn unique_thread_count(f: &Fixture, account_id: &str) -> usize {
-    let mut seen: Vec<&str> = f.emails_for(account_id).map(|e| e.thread_id.as_str()).collect();
+    let mut seen: Vec<&str> = f
+        .emails_for(account_id)
+        .map(|e| e.thread_id.as_str())
+        .collect();
     seen.sort_unstable();
     seen.dedup();
     seen.len()
@@ -173,7 +178,14 @@ async fn list_labels(State(state): State<AppState>, headers: HeaderMap) -> Respo
 }
 
 const SYSTEM_LABELS: &[&str] = &[
-    "INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "IMPORTANT", "STARRED", "UNREAD",
+    "INBOX",
+    "SENT",
+    "DRAFT",
+    "TRASH",
+    "SPAM",
+    "IMPORTANT",
+    "STARRED",
+    "UNREAD",
 ];
 
 fn label_value(id: &str, name: &str, kind: &str, fixture: &Fixture, account_id: &str) -> Value {
@@ -221,7 +233,9 @@ fn label_counts(fixture: &Fixture, label_id: &str, account_id: &str) -> (u64, u6
 }
 
 fn email_carries_label(email: &Email, fixture: &Fixture, label_id: &str) -> bool {
-    label_ids_for(email, fixture).iter().any(|id| id == label_id)
+    label_ids_for(email, fixture)
+        .iter()
+        .any(|id| id == label_id)
 }
 
 /// Compute the full label set for a fixture email. The projection
@@ -265,8 +279,7 @@ async fn list_threads(
                 "invalidQuery",
             );
         };
-        let cutoff = chrono::Utc
-            .from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default());
+        let cutoff = chrono::Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default());
         threads.retain(|t| t.received_at >= cutoff);
     }
 
@@ -530,7 +543,10 @@ fn text_leaf(part_id: String, headers: Vec<Value>, body_str: &str) -> Value {
 
 fn attachment_leaf(part_id: String, a: &Attachment) -> Value {
     let mut headers = vec![
-        header("Content-Type", &format!("{}; name=\"{}\"", a.content_type, a.name)),
+        header(
+            "Content-Type",
+            &format!("{}; name=\"{}\"", a.content_type, a.name),
+        ),
         header(
             "Content-Disposition",
             &format!("{}; filename=\"{}\"", a.disposition.as_str(), a.name),
@@ -542,7 +558,10 @@ fn attachment_leaf(part_id: String, a: &Attachment) -> Value {
     }
     let mut leaf = Map::new();
     leaf.insert("partId".to_string(), Value::String(part_id));
-    leaf.insert("mimeType".to_string(), Value::String(a.content_type.clone()));
+    leaf.insert(
+        "mimeType".to_string(),
+        Value::String(a.content_type.clone()),
+    );
     leaf.insert("filename".to_string(), Value::String(a.name.clone()));
     leaf.insert("headers".to_string(), Value::Array(headers));
     leaf.insert(
@@ -567,10 +586,7 @@ fn format_address(a: &Address) -> String {
 }
 
 fn format_address_list(xs: &[Address]) -> String {
-    xs.iter()
-        .map(format_address)
-        .collect::<Vec<_>>()
-        .join(", ")
+    xs.iter().map(format_address).collect::<Vec<_>>().join(", ")
 }
 
 // ── Messages ────────────────────────────────────────────────────────
@@ -724,9 +740,7 @@ async fn history(
             // ratatoskr's full re-sync fallback.
             error(
                 StatusCode::NOT_FOUND,
-                &format!(
-                    "startHistoryId {start} is too old; a full sync is required (historyId)"
-                ),
+                &format!("startHistoryId {start} is too old; a full sync is required (historyId)"),
                 "notFound",
             )
         }
@@ -838,12 +852,14 @@ async fn get_attachment(
             "notFound",
         );
     };
-    let Some(att) = email.attachments.iter().find(|a| a.blob_id == attachment_id) else {
+    let Some(att) = email
+        .attachments
+        .iter()
+        .find(|a| a.blob_id == attachment_id)
+    else {
         return error(
             StatusCode::NOT_FOUND,
-            &format!(
-                "attachment {attachment_id:?} on message {message_id:?} not found"
-            ),
+            &format!("attachment {attachment_id:?} on message {message_id:?} not found"),
             "notFound",
         );
     };
@@ -1078,8 +1094,7 @@ fn decode_token(t: &str) -> Option<u32> {
 // part in base64url (RFC 4648 sec 5) without trailing `=` padding
 // (`parse.rs:269-275` calls `decode_base64url_nopad`).
 
-const URL_ALPHABET: &[u8] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const URL_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 pub fn base64url_no_pad(input: &[u8]) -> String {
     let mut out = String::with_capacity((input.len() * 4).div_ceil(3));

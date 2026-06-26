@@ -183,7 +183,9 @@ fn find_tag_open(haystack: &str, local_name: &str) -> Option<usize> {
         let name_start = after.find(':').filter(|&i| {
             // The prefix is alphabetic and short; reject anything
             // containing whitespace or a slash before the colon.
-            after[..i].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            after[..i]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         });
         let name_slice = match name_start {
             Some(i) => &after[i + 1..],
@@ -210,7 +212,11 @@ fn find_tag_close(haystack: &str, local_name: &str) -> Option<usize> {
         let abs = search_from + rel;
         let after = &haystack[abs + 2..];
         let name_slice = match after.find(':') {
-            Some(i) if after[..i].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => {
+            Some(i)
+                if after[..i]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+            {
                 &after[i + 1..]
             }
             _ => after,

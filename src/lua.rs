@@ -47,8 +47,8 @@ const MAX_BULK_COUNT: i64 = 10_000_000;
 /// Discards the dispatcher; for callback-aware loading, use
 /// [`crate::scenario::load`].
 pub fn load(path: &Path) -> Result<Fixture, String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let source =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let chunk_name = format!("@{}", path.display());
     let dir = path.parent().unwrap_or(Path::new("."));
     load_source_with_dir(&source, &chunk_name, dir)
@@ -444,13 +444,15 @@ fn builder_contact(state: &mut State) -> dellingr::Result<u8> {
     let display_name = read_string_opt(state, 1, "display_name")?;
     let emails = read_contact_email_array_opt(state, 1, "emails")?;
     let account_id = read_string_opt(state, 1, "account_id")?;
-    builder_mut(state)?.contacts.push(crate::fixture::RawContact {
-        id,
-        folder_id,
-        display_name,
-        emails,
-        account_id,
-    });
+    builder_mut(state)?
+        .contacts
+        .push(crate::fixture::RawContact {
+            id,
+            folder_id,
+            display_name,
+            emails,
+            account_id,
+        });
     Ok(0)
 }
 
@@ -693,7 +695,9 @@ fn read_contact_email_array_opt_present(
                         state.pop(1);
                         return fail(
                             state,
-                            format!("field {key:?} entry {i} must be a string or {{address, name}} table"),
+                            format!(
+                                "field {key:?} entry {i} must be a string or {{address, name}} table"
+                            ),
                         );
                     }
                 }
@@ -739,7 +743,9 @@ fn read_contact_email_array_opt(
                         state.pop(1);
                         return fail(
                             state,
-                            format!("field {key:?} entry {i} must be a string or {{address, name}} table"),
+                            format!(
+                                "field {key:?} entry {i} must be a string or {{address, name}} table"
+                            ),
                         );
                     }
                 }
@@ -795,8 +801,7 @@ fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
     let start_at_raw = read_string_opt(state, 1, "start_at")?
         .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_string());
     let interval_seconds = read_int_opt(state, 1, "interval_seconds")?.unwrap_or(60);
-    let id_prefix = read_string_opt(state, 1, "id_prefix")?
-        .unwrap_or_else(|| "bulk".to_string());
+    let id_prefix = read_string_opt(state, 1, "id_prefix")?.unwrap_or_else(|| "bulk".to_string());
 
     let start = match DateTime::parse_from_rfc3339(&start_at_raw) {
         Ok(dt) => dt.with_timezone(&Utc),
@@ -919,8 +924,7 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
         .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_string());
     let thread_interval = read_int_opt(state, 1, "thread_interval_seconds")?.unwrap_or(3600);
     let reply_interval = read_int_opt(state, 1, "reply_interval_seconds")?.unwrap_or(300);
-    let id_prefix = read_string_opt(state, 1, "id_prefix")?
-        .unwrap_or_else(|| "thread".to_string());
+    let id_prefix = read_string_opt(state, 1, "id_prefix")?.unwrap_or_else(|| "thread".to_string());
 
     let start = match DateTime::parse_from_rfc3339(&start_at_raw) {
         Ok(dt) => dt.with_timezone(&Utc),
@@ -969,9 +973,11 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
             } else {
                 format!("Re: {first_subject}")
             };
-            let body_tmpl = templates::BODY_TEMPLATES
-                [(seed.wrapping_add(thread_i as u64).wrapping_add(msg_i as u64) as usize)
-                    % templates::BODY_TEMPLATES.len()];
+            let body_tmpl = templates::BODY_TEMPLATES[(seed
+                .wrapping_add(thread_i as u64)
+                .wrapping_add(msg_i as u64)
+                as usize)
+                % templates::BODY_TEMPLATES.len()];
             let body = templates::fill_template(body_tmpl, &mut rng);
 
             let (from_name, from_email) = templates::pick_address(&mut rng);
@@ -996,8 +1002,7 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
             if msg_i > 0 {
                 // Reply: In-Reply-To = the immediate parent;
                 // References = the full chain back to the root.
-                email.in_reply_to =
-                    vec![prior_message_ids.last().expect("non-empty").clone()];
+                email.in_reply_to = vec![prior_message_ids.last().expect("non-empty").clone()];
                 email.references = prior_message_ids.clone();
             }
             prior_message_ids.push(message_id_header);
@@ -1053,8 +1058,7 @@ fn builder_bulk_mailboxes(state: &mut State) -> dellingr::Result<u8> {
         return fail(state, "bulk_mailboxes branching must be >= 1");
     }
     let seed = read_int_opt(state, 1, "seed")?.unwrap_or(42) as u64;
-    let id_prefix = read_string_opt(state, 1, "id_prefix")?
-        .unwrap_or_else(|| "mb".to_string());
+    let id_prefix = read_string_opt(state, 1, "id_prefix")?.unwrap_or_else(|| "mb".to_string());
 
     let builder = builder_mut(state)?;
     builder.mailboxes.reserve(count as usize);
@@ -1072,8 +1076,8 @@ fn builder_bulk_mailboxes(state: &mut State) -> dellingr::Result<u8> {
         // Stable name pick. Suffix with the index once the pool
         // wraps so a 100-mailbox tree doesn't collapse into 20
         // duplicate "Atlas" / "Beacon" entries.
-        let base = templates::PROJECTS
-            [(seed.wrapping_add(i as u64) as usize) % templates::PROJECTS.len()];
+        let base =
+            templates::PROJECTS[(seed.wrapping_add(i as u64) as usize) % templates::PROJECTS.len()];
         let name = if (count as usize) > templates::PROJECTS.len() {
             format!("{base} {i:0pad$}")
         } else {
@@ -1292,7 +1296,10 @@ fn read_contact_folder_create(
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
             state.pop(2);
-            return fail(state, format!("contact_folder_create entry {i} must be a table"));
+            return fail(
+                state,
+                format!("contact_folder_create entry {i} must be a table"),
+            );
         }
         let entry_idx = state.get_top() as isize;
         let raw = crate::fixture::RawContactFolder {
@@ -1334,7 +1341,10 @@ fn read_contact_folder_update(
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
             state.pop(2);
-            return fail(state, format!("contact_folder_update entry {i} must be a table"));
+            return fail(
+                state,
+                format!("contact_folder_update entry {i} must be a table"),
+            );
         }
         let entry_idx = state.get_top() as isize;
         let id = read_string(state, entry_idx, "id")?;
@@ -1429,12 +1439,13 @@ fn read_contact_update(
         let emails = read_contact_email_array_opt_present(state, entry_idx, "emails")?
             .map(|raws| raws.into_iter().map(ContactEmail::from).collect());
         state.pop(1);
-        let op = crate::fixture::contact_update_op(id, display_name, folder_id, emails)
-            .map_err(|e| {
+        let op = crate::fixture::contact_update_op(id, display_name, folder_id, emails).map_err(
+            |e| {
                 state.error(ErrorKind::InternalError(format!(
                     "contact_update entry {i}: {e}"
                 )))
-            })?;
+            },
+        )?;
         ops.push(op);
     }
     state.pop(1);
@@ -1444,11 +1455,7 @@ fn read_contact_update(
 // ── Per-op readers for the change builder ───────────────────────────
 
 #[allow(clippy::cast_possible_wrap)]
-fn read_email_create(
-    state: &mut State,
-    t: isize,
-    ops: &mut Vec<ChangeOp>,
-) -> dellingr::Result<()> {
+fn read_email_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
     let typ = lookup(state, t, "email_create")?;
     match typ {
         LuaType::Nil => {
@@ -1556,11 +1563,7 @@ fn read_email_create(
 }
 
 #[allow(clippy::cast_possible_wrap)]
-fn read_email_update(
-    state: &mut State,
-    t: isize,
-    ops: &mut Vec<ChangeOp>,
-) -> dellingr::Result<()> {
+fn read_email_update(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
     let typ = lookup(state, t, "email_update")?;
     match typ {
         LuaType::Nil => {
@@ -1587,12 +1590,11 @@ fn read_email_update(
         let keywords = read_string_array_opt_present(state, entry_idx, "keywords")?;
         let mailbox_ids = read_string_array_opt_present(state, entry_idx, "mailbox_ids")?;
         state.pop(1);
-        let op = crate::fixture::email_update_op(id, keywords, mailbox_ids)
-            .map_err(|e| {
-                state.error(ErrorKind::InternalError(format!(
-                    "email_update entry {i}: {e}"
-                )))
-            })?;
+        let op = crate::fixture::email_update_op(id, keywords, mailbox_ids).map_err(|e| {
+            state.error(ErrorKind::InternalError(format!(
+                "email_update entry {i}: {e}"
+            )))
+        })?;
         ops.push(op);
     }
     state.pop(1);
@@ -1600,11 +1602,7 @@ fn read_email_update(
 }
 
 #[allow(clippy::cast_possible_wrap)]
-fn read_email_move(
-    state: &mut State,
-    t: isize,
-    ops: &mut Vec<ChangeOp>,
-) -> dellingr::Result<()> {
+fn read_email_move(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
     let typ = lookup(state, t, "email_move")?;
     match typ {
         LuaType::Nil => {
@@ -1761,19 +1759,13 @@ fn read_mailbox_update(
         let role = read_string_opt(state, entry_idx, "role")?;
         let is_subscribed = read_bool_opt(state, entry_idx, "is_subscribed")?;
         state.pop(1);
-        let op = crate::fixture::mailbox_update_op(
-            id,
-            name,
-            parent_id,
-            sort_order,
-            role,
-            is_subscribed,
-        )
-        .map_err(|e| {
-            state.error(ErrorKind::InternalError(format!(
-                "mailbox_update entry {i}: {e}"
-            )))
-        })?;
+        let op =
+            crate::fixture::mailbox_update_op(id, name, parent_id, sort_order, role, is_subscribed)
+                .map_err(|e| {
+                    state.error(ErrorKind::InternalError(format!(
+                        "mailbox_update entry {i}: {e}"
+                    )))
+                })?;
         ops.push(op);
     }
     state.pop(1);
@@ -1781,11 +1773,7 @@ fn read_mailbox_update(
 }
 
 #[allow(clippy::cast_possible_wrap)]
-fn read_event_create(
-    state: &mut State,
-    t: isize,
-    ops: &mut Vec<ChangeOp>,
-) -> dellingr::Result<()> {
+fn read_event_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
     let typ = lookup(state, t, "event_create")?;
     match typ {
         LuaType::Nil => {
@@ -1837,11 +1825,7 @@ fn read_event_create(
 }
 
 #[allow(clippy::cast_possible_wrap)]
-fn read_event_update(
-    state: &mut State,
-    t: isize,
-    ops: &mut Vec<ChangeOp>,
-) -> dellingr::Result<()> {
+fn read_event_update(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
     let typ = lookup(state, t, "event_update")?;
     match typ {
         LuaType::Nil => {
@@ -2033,11 +2017,7 @@ fn read_string_array(state: &mut State, t: isize, key: &str) -> dellingr::Result
     result
 }
 
-fn read_string_array_opt(
-    state: &mut State,
-    t: isize,
-    key: &str,
-) -> dellingr::Result<Vec<String>> {
+fn read_string_array_opt(state: &mut State, t: isize, key: &str) -> dellingr::Result<Vec<String>> {
     let typ = lookup(state, t, key)?;
     let result = match typ {
         LuaType::Nil => Ok(Vec::new()),
@@ -2127,10 +2107,7 @@ fn read_address_array_opt(
 
 // Same stack-top cast story as `read_string_array_at_top`.
 #[allow(clippy::cast_possible_wrap)]
-fn read_address_array_at_top(
-    state: &mut State,
-    key: &str,
-) -> dellingr::Result<Vec<RawAddress>> {
+fn read_address_array_at_top(state: &mut State, key: &str) -> dellingr::Result<Vec<RawAddress>> {
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     let mut out = Vec::with_capacity(len);
@@ -2247,10 +2224,7 @@ impl Dispatcher {
     where
         F: FnOnce(&mut State) -> dellingr::Result<()>,
     {
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("dispatcher mutex poisoned");
+        let mut inner = self.inner.lock().expect("dispatcher mutex poisoned");
         let key = (protocol.to_string(), command.to_string());
         let anchor = match inner.handlers.get(&key).copied() {
             Some(a) => a,
@@ -2317,12 +2291,7 @@ impl DispatcherInner {
     }
 }
 
-fn run_dispatch<F>(
-    state: &mut State,
-    anchor: Anchor,
-    call_index: u64,
-    build_req: F,
-) -> Override
+fn run_dispatch<F>(state: &mut State, anchor: Anchor, call_index: u64, build_req: F) -> Override
 where
     F: FnOnce(&mut State) -> dellingr::Result<()>,
 {
@@ -2366,10 +2335,10 @@ fn decode_override(state: &mut State) -> Override {
             // is safe.
             #[allow(clippy::cast_possible_wrap)]
             let table_idx = state.get_top() as isize;
-            let status = field_string(state, table_idx, "status")
-                .unwrap_or_else(|| "BAD".to_string());
-            let message = field_string(state, table_idx, "message")
-                .unwrap_or_else(|| "scripted".to_string());
+            let status =
+                field_string(state, table_idx, "status").unwrap_or_else(|| "BAD".to_string());
+            let message =
+                field_string(state, table_idx, "message").unwrap_or_else(|| "scripted".to_string());
             Override::Tagged { status, message }
         }
         // Anything else (number, string, bool, function) is treated

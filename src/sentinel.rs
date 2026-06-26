@@ -23,7 +23,10 @@ pub async fn write_ready(path: &Path, ports: &[ProtocolPort]) -> io::Result<()> 
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "readiness path has no filename")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "readiness path has no filename",
+        )
     })?;
     let mut tmp_name = std::ffi::OsString::from(".");
     tmp_name.push(file_name);

@@ -50,12 +50,7 @@ async fn body_json(resp: axum::response::Response) -> Value {
 async fn graph_get(r: &axum::Router, uri: &str) -> Value {
     let resp = r
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
@@ -296,7 +291,10 @@ async fn calendar_event_set_create_update_destroy_round_trip() {
     )
     .await;
     assert_eq!(after_create[1]["list"][0]["title"], "Lunch");
-    assert_eq!(after_create[1]["list"][0]["calendarIds"]["cal-personal"], true);
+    assert_eq!(
+        after_create[1]["list"][0]["calendarIds"]["cal-personal"],
+        true
+    );
 
     // Update.
     let updated = jmap_call(
@@ -316,10 +314,7 @@ async fn calendar_event_set_create_update_destroy_round_trip() {
         json!({"accountId": "account-1", "ids": [&new_id]}),
     )
     .await;
-    assert_eq!(
-        after_update[1]["list"][0]["title"],
-        "Lunch (rescheduled)"
-    );
+    assert_eq!(after_update[1]["list"][0]["title"], "Lunch (rescheduled)");
 
     // Destroy.
     let destroyed = jmap_call(
@@ -568,16 +563,9 @@ async fn calendar_event_changes_does_not_leak_across_calendars() {
     // the same delta window, dominance must cancel them entirely:
     // a sync client should never see the transient event.
     let work_id = {
-        let resp = jmap_call(
-            &r,
-            "CalendarEvent/get",
-            json!({"accountId": "account-1"}),
-        )
-        .await;
+        let resp = jmap_call(&r, "CalendarEvent/get", json!({"accountId": "account-1"})).await;
         let list = resp[1]["list"].as_array().unwrap();
-        list.iter()
-            .find(|e| e["title"] == "in work")
-            .unwrap()["id"]
+        list.iter().find(|e| e["title"] == "in work").unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string()
@@ -611,7 +599,9 @@ async fn calendar_event_changes_does_not_leak_across_calendars() {
          got created={created:?}"
     );
     assert!(
-        !destroyed.iter().any(|v| v.as_str() == Some(work_id.as_str())),
+        !destroyed
+            .iter()
+            .any(|v| v.as_str() == Some(work_id.as_str())),
         "destroyed-in-same-window event must cancel under dominance, \
          not surface as destroyed either; got destroyed={destroyed:?}"
     );
@@ -712,7 +702,10 @@ async fn jmap_calendar_event_get_emits_recurrence_rules() {
     assert_eq!(days, vec!["mo", "we", "fr"]);
     assert!(by_day.iter().all(|d| d.get("nthOfPeriod").is_none()));
     assert_eq!(rule["count"], 10);
-    assert!(rule.get("interval").is_none(), "default interval=1 should be omitted");
+    assert!(
+        rule.get("interval").is_none(),
+        "default interval=1 should be omitted"
+    );
     assert!(rule.get("until").is_none());
 
     let monthly = by_id["ev-monthly"];
@@ -784,7 +777,10 @@ async fn jmap_calendar_event_set_update_clears_recurrence() {
     });
     let resp = jmap_call(&r, "CalendarEvent/set", body).await;
     assert!(
-        resp[1]["updated"].as_object().unwrap().contains_key("ev-weekly"),
+        resp[1]["updated"]
+            .as_object()
+            .unwrap()
+            .contains_key("ev-weekly"),
         "expected updated key: {:?}",
         resp[1]
     );

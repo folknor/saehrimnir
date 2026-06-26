@@ -53,9 +53,7 @@ pub fn router() -> Router<AppState> {
         // handler.
         .route(
             "/v1/people/{spec}",
-            get(get_person)
-                .patch(update_contact)
-                .delete(delete_contact),
+            get(get_person).patch(update_contact).delete(delete_contact),
         )
 }
 
@@ -211,17 +209,14 @@ async fn list_connections(
         );
     }
     let end = (offset + page_size).min(total);
-    let slice: Vec<Value> = sorted[offset..end].iter().map(|c| serialize_person(c)).collect();
+    let slice: Vec<Value> = sorted[offset..end]
+        .iter()
+        .map(|c| serialize_person(c))
+        .collect();
     let mut body = Map::new();
     body.insert("connections".into(), Value::Array(slice));
-    body.insert(
-        "totalPeople".into(),
-        Value::Number((total as u64).into()),
-    );
-    body.insert(
-        "totalItems".into(),
-        Value::Number((total as u64).into()),
-    );
+    body.insert("totalPeople".into(), Value::Number((total as u64).into()));
+    body.insert("totalItems".into(), Value::Number((total as u64).into()));
     if end < total {
         body.insert(
             "nextPageToken".into(),
@@ -327,7 +322,11 @@ async fn update_contact(
     }
 
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-    if !fix.contacts.iter().any(|c| c.account_id == account_id && c.id == id) {
+    if !fix
+        .contacts
+        .iter()
+        .any(|c| c.account_id == account_id && c.id == id)
+    {
         return error(
             StatusCode::NOT_FOUND,
             &format!("contact {id:?} not declared in fixture"),
@@ -398,7 +397,8 @@ async fn delete_contact(
     let acct = account_id.clone();
     let _ = fix.mutate(|f| {
         let len_before = f.contacts.len();
-        f.contacts.retain(|c| !(c.account_id == acct && c.id == id_for_diff));
+        f.contacts
+            .retain(|c| !(c.account_id == acct && c.id == id_for_diff));
         if f.contacts.len() < len_before {
             MutationDiff {
                 contact_destroyed: vec![id_for_diff.clone()],

@@ -29,7 +29,8 @@ pub(crate) fn format_dt(dt: DateTime<Utc>) -> String {
 /// treating the latter as UTC. Returns None for any other shape.
 pub(crate) fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
     // RFC 5545 form: `YYYYMMDDTHHMMSS[Z]`. Try the Z form first.
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s.trim_end_matches('Z'), "%Y%m%dT%H%M%S") {
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s.trim_end_matches('Z'), "%Y%m%dT%H%M%S")
+    {
         return Some(dt.and_utc());
     }
     // RFC 3339 fallback (some clients send full timestamps).
@@ -478,6 +479,9 @@ mod tests {
             .expect("ORGANIZER line");
         assert!(!organizer_line.contains('\r'));
         assert!(!organizer_line.contains('\n'));
-        assert_eq!(organizer_line, "ORGANIZER:mailto:evil@xDESCRIPTION:injected");
+        assert_eq!(
+            organizer_line,
+            "ORGANIZER:mailto:evil@xDESCRIPTION:injected"
+        );
     }
 }

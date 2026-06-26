@@ -142,7 +142,10 @@ impl SubmissionLog {
     }
 
     pub fn push(&self, s: Submission) {
-        self.0.lock().expect("submission log mutex poisoned").push(s);
+        self.0
+            .lock()
+            .expect("submission log mutex poisoned")
+            .push(s);
     }
 
     /// Return a copy of every submission so far.
@@ -459,12 +462,16 @@ impl Conn {
         self.stream_mut()
             .write_all(b"250-saehrimnir greets you\r\n")
             .await?;
-        self.stream_mut().write_all(b"250-SIZE 52428800\r\n").await?;
+        self.stream_mut()
+            .write_all(b"250-SIZE 52428800\r\n")
+            .await?;
         self.stream_mut().write_all(b"250-8BITMIME\r\n").await?;
         if advertise_starttls {
             self.stream_mut().write_all(b"250-STARTTLS\r\n").await?;
         }
-        self.stream_mut().write_all(b"250 AUTH PLAIN LOGIN XOAUTH2\r\n").await?;
+        self.stream_mut()
+            .write_all(b"250 AUTH PLAIN LOGIN XOAUTH2\r\n")
+            .await?;
         self.stream_mut().flush().await
     }
 
@@ -721,9 +728,7 @@ fn split_verb(line: &str) -> (&str, &str) {
 /// truly malformed input (a token that starts with `=` or has no key
 /// before the `=`) is rejected so the client gets a `501`. Unknown
 /// parameter keys are accepted silently - the mock just records them.
-fn split_envelope_payload(
-    payload: &str,
-) -> Result<(String, BTreeMap<String, String>), String> {
+fn split_envelope_payload(payload: &str) -> Result<(String, BTreeMap<String, String>), String> {
     let trimmed = payload.trim();
     let (addr, rest) = match trimmed.find(|c: char| c.is_ascii_whitespace()) {
         Some(i) => (&trimmed[..i], trimmed[i..].trim_start()),
@@ -780,7 +785,18 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, test_fixture(), crate::oauth::TokenStore::default(), None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
+            serve_connection(
+                server,
+                log_clone,
+                None,
+                test_fixture(),
+                crate::oauth::TokenStore::default(),
+                None,
+                crate::request_log::RequestLog::default(),
+                crate::latency::LatencyKnob::default(),
+                &mut rx,
+            )
+            .await
         });
         client.write_all(script).await.unwrap();
         client.shutdown().await.unwrap();
@@ -813,19 +829,14 @@ mod tests {
 
     #[tokio::test]
     async fn auth_with_initial_response_is_accepted() {
-        let (out, _) = run_script(
-            b"EHLO me\r\nAUTH PLAIN AGFsaWNlAGh1bnRlcg==\r\nQUIT\r\n",
-        )
-        .await;
+        let (out, _) = run_script(b"EHLO me\r\nAUTH PLAIN AGFsaWNlAGh1bnRlcg==\r\nQUIT\r\n").await;
         assert!(out.contains("235 authentication accepted\r\n"));
     }
 
     #[tokio::test]
     async fn auth_with_continuation_is_accepted() {
-        let (out, _) = run_script(
-            b"EHLO me\r\nAUTH PLAIN\r\nAGFsaWNlAGh1bnRlcg==\r\nQUIT\r\n",
-        )
-        .await;
+        let (out, _) =
+            run_script(b"EHLO me\r\nAUTH PLAIN\r\nAGFsaWNlAGh1bnRlcg==\r\nQUIT\r\n").await;
         assert!(out.contains("334 \r\n"), "expected challenge: {out:?}");
         assert!(out.contains("235 authentication accepted\r\n"));
     }
@@ -850,10 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_without_recipients_is_503() {
-        let (out, _) = run_script(
-            b"EHLO me\r\nMAIL FROM:<a@b>\r\nDATA\r\nQUIT\r\n",
-        )
-        .await;
+        let (out, _) = run_script(b"EHLO me\r\nMAIL FROM:<a@b>\r\nDATA\r\nQUIT\r\n").await;
         assert!(out.contains("503 DATA requires MAIL FROM + at least one RCPT TO"));
     }
 
@@ -884,7 +892,10 @@ mod tests {
         assert_eq!(s.from, "<alice@example.com>");
         assert_eq!(
             s.recipients,
-            vec!["<bob@example.com>".to_string(), "<carol@example.com>".to_string()]
+            vec![
+                "<bob@example.com>".to_string(),
+                "<carol@example.com>".to_string()
+            ]
         );
         assert_eq!(s.auth_mechanism.as_deref(), Some("PLAIN"));
 
@@ -971,7 +982,18 @@ mod tests {
         let log_clone = log.clone();
         let task = tokio::spawn(async move {
             let mut rx = rx;
-            serve_connection(server, log_clone, None, test_fixture(), crate::oauth::TokenStore::default(), None, crate::request_log::RequestLog::default(), crate::latency::LatencyKnob::default(), &mut rx).await
+            serve_connection(
+                server,
+                log_clone,
+                None,
+                test_fixture(),
+                crate::oauth::TokenStore::default(),
+                None,
+                crate::request_log::RequestLog::default(),
+                crate::latency::LatencyKnob::default(),
+                &mut rx,
+            )
+            .await
         });
         let mut greet = vec![0u8; GREETING.len()];
         client.read_exact(&mut greet).await.unwrap();

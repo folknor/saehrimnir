@@ -26,8 +26,7 @@ fn multi_account_fixture() -> saehrimnir::shared::FixtureHandle {
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0];
@@ -57,7 +56,18 @@ async fn run_with_log(script: &[u8]) -> (String, SubmissionLog) {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, None, default_fixture(), saehrimnir::oauth::TokenStore::default(), None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        smtp::serve_connection(
+            server,
+            log_clone,
+            None,
+            default_fixture(),
+            saehrimnir::oauth::TokenStore::default(),
+            None,
+            saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
+            &mut rx,
+        )
+        .await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -141,10 +151,7 @@ async fn dot_stuffing_is_reversed() {
 #[tokio::test]
 async fn missing_envelope_pieces_yield_503() {
     // DATA without RCPT TO -> 503.
-    let (out, log) = run_with_log(
-        b"EHLO me\r\nMAIL FROM:<a@b>\r\nDATA\r\nQUIT\r\n",
-    )
-    .await;
+    let (out, log) = run_with_log(b"EHLO me\r\nMAIL FROM:<a@b>\r\nDATA\r\nQUIT\r\n").await;
     assert!(out.contains("503 DATA requires"));
     assert!(log.snapshot().is_empty());
 }
@@ -162,21 +169,28 @@ async fn auth_attribute_round_trips() {
 
 // ── Reactive-callback tests ────────────────────────────────────────
 
-async fn run_with_dispatcher(
-    scenario: &str,
-    script: &[u8],
-) -> (String, SubmissionLog) {
+async fn run_with_dispatcher(scenario: &str, script: &[u8]) -> (String, SubmissionLog) {
     let log = SubmissionLog::new();
     let log_clone = log.clone();
-    let (_fixture, dispatcher) =
-        lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
+    let (_fixture, dispatcher) = lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
     let dispatcher = Some(Arc::new(dispatcher));
 
     let (server, mut client) = tokio::io::duplex(64 * 1024);
     let (_tx, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, dispatcher, default_fixture(), saehrimnir::oauth::TokenStore::default(), None, saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        smtp::serve_connection(
+            server,
+            log_clone,
+            dispatcher,
+            default_fixture(),
+            saehrimnir::oauth::TokenStore::default(),
+            None,
+            saehrimnir::request_log::RequestLog::default(),
+            saehrimnir::latency::LatencyKnob::default(),
+            &mut rx,
+        )
+        .await
     });
     client.write_all(script).await.unwrap();
     client.shutdown().await.unwrap();
@@ -231,7 +245,10 @@ async fn auth_callback_can_inject_invalid_credentials() {
     .await;
     assert!(out.contains("535 invalid credentials"), "got: {out:?}");
     // 235 must NOT appear - the override skipped the success line.
-    assert!(!out.contains("235"), "AUTH 235 leaked through override: {out:?}");
+    assert!(
+        !out.contains("235"),
+        "AUTH 235 leaked through override: {out:?}"
+    );
     // The submission still goes through (override only fails AUTH);
     // auth_mechanism is None because state.auth was never set.
     let snap = log.snapshot();
@@ -258,7 +275,10 @@ async fn auth_callback_can_inject_temporary_failure_by_mechanism() {
         b"EHLO me\r\nAUTH XOAUTH2 dXNlcj1hbGljZQ==\r\nQUIT\r\n",
     )
     .await;
-    assert!(out.contains("454 oauth temporarily unavailable"), "got: {out:?}");
+    assert!(
+        out.contains("454 oauth temporarily unavailable"),
+        "got: {out:?}"
+    );
 }
 
 #[tokio::test]
@@ -335,7 +355,18 @@ async fn smtp_dispatch_records_request_log_entries() {
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut rx = rx;
-        smtp::serve_connection(server, log_clone, None, default_fixture(), saehrimnir::oauth::TokenStore::default(), None, req_log_clone, saehrimnir::latency::LatencyKnob::default(), &mut rx).await
+        smtp::serve_connection(
+            server,
+            log_clone,
+            None,
+            default_fixture(),
+            saehrimnir::oauth::TokenStore::default(),
+            None,
+            req_log_clone,
+            saehrimnir::latency::LatencyKnob::default(),
+            &mut rx,
+        )
+        .await
     });
 
     let script = b"\
@@ -371,11 +402,9 @@ async fn smtp_dispatch_records_request_log_entries() {
 // upgrade path doesn't drop bytes and capture works post-upgrade.
 mod starttls {
     use super::*;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
-    use rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-    };
     use std::sync::Arc;
     use tokio::net::TcpStream;
     use tokio_rustls::TlsConnector;
@@ -434,10 +463,20 @@ mod starttls {
         let log = SubmissionLog::new();
         let log_clone = log.clone();
         let (_tx, rx) = watch::channel(false);
-        let acceptor =
-            Arc::new(saehrimnir::tls::make_acceptor().expect("acceptor"));
+        let acceptor = Arc::new(saehrimnir::tls::make_acceptor().expect("acceptor"));
         let server_task = tokio::spawn(async move {
-            smtp::serve(listener, log_clone, None, default_fixture(), saehrimnir::oauth::TokenStore::default(), Some(acceptor), saehrimnir::request_log::RequestLog::default(), saehrimnir::latency::LatencyKnob::default(), rx).await
+            smtp::serve(
+                listener,
+                log_clone,
+                None,
+                default_fixture(),
+                saehrimnir::oauth::TokenStore::default(),
+                Some(acceptor),
+                saehrimnir::request_log::RequestLog::default(),
+                saehrimnir::latency::LatencyKnob::default(),
+                rx,
+            )
+            .await
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -583,9 +622,7 @@ async fn smtp_auth_unrecognised_user_stays_on_primary() {
 async fn smtp_auth_xoauth2_binds_via_token_store() {
     let store = saehrimnir::oauth::TokenStore::default();
     let token = store.mint("authorization_code", "account-secondary", 1);
-    let payload = format!(
-        "user=secondary@example.com\x01auth=Bearer {token}\x01\x01"
-    );
+    let payload = format!("user=secondary@example.com\x01auth=Bearer {token}\x01\x01");
     let encoded = base64_encode(payload.as_bytes());
     let script = format!(
         "EHLO me\r\n\

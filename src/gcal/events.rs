@@ -59,9 +59,7 @@ pub fn router() -> Router<AppState> {
 // Workaround: axum's `MethodRouter::delete` re-exports clash with
 // our `delete_route` rename above. Wrap the handler so the axum
 // re-export resolves correctly via the `routing` import.
-fn delete_event_route()
--> axum::routing::MethodRouter<AppState>
-{
+fn delete_event_route() -> axum::routing::MethodRouter<AppState> {
     delete_route(delete_event)
 }
 
@@ -104,14 +102,14 @@ async fn calendar_list(State(state): State<AppState>, headers: HeaderMap) -> Res
 
 fn serialize_calendar(c: &Calendar) -> Value {
     let mut obj = Map::new();
-    obj.insert("kind".into(), Value::String("calendar#calendarListEntry".into()));
+    obj.insert(
+        "kind".into(),
+        Value::String("calendar#calendarListEntry".into()),
+    );
     obj.insert("id".into(), Value::String(c.id.clone()));
     obj.insert("summary".into(), Value::String(c.name.clone()));
     if let Some(color) = &c.color {
-        obj.insert(
-            "backgroundColor".into(),
-            Value::String(color.clone()),
-        );
+        obj.insert("backgroundColor".into(), Value::String(color.clone()));
     }
     if c.is_default {
         obj.insert("primary".into(), Value::Bool(true));
@@ -217,7 +215,10 @@ async fn list_events(
         );
     }
     let end = (offset + page_size).min(total);
-    let items: Vec<Value> = all[offset..end].iter().map(|e| serialize_event(e)).collect();
+    let items: Vec<Value> = all[offset..end]
+        .iter()
+        .map(|e| serialize_event(e))
+        .collect();
 
     let mut body = Map::new();
     body.insert("kind".into(), Value::String("calendar#events".into()));
@@ -290,10 +291,7 @@ fn serialize_event(e: &Event) -> Value {
                 if let Some(n) = &a.name {
                     m.insert("displayName".into(), Value::String(n.clone()));
                 }
-                m.insert(
-                    "responseStatus".into(),
-                    Value::String("needsAction".into()),
-                );
+                m.insert("responseStatus".into(), Value::String("needsAction".into()));
                 Value::Object(m)
             })
             .collect();
@@ -350,10 +348,7 @@ async fn create_event(
     let account_id = bearer_account(&state, &headers);
     {
         let fixture = state.fixture();
-        if !fixture
-            .calendars_for(&account_id)
-            .any(|c| c.id == calendar)
-        {
+        if !fixture.calendars_for(&account_id).any(|c| c.id == calendar) {
             return error(
                 StatusCode::NOT_FOUND,
                 &format!("calendar {calendar:?} not declared in fixture"),
@@ -482,7 +477,8 @@ async fn delete_event(
         .map(|e| e.calendar_id.clone());
     let _ = fix.mutate(|f| {
         let len_before = f.events.len();
-        f.events.retain(|e| !(e.account_id == acct && e.id == id_for_diff));
+        f.events
+            .retain(|e| !(e.account_id == acct && e.id == id_for_diff));
         if f.events.len() < len_before {
             MutationDiff {
                 event_destroyed: vec![id_for_diff.clone()],
@@ -524,8 +520,8 @@ fn build_event_from_create(
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let (start, end, is_all_day) = parse_event_times(obj.get("start"), obj.get("end"))
-        .ok_or_else(|| {
+    let (start, end, is_all_day) =
+        parse_event_times(obj.get("start"), obj.get("end")).ok_or_else(|| {
             Box::new(error(
                 StatusCode::BAD_REQUEST,
                 "start / end missing or malformed",
@@ -590,9 +586,7 @@ fn parse_gcal_recurrence(v: &Value) -> (Option<String>, Vec<chrono::DateTime<chr
         } else if let Some(rest) = s.strip_prefix("EXDATE:") {
             // EXDATE may carry a TZID parameter (`EXDATE;TZID=...:...`)
             // - strip the param segment if present.
-            let value = rest
-                .rsplit_once(':')
-                .map_or(rest, |(_params, val)| val);
+            let value = rest.rsplit_once(':').map_or(rest, |(_params, val)| val);
             for part in value.split(',') {
                 if let Some(dt) = parse_ical_dt(part.trim()) {
                     exdates.push(dt);
@@ -670,7 +664,11 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
 fn parse_event_times(
     start: Option<&Value>,
     end: Option<&Value>,
-) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, bool)> {
+) -> Option<(
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+    bool,
+)> {
     let s = start?;
     let e = end?;
     if let (Some(sdt), Some(edt)) = (parse_date_time(s), parse_date_time(e)) {

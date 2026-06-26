@@ -256,10 +256,12 @@ async fn email_query_pagination_terminates_below_limit() {
         "q1",
     )
     .await;
-    assert!(v2["methodResponses"][0][1]["ids"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(
+        v2["methodResponses"][0][1]["ids"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -281,7 +283,9 @@ async fn email_get_full_email_shape_with_body_values() {
     assert_eq!(item["blobId"], "blob-email-001");
     // mailboxIds + keywords are bool maps, not arrays.
     assert_eq!(item["mailboxIds"], json!({"mbx-inbox": true}));
-    let received = item["receivedAt"].as_str().expect("receivedAt is a UTCDate string");
+    let received = item["receivedAt"]
+        .as_str()
+        .expect("receivedAt is a UTCDate string");
     assert!(
         chrono::DateTime::parse_from_rfc3339(received).is_ok(),
         "receivedAt {received:?} is RFC3339",
@@ -290,9 +294,7 @@ async fn email_get_full_email_shape_with_body_values() {
     assert_eq!(from[0]["email"], "alice@example.com");
 
     let part_id = item["textBody"][0]["partId"].as_str().unwrap();
-    assert_eq!(
-        item["bodyValues"][part_id]["value"], "First message body."
-    );
+    assert_eq!(item["bodyValues"][part_id]["value"], "First message body.");
     // The three custom-header keys ratatoskr asks for are always present.
     for k in [
         "header:List-Unsubscribe:asText",
@@ -348,9 +350,17 @@ async fn thread_changes_projects_email_delta_onto_threads() {
     let app = router();
 
     // Seed state via an empty Email/get.
-    let v = jmap_call_on(&app, "Email/get", json!({ "accountId": "account-1", "ids": [] }), "t0")
-        .await;
-    let seed = v["methodResponses"][0][1]["state"].as_str().unwrap().to_string();
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({ "accountId": "account-1", "ids": [] }),
+        "t0",
+    )
+    .await;
+    let seed = v["methodResponses"][0][1]["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // No changes since the seed -> empty delta, state echoes back.
     let v = jmap_call_on(
@@ -467,7 +477,10 @@ async fn contact_card_get_null_ids_projects_jscontact_cards() {
     assert_eq!(alice["uid"], "contact-001");
     assert_eq!(alice["kind"], "individual");
     assert_eq!(alice["addressBookIds"], json!({ "cf-default": true }));
-    assert_eq!(alice["name"], json!({ "@type": "Name", "full": "Alice Anderson" }));
+    assert_eq!(
+        alice["name"],
+        json!({ "@type": "Name", "full": "Alice Anderson" })
+    );
     assert_eq!(
         alice["emails"],
         json!({
@@ -563,7 +576,10 @@ async fn contact_card_query_filters_and_paginates() {
     )
     .await;
     let result = &v["methodResponses"][0][1];
-    assert_eq!(result["ids"], json!(["contact-001", "contact-002", "contact-003"]));
+    assert_eq!(
+        result["ids"],
+        json!(["contact-001", "contact-002", "contact-003"])
+    );
     assert_eq!(result["total"], 3);
 
     // text filter matches display name...
@@ -675,7 +691,10 @@ async fn contact_card_set_and_changes_round_trip() {
         "s4",
     )
     .await;
-    assert_eq!(v["methodResponses"][0][1]["list"][0]["name"]["full"], "Renamed");
+    assert_eq!(
+        v["methodResponses"][0][1]["list"][0]["name"]["full"],
+        "Renamed"
+    );
 
     // Destroy.
     let v = jmap_call_on(
@@ -1034,10 +1053,10 @@ async fn responses_are_byte_identical_across_runs() {
 // ── Reactive-callback tests ────────────────────────────────────────
 
 fn router_with_lua_scenario(scenario: &str) -> axum::Router {
-    let (fixture, dispatcher) =
-        lua::load_source_with_dispatcher(scenario, "@cb-test").unwrap();
+    let (fixture, dispatcher) = lua::load_source_with_dispatcher(scenario, "@cb-test").unwrap();
     routes::router(
-        routes::AppState::for_test(saehrimnir::shared::handle(fixture)).with_dispatcher(Arc::new(dispatcher)),
+        routes::AppState::for_test(saehrimnir::shared::handle(fixture))
+            .with_dispatcher(Arc::new(dispatcher)),
     )
 }
 
@@ -1230,7 +1249,9 @@ async fn jmap_callback_ids_absent_when_request_omits_them() {
 
 fn router_with_smtp_log(log: saehrimnir::smtp::SubmissionLog) -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_submission_log(log))
+    routes::router(
+        routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_submission_log(log),
+    )
 }
 
 fn sample_submission(from: &str, attachment_size: usize) -> saehrimnir::smtp::Submission {
@@ -1428,10 +1449,7 @@ async fn jmap_request_log_surfaces_ids_and_properties() {
     let snap = request_log.snapshot();
     assert_eq!(snap[0].command, "Email/get");
     assert_eq!(snap[0].detail["account_id"], "account-1");
-    assert_eq!(
-        snap[0].detail["ids"],
-        json!(["email-1", "email-2"])
-    );
+    assert_eq!(snap[0].detail["ids"], json!(["email-1", "email-2"]));
     assert_eq!(snap[0].detail["properties"], json!(["id", "keywords"]));
 
     // Email/query call doesn't carry ids/properties so those fields
@@ -1452,8 +1470,10 @@ async fn test_requests_get_returns_snapshot_and_delete_clears() {
     request_log.record("imap", "CAPABILITY", json!({"tag": "a1"}));
     request_log.record("smtp", "EHLO", json!({"args": "client"}));
 
-    let app =
-        router_with_logs(saehrimnir::smtp::SubmissionLog::default(), request_log.clone());
+    let app = router_with_logs(
+        saehrimnir::smtp::SubmissionLog::default(),
+        request_log.clone(),
+    );
 
     // GET returns the array.
     let resp = app
@@ -1809,7 +1829,9 @@ async fn test_requests_stable_strips_received_at() {
 
 fn router_with_token_store(store: saehrimnir::oauth::TokenStore) -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
-    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store))
+    routes::router(
+        routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store),
+    )
 }
 
 #[tokio::test]
@@ -1873,7 +1895,12 @@ async fn oauth_token_refresh_grant_works_via_json_body() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
-    assert!(v["access_token"].as_str().unwrap().starts_with("mock-access-"));
+    assert!(
+        v["access_token"]
+            .as_str()
+            .unwrap()
+            .starts_with("mock-access-")
+    );
 }
 
 #[tokio::test]
@@ -2073,7 +2100,9 @@ fn router_with_enforce(store: saehrimnir::oauth::TokenStore) -> axum::Router {
         enforce: true,
         issuer: "https://saehrimnir.test/oauth".to_string(),
     };
-    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store))
+    routes::router(
+        routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store),
+    )
 }
 
 #[tokio::test]
@@ -2319,7 +2348,10 @@ async fn email_set_destroy_round_trips() {
         "c1",
     )
     .await;
-    assert_eq!(v["methodResponses"][0][1]["destroyed"], json!(["email-001"]));
+    assert_eq!(
+        v["methodResponses"][0][1]["destroyed"],
+        json!(["email-001"])
+    );
 
     let v = jmap_call_on(
         &app,
@@ -2402,7 +2434,10 @@ async fn mailbox_set_create_then_destroy_cancels_in_changes() {
     )
     .await;
     let body = &v["methodResponses"][0][1];
-    let server_id = body["created"]["scratch"]["id"].as_str().unwrap().to_string();
+    let server_id = body["created"]["scratch"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(server_id, "mock-mailbox-3");
 
     let v = jmap_call_on(
@@ -2443,10 +2478,7 @@ async fn mailbox_set_destroy_rejects_non_empty_mailbox() {
     .await;
     let body = &v["methodResponses"][0][1];
     assert!(body["destroyed"].is_null());
-    assert_eq!(
-        body["notDestroyed"]["mbx-inbox"]["type"],
-        "mailboxHasEmail"
-    );
+    assert_eq!(body["notDestroyed"]["mbx-inbox"]["type"], "mailboxHasEmail");
     assert_eq!(body["oldState"], "fixture-state");
     assert_eq!(body["newState"], "fixture-state");
 }
@@ -2605,11 +2637,8 @@ async fn multi_account_email_get_scopes_by_accountid() {
 
 #[tokio::test]
 async fn multi_account_unknown_accountid_returns_account_not_found() {
-    let resp = multi_account_jmap_call(
-        "Mailbox/get",
-        json!({ "accountId": "account-bogus" }),
-    )
-    .await;
+    let resp =
+        multi_account_jmap_call("Mailbox/get", json!({ "accountId": "account-bogus" })).await;
     assert_eq!(resp[0], "error");
     assert_eq!(resp[1]["type"], "accountNotFound");
 }
@@ -2819,7 +2848,10 @@ async fn multi_account_secondary_write_does_not_move_primary_state() {
         "c0",
     )
     .await;
-    let s_p = v["methodResponses"][0][1]["state"].as_str().unwrap().to_string();
+    let s_p = v["methodResponses"][0][1]["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Step 2: secondary write advances the SECONDARY's token only.
     let v = jmap_call_on(
@@ -2853,9 +2885,21 @@ async fn multi_account_secondary_write_does_not_move_primary_state() {
         json!(s_p),
         "secondary write moved primary's Email state token: {body}"
     );
-    assert_eq!(body["created"], json!([]), "primary leaked a created: {body}");
-    assert_eq!(body["updated"], json!([]), "primary leaked an updated: {body}");
-    assert_eq!(body["destroyed"], json!([]), "primary leaked a destroyed: {body}");
+    assert_eq!(
+        body["created"],
+        json!([]),
+        "primary leaked a created: {body}"
+    );
+    assert_eq!(
+        body["updated"],
+        json!([]),
+        "primary leaked an updated: {body}"
+    );
+    assert_eq!(
+        body["destroyed"],
+        json!([]),
+        "primary leaked a destroyed: {body}"
+    );
 
     // Mailbox mirror: the same isolation for Mailbox/changes.
     let v = jmap_call_on(
@@ -2865,7 +2909,10 @@ async fn multi_account_secondary_write_does_not_move_primary_state() {
         "c3",
     )
     .await;
-    let mb_s_p = v["methodResponses"][0][1]["state"].as_str().unwrap().to_string();
+    let mb_s_p = v["methodResponses"][0][1]["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
     jmap_call_on(
         &app,
         "Mailbox/set",
@@ -2884,7 +2931,11 @@ async fn multi_account_secondary_write_does_not_move_primary_state() {
     )
     .await;
     let body = &v["methodResponses"][0][1];
-    assert_eq!(body["newState"], json!(mb_s_p), "secondary write moved primary's Mailbox state: {body}");
+    assert_eq!(
+        body["newState"],
+        json!(mb_s_p),
+        "secondary write moved primary's Mailbox state: {body}"
+    );
     assert_eq!(body["created"], json!([]));
     assert_eq!(body["updated"], json!([]));
     assert_eq!(body["destroyed"], json!([]));
@@ -2894,11 +2945,8 @@ async fn multi_account_secondary_write_does_not_move_primary_state() {
 async fn multi_account_email_query_scopes_by_accountid() {
     // The query path is Email/query with a filter; assert that
     // primary's filter sees only primary's emails.
-    let resp = multi_account_jmap_call(
-        "Email/query",
-        json!({ "accountId": "account-secondary" }),
-    )
-    .await;
+    let resp =
+        multi_account_jmap_call("Email/query", json!({ "accountId": "account-secondary" })).await;
     let body = &resp[1];
     assert_eq!(body["accountId"], "account-secondary");
     let ids = body["ids"].as_array().unwrap();
@@ -3039,8 +3087,7 @@ async fn oauth_token_endpoint_rejects_unknown_account_id() {
 async fn multi_account_oauth_userinfo_returns_primary_claims() {
     let store = saehrimnir::oauth::TokenStore::default();
     let token = store.mint("authorization_code", "account-primary", 0xdead_beef);
-    let fix =
-        fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
     let app = routes::router(
         routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_token_store(store),
     );

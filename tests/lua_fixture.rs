@@ -121,7 +121,10 @@ fn body_raw_bytes_loads_and_lives_alongside_body_text() {
     .unwrap();
     let em = &fix.emails[0];
     assert!(matches!(&em.body, fixture::Body::Text(t) if t == "structured view"));
-    assert_eq!(em.raw_bytes.as_deref(), Some("From: x@y\r\n\r\nbroken body"));
+    assert_eq!(
+        em.raw_bytes.as_deref(),
+        Some("From: x@y\r\n\r\nbroken body")
+    );
 }
 
 #[test]
@@ -234,21 +237,13 @@ fn lua_attach_fixture_matches_equivalent_toml() {
 
 #[test]
 fn lua_loader_rejects_missing_fixture_call() {
-    let err = lua::load_source(
-        r#"account({ id = "a", name = "a@b" })"#,
-        "@test",
-    )
-    .unwrap_err();
+    let err = lua::load_source(r#"account({ id = "a", name = "a@b" })"#, "@test").unwrap_err();
     assert!(err.contains("fixture"), "unexpected error: {err}");
 }
 
 #[test]
 fn lua_loader_rejects_missing_account_call() {
-    let err = lua::load_source(
-        r#"fixture({ name = "x" })"#,
-        "@test",
-    )
-    .unwrap_err();
+    let err = lua::load_source(r#"fixture({ name = "x" })"#, "@test").unwrap_err();
     assert!(err.contains("account"), "unexpected error: {err}");
 }
 
@@ -544,7 +539,10 @@ fn bulk_emails_negative_interval_overflow_caught_clean() {
         "@bulk",
     )
     .unwrap_err();
-    assert!(err.contains("range") || err.contains("chrono"), "got: {err}");
+    assert!(
+        err.contains("range") || err.contains("chrono"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -619,8 +617,7 @@ fn bulk_mailboxes_names_disambiguate_when_count_exceeds_pool() {
         bulk_mailboxes({ count = 25 })
     "#;
     let f = lua::load_source(script, "@names").unwrap();
-    let names: std::collections::HashSet<_> =
-        f.mailboxes.iter().map(|m| m.name.clone()).collect();
+    let names: std::collections::HashSet<_> = f.mailboxes.iter().map(|m| m.name.clone()).collect();
     assert_eq!(names.len(), 25, "names must be unique across the tree");
 }
 
@@ -705,7 +702,10 @@ fn wait_helper_blocks_for_at_least_the_requested_duration() {
     let result = dispatcher.dispatch("test", "ping", |_state| Ok(()));
     let elapsed = start.elapsed();
     assert!(matches!(result, lua::Override::Tagged { .. }));
-    assert!(elapsed >= std::time::Duration::from_millis(50), "got: {elapsed:?}");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(50),
+        "got: {elapsed:?}"
+    );
 }
 
 #[test]

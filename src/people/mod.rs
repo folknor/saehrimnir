@@ -111,9 +111,7 @@ async fn enforce_bearer_middleware(
     };
     match decision {
         BearerDecision::Allow => next.run(req).await,
-        BearerDecision::Deny(reason) => {
-            error(StatusCode::UNAUTHORIZED, &reason, "authError")
-        }
+        BearerDecision::Deny(reason) => error(StatusCode::UNAUTHORIZED, &reason, "authError"),
     }
 }
 

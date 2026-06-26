@@ -118,7 +118,14 @@ async fn labels_include_system_and_fixture_user_labels() {
     // All eight system labels should be advertised, even if the
     // fixture has no Sent/Trash/etc. mailbox.
     for must in [
-        "INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "IMPORTANT", "STARRED", "UNREAD",
+        "INBOX",
+        "SENT",
+        "DRAFT",
+        "TRASH",
+        "SPAM",
+        "IMPORTANT",
+        "STARRED",
+        "UNREAD",
     ] {
         assert!(system.contains(&must), "missing {must}: {system:?}");
     }
@@ -145,14 +152,15 @@ async fn list_threads_returns_stubs_in_recent_order() {
 
 #[tokio::test]
 async fn list_threads_paginates_via_next_page_token() {
-    let (_status, v) =
-        get_json("/gmail/v1/users/me/threads?maxResults=1").await;
+    let (_status, v) = get_json("/gmail/v1/users/me/threads?maxResults=1").await;
     let threads = v["threads"].as_array().unwrap();
     assert_eq!(threads.len(), 1);
     assert_eq!(threads[0]["id"], "email-002");
     let token = v["nextPageToken"].as_str().unwrap();
-    let (_status, v2) =
-        get_json(&format!("/gmail/v1/users/me/threads?maxResults=1&pageToken={token}")).await;
+    let (_status, v2) = get_json(&format!(
+        "/gmail/v1/users/me/threads?maxResults=1&pageToken={token}"
+    ))
+    .await;
     let threads = v2["threads"].as_array().unwrap();
     assert_eq!(threads[0]["id"], "email-001");
     assert!(v2.get("nextPageToken").is_none());
@@ -160,12 +168,10 @@ async fn list_threads_paginates_via_next_page_token() {
 
 #[tokio::test]
 async fn list_threads_filter_after_drops_older() {
-    let (_status, v) =
-        get_json("/gmail/v1/users/me/threads?q=after%3A2026%2F1%2F16").await;
+    let (_status, v) = get_json("/gmail/v1/users/me/threads?q=after%3A2026%2F1%2F16").await;
     assert_eq!(v["threads"].as_array().unwrap().len(), 0);
 
-    let (_status, v) =
-        get_json("/gmail/v1/users/me/threads?q=after%3A2026%2F1%2F1").await;
+    let (_status, v) = get_json("/gmail/v1/users/me/threads?q=after%3A2026%2F1%2F1").await;
     assert_eq!(v["threads"].as_array().unwrap().len(), 2);
 }
 
@@ -175,16 +181,14 @@ async fn list_threads_unparseable_q_returns_400_not_unfiltered_dump() {
     // and returned the full thread list. Now it errors out so
     // ratatoskr notices a typo or operator drift instead of
     // re-ingesting old threads.
-    let (status, v) =
-        get_json("/gmail/v1/users/me/threads?q=is%3Aunread").await;
+    let (status, v) = get_json("/gmail/v1/users/me/threads?q=is%3Aunread").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(v["error"]["errors"][0]["reason"], "invalidQuery");
 }
 
 #[tokio::test]
 async fn get_thread_full_format_returns_message_payload() {
-    let (status, v) =
-        get_json("/gmail/v1/users/me/threads/email-001?format=full").await;
+    let (status, v) = get_json("/gmail/v1/users/me/threads/email-001?format=full").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["id"], "email-001");
     assert_eq!(v["historyId"], "1");
@@ -225,12 +229,12 @@ async fn get_thread_full_format_returns_message_payload() {
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.clone())
     };
-    assert_eq!(
-        lookup("From"),
-        Some("<alice@example.com>".to_string())
-    );
+    assert_eq!(lookup("From"), Some("<alice@example.com>".to_string()));
     assert_eq!(lookup("Subject"), Some("Hello".to_string()));
-    assert_eq!(lookup("Content-Type"), Some("text/plain; charset=utf-8".to_string()));
+    assert_eq!(
+        lookup("Content-Type"),
+        Some("text/plain; charset=utf-8".to_string())
+    );
     assert_eq!(
         lookup("Message-ID"),
         Some("<email-001@example.com>".to_string())
@@ -252,8 +256,7 @@ async fn get_thread_unknown_returns_404_with_gmail_envelope() {
 
 #[tokio::test]
 async fn history_endpoint_is_stable_no_op() {
-    let (status, v) =
-        get_json("/gmail/v1/users/me/history?startHistoryId=1").await;
+    let (status, v) = get_json("/gmail/v1/users/me/history?startHistoryId=1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["history"].as_array().unwrap().len(), 0);
     assert_eq!(v["historyId"], "1");
@@ -285,8 +288,10 @@ async fn list_messages_paginates_via_next_page_token() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["id"], "email-002");
     let token = v["nextPageToken"].as_str().unwrap();
-    let (_status, v2) =
-        get_json(&format!("/gmail/v1/users/me/messages?maxResults=1&pageToken={token}")).await;
+    let (_status, v2) = get_json(&format!(
+        "/gmail/v1/users/me/messages?maxResults=1&pageToken={token}"
+    ))
+    .await;
     let messages = v2["messages"].as_array().unwrap();
     assert_eq!(messages[0]["id"], "email-001");
     assert!(v2.get("nextPageToken").is_none());
@@ -369,10 +374,7 @@ async fn get_message_unknown_returns_404_with_gmail_envelope() {
 async fn attachment_fetch_returns_404_for_missing_blobs() {
     // v0 fixtures have no attachments; any call gets the canonical
     // Gmail error envelope.
-    let (status, v) = get_json(
-        "/gmail/v1/users/me/messages/email-001/attachments/aaa",
-    )
-    .await;
+    let (status, v) = get_json("/gmail/v1/users/me/messages/email-001/attachments/aaa").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
 }
@@ -381,8 +383,7 @@ async fn attachment_fetch_returns_404_for_missing_blobs() {
 async fn send_as_empty_fixture_returns_empty_list() {
     // `fixtures/jmap-small.toml` declares no `[[send_as]]` rows;
     // a GET still returns the envelope with an empty array.
-    let (status, v) =
-        get_json("/gmail/v1/users/me/settings/sendAs").await;
+    let (status, v) = get_json("/gmail/v1/users/me/settings/sendAs").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["sendAs"].as_array().unwrap().len(), 0);
 }
@@ -515,10 +516,8 @@ async fn send_as_patch_ignores_is_primary_per_real_gmail() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let v: Value = serde_json::from_slice(
-        &resp.into_body().collect().await.unwrap().to_bytes(),
-    )
-    .unwrap();
+    let v: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(v["isPrimary"], true, "isPrimary should be read-only");
 }
 
@@ -530,10 +529,7 @@ async fn send_as_with_bearer_scoping_returns_each_accounts_identity() {
     let store = TokenStore::default();
     let token_secondary = store.mint("authorization_code", "account-secondary", 1);
 
-    let mut fix = fixture::load(std::path::Path::new(
-        "fixtures/multi-account-small.toml",
-    ))
-    .unwrap();
+    let mut fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
     fix.oauth = saehrimnir::fixture::OAuthConfig {
         enforce: false,
         issuer: "https://saehrimnir.test/oauth".to_string(),
@@ -542,12 +538,8 @@ async fn send_as_with_bearer_scoping_returns_each_accounts_identity() {
     let shared = saehrimnir::shared::SharedHandles::for_test(handle).with_token_store(store);
     let app = gmail::router(gmail::AppState { shared });
 
-    let (status, v) = get_json_with_bearer(
-        app,
-        "/gmail/v1/users/me/settings/sendAs",
-        &token_secondary,
-    )
-    .await;
+    let (status, v) =
+        get_json_with_bearer(app, "/gmail/v1/users/me/settings/sendAs", &token_secondary).await;
     assert_eq!(status, StatusCode::OK);
     let list = v["sendAs"].as_array().unwrap();
     assert_eq!(list.len(), 1);
@@ -564,10 +556,10 @@ async fn unimplemented_paths_return_gmail_shaped_404() {
 // ── Reactive-callback tests ────────────────────────────────────────
 
 fn router_with_lua_scenario(scenario: &str) -> axum::Router {
-    let (fixture, dispatcher) =
-        lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
+    let (fixture, dispatcher) = lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
     gmail::router(
-        gmail::AppState::for_test(saehrimnir::shared::handle(fixture)).with_dispatcher(Arc::new(dispatcher)),
+        gmail::AppState::for_test(saehrimnir::shared::handle(fixture))
+            .with_dispatcher(Arc::new(dispatcher)),
     )
 }
 
@@ -615,11 +607,7 @@ async fn get_thread_callback_passes_thread_id_to_script() {
         end)
     "#;
     let router = router_with_lua_scenario(scenario);
-    let (status, v) = get_json_via(
-        router,
-        "/gmail/v1/users/me/threads/abc-123?format=full",
-    )
-    .await;
+    let (status, v) = get_json_via(router, "/gmail/v1/users/me/threads/abc-123?format=full").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
     assert_eq!(v["error"]["message"], "asked for abc-123");
@@ -636,11 +624,7 @@ async fn get_message_callback_passes_message_id_to_script() {
         end)
     "#;
     let router = router_with_lua_scenario(scenario);
-    let (status, v) = get_json_via(
-        router,
-        "/gmail/v1/users/me/messages/msg-xyz?format=full",
-    )
-    .await;
+    let (status, v) = get_json_via(router, "/gmail/v1/users/me/messages/msg-xyz?format=full").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
     assert_eq!(v["error"]["message"], "asked for msg-xyz");
@@ -679,7 +663,8 @@ async fn gmail_middleware_records_request_log_entries() {
     let request_log = RequestLog::default();
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
     let app = gmail::router(
-        gmail::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(request_log.clone()),
+        gmail::AppState::for_test(saehrimnir::shared::handle(fix))
+            .with_request_log(request_log.clone()),
     );
 
     let _ = get_json_via(app.clone(), "/gmail/v1/users/me/profile").await;
@@ -701,20 +686,14 @@ async fn gmail_middleware_records_request_log_entries() {
 // Gmail handlers scope reads by the bearer-token-resolved account
 // (falling back to primary when the bearer is unknown).
 
-fn multi_account_gmail_router(
-    store: saehrimnir::oauth::TokenStore,
-) -> axum::Router {
+fn multi_account_gmail_router(store: saehrimnir::oauth::TokenStore) -> axum::Router {
     let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
     let shared = saehrimnir::shared::SharedHandles::for_test(saehrimnir::shared::handle(fix))
         .with_token_store(store);
     gmail::router(gmail::AppState { shared })
 }
 
-async fn get_with_bearer(
-    router: axum::Router,
-    uri: &str,
-    token: &str,
-) -> (StatusCode, Value) {
+async fn get_with_bearer(router: axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
     let resp = router
         .oneshot(
             Request::builder()

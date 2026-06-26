@@ -62,7 +62,9 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/v1.0/me/events/{event}",
-            get(get_event_me).patch(patch_event_me).delete(delete_event_me),
+            get(get_event_me)
+                .patch(patch_event_me)
+                .delete(delete_event_me),
         )
         .route("/v1.0/me/events/{event}/{action}", post(rsvp_me))
         // /users/{user}/...
@@ -106,10 +108,7 @@ async fn list_calendars_me(
     list_calendars_impl(state, &account_id, headers, q).await
 }
 
-async fn get_calendar_me(
-    State(state): State<AppState>,
-    Path(calendar): Path<String>,
-) -> Response {
+async fn get_calendar_me(State(state): State<AppState>, Path(calendar): Path<String>) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_calendar_impl(state, &account_id, &calendar).await
 }
@@ -404,10 +403,7 @@ async fn list_events_impl(
         );
     }
     let q = odata::OdataQuery::parse(raw_query.as_deref());
-    let top = q
-        .top
-        .unwrap_or(EVENTS_DEFAULT_TOP)
-        .clamp(1, EVENTS_MAX_TOP);
+    let top = q.top.unwrap_or(EVENTS_DEFAULT_TOP).clamp(1, EVENTS_MAX_TOP);
     let skip = parse_skiptoken(q.skiptoken.as_deref())
         .or(q.skip)
         .unwrap_or(0);
@@ -485,10 +481,7 @@ async fn calendar_view_impl(
         odata::query_param(raw_query.as_deref(), "startDateTime").and_then(|s| parse_view_dt(&s));
     let end =
         odata::query_param(raw_query.as_deref(), "endDateTime").and_then(|s| parse_view_dt(&s));
-    let top = q
-        .top
-        .unwrap_or(EVENTS_DEFAULT_TOP)
-        .clamp(1, EVENTS_MAX_TOP);
+    let top = q.top.unwrap_or(EVENTS_DEFAULT_TOP).clamp(1, EVENTS_MAX_TOP);
     let skip = parse_skiptoken(q.skiptoken.as_deref())
         .or(q.skip)
         .unwrap_or(0);
@@ -600,8 +593,12 @@ async fn delta_events_impl(
     );
 
     if q.deltatoken.as_deref() == Some("latest") {
-        let delta_link =
-            odata::build_delta_link(&host, &path, raw_query.as_deref(), fixture.state_for(account_id));
+        let delta_link = odata::build_delta_link(
+            &host,
+            &path,
+            raw_query.as_deref(),
+            fixture.state_for(account_id),
+        );
         return ok_json(json!({
             "@odata.context": context,
             "value": [],
@@ -626,8 +623,12 @@ async fn delta_events_impl(
             for id in &delta.destroyed {
                 value.push(graph_event_tombstone(id));
             }
-            let delta_link =
-                odata::build_delta_link(&host, &path, raw_query.as_deref(), fixture.state_for(account_id));
+            let delta_link = odata::build_delta_link(
+                &host,
+                &path,
+                raw_query.as_deref(),
+                fixture.state_for(account_id),
+            );
             return ok_json(json!({
                 "@odata.context": context,
                 "value": value,
@@ -668,7 +669,12 @@ async fn delta_events_impl(
         let next_off = u32::try_from(next_offset_val).unwrap_or(u32::MAX);
         envelope.insert(
             "@odata.nextLink".to_string(),
-            Value::String(odata::build_next_link(&host, &path, raw_query.as_deref(), next_off)),
+            Value::String(odata::build_next_link(
+                &host,
+                &path,
+                raw_query.as_deref(),
+                next_off,
+            )),
         );
     } else {
         envelope.insert(
@@ -886,7 +892,8 @@ async fn delete_event_impl(
             .map(|e| e.calendar_id.clone());
         let _ = fix.mutate(|f| {
             let len_before = f.events.len();
-            f.events.retain(|e| !(e.account_id == acct && e.id == event_id));
+            f.events
+                .retain(|e| !(e.account_id == acct && e.id == event_id));
             if f.events.len() < len_before {
                 MutationDiff {
                     event_destroyed: vec![event_id.clone()],
@@ -1010,10 +1017,7 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
                 })?;
             }
             "body" => {
-                event.body_text = v
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                event.body_text = v.get("content").and_then(Value::as_str).map(str::to_string);
             }
             "location" => {
                 event.location = v
@@ -1141,7 +1145,10 @@ fn serialize_calendar(_fixture: &Fixture, c: &Calendar) -> Value {
 fn serialize_event(_fixture: &Fixture, e: &Event) -> Value {
     let mut out = Map::new();
     out.insert("id".to_string(), Value::String(e.id.clone()));
-    out.insert("calendarId".to_string(), Value::String(e.calendar_id.clone()));
+    out.insert(
+        "calendarId".to_string(),
+        Value::String(e.calendar_id.clone()),
+    );
     out.insert("subject".to_string(), Value::String(e.subject.clone()));
     if let Some(p) = &e.body_preview {
         out.insert("bodyPreview".to_string(), Value::String(p.clone()));
@@ -1169,10 +1176,7 @@ fn serialize_event(_fixture: &Fixture, e: &Event) -> Value {
     );
     out.insert("isAllDay".to_string(), Value::Bool(e.is_all_day));
     if let Some(loc) = &e.location {
-        out.insert(
-            "location".to_string(),
-            json!({ "displayName": loc }),
-        );
+        out.insert("location".to_string(), json!({ "displayName": loc }));
     }
     if let Some(org) = &e.organizer {
         out.insert(
@@ -1228,7 +1232,10 @@ fn graph_recurrence(
             let days = if rule.by_day.is_empty() {
                 vec![weekday_of(start).graph().to_string()]
             } else {
-                rule.by_day.iter().map(|d| d.weekday.graph().to_string()).collect()
+                rule.by_day
+                    .iter()
+                    .map(|d| d.weekday.graph().to_string())
+                    .collect()
             };
             json!({
                 "type": "weekly",
@@ -1437,10 +1444,7 @@ fn parse_graph_recurrence(v: &Value) -> Option<String> {
         _ => return None,
     }
 
-    let rtype = range
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("noEnd");
+    let rtype = range.get("type").and_then(Value::as_str).unwrap_or("noEnd");
     match rtype.to_ascii_lowercase().as_str() {
         "noend" => {}
         "enddate" => {

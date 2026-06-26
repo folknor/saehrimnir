@@ -40,10 +40,7 @@ pub fn router(state: AppState) -> Router {
             "/test/smtp/submissions",
             get(list_smtp_submissions).delete(clear_smtp_submissions),
         )
-        .route(
-            "/test/requests",
-            get(list_requests).delete(clear_requests),
-        )
+        .route("/test/requests", get(list_requests).delete(clear_requests))
         .route("/test/fixture/reset", post(reset_fixture))
         .route("/test/fixture/step", post(step_fixture))
         .route("/test/snapshot-state", get(snapshot_state))
@@ -55,7 +52,10 @@ pub fn router(state: AppState) -> Router {
             get(list_pubsub).delete(clear_pubsub),
         )
         .route("/test/gmail/pubsub/publish", post(publish_pubsub))
-        .route("/test/gmail/pubsub/push-endpoint", post(set_pubsub_endpoint))
+        .route(
+            "/test/gmail/pubsub/push-endpoint",
+            post(set_pubsub_endpoint),
+        )
         .with_state(state)
 }
 
@@ -99,10 +99,7 @@ async fn clear_pubsub(State(state): State<AppState>) -> StatusCode {
 /// Returns the published Pub/Sub envelope. The state-mutation trigger
 /// publishes automatically for any account with an active `users.watch`;
 /// this route lets a harness stage a notification directly.
-async fn publish_pubsub(
-    State(state): State<AppState>,
-    body: Option<Json<Value>>,
-) -> Response {
+async fn publish_pubsub(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
     let body = match body {
         Some(Json(Value::Object(m))) => m,
         _ => {
@@ -131,7 +128,10 @@ async fn publish_pubsub(
         .get("account_id")
         .and_then(|v| v.as_str())
         .unwrap_or(email);
-    let env = state.shared.push.publish_gmail(email, history_id, account_id);
+    let env = state
+        .shared
+        .push
+        .publish_gmail(email, history_id, account_id);
     (StatusCode::OK, Json(env)).into_response()
 }
 
@@ -139,10 +139,7 @@ async fn publish_pubsub(
 /// URL a Pub/Sub push for an account is delivered to (mirrors a real
 /// Pub/Sub subscription's push-endpoint config). Body:
 /// `{ "account_id": "account-1", "url": "http://127.0.0.1:PORT/push" }`.
-async fn set_pubsub_endpoint(
-    State(state): State<AppState>,
-    body: Option<Json<Value>>,
-) -> Response {
+async fn set_pubsub_endpoint(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
     let body = match body {
         Some(Json(Value::Object(m))) => m,
         _ => {
@@ -334,7 +331,11 @@ async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     // fixture rwlock are needed, acquire the cursor first. Matches
     // `step_fixture`'s order so a future change that holds both
     // simultaneously can't deadlock against either.
-    let mut cursor = state.shared.change_cursor.lock().expect("cursor lock poisoned");
+    let mut cursor = state
+        .shared
+        .change_cursor
+        .lock()
+        .expect("cursor lock poisoned");
     {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
         *fix = (*state.shared.baseline).clone();
@@ -372,10 +373,7 @@ const LATENCY_MAX_MS: u64 = 60_000;
 /// `"per_protocol": {"graph": 0}` clears the graph entry. Values
 /// above `LATENCY_MAX_MS` (60s) return 400. Returns 200 + the post-
 /// update snapshot for round-trip verification.
-async fn set_latency(
-    State(state): State<AppState>,
-    body: Option<Json<Value>>,
-) -> Response {
+async fn set_latency(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
     let body_obj: Map<String, Value> = match body {
         None => Map::new(),
         Some(Json(Value::Null)) => Map::new(),
@@ -581,10 +579,7 @@ async fn snapshot_state(State(state): State<AppState>) -> Json<Value> {
 /// applying; any per-op error rewinds them so a failed step never
 /// leaves a half-mutated fixture (the cursor stays put, too). On
 /// success the cursor advances by one.
-async fn step_fixture(
-    State(state): State<AppState>,
-    body: Option<Json<Value>>,
-) -> Response {
+async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
     let body_obj: Map<String, Value> = match body {
         None => Map::new(),
         Some(Json(Value::Null)) => Map::new(),
@@ -615,7 +610,11 @@ async fn step_fixture(
         }
     };
 
-    let mut cursor = state.shared.change_cursor.lock().expect("cursor lock poisoned");
+    let mut cursor = state
+        .shared
+        .change_cursor
+        .lock()
+        .expect("cursor lock poisoned");
     let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
 
     // Cursor past the script end: nothing to apply.
@@ -659,11 +658,8 @@ async fn step_fixture(
     let saved_mailboxes = touched.mailboxes.then(|| fix.mailboxes.clone());
     let saved_events = touched.events.then(|| fix.events.clone());
     let saved_contacts = touched.contacts.then(|| fix.contacts.clone());
-    let saved_contact_folders = touched
-        .contact_folders
-        .then(|| fix.contact_folders.clone());
-    let saved_mailbox_uid_history =
-        touched.emails.then(|| fix.mailbox_uid_history.clone());
+    let saved_contact_folders = touched.contact_folders.then(|| fix.contact_folders.clone());
+    let saved_mailbox_uid_history = touched.emails.then(|| fix.mailbox_uid_history.clone());
 
     let mut diff = crate::fixture::MutationDiff::default();
     let mut moved: Vec<String> = Vec::new();
@@ -872,7 +868,10 @@ fn apply_change_step(
                             &step.id,
                             i,
                             "unknownMailbox",
-                            &format!("email_create email {:?}: mailbox {mid:?} not in fixture", email.id),
+                            &format!(
+                                "email_create email {:?}: mailbox {mid:?} not in fixture",
+                                email.id
+                            ),
                         ));
                     };
                     match &first_mb_account {
@@ -1274,9 +1273,7 @@ fn apply_change_step(
                         &step.id,
                         i,
                         "folderHasContacts",
-                        &format!(
-                            "contact_folder_destroy {id:?}: folder still has contacts"
-                        ),
+                        &format!("contact_folder_destroy {id:?}: folder still has contacts"),
                     ));
                 }
                 let destroyed_account = fix
@@ -1362,11 +1359,9 @@ fn apply_change_step(
                     }
                 };
                 let mut clone = fix.contacts[idx].clone();
-                if let Err(err) = crate::fixture::apply_contact_patch(
-                    &mut clone,
-                    patch,
-                    &fix.contact_folders,
-                ) {
+                if let Err(err) =
+                    crate::fixture::apply_contact_patch(&mut clone, patch, &fix.contact_folders)
+                {
                     return Err(step_apply_error(
                         &step.id,
                         i,
@@ -1405,7 +1400,12 @@ fn apply_change_step(
     Ok(())
 }
 
-fn step_apply_error(step_id: &str, op_index: usize, kind: &str, detail: &str) -> (StatusCode, Value) {
+fn step_apply_error(
+    step_id: &str,
+    op_index: usize,
+    kind: &str,
+    detail: &str,
+) -> (StatusCode, Value) {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         json!({

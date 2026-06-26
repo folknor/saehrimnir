@@ -183,7 +183,10 @@ async fn gmail_threads_get_emits_raw_bytes_as_payload_body_data() {
     let body_size = payload["body"]["size"].as_u64().unwrap();
     assert_eq!(usize::try_from(body_size).unwrap(), MALFORMED_BODY.len());
     let size_estimate = v["messages"][0]["sizeEstimate"].as_u64().unwrap();
-    assert_eq!(usize::try_from(size_estimate).unwrap(), MALFORMED_BODY.len());
+    assert_eq!(
+        usize::try_from(size_estimate).unwrap(),
+        MALFORMED_BODY.len()
+    );
 }
 
 #[tokio::test]
@@ -200,7 +203,8 @@ async fn imap_uid_fetch_still_emits_raw_bytes_verbatim() {
 #[tokio::test]
 async fn jmap_truncated_multipart_body_round_trips_intact() {
     // Adversarial: claim multipart but never emit the boundary.
-    let raw = "Content-Type: multipart/mixed; boundary=\"X\"\r\n\r\n--X-but-no-boundary-line\r\nbroken";
+    let raw =
+        "Content-Type: multipart/mixed; boundary=\"X\"\r\n\r\n--X-but-no-boundary-line\r\nbroken";
     let r = jmap_router_from_scenario(&scenario_with_malformed("ignored", raw));
     let req = json!({
         "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],

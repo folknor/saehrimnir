@@ -10,7 +10,6 @@
 //! materialise everything into a Vec then OOM" bugs that don't
 //! show up at the 2-email scale of `jmap-small`.
 
-
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
@@ -223,9 +222,7 @@ async fn gmail_threads_pagination_through_full_inbox() {
         }
         match v.get("nextPageToken").and_then(Value::as_str) {
             Some(token) => {
-                next_uri = format!(
-                    "/gmail/v1/users/me/threads?maxResults=100&pageToken={token}"
-                );
+                next_uri = format!("/gmail/v1/users/me/threads?maxResults=100&pageToken={token}");
             }
             None => break,
         }

@@ -77,14 +77,11 @@ fn dispatch(
             .get("accountId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let ids: Option<Vec<String>> = args
-            .get("ids")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            });
+        let ids: Option<Vec<String>> = args.get("ids").and_then(Value::as_array).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        });
         let result = d.dispatch("jmap", name, move |state| {
             if let Some(a) = &account_id {
                 crate::lua::req_set_str(state, "account_id", a)?;
@@ -188,12 +185,10 @@ fn dispatch(
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
-        "CalendarEvent/changes" => {
-            match crate::jmap_calendar::calendar_event_changes(&fix, args) {
-                Ok(v) => (name.to_string(), v),
-                Err(err) => ("error".to_string(), err),
-            }
-        }
+        "CalendarEvent/changes" => match crate::jmap_calendar::calendar_event_changes(&fix, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
         _ => (
             "error".to_string(),
             json!({
@@ -208,12 +203,15 @@ fn dispatch(
 
 /// RFC 8621 §2.1.
 fn mailbox_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
-    let account_id = args.get("accountId").and_then(Value::as_str).ok_or_else(|| {
-        json!({
-            "type": "invalidArguments",
-            "description": "missing accountId",
-        })
-    })?;
+    let account_id = args
+        .get("accountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            json!({
+                "type": "invalidArguments",
+                "description": "missing accountId",
+            })
+        })?;
     if fixture.account(account_id).is_none() {
         return Err(json!({
             "type": "accountNotFound",
@@ -292,7 +290,10 @@ fn serialize_mailbox(fixture: &Fixture, m: &Mailbox) -> Value {
         "sortOrder".to_string(),
         Value::Number(m.sort_order.unwrap_or(0).into()),
     );
-    obj.insert("totalEmails".to_string(), Value::Number(total_emails.into()));
+    obj.insert(
+        "totalEmails".to_string(),
+        Value::Number(total_emails.into()),
+    );
     obj.insert(
         "unreadEmails".to_string(),
         Value::Number(unread_emails.into()),
@@ -486,7 +487,10 @@ fn changes_response(
     is_email: bool,
 ) -> Value {
     let mut out = Map::new();
-    out.insert("accountId".to_string(), Value::String(account_id.to_string()));
+    out.insert(
+        "accountId".to_string(),
+        Value::String(account_id.to_string()),
+    );
     out.insert("oldState".to_string(), Value::String(old_state.to_string()));
     out.insert("newState".to_string(), Value::String(new_state.to_string()));
     out.insert("hasMoreChanges".to_string(), Value::Bool(false));
@@ -519,12 +523,15 @@ const QUERY_LIMIT_DEFAULT: u64 = 50;
 // each use - they cannot panic and aren't wire errors to surface.
 #[allow(clippy::unwrap_in_result)]
 fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
-    let account_id = args.get("accountId").and_then(Value::as_str).ok_or_else(|| {
-        json!({
-            "type": "invalidArguments",
-            "description": "missing accountId",
-        })
-    })?;
+    let account_id = args
+        .get("accountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            json!({
+                "type": "invalidArguments",
+                "description": "missing accountId",
+            })
+        })?;
     if fixture.account(account_id).is_none() {
         return Err(json!({
             "type": "accountNotFound",
@@ -610,10 +617,7 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
         Value::String(fixture.state_for(account_id).to_string()),
     );
     out.insert("canCalculateChanges".to_string(), Value::Bool(false));
-    out.insert(
-        "position".to_string(),
-        Value::Number(position.into()),
-    );
+    out.insert("position".to_string(), Value::Number(position.into()));
     out.insert("ids".to_string(), Value::Array(ids));
     if calculate_total {
         out.insert("total".to_string(), Value::Number(total.into()));
@@ -729,12 +733,15 @@ fn parse_filter(raw: Option<&Value>) -> Result<Filter, Value> {
 /// `header:*:asText` keys ratatoskr asks for are always present and
 /// always `null` in v0.
 fn email_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
-    let account_id = args.get("accountId").and_then(Value::as_str).ok_or_else(|| {
-        json!({
-            "type": "invalidArguments",
-            "description": "missing accountId",
-        })
-    })?;
+    let account_id = args
+        .get("accountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            json!({
+                "type": "invalidArguments",
+                "description": "missing accountId",
+            })
+        })?;
     if fixture.account(account_id).is_none() {
         return Err(json!({
             "type": "accountNotFound",
@@ -825,14 +832,13 @@ fn serialize_email(e: &Email, fetch_text: bool, fetch_html: bool, fetch_all: boo
     obj.insert(
         "receivedAt".to_string(),
         Value::String(
-            e.received_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            e.received_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         ),
     );
     obj.insert(
         "sentAt".to_string(),
-        Value::String(
-            e.sent_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        ),
+        Value::String(e.sent_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
     );
 
     obj.insert("mailboxIds".to_string(), bool_map(&e.mailbox_ids));
@@ -918,10 +924,7 @@ fn serialize_attachment(e: &Email, index: usize, a: &Attachment) -> Value {
     obj.insert("blobId".to_string(), Value::String(a.blob_id.clone()));
     obj.insert("size".to_string(), Value::Number(a.size.into()));
     obj.insert("name".to_string(), Value::String(a.name.clone()));
-    obj.insert(
-        "type".to_string(),
-        Value::String(a.content_type.clone()),
-    );
+    obj.insert("type".to_string(), Value::String(a.content_type.clone()));
     obj.insert(
         "disposition".to_string(),
         Value::String(a.disposition.as_str().to_string()),
@@ -1048,12 +1051,15 @@ fn serialize_address_list(xs: &[Address]) -> Value {
 /// an explicit id array returns matched threads with unknown ids in
 /// `notFound`.
 fn thread_get(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
-    let account_id = args.get("accountId").and_then(Value::as_str).ok_or_else(|| {
-        json!({
-            "type": "invalidArguments",
-            "description": "missing accountId",
-        })
-    })?;
+    let account_id = args
+        .get("accountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            json!({
+                "type": "invalidArguments",
+                "description": "missing accountId",
+            })
+        })?;
     if fixture.account(account_id).is_none() {
         return Err(json!({
             "type": "accountNotFound",
@@ -1201,8 +1207,14 @@ fn thread_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     }
 
     let mut out = Map::new();
-    out.insert("accountId".to_string(), Value::String(account_id.to_string()));
-    out.insert("oldState".to_string(), Value::String(since_state.to_string()));
+    out.insert(
+        "accountId".to_string(),
+        Value::String(account_id.to_string()),
+    );
+    out.insert(
+        "oldState".to_string(),
+        Value::String(since_state.to_string()),
+    );
     out.insert(
         "newState".to_string(),
         Value::String(fixture.state_for(account_id).to_string()),
@@ -1266,7 +1278,11 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
     let destroys: Vec<String> = args
         .get("destroy")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut created_out = Map::new();
@@ -1373,8 +1389,7 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
                     destroyed_out.push(id.clone());
                 }
                 None => {
-                    not_destroyed
-                        .insert(id.clone(), set_error("notFound", "no such email"));
+                    not_destroyed.insert(id.clone(), set_error("notFound", "no such email"));
                 }
             }
         }
@@ -1396,13 +1411,10 @@ fn email_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
     ))
 }
 
-fn build_email_from_create(
-    fix: &mut Fixture,
-    body: &Value,
-) -> Result<(String, Email), Value> {
-    let body = body.as_object().ok_or_else(|| {
-        set_error("invalidProperties", "create body must be an object")
-    })?;
+fn build_email_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, Email), Value> {
+    let body = body
+        .as_object()
+        .ok_or_else(|| set_error("invalidProperties", "create body must be an object"))?;
     let mailbox_ids: Vec<String> = body
         .get("mailboxIds")
         .and_then(Value::as_object)
@@ -1565,7 +1577,11 @@ fn mailbox_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
     let destroys: Vec<String> = args
         .get("destroy")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut created_out = Map::new();
@@ -1689,17 +1705,21 @@ fn build_mailbox_from_create(
     request_account_id: &str,
     body: &Value,
 ) -> Result<Mailbox, Value> {
-    let body = body.as_object().ok_or_else(|| {
-        set_error("invalidProperties", "create body must be an object")
-    })?;
+    let body = body
+        .as_object()
+        .ok_or_else(|| set_error("invalidProperties", "create body must be an object"))?;
     let name = body
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| set_error("invalidProperties", "missing name"))?
         .to_string();
-    let parent_id = body
-        .get("parentId")
-        .and_then(|v| if v.is_null() { None } else { v.as_str().map(String::from) });
+    let parent_id = body.get("parentId").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            v.as_str().map(String::from)
+        }
+    });
     if let Some(pid) = &parent_id {
         let parent = fix.mailboxes.iter().find(|m| &m.id == pid);
         let Some(parent) = parent else {
@@ -1752,9 +1772,9 @@ pub(crate) fn apply_mailbox_patch(mailbox: &mut Mailbox, patch: &Value) -> Resul
     for (path, value) in obj {
         match path.as_str() {
             "name" => {
-                let s = value.as_str().ok_or_else(|| {
-                    set_error("invalidProperties", "name must be a string")
-                })?;
+                let s = value
+                    .as_str()
+                    .ok_or_else(|| set_error("invalidProperties", "name must be a string"))?;
                 mailbox.name = s.to_string();
             }
             "parentId" => {
@@ -1835,7 +1855,10 @@ fn set_response(
     not_destroyed: Map<String, Value>,
 ) -> Value {
     let mut out = Map::new();
-    out.insert("accountId".to_string(), Value::String(account_id.to_string()));
+    out.insert(
+        "accountId".to_string(),
+        Value::String(account_id.to_string()),
+    );
     out.insert("oldState".to_string(), Value::String(old_state.to_string()));
     out.insert("newState".to_string(), Value::String(new_state.to_string()));
     out.insert(
@@ -2071,7 +2094,11 @@ mod tests {
         let f = crate::shared::handle(fix());
         let req = JmapRequest {
             using: vec!["urn:ietf:params:jmap:core".into()],
-            method_calls: vec![("Mailbox/get".into(), json!({"accountId": "acct"}), "c0".into())],
+            method_calls: vec![(
+                "Mailbox/get".into(),
+                json!({"accountId": "acct"}),
+                "c0".into(),
+            )],
             created_ids: None,
         };
         let resp = handle(&f, None, req);
@@ -2088,7 +2115,11 @@ mod tests {
         let req = JmapRequest {
             using: vec![],
             method_calls: vec![
-                ("Mailbox/get".into(), json!({"accountId": "acct"}), "a".into()),
+                (
+                    "Mailbox/get".into(),
+                    json!({"accountId": "acct"}),
+                    "a".into(),
+                ),
                 ("Email/import".into(), json!({}), "b".into()),
             ],
             created_ids: None,
@@ -2225,9 +2256,11 @@ mod tests {
     fn email_query_after_filter_uses_unix_seconds() {
         let f = fix_for_query();
         // 2026-01-15T11:00:00Z -> matches "a", "a2", "b".
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 11, 0, 0).unwrap().timestamp();
-        let resp =
-            email_query(&f, &json!({"accountId": "acct", "filter": {"after": ts}})).unwrap();
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 15, 11, 0, 0)
+            .unwrap()
+            .timestamp();
+        let resp = email_query(&f, &json!({"accountId": "acct", "filter": {"after": ts}})).unwrap();
         let ids: Vec<&str> = resp
             .get("ids")
             .unwrap()
@@ -2303,19 +2336,19 @@ mod tests {
     fn email_query_pagination_terminates_below_limit() {
         let f = fix_for_query();
         // limit 2 across 5 ids -> pages of 2, 2, 1.
-        let p1 = email_query(&f, &json!({"accountId": "acct", "limit": 2, "position": 0}))
-            .unwrap();
-        let p2 = email_query(&f, &json!({"accountId": "acct", "limit": 2, "position": 2}))
-            .unwrap();
-        let p3 = email_query(&f, &json!({"accountId": "acct", "limit": 2, "position": 4}))
-            .unwrap();
+        let p1 = email_query(&f, &json!({"accountId": "acct", "limit": 2, "position": 0})).unwrap();
+        let p2 = email_query(&f, &json!({"accountId": "acct", "limit": 2, "position": 2})).unwrap();
+        let p3 = email_query(&f, &json!({"accountId": "acct", "limit": 2, "position": 4})).unwrap();
         let len = |v: &Value| v.get("ids").unwrap().as_array().unwrap().len();
         assert_eq!(len(&p1), 2);
         assert_eq!(len(&p2), 2);
         assert_eq!(len(&p3), 1);
         // Position past total returns empty without erroring.
-        let p4 = email_query(&f, &json!({"accountId": "acct", "limit": 2, "position": 99}))
-            .unwrap();
+        let p4 = email_query(
+            &f,
+            &json!({"accountId": "acct", "limit": 2, "position": 99}),
+        )
+        .unwrap();
         assert_eq!(len(&p4), 0);
     }
 
@@ -2410,7 +2443,9 @@ mod tests {
 
     fn fix_for_get() -> Fixture {
         let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
-        let sent = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 9, 59, 50).unwrap();
+        let sent = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 15, 9, 59, 50)
+            .unwrap();
         Fixture {
             name: "g".into(),
             state_seed: "s1".into(),
@@ -2559,7 +2594,10 @@ mod tests {
         assert_eq!(entry.get("isTruncated").unwrap(), false);
 
         // Attachments empty array.
-        assert_eq!(item.get("attachments").unwrap().as_array().unwrap().len(), 0);
+        assert_eq!(
+            item.get("attachments").unwrap().as_array().unwrap().len(),
+            0
+        );
 
         // The three custom-header keys are always present, always null.
         for k in [
@@ -2582,11 +2620,7 @@ mod tests {
     #[test]
     fn email_get_reports_not_found() {
         let f = fix_for_get();
-        let resp = email_get(
-            &f,
-            &json!({"accountId": "acct", "ids": ["e1", "ghost"]}),
-        )
-        .unwrap();
+        let resp = email_get(&f, &json!({"accountId": "acct", "ids": ["e1", "ghost"]})).unwrap();
         assert_eq!(resp.get("list").unwrap().as_array().unwrap().len(), 1);
         let nf = resp.get("notFound").unwrap().as_array().unwrap();
         assert_eq!(nf, &vec![Value::String("ghost".into())]);

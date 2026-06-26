@@ -68,7 +68,12 @@ pub(crate) fn address_book_get(fixture: &Fixture, args: &Value) -> Result<Value,
         Some(_) => return Err(invalid_args("ids must be an array or null")),
     };
 
-    Ok(get_response(account_id, fixture.state_for(account_id), list, not_found))
+    Ok(get_response(
+        account_id,
+        fixture.state_for(account_id),
+        list,
+        not_found,
+    ))
 }
 
 fn serialize_address_book(f: &ContactFolder) -> Value {
@@ -122,7 +127,12 @@ pub(crate) fn contact_card_get(fixture: &Fixture, args: &Value) -> Result<Value,
         Some(_) => return Err(invalid_args("ids must be an array or null")),
     };
 
-    Ok(get_response(account_id, fixture.state_for(account_id), list, not_found))
+    Ok(get_response(
+        account_id,
+        fixture.state_for(account_id),
+        list,
+        not_found,
+    ))
 }
 
 /// Project one fixture `Contact` to a JSContact Card (RFC 9553). The
@@ -546,7 +556,11 @@ fn apply_contact_patch(fix: &Fixture, contact: &mut Contact, patch: &Value) -> R
     for (k, v) in obj {
         match k.as_str() {
             "name" => {
-                contact.display_name = if v.is_null() { None } else { name_full(Some(v)) };
+                contact.display_name = if v.is_null() {
+                    None
+                } else {
+                    name_full(Some(v))
+                };
             }
             "emails" => {
                 contact.emails = parse_emails(Some(v));

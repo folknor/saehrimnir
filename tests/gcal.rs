@@ -42,7 +42,12 @@ async fn body_json(resp: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-async fn http(r: &axum::Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+async fn http(
+    r: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(method)
         .uri(uri)
@@ -154,10 +159,12 @@ async fn list_events_with_unknown_sync_token_returns_410() {
     assert_eq!(status, StatusCode::GONE);
     assert_eq!(v["error"]["code"], 410);
     assert_eq!(v["error"]["errors"][0]["reason"], "fullSyncRequired");
-    assert!(v["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("sync token"));
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sync token")
+    );
 }
 
 #[tokio::test]
@@ -228,13 +235,7 @@ async fn create_patch_delete_round_trip() {
 #[tokio::test]
 async fn unknown_calendar_returns_404() {
     let r = router();
-    let (status, v) = http(
-        &r,
-        "GET",
-        "/calendar/v3/calendars/cal-nope/events",
-        None,
-    )
-    .await;
+    let (status, v) = http(&r, "GET", "/calendar/v3/calendars/cal-nope/events", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
 }
@@ -251,13 +252,7 @@ async fn list_events_emits_cancelled_tombstone_after_destroy() {
 
     // Bootstrap → save token; fixture has ev-001 + ev-002 in
     // cal-work.
-    let (_, bootstrap) = http(
-        &r,
-        "GET",
-        "/calendar/v3/calendars/cal-work/events",
-        None,
-    )
-    .await;
+    let (_, bootstrap) = http(&r, "GET", "/calendar/v3/calendars/cal-work/events", None).await;
     let token = bootstrap["nextSyncToken"].as_str().unwrap().to_string();
     assert_eq!(bootstrap["items"].as_array().unwrap().len(), 2);
 
@@ -344,12 +339,7 @@ async fn gcal_create_surfaces_in_graph_calendar_view_delta() {
         .map(|(_, rest)| format!("/v1.0/{rest}"))
         .unwrap();
     let resp = graph_r
-        .oneshot(
-            Request::builder()
-                .uri(path)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -377,13 +367,7 @@ fn recurrence_router() -> axum::Router {
 #[tokio::test]
 async fn gcal_recurring_event_emits_rrule_array() {
     let r = recurrence_router();
-    let (status, v) = http(
-        &r,
-        "GET",
-        "/calendar/v3/calendars/cal-work/events",
-        None,
-    )
-    .await;
+    let (status, v) = http(&r, "GET", "/calendar/v3/calendars/cal-work/events", None).await;
     assert_eq!(status, StatusCode::OK);
     let items = v["items"].as_array().unwrap();
     let weekly = items.iter().find(|e| e["id"] == "ev-weekly").unwrap();
@@ -395,12 +379,18 @@ async fn gcal_recurring_event_emits_rrule_array() {
     let rec = monthly["recurrence"].as_array().unwrap();
     // RRULE first, then one EXDATE per excluded date.
     assert_eq!(rec.len(), 3);
-    assert_eq!(rec[0], "RRULE:FREQ=MONTHLY;BYMONTHDAY=15;UNTIL=20261215T170000Z");
+    assert_eq!(
+        rec[0],
+        "RRULE:FREQ=MONTHLY;BYMONTHDAY=15;UNTIL=20261215T170000Z"
+    );
     assert_eq!(rec[1], "EXDATE:20260315T170000Z");
     assert_eq!(rec[2], "EXDATE:20260715T170000Z");
 
     let single = items.iter().find(|e| e["id"] == "ev-single").unwrap();
-    assert!(single.get("recurrence").is_none(), "single instance leaked recurrence");
+    assert!(
+        single.get("recurrence").is_none(),
+        "single instance leaked recurrence"
+    );
 }
 
 // ── Multi-account (Stage 4: OAuth-scoped tokens) ────────────────────
@@ -500,7 +490,13 @@ async fn gcal_create_event_with_recurrence_round_trips() {
             "EXDATE:20260309T100000Z",
         ],
     });
-    let (status, v) = http(&r, "POST", "/calendar/v3/calendars/cal-work/events", Some(body)).await;
+    let (status, v) = http(
+        &r,
+        "POST",
+        "/calendar/v3/calendars/cal-work/events",
+        Some(body),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let id = v["id"].as_str().unwrap().to_string();
     let rec = v["recurrence"].as_array().unwrap();
@@ -529,7 +525,13 @@ async fn gcal_patch_recurrence_replaces_and_clears() {
         "start": { "dateTime": "2026-04-01T10:00:00Z", "timeZone": "UTC" },
         "end":   { "dateTime": "2026-04-01T10:30:00Z", "timeZone": "UTC" },
     });
-    let (_, v) = http(&r, "POST", "/calendar/v3/calendars/cal-work/events", Some(body)).await;
+    let (_, v) = http(
+        &r,
+        "POST",
+        "/calendar/v3/calendars/cal-work/events",
+        Some(body),
+    )
+    .await;
     let id = v["id"].as_str().unwrap().to_string();
 
     // PATCH to add recurrence.
@@ -555,5 +557,8 @@ async fn gcal_patch_recurrence_replaces_and_clears() {
         Some(body),
     )
     .await;
-    assert!(v.get("recurrence").is_none(), "expected recurrence cleared: {v}");
+    assert!(
+        v.get("recurrence").is_none(),
+        "expected recurrence cleared: {v}"
+    );
 }

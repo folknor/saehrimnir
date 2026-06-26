@@ -114,10 +114,7 @@ pub fn router(state: AppState) -> Router {
         .merge(group_sync::router())
         .merge(settings::router())
         .fallback(any(not_implemented))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            log_request,
-        ))
+        .layer(middleware::from_fn_with_state(state.clone(), log_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_bearer_middleware,
@@ -146,9 +143,11 @@ async fn enforce_bearer_middleware(
     };
     match decision {
         BearerDecision::Allow => next.run(req).await,
-        BearerDecision::Deny(reason) => {
-            error(StatusCode::UNAUTHORIZED, "InvalidAuthenticationToken", &reason)
-        }
+        BearerDecision::Deny(reason) => error(
+            StatusCode::UNAUTHORIZED,
+            "InvalidAuthenticationToken",
+            &reason,
+        ),
     }
 }
 

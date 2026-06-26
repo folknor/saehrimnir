@@ -609,15 +609,16 @@ impl Fixture {
         &'a self,
         account_id: &'a str,
     ) -> impl Iterator<Item = &'a Mailbox> + 'a {
-        self.mailboxes.iter().filter(move |m| m.account_id == account_id)
+        self.mailboxes
+            .iter()
+            .filter(move |m| m.account_id == account_id)
     }
 
     /// Emails scoped to one account.
-    pub fn emails_for<'a>(
-        &'a self,
-        account_id: &'a str,
-    ) -> impl Iterator<Item = &'a Email> + 'a {
-        self.emails.iter().filter(move |e| e.account_id == account_id)
+    pub fn emails_for<'a>(&'a self, account_id: &'a str) -> impl Iterator<Item = &'a Email> + 'a {
+        self.emails
+            .iter()
+            .filter(move |e| e.account_id == account_id)
     }
 
     /// Calendars scoped to one account.
@@ -625,15 +626,16 @@ impl Fixture {
         &'a self,
         account_id: &'a str,
     ) -> impl Iterator<Item = &'a Calendar> + 'a {
-        self.calendars.iter().filter(move |c| c.account_id == account_id)
+        self.calendars
+            .iter()
+            .filter(move |c| c.account_id == account_id)
     }
 
     /// Events scoped to one account.
-    pub fn events_for<'a>(
-        &'a self,
-        account_id: &'a str,
-    ) -> impl Iterator<Item = &'a Event> + 'a {
-        self.events.iter().filter(move |e| e.account_id == account_id)
+    pub fn events_for<'a>(&'a self, account_id: &'a str) -> impl Iterator<Item = &'a Event> + 'a {
+        self.events
+            .iter()
+            .filter(move |e| e.account_id == account_id)
     }
 
     /// Contact folders scoped to one account.
@@ -641,7 +643,9 @@ impl Fixture {
         &'a self,
         account_id: &'a str,
     ) -> impl Iterator<Item = &'a ContactFolder> + 'a {
-        self.contact_folders.iter().filter(move |c| c.account_id == account_id)
+        self.contact_folders
+            .iter()
+            .filter(move |c| c.account_id == account_id)
     }
 
     /// Contacts scoped to one account.
@@ -649,7 +653,9 @@ impl Fixture {
         &'a self,
         account_id: &'a str,
     ) -> impl Iterator<Item = &'a Contact> + 'a {
-        self.contacts.iter().filter(move |c| c.account_id == account_id)
+        self.contacts
+            .iter()
+            .filter(move |c| c.account_id == account_id)
     }
 
     /// Categories scoped to one account.
@@ -657,15 +663,16 @@ impl Fixture {
         &'a self,
         account_id: &'a str,
     ) -> impl Iterator<Item = &'a Category> + 'a {
-        self.categories.iter().filter(move |c| c.account_id == account_id)
+        self.categories
+            .iter()
+            .filter(move |c| c.account_id == account_id)
     }
 
     /// SendAs identities scoped to one account.
-    pub fn send_as_for<'a>(
-        &'a self,
-        account_id: &'a str,
-    ) -> impl Iterator<Item = &'a SendAs> + 'a {
-        self.send_as.iter().filter(move |s| s.account_id == account_id)
+    pub fn send_as_for<'a>(&'a self, account_id: &'a str) -> impl Iterator<Item = &'a SendAs> + 'a {
+        self.send_as
+            .iter()
+            .filter(move |s| s.account_id == account_id)
     }
 
     /// Read-only view of the per-mailbox UID history. Returns the
@@ -1132,12 +1139,7 @@ impl Fixture {
     /// "account never mutated" case (no log entry) into a seed-only
     /// resolution: `since == seed` is the empty delta, anything else
     /// is `cannotCalculateChanges`.
-    fn walk_account<'a, F>(
-        &'a self,
-        since: &str,
-        account_id: &str,
-        project: F,
-    ) -> Option<DeltaSet>
+    fn walk_account<'a, F>(&'a self, since: &str, account_id: &str, project: F) -> Option<DeltaSet>
     where
         F: Fn(&'a Transition) -> (&'a Vec<String>, &'a Vec<String>, &'a Vec<String>),
     {
@@ -1185,11 +1187,7 @@ impl Fixture {
     /// delta and its state token does not move (RFC 8620 §1.5.2).
     /// `since` older than the seed (or evicted from the account's
     /// bounded ring) returns `None` -> `cannotCalculateChanges`.
-    pub fn email_delta_since_account(
-        &self,
-        since: &str,
-        account_id: &str,
-    ) -> Option<DeltaSet> {
+    pub fn email_delta_since_account(&self, since: &str, account_id: &str) -> Option<DeltaSet> {
         self.walk_account(since, account_id, |t| {
             (&t.email_created, &t.email_updated, &t.email_destroyed)
         })
@@ -1197,11 +1195,7 @@ impl Fixture {
 
     /// Per-account mailbox delta. Same shape as
     /// [`Self::email_delta_since_account`].
-    pub fn mailbox_delta_since_account(
-        &self,
-        since: &str,
-        account_id: &str,
-    ) -> Option<DeltaSet> {
+    pub fn mailbox_delta_since_account(&self, since: &str, account_id: &str) -> Option<DeltaSet> {
         self.walk_account(since, account_id, |t| {
             (&t.mailbox_created, &t.mailbox_updated, &t.mailbox_destroyed)
         })
@@ -1257,13 +1251,13 @@ impl Fixture {
     /// walker (and the CalDAV MKCALENDAR / DELETE writes that feed it).
     /// Walks the account's own log, so every calendar id in it already
     /// belongs to the account.
-    pub fn calendar_delta_since_account(
-        &self,
-        since: &str,
-        account_id: &str,
-    ) -> Option<DeltaSet> {
+    pub fn calendar_delta_since_account(&self, since: &str, account_id: &str) -> Option<DeltaSet> {
         self.walk_account(since, account_id, |t| {
-            (&t.calendar_created, &t.calendar_updated, &t.calendar_destroyed)
+            (
+                &t.calendar_created,
+                &t.calendar_updated,
+                &t.calendar_destroyed,
+            )
         })
     }
 
@@ -2374,7 +2368,10 @@ pub(crate) enum RawContactEmail {
 impl From<RawContactEmail> for ContactEmail {
     fn from(raw: RawContactEmail) -> Self {
         match raw {
-            RawContactEmail::Bare(address) => Self { address, name: None },
+            RawContactEmail::Bare(address) => Self {
+                address,
+                name: None,
+            },
             RawContactEmail::Full { address, name } => Self { address, name },
         }
     }
@@ -2631,8 +2628,8 @@ pub fn load(path: &Path) -> Result<Fixture, String> {
     if path.extension().is_some_and(|e| e == "lua") {
         crate::lua::load(path)
     } else {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let raw: RawFixture =
             toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
         let dir = path.parent().unwrap_or(Path::new("."));
@@ -2674,9 +2671,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         if accounts_raw.len() == 1 {
             accounts_raw[0].primary = true;
         } else {
-            return Err(
-                "fixture declares multiple accounts but none is `primary = true`".into(),
-            );
+            return Err("fixture declares multiple accounts but none is `primary = true`".into());
         }
     } else if primary_flags > 1 {
         return Err(format!(
@@ -2712,22 +2707,23 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         .find(|a| a.primary)
         .map(|a| a.id.clone())
         .expect("primary guaranteed by primary_flags check above");
-    let account_ids: HashMap<String, ()> =
-        accounts.iter().map(|a| (a.id.clone(), ())).collect();
-    let resolve_account =
-        |raw: Option<&String>, resource: &str, id: &str| -> Result<String, String> {
-            match raw {
-                Some(a) => {
-                    if !account_ids.contains_key(a) {
-                        return Err(format!(
-                            "{resource} {id:?}: account_id {a:?} does not match any declared account"
-                        ));
-                    }
-                    Ok(a.clone())
+    let account_ids: HashMap<String, ()> = accounts.iter().map(|a| (a.id.clone(), ())).collect();
+    let resolve_account = |raw: Option<&String>,
+                           resource: &str,
+                           id: &str|
+     -> Result<String, String> {
+        match raw {
+            Some(a) => {
+                if !account_ids.contains_key(a) {
+                    return Err(format!(
+                        "{resource} {id:?}: account_id {a:?} does not match any declared account"
+                    ));
                 }
-                None => Ok(primary_id.clone()),
+                Ok(a.clone())
             }
-        };
+            None => Ok(primary_id.clone()),
+        }
+    };
 
     let mut mb_ids: HashMap<String, ()> = HashMap::new();
     for mb in &raw.mailboxes {
@@ -2870,8 +2866,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
                 ));
             }
         }
-        let start =
-            parse_ts(&ev.start).map_err(|e| format!("event {:?} start: {e}", ev.id))?;
+        let start = parse_ts(&ev.start).map_err(|e| format!("event {:?} start: {e}", ev.id))?;
         let end = parse_ts(&ev.end).map_err(|e| format!("event {:?} end: {e}", ev.id))?;
         let mut recurrence_exdates: Vec<DateTime<Utc>> =
             Vec::with_capacity(ev.recurrence_exdates.len());
@@ -3007,10 +3002,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
                 ));
             }
             if seen.insert(m.as_str(), ()).is_some() {
-                return Err(format!(
-                    "group {:?}: duplicate member {m:?}",
-                    grp.id
-                ));
+                return Err(format!("group {:?}: duplicate member {m:?}", grp.id));
             }
         }
         groups.push(Group {
@@ -3112,15 +3104,16 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     // mint `mock-email-3` because the old code did `len() + 1`.
     // Tests pin that value, so the counter starts at len when no
     // mock-prefixed declarations beat it.
-    let synthetic_event_seq = max_mock_seq(events.iter().map(|e| e.id.as_str()), "mock-event-")
-        .max(events.len() as u64);
-    let synthetic_email_seq = max_mock_seq(emails.iter().map(|e| e.id.as_str()), "mock-email-")
-        .max(emails.len() as u64);
+    let synthetic_event_seq =
+        max_mock_seq(events.iter().map(|e| e.id.as_str()), "mock-event-").max(events.len() as u64);
+    let synthetic_email_seq =
+        max_mock_seq(emails.iter().map(|e| e.id.as_str()), "mock-email-").max(emails.len() as u64);
     let synthetic_category_seq =
         max_mock_seq(categories.iter().map(|c| c.id.as_str()), "mock-category-")
             .max(categories.len() as u64);
-    let synthetic_contact_seq = max_mock_seq(contacts.iter().map(|c| c.id.as_str()), "mock-contact-")
-        .max(contacts.len() as u64);
+    let synthetic_contact_seq =
+        max_mock_seq(contacts.iter().map(|c| c.id.as_str()), "mock-contact-")
+            .max(contacts.len() as u64);
     Ok(Fixture {
         name: raw.name,
         state_seed,
@@ -3320,7 +3313,8 @@ pub(crate) fn event_create_op(raw: RawEvent) -> Result<ChangeOp, String> {
     let id_for_msg = raw.id.clone();
     let start = parse_ts(&raw.start).map_err(|e| format!("{id_for_msg:?} start: {e}"))?;
     let end = parse_ts(&raw.end).map_err(|e| format!("{id_for_msg:?} end: {e}"))?;
-    let mut recurrence_exdates: Vec<DateTime<Utc>> = Vec::with_capacity(raw.recurrence_exdates.len());
+    let mut recurrence_exdates: Vec<DateTime<Utc>> =
+        Vec::with_capacity(raw.recurrence_exdates.len());
     for s in &raw.recurrence_exdates {
         recurrence_exdates
             .push(parse_ts(s).map_err(|e| format!("{id_for_msg:?} recurrence_exdates: {e}"))?);
@@ -3403,10 +3397,7 @@ pub(crate) fn contact_folder_update_op(
         patch.insert("display_name".into(), serde_json::Value::String(n));
     }
     if let Some(p) = parent_folder_id {
-        patch.insert(
-            "parent_folder_id".into(),
-            serde_json::Value::String(p),
-        );
+        patch.insert("parent_folder_id".into(), serde_json::Value::String(p));
     }
     if patch.is_empty() {
         return Err("at least one field must be set");
@@ -3677,15 +3668,17 @@ fn normalize_change_step(
     }
     for u in raw.email_update {
         let entry_id = u.id.clone();
-        ops.push(email_update_op(u.id, u.keywords, u.mailbox_ids).map_err(|e| {
-            format!("change step {id:?}: email_update entry {entry_id:?}: {e}")
-        })?);
+        ops.push(
+            email_update_op(u.id, u.keywords, u.mailbox_ids)
+                .map_err(|e| format!("change step {id:?}: email_update entry {entry_id:?}: {e}"))?,
+        );
     }
     for m in raw.email_move {
         let entry_id = m.id.clone();
-        ops.push(email_move_op(m.id, m.mailbox_ids).map_err(|e| {
-            format!("change step {id:?}: email_move entry {entry_id:?}: {e}")
-        })?);
+        ops.push(
+            email_move_op(m.id, m.mailbox_ids)
+                .map_err(|e| format!("change step {id:?}: email_move entry {entry_id:?}: {e}"))?,
+        );
     }
     for d in raw.email_destroy {
         ops.push(ChangeOp::EmailDestroy { id: d });
@@ -3693,9 +3686,10 @@ fn normalize_change_step(
 
     for mb in raw.mailbox_create {
         let entry_id = mb.id.clone();
-        ops.push(mailbox_create_op(mb).map_err(|e| {
-            format!("change step {id:?}: mailbox_create {entry_id:?}: {e}")
-        })?);
+        ops.push(
+            mailbox_create_op(mb)
+                .map_err(|e| format!("change step {id:?}: mailbox_create {entry_id:?}: {e}"))?,
+        );
     }
     for u in raw.mailbox_update {
         let entry_id = u.id.clone();
@@ -3708,9 +3702,7 @@ fn normalize_change_step(
                 u.role,
                 u.is_subscribed,
             )
-            .map_err(|e| {
-                format!("change step {id:?}: mailbox_update entry {entry_id:?}: {e}")
-            })?,
+            .map_err(|e| format!("change step {id:?}: mailbox_update entry {entry_id:?}: {e}"))?,
         );
     }
     for d in raw.mailbox_destroy {
@@ -3718,18 +3710,13 @@ fn normalize_change_step(
     }
 
     for ev in raw.event_create {
-        ops.push(
-            event_create_op(ev)
-                .map_err(|e| format!("change step {id:?}: event_create {e}"))?,
-        );
+        ops.push(event_create_op(ev).map_err(|e| format!("change step {id:?}: event_create {e}"))?);
     }
     for u in raw.event_update {
         let entry_id = u.id.clone();
         ops.push(
             event_update_op(u.id, u.subject, u.start, u.end, u.location, u.body_text)
-                .map_err(|e| {
-                    format!("change step {id:?}: event_update entry {entry_id:?}: {e}")
-                })?,
+                .map_err(|e| format!("change step {id:?}: event_update entry {entry_id:?}: {e}"))?,
         );
     }
     for d in raw.event_destroy {
@@ -3742,12 +3729,9 @@ fn normalize_change_step(
     for u in raw.contact_folder_update {
         let entry_id = u.id.clone();
         ops.push(
-            contact_folder_update_op(u.id, u.display_name, u.parent_folder_id)
-                .map_err(|e| {
-                    format!(
-                        "change step {id:?}: contact_folder_update entry {entry_id:?}: {e}"
-                    )
-                })?,
+            contact_folder_update_op(u.id, u.display_name, u.parent_folder_id).map_err(|e| {
+                format!("change step {id:?}: contact_folder_update entry {entry_id:?}: {e}")
+            })?,
         );
     }
     for d in raw.contact_folder_destroy {
@@ -3822,9 +3806,7 @@ pub(crate) fn normalize_email(
     // sets `email.account_id` explicitly, validate it matches.
     let derived_account: String = if let Some(mb_accounts) = mb_accounts {
         let mut iter = em.mailbox_ids.iter();
-        let first_mb = iter
-            .next()
-            .expect("non-empty checked above");
+        let first_mb = iter.next().expect("non-empty checked above");
         let first_acct = mb_accounts
             .get(first_mb)
             .expect("mailbox existence checked above")
@@ -3987,8 +3969,7 @@ fn is_email_shaped(s: &str) -> bool {
 /// Each parent_id is already validated to exist by the caller, so the
 /// `expect()` below is sound.
 fn detect_cycles(mailboxes: &[Mailbox]) -> Result<(), String> {
-    let by_id: HashMap<&str, &Mailbox> =
-        mailboxes.iter().map(|m| (m.id.as_str(), m)).collect();
+    let by_id: HashMap<&str, &Mailbox> = mailboxes.iter().map(|m| (m.id.as_str(), m)).collect();
     for start in mailboxes {
         let mut cur = start;
         for _ in 0..mailboxes.len() {
@@ -4057,7 +4038,10 @@ mod tests {
         assert_eq!(fix.emails[0].sent_at, fix.emails[0].received_at);
         assert!(matches!(&fix.emails[0].body, Body::Text(t) if t == "hello"));
         assert_eq!(fix.emails[0].size, 5);
-        assert_eq!(fix.emails[0].from.as_ref().unwrap().email, "alice@example.com");
+        assert_eq!(
+            fix.emails[0].from.as_ref().unwrap().email,
+            "alice@example.com"
+        );
         assert!(fix.emails[0].from.as_ref().unwrap().name.is_none());
     }
 

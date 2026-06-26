@@ -66,10 +66,7 @@ pub fn router() -> Router<AppState> {
             get(list_all_contacts_me).post(create_contact_default_me),
         )
         // /users/{user}/...
-        .route(
-            "/v1.0/users/{user}/contactFolders",
-            get(list_folders_user),
-        )
+        .route("/v1.0/users/{user}/contactFolders", get(list_folders_user))
         .route(
             "/v1.0/users/{user}/contactFolders/{folder}",
             get(get_folder_user),
@@ -109,10 +106,7 @@ async fn list_folders_me(
     list_folders_impl(state, &account_id, headers, raw_query, true).await
 }
 
-async fn get_folder_me(
-    State(state): State<AppState>,
-    Path(folder): Path<String>,
-) -> Response {
+async fn get_folder_me(State(state): State<AppState>, Path(folder): Path<String>) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_folder_impl(state, &account_id, &folder).await
 }
@@ -154,10 +148,7 @@ async fn get_contact_in_folder_me(
     get_contact_in_folder_impl(state, &account_id, &folder, &contact).await
 }
 
-async fn get_contact_me(
-    State(state): State<AppState>,
-    Path(contact): Path<String>,
-) -> Response {
+async fn get_contact_me(State(state): State<AppState>, Path(contact): Path<String>) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_contact_impl(state, &account_id, &contact).await
 }
@@ -294,9 +285,7 @@ async fn list_folders_impl(
     let mut envelope = Map::new();
     envelope.insert(
         "@odata.context".to_string(),
-        Value::String(
-            "https://graph.microsoft.com/v1.0/$metadata#me/contactFolders".to_string(),
-        ),
+        Value::String("https://graph.microsoft.com/v1.0/$metadata#me/contactFolders".to_string()),
     );
     envelope.insert("value".to_string(), Value::Array(value));
     if has_more {
@@ -583,8 +572,12 @@ async fn delta_contacts_impl(
     );
 
     if q.deltatoken.as_deref() == Some("latest") {
-        let delta_link =
-            odata::build_delta_link(&host, &path, raw_query.as_deref(), fixture.state_for(account_id));
+        let delta_link = odata::build_delta_link(
+            &host,
+            &path,
+            raw_query.as_deref(),
+            fixture.state_for(account_id),
+        );
         return ok_json(json!({
             "@odata.context": context,
             "value": [],
@@ -609,8 +602,12 @@ async fn delta_contacts_impl(
             for id in &delta.destroyed {
                 value.push(graph_contact_tombstone(id));
             }
-            let delta_link =
-                odata::build_delta_link(&host, &path, raw_query.as_deref(), fixture.state_for(account_id));
+            let delta_link = odata::build_delta_link(
+                &host,
+                &path,
+                raw_query.as_deref(),
+                fixture.state_for(account_id),
+            );
             return ok_json(json!({
                 "@odata.context": context,
                 "value": value,
@@ -682,10 +679,7 @@ fn serialize_folder(folder: &ContactFolder) -> Value {
         Value::String(folder.display_name.clone()),
     );
     if let Some(parent) = &folder.parent_folder_id {
-        obj.insert(
-            "parentFolderId".to_string(),
-            Value::String(parent.clone()),
-        );
+        obj.insert("parentFolderId".to_string(), Value::String(parent.clone()));
     }
     Value::Object(obj)
 }
@@ -869,7 +863,12 @@ async fn delete_contact_impl(state: AppState, account_id: &str, contact: &str) -
     }
 }
 
-fn create_contact_core(fix: &mut Fixture, account_id: &str, folder_id: &str, body: &Value) -> Value {
+fn create_contact_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    folder_id: &str,
+    body: &Value,
+) -> Value {
     let display_name = body
         .get("displayName")
         .and_then(Value::as_str)
@@ -948,7 +947,8 @@ fn delete_contact_core(fix: &mut Fixture, account_id: &str, contact_id: &str) ->
         return false;
     };
     let _ = fix.mutate(move |f| {
-        f.contacts.retain(|c| !(c.account_id == acct && c.id == cid));
+        f.contacts
+            .retain(|c| !(c.account_id == acct && c.id == cid));
         MutationDiff {
             contact_destroyed: vec![cid.clone()],
             contact_destroyed_parents: vec![folder.clone()],
@@ -988,7 +988,10 @@ fn parse_contact_email_filter(filter: &str) -> Option<String> {
 fn contact_email_matches(c: &Contact, want: Option<&str>) -> bool {
     match want {
         None => true,
-        Some(addr) => c.emails.iter().any(|e| e.address.eq_ignore_ascii_case(addr)),
+        Some(addr) => c
+            .emails
+            .iter()
+            .any(|e| e.address.eq_ignore_ascii_case(addr)),
     }
 }
 
@@ -1039,7 +1042,9 @@ fn resolve_folder<'a>(
             .contact_folders_for(account_id)
             .find(|f| f.is_default);
     }
-    fixture.contact_folders_for(account_id).find(|f| f.id == key)
+    fixture
+        .contact_folders_for(account_id)
+        .find(|f| f.id == key)
 }
 
 fn host_or_default(headers: &HeaderMap) -> String {

@@ -217,10 +217,7 @@ pub async fn token_endpoint(
     body: axum::body::Bytes,
 ) -> Response {
     let form = parse_token_body(&headers, &body);
-    let grant_type = form
-        .get("grant_type")
-        .map(String::as_str)
-        .unwrap_or("");
+    let grant_type = form.get("grant_type").map(String::as_str).unwrap_or("");
     if grant_type != "authorization_code" && grant_type != "refresh_token" {
         return (
             StatusCode::BAD_REQUEST,
@@ -384,10 +381,7 @@ pub struct UserInfoState {
 /// `GET /oauth/userinfo`. Reads the bearer, returns the fixture
 /// account's identity claims. 401 if no token, unknown token, or
 /// invalidated token.
-pub async fn userinfo_endpoint(
-    State(state): State<UserInfoState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn userinfo_endpoint(State(state): State<UserInfoState>, headers: HeaderMap) -> Response {
     let Some(token) = bearer_token(&headers) else {
         return unauthorized("missing or malformed Authorization header");
     };
@@ -399,7 +393,9 @@ pub async fn userinfo_endpoint(
     // `email` and `name` source from `account.name` (loader
     // rejects non-email-shaped names so the claim is safe).
     let fixture = state.fixture.read().expect("fixture lock poisoned");
-    let acct = fixture.account(&account_id).unwrap_or_else(|| fixture.primary_account());
+    let acct = fixture
+        .account(&account_id)
+        .unwrap_or_else(|| fixture.primary_account());
     Json(json!({
         "sub": acct.id,
         "email": acct.name,
@@ -490,11 +486,7 @@ pub enum BearerDecision {
 /// and looking the account up in the token store. Fixtures that
 /// don't bind a token (the no-auth baseline) keep getting
 /// primary, matching v0 behaviour.
-pub fn account_from_bearer(
-    fixture: &Fixture,
-    store: &TokenStore,
-    headers: &HeaderMap,
-) -> String {
+pub fn account_from_bearer(fixture: &Fixture, store: &TokenStore, headers: &HeaderMap) -> String {
     if let Some(token) = bearer_token(headers)
         && let Some(account_id) = store.account_for_token(&token)
         && fixture.account(&account_id).is_some()
@@ -504,18 +496,12 @@ pub fn account_from_bearer(
     fixture.primary_account().id.clone()
 }
 
-pub fn check_bearer(
-    fixture: &Fixture,
-    store: &TokenStore,
-    headers: &HeaderMap,
-) -> BearerDecision {
+pub fn check_bearer(fixture: &Fixture, store: &TokenStore, headers: &HeaderMap) -> BearerDecision {
     if !fixture.oauth.enforce {
         return BearerDecision::Allow;
     }
     match bearer_token(headers) {
-        None => BearerDecision::Deny(
-            "missing or malformed Authorization: Bearer header".into(),
-        ),
+        None => BearerDecision::Deny("missing or malformed Authorization: Bearer header".into()),
         Some(t) if !store.is_active(&t) => {
             BearerDecision::Deny("token is unknown or has been invalidated".into())
         }

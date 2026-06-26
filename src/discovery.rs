@@ -79,7 +79,13 @@ pub async fn dispatch(
         return serve_webfinger(doc, &params, &state.base_url, prefix);
     }
     if let Some(prefix) = strip_suffix(&with_lead, OIDC_SUFFIX) {
-        log_request(&state, "openid-configuration", prefix, &params, connection_id);
+        log_request(
+            &state,
+            "openid-configuration",
+            prefix,
+            &params,
+            connection_id,
+        );
         let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
         let Some(entry) = fixture.discovery.lookup(prefix) else {
             return not_found(prefix);
@@ -177,7 +183,10 @@ fn serve_webfinger(
 
 fn serve_oidc(doc: &OidcDoc, base_url: &str) -> Response {
     if let Some(body) = &doc.raw_body {
-        let ct = doc.raw_content_type.as_deref().unwrap_or("application/json");
+        let ct = doc
+            .raw_content_type
+            .as_deref()
+            .unwrap_or("application/json");
         return raw_body(StatusCode::OK, ct, body.clone());
     }
     let mut body = serde_json::Map::new();
@@ -226,9 +235,11 @@ fn serve_oidc(doc: &OidcDoc, base_url: &str) -> Response {
                 .collect(),
         ),
     );
-    let ct = doc.raw_content_type.as_deref().unwrap_or("application/json");
-    let bytes =
-        serde_json::to_vec(&Value::Object(body)).expect("json serialisation cannot fail");
+    let ct = doc
+        .raw_content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    let bytes = serde_json::to_vec(&Value::Object(body)).expect("json serialisation cannot fail");
     raw_body_bytes(StatusCode::OK, ct, bytes)
 }
 

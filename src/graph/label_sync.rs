@@ -58,10 +58,7 @@ async fn list_categories_me(State(state): State<AppState>) -> Response {
     list_categories_impl(state, &account_id).await
 }
 
-async fn get_category_me(
-    State(state): State<AppState>,
-    Path(category): Path<String>,
-) -> Response {
+async fn get_category_me(State(state): State<AppState>, Path(category): Path<String>) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_category_impl(state, &account_id, &category).await
 }
@@ -96,10 +93,7 @@ async fn delete_category_me(
 
 // ── /users/{user}/ wrappers ─────────────────────────────────────────
 
-async fn list_categories_user(
-    State(state): State<AppState>,
-    Path(user): Path<String>,
-) -> Response {
+async fn list_categories_user(State(state): State<AppState>, Path(user): Path<String>) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
@@ -163,7 +157,10 @@ async fn list_categories_impl(state: AppState, account_id: &str) -> Response {
         return o;
     }
     let fixture = state.fixture();
-    let value: Vec<Value> = fixture.categories_for(account_id).map(serialize_category).collect();
+    let value: Vec<Value> = fixture
+        .categories_for(account_id)
+        .map(serialize_category)
+        .collect();
     ok_json(json!({
         "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#me/outlook/masterCategories",
         "value": value,
@@ -178,7 +175,10 @@ async fn get_category_impl(state: AppState, account_id: &str, category: &str) ->
         return o;
     }
     let fixture = state.fixture();
-    match fixture.categories_for(account_id).find(|c| c.id == category) {
+    match fixture
+        .categories_for(account_id)
+        .find(|c| c.id == category)
+    {
         Some(c) => ok_json(serialize_category(c)),
         None => not_found(category),
     }
@@ -221,10 +221,7 @@ async fn create_category_impl(
             "displayName is required",
         );
     };
-    let color = obj
-        .get("color")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let color = obj.get("color").and_then(Value::as_str).map(str::to_string);
     let client_id = obj.get("id").and_then(Value::as_str).map(str::to_string);
 
     let result: Result<Value, Response> = {
@@ -370,7 +367,8 @@ async fn delete_category_impl(
         let acct = account_id.to_string();
         let _ = fix.mutate(|f| {
             let before = f.categories.len();
-            f.categories.retain(|c| !(c.account_id == acct && c.id == id));
+            f.categories
+                .retain(|c| !(c.account_id == acct && c.id == id));
             if f.categories.len() < before {
                 MutationDiff {
                     category_destroyed: vec![id.clone()],

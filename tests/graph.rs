@@ -87,7 +87,11 @@ async fn send_json(
         }
         None => Body::empty(),
     };
-    let resp = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = if bytes.is_empty() {
@@ -129,8 +133,7 @@ async fn graph_create_draft_then_send() {
     );
 
     // Send it (bifrost POSTs an empty body); unknown id 404s.
-    let (status, _) =
-        send_json(&app, "POST", &format!("/v1.0/me/messages/{id}/send"), None).await;
+    let (status, _) = send_json(&app, "POST", &format!("/v1.0/me/messages/{id}/send"), None).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let (status, _) = send_json(&app, "POST", "/v1.0/me/messages/ghost/send", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -186,8 +189,13 @@ async fn graph_settings_stubs() {
     assert_eq!(status, StatusCode::CREATED);
     assert!(v["id"].is_string());
     assert_eq!(v["expirationDateTime"], "2026-07-01T00:00:00Z");
-    let (status, _) =
-        send_json(&app, "DELETE", "/v1.0/subscriptions/mock-subscription-1", None).await;
+    let (status, _) = send_json(
+        &app,
+        "DELETE",
+        "/v1.0/subscriptions/mock-subscription-1",
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
@@ -240,8 +248,7 @@ async fn graph_mailfolder_crud_round_trip() {
     assert_eq!(v["parentFolderId"], "mbx-inbox");
 
     // Delete it; it disappears from the folder list.
-    let (status, _) =
-        send_json(&app, "DELETE", &format!("/v1.0/me/mailFolders/{id}"), None).await;
+    let (status, _) = send_json(&app, "DELETE", &format!("/v1.0/me/mailFolders/{id}"), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let (status, v) = get_json_with(app, "/v1.0/me/mailFolders").await;
@@ -275,8 +282,7 @@ async fn graph_get_single_message_projects_email() {
 #[tokio::test]
 async fn graph_message_value_returns_assembled_rfc822() {
     // bifrost's open_raw_rfc822 defers real body bytes to $value.
-    let (status, bytes, _headers) =
-        get_raw(router(), "/v1.0/me/messages/email-001/$value").await;
+    let (status, bytes, _headers) = get_raw(router(), "/v1.0/me/messages/email-001/$value").await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).unwrap();
     assert!(body.contains("Subject: Hello"), "got: {body}");
@@ -299,8 +305,7 @@ async fn graph_messages_collection_filters_by_conversation() {
 
     // conversationId filter narrows to that thread (bifrost's
     // message_values_for_thread path).
-    let (status, v) =
-        get_json("/v1.0/me/messages?$filter=conversationId%20eq%20'email-002'").await;
+    let (status, v) = get_json("/v1.0/me/messages?$filter=conversationId%20eq%20'email-002'").await;
     assert_eq!(status, StatusCode::OK);
     let vals = v["value"].as_array().unwrap();
     assert_eq!(vals.len(), 1);
@@ -536,21 +541,17 @@ async fn graph_directory_search_matches_accounts() {
     assert!(mails.contains(&"test@example.com"), "got {mails:?}");
 
     // A non-matching prefix yields an empty directory.
-    let (status, v) = get_json(
-        "/v1.0/users?$filter=startswith(displayName,'zzz')%20or%20startswith(mail,'zzz')",
-    )
-    .await;
+    let (status, v) =
+        get_json("/v1.0/users?$filter=startswith(displayName,'zzz')%20or%20startswith(mail,'zzz')")
+            .await;
     assert_eq!(status, StatusCode::OK);
     assert!(v["value"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn graph_list_message_attachments_returns_metadata_with_bytes() {
-    let (status, v) = get_json_with(
-        attach_router(),
-        "/v1.0/me/messages/email-001/attachments",
-    )
-    .await;
+    let (status, v) =
+        get_json_with(attach_router(), "/v1.0/me/messages/email-001/attachments").await;
     assert_eq!(status, StatusCode::OK);
     let arr = v["value"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
@@ -559,7 +560,10 @@ async fn graph_list_message_attachments_returns_metadata_with_bytes() {
     assert_eq!(a["name"], "sample.txt");
     assert_eq!(a["contentType"], "text/plain");
     assert_eq!(a["@odata.type"], "#microsoft.graph.fileAttachment");
-    assert!(a["contentBytes"].as_str().unwrap().ends_with("=") || !a["contentBytes"].as_str().unwrap().is_empty());
+    assert!(
+        a["contentBytes"].as_str().unwrap().ends_with("=")
+            || !a["contentBytes"].as_str().unwrap().is_empty()
+    );
 }
 
 #[tokio::test]
@@ -590,11 +594,8 @@ async fn graph_messages_with_expand_attachments_embeds_them() {
 
 #[tokio::test]
 async fn graph_messages_without_expand_omits_attachment_data() {
-    let (status, v) = get_json_with(
-        attach_router(),
-        "/v1.0/me/mailFolders/mbx-inbox/messages",
-    )
-    .await;
+    let (status, v) =
+        get_json_with(attach_router(), "/v1.0/me/mailFolders/mbx-inbox/messages").await;
     assert_eq!(status, StatusCode::OK);
     let msg = &v["value"][0];
     assert_eq!(msg["hasAttachments"], true);
@@ -660,12 +661,7 @@ async fn list_messages_in_inbox() {
     assert_eq!(m["body"]["contentType"], "text");
     assert_eq!(m["body"]["content"], "Reply body.");
     // ISO 8601 with `Z` suffix.
-    assert!(
-        m["receivedDateTime"]
-            .as_str()
-            .unwrap()
-            .ends_with("Z")
-    );
+    assert!(m["receivedDateTime"].as_str().unwrap().ends_with("Z"));
     // Recipients shape.
     let from = &m["from"];
     assert_eq!(from["emailAddress"]["address"], "carol@example.com");
@@ -681,8 +677,7 @@ async fn list_messages_in_inbox() {
     assert!(
         headers
             .iter()
-            .any(|h| h["name"] == "In-Reply-To"
-                && h["value"] == "<email-001@example.com>")
+            .any(|h| h["name"] == "In-Reply-To" && h["value"] == "<email-001@example.com>")
     );
 }
 
@@ -705,8 +700,7 @@ async fn list_messages_with_filter_after_drops_older_messages() {
 
 #[tokio::test]
 async fn list_messages_pagination_emits_next_link_with_skiptoken() {
-    let (_status, v) =
-        get_json("/v1.0/me/mailFolders/inbox/messages?$top=1").await;
+    let (_status, v) = get_json("/v1.0/me/mailFolders/inbox/messages?$top=1").await;
     let ids: Vec<&str> = v["value"]
         .as_array()
         .unwrap()
@@ -734,8 +728,7 @@ async fn list_messages_pagination_emits_next_link_with_skiptoken() {
 
 #[tokio::test]
 async fn delta_initial_emits_messages_then_delta_link() {
-    let (_status, v) =
-        get_json("/v1.0/me/mailFolders/inbox/messages/delta").await;
+    let (_status, v) = get_json("/v1.0/me/mailFolders/inbox/messages/delta").await;
     assert_eq!(v["value"].as_array().unwrap().len(), 2);
     let delta = v["@odata.deltaLink"].as_str().unwrap();
     assert!(delta.contains("$deltatoken="));
@@ -746,7 +739,12 @@ async fn delta_initial_emits_messages_then_delta_link() {
     let path = delta.trim_start_matches("http://127.0.0.1:9999");
     let (_status, v2) = get_json(path).await;
     assert!(v2["value"].as_array().unwrap().is_empty());
-    assert!(v2["@odata.deltaLink"].as_str().unwrap().contains("$deltatoken="));
+    assert!(
+        v2["@odata.deltaLink"]
+            .as_str()
+            .unwrap()
+            .contains("$deltatoken=")
+    );
 }
 
 #[tokio::test]
@@ -754,10 +752,8 @@ async fn delta_with_deltatoken_latest_emits_empty_dump() {
     // The "$deltatoken=latest" shortcut: client uses this when
     // discovering a brand-new folder mid-cycle and just wants a
     // forward-only cursor, not a full message dump.
-    let (_status, v) = get_json(
-        "/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=latest",
-    )
-    .await;
+    let (_status, v) =
+        get_json("/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=latest").await;
     assert!(v["value"].as_array().unwrap().is_empty());
     assert!(v["@odata.deltaLink"].is_string());
 }
@@ -765,8 +761,7 @@ async fn delta_with_deltatoken_latest_emits_empty_dump() {
 #[tokio::test]
 async fn delta_paginates_when_top_smaller_than_total() {
     // $top=1: first page has email-002 + nextLink (no deltaLink yet).
-    let (_status, v) =
-        get_json("/v1.0/me/mailFolders/inbox/messages/delta?$top=1").await;
+    let (_status, v) = get_json("/v1.0/me/mailFolders/inbox/messages/delta?$top=1").await;
     assert_eq!(v["value"].as_array().unwrap().len(), 1);
     assert!(v.get("@odata.nextLink").is_some());
     assert!(v.get("@odata.deltaLink").is_none());
@@ -785,10 +780,7 @@ async fn malformed_skiptoken_returns_400_not_silent_restart() {
     // Regression: a $skiptoken we can't decode used to silently
     // fall back to offset 0, which would loop a client forever on
     // a stale or corrupted token. Now it surfaces as 400.
-    let (status, v) = get_json(
-        "/v1.0/me/mailFolders/inbox/messages?$skiptoken=garbage",
-    )
-    .await;
+    let (status, v) = get_json("/v1.0/me/mailFolders/inbox/messages?$skiptoken=garbage").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(v["error"]["code"], "InvalidQueryParameter");
 }
@@ -817,10 +809,10 @@ async fn child_folders_for_top_level_folder() {
 // ── Reactive-callback tests ────────────────────────────────────────
 
 fn router_with_lua_scenario(scenario: &str) -> axum::Router {
-    let (fixture, dispatcher) =
-        lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
+    let (fixture, dispatcher) = lua::load_source_with_dispatcher(scenario, "@cb").unwrap();
     graph::router(
-        graph::AppState::for_test(saehrimnir::shared::handle(fixture)).with_dispatcher(Arc::new(dispatcher)),
+        graph::AppState::for_test(saehrimnir::shared::handle(fixture))
+            .with_dispatcher(Arc::new(dispatcher)),
     )
 }
 
@@ -852,8 +844,7 @@ async fn list_messages_callback_overrides_with_400() {
         end)
     "#;
     let router = router_with_lua_scenario(scenario);
-    let (status, v) =
-        get_json_via(router, "/v1.0/me/mailFolders/inbox/messages").await;
+    let (status, v) = get_json_via(router, "/v1.0/me/mailFolders/inbox/messages").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(v["error"]["code"], "ServerError");
     assert_eq!(v["error"]["message"], "synthetic inbox");
@@ -873,19 +864,11 @@ async fn delta_messages_callback_call_index_increments() {
     "#;
     let router = router_with_lua_scenario(scenario);
     // First call passes through (default delta dump).
-    let (s1, v1) = get_json_via(
-        router.clone(),
-        "/v1.0/me/mailFolders/inbox/messages/delta",
-    )
-    .await;
+    let (s1, v1) = get_json_via(router.clone(), "/v1.0/me/mailFolders/inbox/messages/delta").await;
     assert_eq!(s1, StatusCode::OK);
     assert!(v1.get("@odata.deltaLink").is_some());
     // Second call gets the override.
-    let (s2, v2) = get_json_via(
-        router,
-        "/v1.0/me/mailFolders/inbox/messages/delta",
-    )
-    .await;
+    let (s2, v2) = get_json_via(router, "/v1.0/me/mailFolders/inbox/messages/delta").await;
     assert_eq!(s2, StatusCode::BAD_REQUEST);
     assert_eq!(v2["error"]["code"], "Throttled");
 }
@@ -900,7 +883,8 @@ async fn graph_middleware_records_request_log_entries() {
     let request_log = RequestLog::default();
     let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
     let app = graph::router(
-        graph::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(request_log.clone()),
+        graph::AppState::for_test(saehrimnir::shared::handle(fix))
+            .with_request_log(request_log.clone()),
     );
 
     let _ = get_json_with(app.clone(), "/v1.0/me/mailFolders").await;
@@ -918,10 +902,7 @@ async fn graph_middleware_records_request_log_entries() {
 // ── Calendar surface (Microsoft Graph) ──────────────────────────────
 
 fn calendar_router() -> axum::Router {
-    let fix = fixture::load(std::path::Path::new(
-        "fixtures/graph-calendar-small.toml",
-    ))
-    .unwrap();
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
     graph::router(graph::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
@@ -986,8 +967,7 @@ async fn graph_get_calendar_404s_unknown_id() {
 
 #[tokio::test]
 async fn graph_list_events_filters_by_calendar_and_paginates() {
-    let (status, v) =
-        get_json_with(calendar_router(), "/v1.0/me/calendars/cal-work/events").await;
+    let (status, v) = get_json_with(calendar_router(), "/v1.0/me/calendars/cal-work/events").await;
     assert_eq!(status, StatusCode::OK);
     let arr = v["value"].as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -1044,7 +1024,12 @@ async fn graph_calendar_view_delta_returns_full_then_empty() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["value"].as_array().unwrap().len(), 2);
-    assert!(v["@odata.deltaLink"].as_str().unwrap().contains("$deltatoken="));
+    assert!(
+        v["@odata.deltaLink"]
+            .as_str()
+            .unwrap()
+            .contains("$deltatoken=")
+    );
 
     let (_, v2) = get_json_with(
         calendar_router(),
@@ -1066,8 +1051,11 @@ async fn graph_get_event_projects_fixture() {
 async fn graph_calendar_view_filters_by_range() {
     // No bounds: both cal-work events (the non-delta read bifrost's
     // events_in_range drives).
-    let (status, v) =
-        get_json_with(calendar_router(), "/v1.0/me/calendars/cal-work/calendarView").await;
+    let (status, v) = get_json_with(
+        calendar_router(),
+        "/v1.0/me/calendars/cal-work/calendarView",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["value"].as_array().unwrap().len(), 2);
 
@@ -1102,21 +1090,28 @@ async fn graph_event_rsvp() {
     assert_eq!(status, StatusCode::ACCEPTED);
 
     // unknown action -> 400, unknown event -> 404.
-    let (status, _) =
-        send_json(&app, "POST", "/v1.0/me/events/ev-001/frobnicate", Some(json!({}))).await;
+    let (status, _) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/events/ev-001/frobnicate",
+        Some(json!({})),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, _) =
-        send_json(&app, "POST", "/v1.0/me/events/ghost/accept", Some(json!({}))).await;
+    let (status, _) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/events/ghost/accept",
+        Some(json!({})),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn graph_create_event_echoes_body_and_logs_request() {
     let log = saehrimnir::request_log::RequestLog::default();
-    let fix = fixture::load(std::path::Path::new(
-        "fixtures/graph-calendar-small.toml",
-    ))
-    .unwrap();
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
     let app = graph::router(
         graph::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(log.clone()),
     );
@@ -1149,7 +1144,9 @@ async fn graph_create_event_echoes_body_and_logs_request() {
     let snap = log.snapshot();
     let mutation = snap
         .iter()
-        .find(|e| e.command == "POST /v1.0/me/calendars/cal-work/events" && !e.detail["body"].is_null())
+        .find(|e| {
+            e.command == "POST /v1.0/me/calendars/cal-work/events" && !e.detail["body"].is_null()
+        })
         .expect("mutation entry recorded");
     assert_eq!(mutation.detail["body"]["subject"], "New meeting");
 }
@@ -1157,10 +1154,7 @@ async fn graph_create_event_echoes_body_and_logs_request() {
 #[tokio::test]
 async fn graph_patch_event_echoes_body_and_logs_request() {
     let log = saehrimnir::request_log::RequestLog::default();
-    let fix = fixture::load(std::path::Path::new(
-        "fixtures/graph-calendar-small.toml",
-    ))
-    .unwrap();
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
     let app = graph::router(
         graph::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(log.clone()),
     );
@@ -1184,10 +1178,7 @@ async fn graph_patch_event_echoes_body_and_logs_request() {
 #[tokio::test]
 async fn graph_delete_event_returns_204_and_logs_request() {
     let log = saehrimnir::request_log::RequestLog::default();
-    let fix = fixture::load(std::path::Path::new(
-        "fixtures/graph-calendar-small.toml",
-    ))
-    .unwrap();
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
     let app = graph::router(
         graph::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(log.clone()),
     );
@@ -1205,17 +1196,16 @@ async fn graph_delete_event_returns_204_and_logs_request() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let snap = log.snapshot();
-    assert!(snap.iter().any(|e| e.command == "DELETE /v1.0/me/events/ev-001"
-        && e.detail["id"] == "ev-001"));
+    assert!(
+        snap.iter()
+            .any(|e| e.command == "DELETE /v1.0/me/events/ev-001" && e.detail["id"] == "ev-001")
+    );
 }
 
 #[tokio::test]
 async fn graph_patch_event_404s_unknown_id() {
     let log = saehrimnir::request_log::RequestLog::default();
-    let fix = fixture::load(std::path::Path::new(
-        "fixtures/graph-calendar-small.toml",
-    ))
-    .unwrap();
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
     let app = graph::router(
         graph::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(log.clone()),
     );
@@ -1233,10 +1223,7 @@ async fn graph_patch_event_404s_unknown_id() {
 #[tokio::test]
 async fn graph_delete_event_404s_unknown_id() {
     let log = saehrimnir::request_log::RequestLog::default();
-    let fix = fixture::load(std::path::Path::new(
-        "fixtures/graph-calendar-small.toml",
-    ))
-    .unwrap();
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
     let app = graph::router(
         graph::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(log.clone()),
     );
@@ -1257,8 +1244,11 @@ async fn graph_delete_event_404s_unknown_id() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["error"]["code"], "ResourceNotFound");
     let snap = log.snapshot();
-    assert!(!snap.iter().any(|e| e.command.starts_with("DELETE /v1.0/me/events/")
-        && !e.detail["id"].is_null()));
+    assert!(
+        !snap
+            .iter()
+            .any(|e| e.command.starts_with("DELETE /v1.0/me/events/") && !e.detail["id"].is_null())
+    );
 }
 
 // ── Calendar mutation round-trip through events/delta ──────────────
@@ -1317,8 +1307,9 @@ async fn graph_calendar_view_delta_does_not_leak_tombstones_across_calendars() {
     .await;
     let value = v["value"].as_array().unwrap();
     assert!(
-        value.iter().any(|e| e["id"] == "ev-001"
-            && e["@removed"]["reason"] == "deleted"),
+        value
+            .iter()
+            .any(|e| e["id"] == "ev-001" && e["@removed"]["reason"] == "deleted"),
         "cal-work missed the tombstone it should see: {value:?}"
     );
 }
@@ -1393,7 +1384,11 @@ async fn graph_calendar_mutations_round_trip_through_delta() {
     let (status, v) = get_json_with(app.clone(), &path_with_token).await;
     assert_eq!(status, StatusCode::OK);
     let value = v["value"].as_array().unwrap();
-    assert_eq!(value.len(), 3, "expected created+updated+destroyed: {value:?}");
+    assert_eq!(
+        value.len(),
+        3,
+        "expected created+updated+destroyed: {value:?}"
+    );
 
     // The created event projects with its full body.
     let created_in_delta = value
@@ -1428,15 +1423,10 @@ async fn graph_calendar_mutations_round_trip_through_delta() {
 
     // Sanity: the initial bootstrap had two events; current cal-work
     // event count is 2 (one created + one survivor after delete).
-    let (_, v3) = get_json_with(
-        app,
-        "/v1.0/me/calendars/cal-work/events",
-    )
-    .await;
+    let (_, v3) = get_json_with(app, "/v1.0/me/calendars/cal-work/events").await;
     assert_eq!(v3["value"].as_array().unwrap().len(), 2);
     let _ = initial_events; // documenting the pre-state was 2 too.
 }
-
 
 // ── Contact sync ─────────────────────────────────────────────────────
 
@@ -1464,11 +1454,7 @@ async fn graph_contact_folders_list_emits_two_folders() {
 
 #[tokio::test]
 async fn graph_contact_folder_by_id_returns_single_folder() {
-    let (status, v) = get_json_with(
-        router_contacts(),
-        "/v1.0/me/contactFolders/cf-default",
-    )
-    .await;
+    let (status, v) = get_json_with(router_contacts(), "/v1.0/me/contactFolders/cf-default").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["id"], "cf-default");
     assert_eq!(v["displayName"], "Contacts");
@@ -1476,22 +1462,14 @@ async fn graph_contact_folder_by_id_returns_single_folder() {
 
 #[tokio::test]
 async fn graph_contact_folder_default_alias_resolves_to_is_default_folder() {
-    let (status, v) = get_json_with(
-        router_contacts(),
-        "/v1.0/me/contactFolders/default",
-    )
-    .await;
+    let (status, v) = get_json_with(router_contacts(), "/v1.0/me/contactFolders/default").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["id"], "cf-default");
 }
 
 #[tokio::test]
 async fn graph_contact_folder_unknown_id_returns_404() {
-    let (status, _) = get_json_with(
-        router_contacts(),
-        "/v1.0/me/contactFolders/cf-bogus",
-    )
-    .await;
+    let (status, _) = get_json_with(router_contacts(), "/v1.0/me/contactFolders/cf-bogus").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -1507,10 +1485,7 @@ async fn graph_contacts_in_folder_emit_full_projection() {
     // Three contacts in cf-default: contact-001, contact-002, contact-003.
     // contact-100 is in cf-vendors and must NOT appear here.
     assert_eq!(contacts.len(), 3);
-    let ids: Vec<&str> = contacts
-        .iter()
-        .map(|c| c["id"].as_str().unwrap())
-        .collect();
+    let ids: Vec<&str> = contacts.iter().map(|c| c["id"].as_str().unwrap()).collect();
     assert_eq!(ids, ["contact-001", "contact-002", "contact-003"]);
 
     // Wire shape: id, parentFolderId, displayName, emailAddresses
@@ -1565,11 +1540,7 @@ async fn graph_single_contact_in_folder_returns_one_body() {
 
 #[tokio::test]
 async fn graph_single_contact_folder_agnostic_resolves_by_id() {
-    let (status, v) = get_json_with(
-        router_contacts(),
-        "/v1.0/me/contacts/contact-100",
-    )
-    .await;
+    let (status, v) = get_json_with(router_contacts(), "/v1.0/me/contacts/contact-100").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["id"], "contact-100");
     assert_eq!(v["parentFolderId"], "cf-vendors");
@@ -1578,8 +1549,11 @@ async fn graph_single_contact_folder_agnostic_resolves_by_id() {
 #[tokio::test]
 async fn graph_list_all_contacts_spans_folders() {
     // bifrost's contacts_list(None) hits the folder-agnostic list.
-    let (status, v) =
-        get_json_with(router_contacts(), "/v1.0/me/contacts?$select=id,displayName").await;
+    let (status, v) = get_json_with(
+        router_contacts(),
+        "/v1.0/me/contacts?$select=id,displayName",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let ids: Vec<&str> = v["value"]
         .as_array()
@@ -1692,16 +1666,9 @@ async fn graph_contacts_delta_initial_dump_then_latest_shortcut() {
 
 // ── Master categories ───────────────────────────────────────────────
 
-fn categories_router_with_log(
-    log: saehrimnir::request_log::RequestLog,
-) -> axum::Router {
-    let fix = fixture::load(std::path::Path::new(
-        "fixtures/graph-categories-small.toml",
-    ))
-    .unwrap();
-    graph::router(
-        graph::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(log),
-    )
+fn categories_router_with_log(log: saehrimnir::request_log::RequestLog) -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-categories-small.toml")).unwrap();
+    graph::router(graph::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(log))
 }
 
 fn categories_router() -> axum::Router {
@@ -1710,11 +1677,7 @@ fn categories_router() -> axum::Router {
 
 #[tokio::test]
 async fn graph_list_categories_projects_fixture_in_declaration_order() {
-    let (status, v) = get_json_with(
-        categories_router(),
-        "/v1.0/me/outlook/masterCategories",
-    )
-    .await;
+    let (status, v) = get_json_with(categories_router(), "/v1.0/me/outlook/masterCategories").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         v["@odata.context"],
@@ -1767,8 +1730,13 @@ async fn graph_create_category_mints_id_when_absent_and_bumps_state() {
         "displayName": "Urgent",
         "color": "preset5",
     });
-    let (status, v) =
-        json_request(app.clone(), "POST", "/v1.0/me/outlook/masterCategories", Some(body)).await;
+    let (status, v) = json_request(
+        app.clone(),
+        "POST",
+        "/v1.0/me/outlook/masterCategories",
+        Some(body),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     // The fixture seeds `synthetic_category_seq` to the highest of
     // (a) the largest `mock-category-N` declared (0 here) and
@@ -1788,8 +1756,7 @@ async fn graph_create_category_mints_id_when_absent_and_bumps_state() {
     assert_eq!(entry.detail["body"]["displayName"], "Urgent");
 
     // Follow-up list reflects the new category.
-    let (_, v) =
-        get_json_with(app, "/v1.0/me/outlook/masterCategories").await;
+    let (_, v) = get_json_with(app, "/v1.0/me/outlook/masterCategories").await;
     assert_eq!(v["value"].as_array().unwrap().len(), 4);
 }
 
@@ -1898,9 +1865,10 @@ async fn graph_delete_category_returns_204_and_removes_resource() {
     assert_eq!(v["value"].as_array().unwrap().len(), 2);
 
     let snap = log.snapshot();
-    assert!(snap.iter().any(|e| e.command
-        == "DELETE /v1.0/me/outlook/masterCategories/cat-work"
-        && e.detail["id"] == "cat-work"));
+    assert!(snap.iter().any(
+        |e| e.command == "DELETE /v1.0/me/outlook/masterCategories/cat-work"
+            && e.detail["id"] == "cat-work"
+    ));
 }
 
 #[tokio::test]
@@ -1923,10 +1891,7 @@ async fn graph_delete_category_404s_unknown_id() {
 async fn graph_category_mutation_records_change_log_transition() {
     // POST -> PATCH -> DELETE should bump fixture.state three times
     // and append three transitions tagged with the right ids.
-    let fix = fixture::load(std::path::Path::new(
-        "fixtures/graph-categories-small.toml",
-    ))
-    .unwrap();
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-categories-small.toml")).unwrap();
     let handle = saehrimnir::shared::handle(fix);
     let initial_state = handle.read().unwrap().primary_state().to_string();
     let app = graph::router(graph::AppState::for_test(Arc::clone(&handle)));
@@ -2069,11 +2034,8 @@ async fn graph_users_named_account_lists_that_accounts_folders() {
 
 #[tokio::test]
 async fn graph_users_me_alias_resolves_to_primary() {
-    let (status, v) = get_json_with(
-        multi_account_graph_router(),
-        "/v1.0/users/me/mailFolders",
-    )
-    .await;
+    let (status, v) =
+        get_json_with(multi_account_graph_router(), "/v1.0/users/me/mailFolders").await;
     assert_eq!(status, StatusCode::OK);
     let folders = v["value"].as_array().unwrap();
     assert_eq!(folders.len(), 1);
@@ -2208,11 +2170,7 @@ async fn graph_users_contact_folders_scope_by_account() {
     assert_eq!(folders[0]["id"], "cf-secondary");
 
     // /me sees only primary's folder.
-    let (status, v) = get_json_with(
-        multi_account_graph_router(),
-        "/v1.0/me/contactFolders",
-    )
-    .await;
+    let (status, v) = get_json_with(multi_account_graph_router(), "/v1.0/me/contactFolders").await;
     assert_eq!(status, StatusCode::OK);
     let folders = v["value"].as_array().unwrap();
     assert_eq!(folders.len(), 1);
@@ -2308,30 +2266,19 @@ async fn graph_groups_lists_every_declared_group() {
 
 #[tokio::test]
 async fn graph_groups_single_returns_resource_or_404() {
-    let (status, v) = get_json_with(
-        multi_account_graph_router(),
-        "/v1.0/groups/grp-leads",
-    )
-    .await;
+    let (status, v) = get_json_with(multi_account_graph_router(), "/v1.0/groups/grp-leads").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["id"], "grp-leads");
 
-    let (status, v) = get_json_with(
-        multi_account_graph_router(),
-        "/v1.0/groups/grp-bogus",
-    )
-    .await;
+    let (status, v) = get_json_with(multi_account_graph_router(), "/v1.0/groups/grp-bogus").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(v["error"]["code"], "ResourceNotFound");
 }
 
 #[tokio::test]
 async fn graph_group_members_projects_accounts_as_users() {
-    let (status, v) = get_json_with(
-        multi_account_graph_router(),
-        "/v1.0/groups/grp-eng/members",
-    )
-    .await;
+    let (status, v) =
+        get_json_with(multi_account_graph_router(), "/v1.0/groups/grp-eng/members").await;
     assert_eq!(status, StatusCode::OK);
     let members = v["value"].as_array().unwrap();
     assert_eq!(members.len(), 2);
@@ -2381,11 +2328,7 @@ async fn graph_users_memberof_scopes_by_account() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // `me` resolves to primary on the users/{} path too.
-    let (_, v) = get_json_with(
-        multi_account_graph_router(),
-        "/v1.0/users/me/memberOf",
-    )
-    .await;
+    let (_, v) = get_json_with(multi_account_graph_router(), "/v1.0/users/me/memberOf").await;
     let groups = v["value"].as_array().unwrap();
     assert_eq!(groups.len(), 2);
 }
@@ -2480,4 +2423,3 @@ async fn graph_patch_recurrence_clears_with_null() {
         "expected recurrence cleared: {v}"
     );
 }
-

@@ -72,10 +72,7 @@ fn serialize_calendar(c: &Calendar) -> Value {
     obj.insert("name".into(), Value::String(c.name.clone()));
     obj.insert(
         "color".into(),
-        c.color
-            .clone()
-            .map(Value::String)
-            .unwrap_or(Value::Null),
+        c.color.clone().map(Value::String).unwrap_or(Value::Null),
     );
     obj.insert("isDefault".into(), Value::Bool(c.is_default));
     obj.insert("isVisible".into(), Value::Bool(true));
@@ -209,10 +206,7 @@ fn serialize_event(e: &Event) -> Value {
 
     if let Some(loc) = &e.location {
         let mut locs = Map::new();
-        locs.insert(
-            "loc1".into(),
-            json!({"@type": "Location", "name": loc}),
-        );
+        locs.insert("loc1".into(), json!({"@type": "Location", "name": loc}));
         out.insert("locations".into(), Value::Object(locs));
     }
 
@@ -221,10 +215,7 @@ fn serialize_event(e: &Event) -> Value {
         participants.insert("org".into(), serialize_participant(org, true));
     }
     for (idx, att) in e.attendees.iter().enumerate() {
-        participants.insert(
-            format!("att{}", idx + 1),
-            serialize_participant(att, false),
-        );
+        participants.insert(format!("att{}", idx + 1), serialize_participant(att, false));
     }
     if !participants.is_empty() {
         out.insert("participants".into(), Value::Object(participants));
@@ -405,16 +396,16 @@ fn serialize_participant(addr: &Address, is_owner: bool) -> Value {
         roles.insert("attendee".into(), Value::Bool(true));
     }
     p.insert("roles".into(), Value::Object(roles));
-    p.insert("participationStatus".into(), Value::String("needs-action".into()));
+    p.insert(
+        "participationStatus".into(),
+        Value::String("needs-action".into()),
+    );
     Value::Object(p)
 }
 
 // ── CalendarEvent/changes ───────────────────────────────────────────
 
-pub(crate) fn calendar_event_changes(
-    fixture: &Fixture,
-    args: &Value,
-) -> Result<Value, Value> {
+pub(crate) fn calendar_event_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?;
     let since_state = require_since_state(args)?;
 
@@ -422,15 +413,17 @@ pub(crate) fn calendar_event_changes(
     // so use the cross-calendar walker. Per-calendar dominance
     // (created+destroyed cancels) already applied by
     // `apply_dominance_and_dedup` inside `delta_since`.
-    let delta = fixture.event_delta_since_any(since_state, account_id).ok_or_else(|| {
-        json!({
-            "type": "cannotCalculateChanges",
-            "description": format!(
-                "sinceState {since_state:?} is not a known fixture state \
-                 (older than the seed or evicted from the bounded change log)"
-            ),
-        })
-    })?;
+    let delta = fixture
+        .event_delta_since_any(since_state, account_id)
+        .ok_or_else(|| {
+            json!({
+                "type": "cannotCalculateChanges",
+                "description": format!(
+                    "sinceState {since_state:?} is not a known fixture state \
+                     (older than the seed or evicted from the bounded change log)"
+                ),
+            })
+        })?;
 
     Ok(json!({
         "accountId": account_id,
@@ -640,10 +633,7 @@ fn parse_event_utc(val: &Value) -> Result<i64, Value> {
 
 // ── CalendarEvent/set ───────────────────────────────────────────────
 
-pub(crate) fn calendar_event_set(
-    fixture: &mut Fixture,
-    args: &Value,
-) -> Result<Value, Value> {
+pub(crate) fn calendar_event_set(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
     let account_id = require_account(fixture, args)?.to_string();
     if let Some(if_in_state) = args.get("ifInState").and_then(Value::as_str)
         && if_in_state != fixture.state_for(&account_id)
@@ -874,14 +864,11 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Value> {
                 event.attendees = atts;
             }
             "calendarIds" => {
-                if let Some(new_cal) = v
-                    .as_object()
-                    .and_then(|m| {
-                        m.iter()
-                            .find(|(_, vv)| vv.as_bool() == Some(true))
-                            .map(|(k, _)| k.clone())
-                    })
-                {
+                if let Some(new_cal) = v.as_object().and_then(|m| {
+                    m.iter()
+                        .find(|(_, vv)| vv.as_bool() == Some(true))
+                        .map(|(k, _)| k.clone())
+                }) {
                     event.calendar_id = new_cal;
                 }
             }
@@ -936,9 +923,7 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Value> {
             .and_then(Value::as_str)
             .unwrap_or(&default_duration);
         let (start, end) = parse_jscalendar_times(&start_str, duration_str, event.is_all_day)
-            .ok_or_else(|| {
-                set_error("invalidProperties", "could not parse start/duration")
-            })?;
+            .ok_or_else(|| set_error("invalidProperties", "could not parse start/duration"))?;
         event.start = start;
         event.end = end;
     }

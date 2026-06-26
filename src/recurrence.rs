@@ -297,8 +297,7 @@ fn parse_by_day(s: &str) -> Option<ByDay> {
 /// keeps the parser permissive against well-formed real-world rules.
 fn parse_until(s: &str) -> Option<DateTime<Utc>> {
     // UTC date-time, e.g. `20260315T100000Z`.
-    if let Ok(dt) =
-        chrono::NaiveDateTime::parse_from_str(s.trim_end_matches('Z'), "%Y%m%dT%H%M%S")
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s.trim_end_matches('Z'), "%Y%m%dT%H%M%S")
     {
         return Some(dt.and_utc());
     }
@@ -331,20 +330,38 @@ mod tests {
     fn parses_monthly_with_byday_ordinal() {
         let r = ParsedRule::parse("FREQ=MONTHLY;BYDAY=2MO,-1FR");
         assert_eq!(r.freq, Some(Frequency::Monthly));
-        assert_eq!(r.by_day[0], ByDay { ordinal: Some(2), weekday: Weekday::Mo });
-        assert_eq!(r.by_day[1], ByDay { ordinal: Some(-1), weekday: Weekday::Fr });
+        assert_eq!(
+            r.by_day[0],
+            ByDay {
+                ordinal: Some(2),
+                weekday: Weekday::Mo
+            }
+        );
+        assert_eq!(
+            r.by_day[1],
+            ByDay {
+                ordinal: Some(-1),
+                weekday: Weekday::Fr
+            }
+        );
     }
 
     #[test]
     fn parses_until_in_utc_form() {
         let r = ParsedRule::parse("FREQ=DAILY;UNTIL=20260315T100000Z");
-        assert_eq!(r.until, Some(Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap()));
+        assert_eq!(
+            r.until,
+            Some(Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap())
+        );
     }
 
     #[test]
     fn parses_until_date_only_form() {
         let r = ParsedRule::parse("FREQ=DAILY;UNTIL=20260315");
-        assert_eq!(r.until, Some(Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap()));
+        assert_eq!(
+            r.until,
+            Some(Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap())
+        );
     }
 
     #[test]

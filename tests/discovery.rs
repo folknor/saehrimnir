@@ -36,15 +36,25 @@ async fn get(path: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
         .unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, headers, bytes)
 }
 
 async fn get_json(path: &str) -> Value {
     let (status, _, bytes) = get(path).await;
     assert_eq!(status, StatusCode::OK, "GET {path}: status {status}");
-    serde_json::from_slice(&bytes)
-        .unwrap_or_else(|e| panic!("GET {path}: body is not JSON: {e}; raw={:?}", String::from_utf8_lossy(&bytes)))
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        panic!(
+            "GET {path}: body is not JSON: {e}; raw={:?}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
 }
 
 #[tokio::test]
@@ -57,7 +67,10 @@ async fn webfinger_serves_jrd_with_prefixed_href() {
     assert_eq!(v["subject"], "acct:user@corp.test");
     let links = v["links"].as_array().unwrap();
     assert_eq!(links.len(), 1);
-    assert_eq!(links[0]["rel"], "http://openid.net/specs/connect/1.0/issuer");
+    assert_eq!(
+        links[0]["rel"],
+        "http://openid.net/specs/connect/1.0/issuer"
+    );
     assert_eq!(
         links[0]["href"],
         format!("{BASE}/idp/realms/corp"),
@@ -67,32 +80,27 @@ async fn webfinger_serves_jrd_with_prefixed_href() {
 
 #[tokio::test]
 async fn webfinger_content_type_is_jrd() {
-    let (_, headers, _) = get(
-        "/corp.test/.well-known/webfinger?resource=acct:user@corp.test",
-    )
-    .await;
+    let (_, headers, _) =
+        get("/corp.test/.well-known/webfinger?resource=acct:user@corp.test").await;
     let ct = headers.get(axum::http::header::CONTENT_TYPE).unwrap();
     assert_eq!(ct.to_str().unwrap(), "application/jrd+json");
 }
 
 #[tokio::test]
 async fn webfinger_filters_by_rel_when_supplied() {
-    let v = get_json("/corp.test/.well-known/webfinger?resource=acct:x&rel=does-not-match")
-        .await;
+    let v = get_json("/corp.test/.well-known/webfinger?resource=acct:x&rel=does-not-match").await;
     assert!(v["links"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn webfinger_unknown_prefix_404s() {
-    let (status, _, _) =
-        get("/nope.test/.well-known/webfinger?resource=acct:x").await;
+    let (status, _, _) = get("/nope.test/.well-known/webfinger?resource=acct:x").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn webfinger_raw_body_passes_through_verbatim() {
-    let (status, _, bytes) =
-        get("/malformed-jrd.test/.well-known/webfinger?resource=acct:x").await;
+    let (status, _, bytes) = get("/malformed-jrd.test/.well-known/webfinger?resource=acct:x").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(std::str::from_utf8(&bytes).unwrap(), "this is not json {{[");
 }
@@ -102,20 +110,18 @@ async fn webfinger_emits_absolute_http_href_verbatim() {
     // Negative-test contract: when the fixture stages an absolute
     // `http://` href, the handler must NOT rewrite it - ratatoskr's
     // scheme check needs to see the raw http:// in the response.
-    let v = get_json(
-        "/insecure-href.test/.well-known/webfinger?resource=acct:x",
-    )
-    .await;
-    assert_eq!(
-        v["links"][0]["href"], "http://insecure.example/issuer",
-    );
+    let v = get_json("/insecure-href.test/.well-known/webfinger?resource=acct:x").await;
+    assert_eq!(v["links"][0]["href"], "http://insecure.example/issuer",);
 }
 
 #[tokio::test]
 async fn oidc_discovery_serves_full_document() {
     let v = get_json("/idp/realms/corp/.well-known/openid-configuration").await;
     assert_eq!(v["issuer"], format!("{BASE}/idp/realms/corp"));
-    assert_eq!(v["authorization_endpoint"], format!("{BASE}/oauth/authorize"));
+    assert_eq!(
+        v["authorization_endpoint"],
+        format!("{BASE}/oauth/authorize")
+    );
     assert_eq!(v["token_endpoint"], format!("{BASE}/oauth/token"));
     assert_eq!(v["userinfo_endpoint"], format!("{BASE}/oauth/userinfo"));
     let scopes = v["scopes_supported"].as_array().unwrap();
@@ -131,7 +137,8 @@ async fn oidc_discovery_with_mismatched_issuer_still_serves() {
     // client the staged document.
     let v = get_json("/wrong-issuer.test/.well-known/openid-configuration").await;
     assert_eq!(
-        v["issuer"], format!("{BASE}/something-else"),
+        v["issuer"],
+        format!("{BASE}/something-else"),
         "fixture-staged issuer must pass through unchanged so the \
          issuer-self-claim mismatch surfaces at the client",
     );
@@ -139,8 +146,7 @@ async fn oidc_discovery_with_mismatched_issuer_still_serves() {
 
 #[tokio::test]
 async fn oidc_discovery_unknown_prefix_404s() {
-    let (status, _, _) =
-        get("/nope.test/.well-known/openid-configuration").await;
+    let (status, _, _) = get("/nope.test/.well-known/openid-configuration").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -202,8 +208,8 @@ async fn discovery_requests_land_in_the_request_log() {
     // Wire up an explicit request log so we can read it back.
     let fix = fixture::load(std::path::Path::new("fixtures/discovery-small.toml")).unwrap();
     let log = saehrimnir::request_log::RequestLog::default();
-    let state = routes::AppState::for_test(saehrimnir::shared::handle(fix))
-        .with_request_log(log.clone());
+    let state =
+        routes::AppState::for_test(saehrimnir::shared::handle(fix)).with_request_log(log.clone());
     let r = routes::router(state);
 
     let _ = r
