@@ -48,7 +48,129 @@ pub fn router(state: AppState) -> Router {
         .route("/test/fixture/step", post(step_fixture))
         .route("/test/snapshot-state", get(snapshot_state))
         .route("/test/latency", get(get_latency).post(set_latency))
+        .route("/test/push/jmap", get(list_jmap_push))
+        .route("/test/push/graph", get(list_graph_push))
+        .route(
+            "/test/gmail/pubsub/messages",
+            get(list_pubsub).delete(clear_pubsub),
+        )
+        .route("/test/gmail/pubsub/publish", post(publish_pubsub))
+        .route("/test/gmail/pubsub/push-endpoint", post(set_pubsub_endpoint))
         .with_state(state)
+}
+
+// ── Test-only push observability + Gmail Pub/Sub control ────────────
+
+/// `GET /test/push/jmap` -> JSON array of every JMAP `StateChange`
+/// frame the push hub has emitted (oldest first). Lets a harness
+/// assert "the WebSocket push fired" without holding a live socket.
+async fn list_jmap_push(State(state): State<AppState>) -> Json<Value> {
+    Json(json!(state.shared.push.jmap_log()))
+}
+
+/// `GET /test/push/graph` -> JSON array of every Graph change-
+/// notification the push hub has emitted. Each entry is
+/// `{ "notification_url": <url>, "body": <Graph notification> }`.
+async fn list_graph_push(State(state): State<AppState>) -> Json<Value> {
+    Json(json!(state.shared.push.graph_log()))
+}
+
+/// `GET /test/gmail/pubsub/messages` -> JSON array of every Pub/Sub
+/// push envelope published onto the mock Pub/Sub source.
+async fn list_pubsub(State(state): State<AppState>) -> Json<Value> {
+    Json(json!(state.shared.push.pubsub_messages()))
+}
+
+/// `DELETE /test/gmail/pubsub/messages` -> clear the Pub/Sub sink.
+async fn clear_pubsub(State(state): State<AppState>) -> StatusCode {
+    state.shared.push.pubsub_clear();
+    StatusCode::NO_CONTENT
+}
+
+/// `POST /test/gmail/pubsub/publish` -> publish a Gmail notification
+/// envelope onto the mock Pub/Sub source. Body:
+/// ```text
+/// { "emailAddress": "a@example.com",   // required
+///   "historyId": 42,                   // required (number)
+///   "account_id": "account-1" }        // optional; routes the
+///                                       // delivery to that account's
+///                                       // registered push endpoint
+/// ```
+/// Returns the published Pub/Sub envelope. The state-mutation trigger
+/// publishes automatically for any account with an active `users.watch`;
+/// this route lets a harness stage a notification directly.
+async fn publish_pubsub(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = match body {
+        Some(Json(Value::Object(m))) => m,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "malformed body", "detail": "expected a JSON object" })),
+            )
+                .into_response();
+        }
+    };
+    let Some(email) = body.get("emailAddress").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "malformed body", "detail": "emailAddress (string) required" })),
+        )
+            .into_response();
+    };
+    let Some(history_id) = body.get("historyId").and_then(serde_json::Value::as_u64) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "malformed body", "detail": "historyId (number) required" })),
+        )
+            .into_response();
+    };
+    let account_id = body
+        .get("account_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(email);
+    let env = state.shared.push.publish_gmail(email, history_id, account_id);
+    (StatusCode::OK, Json(env)).into_response()
+}
+
+/// `POST /test/gmail/pubsub/push-endpoint` -> register the loopback
+/// URL a Pub/Sub push for an account is delivered to (mirrors a real
+/// Pub/Sub subscription's push-endpoint config). Body:
+/// `{ "account_id": "account-1", "url": "http://127.0.0.1:PORT/push" }`.
+async fn set_pubsub_endpoint(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = match body {
+        Some(Json(Value::Object(m))) => m,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "malformed body", "detail": "expected a JSON object" })),
+            )
+                .into_response();
+        }
+    };
+    let (Some(account_id), Some(url)) = (
+        body.get("account_id").and_then(|v| v.as_str()),
+        body.get("url").and_then(|v| v.as_str()),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "malformed body",
+                "detail": "account_id (string) and url (string) required",
+            })),
+        )
+            .into_response();
+    };
+    state
+        .shared
+        .push
+        .gmail_set_push_endpoint(account_id.to_string(), url.to_string());
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ── Test-only SMTP submission log ───────────────────────────────────
@@ -204,6 +326,7 @@ async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     state.shared.request_log.clear();
     state.shared.token_store.clear();
     state.shared.latency.clear();
+    state.shared.push.clear();
     if let Some(d) = &state.shared.dispatcher {
         d.reset_counts();
     }
@@ -570,6 +693,12 @@ async fn step_fixture(
         return (code, Json(payload)).into_response();
     }
 
+    // Snapshot which accounts this diff touches before `diff` is
+    // consumed by `record_transition`, so the push trigger below can
+    // fire per touched account (a mutation on account B must never
+    // push account A). `accounts_touched` resolves ownership the same
+    // way `record_transition` advances per-account logs.
+    let diff_for_push = diff.clone();
     let trans = fix.record_transition(diff);
 
     *cursor += 1;
@@ -578,7 +707,60 @@ async fn step_fixture(
 
     let new_state = fix.primary_state().to_string();
     let fixture_name = fix.name.clone();
+
+    // Build the per-account push snapshots while we still hold the
+    // fixture guard (the push hub never re-locks the fixture). The
+    // Graph `changeType` and `resourceData` id derive from the
+    // aggregate transition: dominant kind (created > deleted >
+    // updated) and the first touched message id.
+    let push_change_type = if !trans.email_created.is_empty() {
+        "created"
+    } else if !trans.email_destroyed.is_empty() {
+        "deleted"
+    } else {
+        "updated"
+    }
+    .to_string();
+    let push_resource_id = trans
+        .email_created
+        .first()
+        .or_else(|| trans.email_updated.first())
+        .or_else(|| trans.email_destroyed.first())
+        .cloned();
+    let pushes: Vec<crate::push::AccountPush> = fix
+        .accounts_touched(&diff_for_push)
+        .into_iter()
+        .map(|acct_id| {
+            let email_address = fix
+                .account(&acct_id)
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            // Bind every borrow of `acct_id` to a local so its temporary
+            // ends here; otherwise the borrows live to the end of the
+            // closure block and collide with the `account_id: acct_id`
+            // move below (E0505).
+            let state = fix.state_for(&acct_id).to_string();
+            let history_id = fix.gmail_history_id(&acct_id);
+            let has_calendars = fix.calendars_for(&acct_id).next().is_some();
+            let has_contacts = fix.contact_folders_for(&acct_id).next().is_some();
+            crate::push::AccountPush {
+                state,
+                history_id,
+                has_calendars,
+                has_contacts,
+                change_type: push_change_type.clone(),
+                resource_id: push_resource_id.clone(),
+                email_address,
+                account_id: acct_id,
+            }
+        })
+        .collect();
     drop(fix);
+
+    // Fire the push surfaces (JMAP StateChange / Gmail Pub/Sub / Graph
+    // webhook) for the touched accounts. No-op for accounts with no
+    // registered subscriber. See `crate::push`.
+    state.shared.push.emit_state_advance(&pushes);
 
     Json(json!({
         "ok": true,

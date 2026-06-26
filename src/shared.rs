@@ -20,6 +20,7 @@ use crate::fixture::Fixture;
 use crate::latency::LatencyKnob;
 use crate::lua::Dispatcher;
 use crate::oauth::TokenStore;
+use crate::push::PushHub;
 use crate::request_log::RequestLog;
 
 /// Shared, mutex-protected handle to the live `Fixture`. Cloning is
@@ -66,6 +67,12 @@ pub struct SharedHandles {
     /// fixtures that don't drive `POST /test/set-latency` see no
     /// delay.
     pub latency: LatencyKnob,
+    /// Provider push hub: the shared registry behind the JMAP
+    /// WebSocket, Gmail Pub/Sub, and Graph webhook surfaces. Cloning
+    /// is an `Arc` bump. The test-admin step path fires it on every
+    /// state advance; the client-facing subscribe endpoints register
+    /// into it. See `crate::push`.
+    pub push: PushHub,
 }
 
 impl SharedHandles {
@@ -84,6 +91,7 @@ impl SharedHandles {
             request_log: RequestLog::default(),
             token_store: TokenStore::default(),
             latency: LatencyKnob::default(),
+            push: PushHub::new(),
         }
     }
 

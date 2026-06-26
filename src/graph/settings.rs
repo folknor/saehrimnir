@@ -9,24 +9,35 @@
 //!   disabled auto-reply; PATCH echoes the submitted setting.
 //! - `messageRules` (inbox server-side filters) - bifrost's
 //!   `filters_*`. GET lists none; create/patch/delete are stubs.
-//! - `/subscriptions` (webhook push) - bifrost's `webhooks.rs`, only
-//!   driven in `PushMode::GraphSubscriptions`. Create/renew echo an
-//!   expiration; delete is a no-op 204.
 //!
-//! None of these record change-log transitions (nothing durable
-//! changes). Reads of state the mock does store stay in the mail /
-//! calendar / contacts modules.
+//! `mailboxSettings` and `messageRules` stay accept-and-ignore (no
+//! fixture slot, nothing durable changes, no change-log transition).
+//!
+//! `/subscriptions` (webhook push) is NOT accept-and-ignore anymore:
+//! the create handler stores the subscription (resource, changeType,
+//! clientState, notificationUrl, expiration) in the shared
+//! `crate::push::PushHub` and echoes Graph's `validationToken` for the
+//! subscription-validation handshake; renew updates the stored
+//! expiration; delete removes it. The stored `clientState` /
+//! `notificationUrl` drive the change-notification the test-admin
+//! state-mutation trigger POSTs to the registered loopback endpoint.
+//! Subscriptions live in the push hub (process-volatile, cleared by
+//! `POST /test/fixture/reset`), not the fixture, so they record no
+//! change-log transition.
+
+use std::collections::HashMap;
 
 use axum::{
     Json, Router,
-    extract::Path,
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
 
 use super::{AppState, ok_json};
+use crate::push::GraphSubscription;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -117,39 +128,118 @@ async fn delete_rule(Path((_folder, _rule)): Path<(String, String)>) -> Response
 
 // ── /subscriptions (webhook push) ───────────────────────────────────
 
-/// Create a webhook subscription: mint an id and echo the requested
-/// `expirationDateTime` + `resource`. No notifications are ever
-/// delivered (opt-in push, default off; the mock has no push side).
-async fn create_subscription(Json(body): Json<Value>) -> Response {
+/// Default subscription expiration echoed when the create body omits
+/// one. Deterministic far-future value (real Graph caps mail
+/// subscriptions near ~3 days; the mock pins it for byte-stable
+/// responses - a harness renews via PATCH exactly as a real client
+/// would).
+const SUBSCRIPTION_EXPIRATION: &str = "2100-01-01T00:00:00Z";
+
+/// `POST /v1.0/subscriptions`. Two behaviours:
+///
+/// 1. **Validation handshake.** When the request carries a
+///    `?validationToken=...` query param, echo it verbatim as
+///    `text/plain` 200 and store nothing. This is Graph's subscription-
+///    validation contract (the side that owns the endpoint must echo
+///    the token); exposing it on this route keeps the whole handshake
+///    loopback-drivable without an out-of-band callback.
+/// 2. **Create.** Otherwise parse the body, resolve the bearer's
+///    account, store the subscription (id, resource, changeType,
+///    clientState, notificationUrl, expiration) in the push hub, and
+///    return 201 with the created resource. The stored `clientState`
+///    and `notificationUrl` drive the change-notification the state-
+///    mutation trigger later POSTs.
+async fn create_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    body: Option<Json<Value>>,
+) -> Response {
+    if let Some(token) = params.get("validationToken") {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain")],
+            token.clone(),
+        )
+            .into_response();
+    }
+    let body = body.map_or(Value::Null, |Json(v)| v);
+    let account_id =
+        crate::oauth::account_from_bearer(&state.fixture(), &state.shared.token_store, &headers);
+    let resource = body
+        .get("resource")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let change_type = body
+        .get("changeType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("created,updated,deleted")
+        .to_string();
+    let notification_url = body
+        .get("notificationUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let client_state = body
+        .get("clientState")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let expiration = body
         .get("expirationDateTime")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let resource = body.get("resource").cloned().unwrap_or(Value::Null);
+        .and_then(|v| v.as_str())
+        .unwrap_or(SUBSCRIPTION_EXPIRATION)
+        .to_string();
+    let id = format!("mock-subscription-{}", state.shared.push.next_seq());
+    state.shared.push.graph_create_subscription(GraphSubscription {
+        id: id.clone(),
+        account_id,
+        resource: resource.clone(),
+        change_type: change_type.clone(),
+        client_state: client_state.clone(),
+        notification_url: notification_url.clone(),
+        expiration: expiration.clone(),
+    });
     (
         StatusCode::CREATED,
         axum::Json(json!({
             "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#subscriptions/$entity",
-            "id": "mock-subscription-1",
+            "id": id,
             "resource": resource,
+            "changeType": change_type,
+            "notificationUrl": notification_url,
+            "clientState": client_state,
             "expirationDateTime": expiration,
         })),
     )
         .into_response()
 }
 
-/// Renew (PATCH): echo the new expiration under the same id.
-async fn renew_subscription(Path(id): Path<String>, Json(body): Json<Value>) -> Response {
+/// Renew (PATCH): update the stored expiration and echo it back. An
+/// unknown id still echoes (real Graph would 404, but a renew against a
+/// never-created mock subscription is a harness mistake, not a wire
+/// contract worth modelling).
+async fn renew_subscription(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
     let expiration = body
         .get("expirationDateTime")
-        .cloned()
-        .unwrap_or(Value::Null);
+        .and_then(|v| v.as_str())
+        .unwrap_or(SUBSCRIPTION_EXPIRATION)
+        .to_string();
+    state
+        .shared
+        .push
+        .graph_renew_subscription(&id, expiration.clone());
     ok_json(json!({
         "id": id,
         "expirationDateTime": expiration,
     }))
 }
 
-async fn delete_subscription(Path(_id): Path<String>) -> Response {
+async fn delete_subscription(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    state.shared.push.graph_delete_subscription(&id);
     StatusCode::NO_CONTENT.into_response()
 }

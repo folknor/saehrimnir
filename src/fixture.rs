@@ -871,6 +871,25 @@ impl Fixture {
         transition_from_diff(agg_from, agg_to, agg_diff)
     }
 
+    /// The set of `account_id`s a `MutationDiff` touches, resolved with
+    /// the same per-resource ownership logic [`Self::record_transition`]
+    /// uses to advance each account's log. Lets the test-admin
+    /// state-mutation path learn exactly which accounts' state advanced
+    /// so it can fire push notifications for those accounts only (a
+    /// mutation on account B must not push account A). Call after the
+    /// mutation has been applied to the live fixture (created / updated
+    /// resources resolve through the live fixture; destroyed resources
+    /// through the diff's parallel `*_destroyed_accounts` / `*_parents`
+    /// vectors). An empty diff yields an empty set.
+    pub fn accounts_touched(&self, diff: &MutationDiff) -> std::collections::BTreeSet<String> {
+        if diff.is_empty() {
+            return std::collections::BTreeSet::new();
+        }
+        self.split_diff_by_account(diff.clone())
+            .into_keys()
+            .collect()
+    }
+
     /// Split a `MutationDiff` into per-account sub-diffs. Each id is
     /// routed to its owning account: created/updated resources resolve
     /// through the live fixture (the closure has already applied the

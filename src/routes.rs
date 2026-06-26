@@ -133,6 +133,7 @@ pub fn router(state: AppState) -> Router {
         .route("/.well-known/jmap", get(session))
         .route("/jmap/session", get(session))
         .route("/jmap/api", post(api))
+        .route("/jmap/ws", get(jmap_ws))
         .route(
             "/jmap/download/{account_id}/{blob_id}/{name}",
             get(download),
@@ -275,6 +276,24 @@ async fn session(
         }),
     );
     top_caps.insert("urn:ietf:params:jmap:mail".to_string(), json!({}));
+    // RFC 8887 WebSocket push capability. `url` carries the ws:// (or
+    // wss://) endpoint a client upgrades for the StateChange channel;
+    // `supportsPush` advertises that the server emits `StateChange`
+    // objects (vs. WebSocket-as-request-transport only). Derived from
+    // the advertised HTTP base by swapping the scheme so it tracks the
+    // actually-bound listener. See `notes/ratatoskr-jmap-surface.md`.
+    let ws_base = base
+        .strip_prefix("https://")
+        .map(|rest| format!("wss://{rest}"))
+        .or_else(|| base.strip_prefix("http://").map(|rest| format!("ws://{rest}")))
+        .unwrap_or_else(|| base.to_string());
+    top_caps.insert(
+        "urn:ietf:params:jmap:websocket".to_string(),
+        json!({
+            "url": format!("{ws_base}/jmap/ws"),
+            "supportsPush": true,
+        }),
+    );
     if advertise_calendars {
         top_caps.insert(
             "urn:ietf:params:jmap:calendars".to_string(),
@@ -460,6 +479,69 @@ async fn download(
         })),
     )
         .into_response()
+}
+
+/// JMAP WebSocket push endpoint (RFC 8887). A client upgrades here for
+/// the `StateChange` channel advertised in the session's
+/// `urn:ietf:params:jmap:websocket` capability. On upgrade we resolve
+/// the caller's account from the bearer (same resolution as the session
+/// resource), register a push listener in the [`crate::push::PushHub`]
+/// keyed by that account, and stream every `StateChange` frame the
+/// state-mutation trigger emits for it.
+///
+/// Inbound frames are accepted leniently: a `WebSocketPushEnable`
+/// request (RFC 8887 §4) is acked into the push channel by virtue of
+/// the registration already being live; any other text frame is
+/// ignored (the mock does not serve JMAP method calls over WebSocket
+/// in v0). A close frame, a transport error, or a dropped receiver
+/// tears the registration down.
+async fn jmap_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    let account_id = {
+        let fix = state.shared.fixture.read().expect("fixture lock poisoned");
+        crate::oauth::account_from_bearer(&fix, &state.shared.token_store, &headers)
+    };
+    // RFC 8887 §3.1: the subprotocol token is "jmap".
+    ws.protocols(["jmap"])
+        .on_upgrade(move |socket| jmap_ws_loop(socket, state, account_id))
+}
+
+/// Drive one upgraded JMAP WebSocket: forward push frames from the hub
+/// to the socket, drain inbound frames until close.
+async fn jmap_ws_loop(
+    mut socket: axum::extract::ws::WebSocket,
+    state: AppState,
+    account_id: String,
+) {
+    use axum::extract::ws::Message;
+
+    let mut rx = state.shared.push.register_jmap_ws(account_id);
+    loop {
+        tokio::select! {
+            frame = rx.recv() => {
+                match frame {
+                    Some(text) => {
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            inbound = socket.recv() => {
+                match inbound {
+                    // Accept and ignore client frames (e.g.
+                    // WebSocketPushEnable); the registration is already
+                    // live so push flows regardless.
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
 }
 
 /// Percent-encode `s` for use as the value of an RFC 5987

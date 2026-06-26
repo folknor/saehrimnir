@@ -9,7 +9,7 @@ use axum::{
     Router,
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use serde_json::{Map, Value, json};
@@ -30,6 +30,12 @@ fn bearer_account(state: &AppState, headers: &HeaderMap) -> String {
 const THREADS_DEFAULT_MAX: u32 = 100;
 const THREADS_HARD_MAX: u32 = 500;
 
+/// Deterministic far-future `users.watch` expiration (unix ms as a
+/// string, ~2100). Real Gmail returns a ~7-day expiry; the mock pins it
+/// so the watch response stays byte-stable. A harness re-arms by
+/// calling `watch` again, exactly as a real client would near expiry.
+const WATCH_EXPIRATION_MS: &str = "4102444800000";
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/gmail/v1/users/me/profile", get(profile))
@@ -39,6 +45,8 @@ pub fn router() -> Router<AppState> {
         .route("/gmail/v1/users/me/messages", get(list_messages))
         .route("/gmail/v1/users/me/messages/{message_id}", get(get_message))
         .route("/gmail/v1/users/me/history", get(history))
+        .route("/gmail/v1/users/me/watch", axum::routing::post(watch))
+        .route("/gmail/v1/users/me/stop", axum::routing::post(stop))
         .route(
             "/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}",
             get(get_attachment),
@@ -73,6 +81,55 @@ fn unique_thread_count(f: &Fixture, account_id: &str) -> usize {
     seen.sort_unstable();
     seen.dedup();
     seen.len()
+}
+
+// ── Push: watch / stop (Cloud Pub/Sub subscribe / unsubscribe) ──────
+
+/// `POST /gmail/v1/users/me/watch` (Gmail `users.watch`). Registers a
+/// Cloud Pub/Sub watch for the bearer-resolved account so the
+/// state-mutation trigger publishes a `{ emailAddress, historyId }`
+/// notification onto the watch's topic. Body carries `topicName` /
+/// `labelIds` / `labelFilterBehavior`. Response mirrors real Gmail:
+/// `{ "historyId": "<string>", "expiration": "<unix-ms-string>" }`.
+async fn watch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<axum::Json<Value>>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let body = body.map_or(Value::Null, |axum::Json(v)| v);
+    let topic_name = body
+        .get("topicName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("projects/saehrimnir/topics/mock")
+        .to_string();
+    let label_ids = body
+        .get("labelIds")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let history_id = state.fixture().gmail_history_id(&account_id);
+    state.shared.push.gmail_watch_set(crate::push::GmailWatch {
+        account_id,
+        topic_name,
+        label_ids,
+    });
+    ok_json(json!({
+        "historyId": history_id.to_string(),
+        "expiration": WATCH_EXPIRATION_MS,
+    }))
+}
+
+/// `POST /gmail/v1/users/me/stop` (Gmail `users.stop`). Cancels the
+/// bearer-resolved account's watch. Real Gmail returns 204 No Content.
+async fn stop(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    state.shared.push.gmail_watch_clear(&account_id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn list_labels(State(state): State<AppState>, headers: HeaderMap) -> Response {

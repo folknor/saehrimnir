@@ -765,6 +765,48 @@ observe the update. Catchall returns Gmail error envelope. Module
 structure leaves room for People-API contacts and Drive sibling
 files.
 
+Push (JMAP WebSocket / Gmail Pub/Sub / Graph webhooks): complete for
+v0, in `src/push.rs` (`PushHub`, cloned into every HTTP `AppState` via
+`SharedHandles`). Emission is driven by the existing test-admin
+state-mutation path: `POST /test/fixture/step`, after
+`record_transition`, resolves the touched accounts
+(`Fixture::accounts_touched`) and calls `PushHub::emit_state_advance`
+once per account, so a mutation on account B never pushes account A.
+Per protocol:
+- JMAP: session advertises `urn:ietf:params:jmap:websocket`
+  (`{ url: ws://.../jmap/ws, supportsPush: true }`). `GET /jmap/ws`
+  upgrades (subprotocol `jmap`), resolves the bearer's account, and
+  registers a push listener; on state advance the hub sends an
+  RFC 8620 §7.1 `StateChange` text frame (`changed.<accountId>.{Email,
+  Mailbox, Thread, EmailDelivery, [CalendarEvent], [ContactCard]}` all
+  carrying the per-account state token). Ungated in v0 even under
+  `[oauth] enforce`.
+- Gmail: `POST /gmail/v1/users/me/watch` registers a Cloud Pub/Sub
+  watch (topicName / labelIds) for the bearer's account and returns
+  `{ historyId, expiration }`; `POST .../stop` cancels it (204). On
+  state advance, an account with an active watch gets a Pub/Sub push
+  envelope (`message.data` = standard-base64 of `{ emailAddress,
+  historyId }`) published onto the in-memory Pub/Sub sink and, if a
+  push endpoint is registered, POSTed there.
+- Graph: `POST /v1.0/subscriptions` echoes a `?validationToken=` as
+  text/plain (validation handshake) or stores the subscription
+  (resource / changeType / clientState / notificationUrl / expiration)
+  in the hub; PATCH renews expiration, DELETE removes (204). On state
+  advance, each subscription bound to the account gets a change-
+  notification (`value[0]` with subscriptionId, changeType,
+  resource, resourceData, the stored clientState) POSTed to its
+  loopback notificationUrl. Subscriptions are process-volatile (cleared
+  by `POST /test/fixture/reset`), not fixture-backed, so they record no
+  change-log transition.
+Observability: every emitted JMAP frame and Graph notification is
+logged and every Pub/Sub message kept in a sink, exposed over
+`GET /test/push/jmap`, `GET /test/push/graph`,
+`GET /test/gmail/pubsub/messages` (+ `DELETE`),
+`POST /test/gmail/pubsub/publish` (manual `{emailAddress, historyId}`
+publish), and `POST /test/gmail/pubsub/push-endpoint`. Live transport
+(WebSocket send, hand-rolled loopback HTTP POST) happens alongside the
+log write. Integration tests in `tests/push.rs`.
+
 Calendar recurrence (all four protocols, read + write): events
 grow `recurrence_rule: Option<String>` (raw RFC 5545 RRULE value,
 no `RRULE:` prefix) and `recurrence_exdates: Vec<DateTime<Utc>>`
