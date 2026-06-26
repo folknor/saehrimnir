@@ -45,6 +45,10 @@ pub fn router(state: AppState) -> Router {
         .route("/test/fixture/step", post(step_fixture))
         .route("/test/snapshot-state", get(snapshot_state))
         .route("/test/latency", get(get_latency).post(set_latency))
+        .route(
+            "/test/jmap/fail-open",
+            post(arm_fail_open).delete(clear_fail_open),
+        )
         .route("/test/push/jmap", get(list_jmap_push))
         .route("/test/push/graph", get(list_graph_push))
         .route(
@@ -324,6 +328,7 @@ async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     state.shared.token_store.clear();
     state.shared.latency.clear();
     state.shared.push.clear();
+    state.shared.open_fault.clear();
     if let Some(d) = &state.shared.dispatcher {
         d.reset_counts();
     }
@@ -471,6 +476,117 @@ async fn set_latency(State(state): State<AppState>, body: Option<Json<Value>>) -
         }
     }
     Json(json!(state.shared.latency.snapshot())).into_response()
+}
+
+// ── Test-only forced session-open failure ───────────────────────────
+
+/// `POST /test/jmap/fail-open` -> arm the forced JMAP session-open
+/// failure knob (`crate::open_fault::OpenFault`). Body (all fields
+/// optional):
+/// ```text
+/// { "count": 3,           // fail the next N consecutive session
+///                          //   opens then auto-clear (default 3,
+///                          //   which matches bifrost's reopen budget)
+///   "sticky": false,      // fail every open until cleared; overrides
+///                          //   `count` when true
+///   "status": 503,        // HTTP status returned on a forced failure
+///   "message": "..." }    // error detail surfaced in the body
+/// ```
+/// An empty body / `{}` arms `count = 3` with the default 503 status.
+/// `count = 0` (and not sticky) clears the knob. Returns 200 + a
+/// snapshot of the remaining budget (`null` = disarmed, `"sticky"`, or
+/// the integer count) for round-trip verification.
+///
+/// This is the connection/auth-establishment analogue of token
+/// revocation (`POST /test/oauth/invalidate`): a stateful fault on the
+/// `/test/*` control plane a harness drives at runtime, then clears via
+/// `DELETE /test/jmap/fail-open` so a subsequent open succeeds and
+/// resume can be exercised.
+async fn arm_fail_open(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
+    let body_obj: Map<String, Value> = match body {
+        None => Map::new(),
+        Some(Json(Value::Null)) => Map::new(),
+        Some(Json(Value::Object(m))) => m,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "malformed body",
+                    "detail": "expected an object or empty body",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let sticky = body_obj
+        .get("sticky")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // `count` only consulted when not sticky. Default 3 = bifrost's
+    // reopen budget, so an empty-body arm exhausts it exactly.
+    let count = if sticky {
+        None
+    } else {
+        match body_obj.get("count") {
+            None => Some(3),
+            Some(v) => match v.as_u64() {
+                Some(n) => Some(n),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "malformed body",
+                            "detail": "count must be a non-negative integer",
+                        })),
+                    )
+                        .into_response();
+                }
+            },
+        }
+    };
+
+    let status = match body_obj.get("status") {
+        None => crate::open_fault::DEFAULT_FAIL_STATUS,
+        Some(v) => match v.as_u64().and_then(|n| u16::try_from(n).ok()) {
+            // Constrain to real HTTP error codes; a 2xx here would
+            // make the "failure" succeed and silently break the test.
+            Some(n) if (400..=599).contains(&n) => n,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "malformed body",
+                        "detail": "status must be an integer in 400..=599",
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
+
+    let message = body_obj
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or(crate::open_fault::DEFAULT_FAIL_MESSAGE)
+        .to_string();
+
+    state.shared.open_fault.arm(count, status, message);
+
+    let remaining = match state.shared.open_fault.snapshot() {
+        None => Value::Null,
+        Some(None) => json!("sticky"),
+        Some(Some(n)) => json!(n),
+    };
+    Json(json!({ "remaining": remaining })).into_response()
+}
+
+/// `DELETE /test/jmap/fail-open` -> 204. Disarm the forced session-open
+/// failure so the next open succeeds. Idempotent.
+async fn clear_fail_open(State(state): State<AppState>) -> StatusCode {
+    state.shared.open_fault.clear();
+    StatusCode::NO_CONTENT
 }
 
 /// `GET /test/snapshot-state` -> 200 + JSON dump of the fixture's

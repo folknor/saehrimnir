@@ -25,6 +25,7 @@ pub mod jmap_contacts;
 pub mod latency;
 pub mod lua;
 pub mod oauth;
+pub mod open_fault;
 pub mod people;
 pub mod push;
 pub mod recurrence;

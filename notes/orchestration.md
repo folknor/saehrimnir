@@ -271,6 +271,28 @@ feature gate guards these. All routes are scoped under `/test/`.
   blobId, Gmail attachmentId, Graph attachment id, and the
   fixture-side `[[email.attachment]] blob_id` IMAP looks up via
   `BODY[N]` -> `attachments[N-2]`).
+- `POST /test/jmap/fail-open` -> arm the forced JMAP session-open
+  failure knob so a consumer's account-open / reopen attempt fails.
+  Body (all fields optional): `{"count": N, "sticky": false,
+  "status": 503, "message": "..."}`. `count` fails the next N
+  consecutive session opens then auto-clears (default 3, which
+  matches bifrost's reopen budget); `sticky: true` fails every open
+  until cleared and overrides `count`; `status` is the HTTP code
+  returned on a forced failure (default 503, constrained to
+  400..=599); `message` is the error detail. An empty body / `{}`
+  arms `count = 3` at status 503; `count = 0` clears. Returns 200 +
+  `{"remaining": <null|"sticky"|N>}`. The `session` handler
+  (`GET /jmap/session`, the resource bifrost's `factory.open`
+  fetches) consumes one attempt from the knob before serving, so
+  each open attempt while armed fails with the chosen status and a
+  JMAP-shaped `urn:ietf:params:jmap:error:serverUnavailable` body.
+  This is the connection-establishment analogue of
+  `POST /test/oauth/invalidate`: a token error surfaces as a 401 the
+  client treats as auth, and a method-level Lua override never
+  reaches the open path, so neither exercises the reopen-budget-
+  exhaustion path; this knob does. Cleared by
+  `DELETE /test/jmap/fail-open` (204) and by
+  `POST /test/fixture/reset`.
 - `POST /test/fixture/reset` -> 204; reset in-process mutable
   state to the post-load baseline. The route is the source of
   truth on what "reset" means; the handler in
@@ -289,8 +311,9 @@ feature gate guards these. All routes are scoped under `/test/`.
 
   Reset additionally rewinds the fixture image itself to the
   post-load baseline (cloned once at startup into
-  `SharedHandles::baseline`), zeros the `change_cursor`, and
-  drops every entry from the latency knob. A harness can re-run
+  `SharedHandles::baseline`), zeros the `change_cursor`, drops
+  every entry from the latency knob, and disarms the
+  `/test/jmap/fail-open` session-open failure knob. A harness can re-run
   the same `change(...)` script in one process by hitting reset
   between runs; the fixture is back to its pristine post-load
   shape and step-1 applies again.

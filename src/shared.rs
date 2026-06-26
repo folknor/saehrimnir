@@ -20,6 +20,7 @@ use crate::fixture::Fixture;
 use crate::latency::LatencyKnob;
 use crate::lua::Dispatcher;
 use crate::oauth::TokenStore;
+use crate::open_fault::OpenFault;
 use crate::push::PushHub;
 use crate::request_log::RequestLog;
 
@@ -73,6 +74,13 @@ pub struct SharedHandles {
     /// state advance; the client-facing subscribe endpoints register
     /// into it. See `crate::push`.
     pub push: PushHub,
+    /// Forced JMAP session-open failure knob. Armed / cleared over the
+    /// `/test/jmap/fail-open` control plane; the `session` handler
+    /// consumes one attempt from it before serving the session
+    /// resource so a harness can drive a consumer's account-reopen
+    /// budget to exhaustion. Defaults to disarmed. Cleared by
+    /// `POST /test/fixture/reset`. See `crate::open_fault`.
+    pub open_fault: OpenFault,
 }
 
 impl SharedHandles {
@@ -92,6 +100,7 @@ impl SharedHandles {
             token_store: TokenStore::default(),
             latency: LatencyKnob::default(),
             push: PushHub::new(),
+            open_fault: OpenFault::default(),
         }
     }
 

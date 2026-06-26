@@ -160,6 +160,16 @@ async fn session(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, Response> {
+    // Forced session-open failure (test-only). bifrost establishes a
+    // JMAP account by fetching this resource; an armed `open_fault`
+    // short-circuits the fetch with an HTTP error so the consumer's
+    // account-open / reopen attempt fails. Checked before bearer
+    // enforcement so the fault forces failure regardless of the auth
+    // state of the open attempt. Each session GET consumes one attempt
+    // from the knob; see `crate::open_fault`.
+    if let Some((status, detail)) = state.shared.open_fault.take() {
+        return Err(open_fault_response(status, &detail));
+    }
     enforce_bearer(&state, &headers).map_err(|b| *b)?;
     let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
     // Resolve the caller's account from the bearer token (parallel
@@ -422,6 +432,26 @@ fn enforce_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Respo
                 .into_response(),
         )),
     }
+}
+
+/// Build the HTTP error returned when the forced session-open failure
+/// knob (`crate::open_fault::OpenFault`) is armed. `status` is the
+/// caller-chosen HTTP status (defaulting to 503 at the arming site);
+/// an out-of-range value falls back to 503. The body reuses the
+/// JMAP-shaped problem object the other JMAP error paths emit so the
+/// failure surface stays uniform; `Client::connect` only needs the
+/// non-2xx status to treat the open as failed.
+fn open_fault_response(status: u16, detail: &str) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    (
+        code,
+        Json(json!({
+            "type": "urn:ietf:params:jmap:error:serverUnavailable",
+            "status": status,
+            "detail": detail,
+        })),
+    )
+        .into_response()
 }
 
 /// Blob-download endpoint per RFC 8620 §6.2. The session resource

@@ -166,6 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token_store: token_store.clone(),
         latency: saehrimnir::latency::LatencyKnob::new(),
         push: saehrimnir::push::PushHub::new(),
+        open_fault: saehrimnir::open_fault::OpenFault::new(),
     };
     let app = routes::router(routes::AppState {
         shared: shared.clone(),
