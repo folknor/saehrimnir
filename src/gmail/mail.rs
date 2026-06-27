@@ -15,7 +15,7 @@ use axum::{
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
-use crate::fixture::{Address, Attachment, Body, Email, Fixture};
+use crate::fixture::{Address, Attachment, Body, Email, Fixture, MutationDiff, Role};
 
 /// Resolve the request's bearer to the account it authorizes.
 /// Falls back to the fixture's primary account when no bearer is
@@ -43,6 +43,21 @@ pub fn router() -> Router<AppState> {
         .route("/gmail/v1/users/me/threads", get(list_threads))
         .route("/gmail/v1/users/me/threads/{thread_id}", get(get_thread))
         .route("/gmail/v1/users/me/messages", get(list_messages))
+        // Mutations. Static `batchModify` / `batchDelete` segments
+        // coexist with the `{message_id}` param at the same level
+        // (matchit 0.8 matches statics before params).
+        .route(
+            "/gmail/v1/users/me/messages/batchModify",
+            axum::routing::post(batch_modify),
+        )
+        .route(
+            "/gmail/v1/users/me/messages/batchDelete",
+            axum::routing::post(batch_delete),
+        )
+        .route(
+            "/gmail/v1/users/me/messages/{message_id}/modify",
+            axum::routing::post(modify_message),
+        )
         .route("/gmail/v1/users/me/messages/{message_id}", get(get_message))
         .route("/gmail/v1/users/me/history", get(history))
         .route("/gmail/v1/users/me/watch", axum::routing::post(watch))
@@ -821,6 +836,250 @@ fn label_wrappers(items: &[(String, Vec<String>)], fixture: &Fixture) -> Vec<Val
             })
         })
         .collect()
+}
+
+// ── Mutations: modify / batchModify / batchDelete ───────────────────
+//
+// bifrost's Gmail mutation pipeline (google `account/mutation.rs`)
+// drives mark-read / star / move / permanent-delete by POSTing
+// `users.messages.batchModify` (addLabelIds / removeLabelIds over an
+// `ids` list) and `users.messages.batchDelete` (destroy an `ids`
+// list); the singular `users.messages.modify` is the per-message form
+// real clients use. Each mutates the shared fixture and records the
+// same change-log transition the read path observes - including the
+// Gmail label-set delta sidecar (`email_label_changes`) - so a
+// follow-up `history.list` / resync reflects it. Gmail label ids map
+// onto the fixture keyword / mailbox model via the inverse of
+// `Fixture::gmail_label_ids` (the read projection): the flag labels
+// UNREAD / STARRED / DRAFT toggle `$`-keywords, the folder-role labels
+// INBOX / SENT / TRASH / SPAM / IMPORTANT toggle the role-mailbox
+// membership, and `Label_<x>` toggles either a roleless mailbox
+// membership or a user keyword. bifrost expects a 2xx with no body it
+// reads, so batchModify / batchDelete return 204; the singular modify
+// returns 200 with the updated Message (matching real Gmail).
+
+/// `POST /gmail/v1/users/me/messages/{id}/modify`.
+async fn modify_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(message_id): Path<String>,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let add = label_list(&body, "addLabelIds");
+    let remove = label_list(&body, "removeLabelIds");
+    let found = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        modify_one(&mut fix, &account_id, &message_id, &add, &remove)
+    };
+    if !found {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("message {message_id:?} not found"),
+            "notFound",
+        );
+    }
+    let fixture = state.fixture();
+    match fixture.emails_for(&account_id).find(|e| e.id == message_id) {
+        Some(e) => ok_json(message_value(e, &fixture)),
+        None => error(
+            StatusCode::NOT_FOUND,
+            &format!("message {message_id:?} not found"),
+            "notFound",
+        ),
+    }
+}
+
+/// `POST /gmail/v1/users/me/messages/batchModify`. Same label patch
+/// applied to every id; 204 No Content on success.
+async fn batch_modify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let ids = label_list(&body, "ids");
+    let add = label_list(&body, "addLabelIds");
+    let remove = label_list(&body, "removeLabelIds");
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        for id in &ids {
+            modify_one(&mut fix, &account_id, id, &add, &remove);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /gmail/v1/users/me/messages/batchDelete`. Permanently
+/// destroys every listed id; 204 No Content.
+async fn batch_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let ids = label_list(&body, "ids");
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        for id in &ids {
+            delete_one(&mut fix, &account_id, id);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Pull a string array (`addLabelIds` / `removeLabelIds` / `ids`) from
+/// a request body, defaulting to empty.
+fn label_list(body: &Value, key: &str) -> Vec<String> {
+    body.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Apply a Gmail label patch to one fixture email, recording an
+/// `email_updated` transition plus the Gmail label-set delta sidecar
+/// so `history.list` projects the precise `labelsAdded` /
+/// `labelsRemoved`. Returns `false` when the id is not in the account.
+fn modify_one(
+    fix: &mut Fixture,
+    account_id: &str,
+    message_id: &str,
+    add: &[String],
+    remove: &[String],
+) -> bool {
+    let acct = account_id.to_string();
+    let mid = message_id.to_string();
+    if !fix.emails_for(account_id).any(|e| e.id == message_id) {
+        return false;
+    }
+    let _ = fix.mutate(|f| {
+        let Some(idx) = f
+            .emails
+            .iter()
+            .position(|e| e.account_id == acct && e.id == mid)
+        else {
+            return MutationDiff::default();
+        };
+        let before = f.gmail_label_ids(&f.emails[idx]);
+        let old_mailboxes = f.emails[idx].mailbox_ids.clone();
+        for label in add {
+            apply_gmail_label(f, idx, &acct, label, true);
+        }
+        for label in remove {
+            apply_gmail_label(f, idx, &acct, label, false);
+        }
+        let new_mailboxes = f.emails[idx].mailbox_ids.clone();
+        f.sync_mailbox_uids(&mid, &old_mailboxes, &new_mailboxes);
+        let after = f.gmail_label_ids(&f.emails[idx]);
+        let mut diff = MutationDiff {
+            email_updated: vec![mid.clone()],
+            ..Default::default()
+        };
+        if let Some(change) = crate::fixture::gmail_label_change(&mid, &before, &after) {
+            diff.email_label_changes.push(change);
+        }
+        diff
+    });
+    true
+}
+
+/// Permanently destroy one fixture email: retire its UID slots in
+/// every mailbox it belonged to and record an `email_destroyed`
+/// transition (so `history.list` projects a `messagesDeleted` record).
+/// Returns `false` when the id is not in the account.
+fn delete_one(fix: &mut Fixture, account_id: &str, message_id: &str) -> bool {
+    let acct = account_id.to_string();
+    let mid = message_id.to_string();
+    let Some((mailboxes, owner)) = fix
+        .emails
+        .iter()
+        .find(|e| e.account_id == acct && e.id == mid)
+        .map(|e| (e.mailbox_ids.clone(), e.account_id.clone()))
+    else {
+        return false;
+    };
+    let _ = fix.mutate(move |f| {
+        f.emails.retain(|e| !(e.account_id == acct && e.id == mid));
+        for mb in &mailboxes {
+            f.retire_uid(mb, &mid);
+        }
+        MutationDiff {
+            email_destroyed: vec![mid.clone()],
+            email_destroyed_accounts: vec![owner.clone()],
+            ..Default::default()
+        }
+    });
+    true
+}
+
+/// Toggle a single Gmail label on / off for `f.emails[idx]`, inverting
+/// `Fixture::gmail_label_ids`. Unknown label ids (no `Label_` prefix
+/// and not a known system label) are ignored.
+fn apply_gmail_label(f: &mut Fixture, idx: usize, account_id: &str, label: &str, add: bool) {
+    match label {
+        // `UNREAD` present == NOT `$seen`, so adding UNREAD clears
+        // `$seen` and removing UNREAD sets it.
+        "UNREAD" => toggle_keyword(&mut f.emails[idx].keywords, "$seen", !add),
+        "STARRED" => toggle_keyword(&mut f.emails[idx].keywords, "$flagged", add),
+        "DRAFT" => toggle_keyword(&mut f.emails[idx].keywords, "$draft", add),
+        "INBOX" => toggle_role_membership(f, idx, account_id, Role::Inbox, add),
+        "SENT" => toggle_role_membership(f, idx, account_id, Role::Sent, add),
+        "TRASH" => toggle_role_membership(f, idx, account_id, Role::Trash, add),
+        "SPAM" => toggle_role_membership(f, idx, account_id, Role::Junk, add),
+        "IMPORTANT" => toggle_role_membership(f, idx, account_id, Role::Important, add),
+        other => {
+            let Some(name) = other.strip_prefix("Label_") else {
+                return;
+            };
+            // `Label_<x>` projects from either a roleless mailbox whose
+            // id is `<x>` or a user keyword `<x>` (see gmail_label_ids).
+            let mailbox_id = f
+                .mailboxes_for(account_id)
+                .find(|m| m.id == name && m.role.is_none())
+                .map(|m| m.id.clone());
+            match mailbox_id {
+                Some(mb) => toggle_membership(f, idx, &mb, add),
+                None => toggle_keyword(&mut f.emails[idx].keywords, name, add),
+            }
+        }
+    }
+}
+
+fn toggle_keyword(keywords: &mut Vec<String>, kw: &str, present: bool) {
+    let has = keywords.iter().any(|k| k == kw);
+    if present && !has {
+        keywords.push(kw.to_string());
+    } else if !present && has {
+        keywords.retain(|k| k != kw);
+    }
+}
+
+/// Add / remove the role-mailbox membership for the email at `idx`,
+/// resolving the account's mailbox carrying `role`. No-op when the
+/// account has no mailbox with that role.
+fn toggle_role_membership(f: &mut Fixture, idx: usize, account_id: &str, role: Role, add: bool) {
+    let mailbox_id = f
+        .mailboxes_for(account_id)
+        .find(|m| m.role == Some(role))
+        .map(|m| m.id.clone());
+    if let Some(mb) = mailbox_id {
+        toggle_membership(f, idx, &mb, add);
+    }
+}
+
+fn toggle_membership(f: &mut Fixture, idx: usize, mailbox_id: &str, add: bool) {
+    let email = &mut f.emails[idx];
+    let has = email.mailbox_ids.iter().any(|m| m == mailbox_id);
+    if add && !has {
+        email.mailbox_ids.push(mailbox_id.to_string());
+    } else if !add && has {
+        email.mailbox_ids.retain(|m| m != mailbox_id);
+    }
 }
 
 // ── Attachments ─────────────────────────────────────────────────────

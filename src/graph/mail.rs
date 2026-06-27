@@ -17,7 +17,7 @@
 use axum::{
     Json, Router,
     extract::{Path, RawQuery, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::Response,
     routing::{get, post},
 };
@@ -250,27 +250,44 @@ async fn get_message_value_me(
 async fn patch_message_me(
     State(state): State<AppState>,
     Path(message_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    patch_message_impl(state, &account_id, &message_id, body).await
+    patch_message_impl(
+        state,
+        &account_id,
+        &message_id,
+        if_match_header(&headers),
+        body,
+    )
+    .await
 }
 
 async fn delete_message_me(
     State(state): State<AppState>,
     Path(message_id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    delete_message_impl(state, &account_id, &message_id).await
+    delete_message_impl(state, &account_id, &message_id, if_match_header(&headers)).await
 }
 
 async fn move_message_me(
     State(state): State<AppState>,
     Path(message_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    move_message_impl(state, &account_id, &message_id, body).await
+    move_message_impl(
+        state,
+        &account_id,
+        &message_id,
+        if_match_header(&headers),
+        body,
+    )
+    .await
 }
 
 async fn list_messages_collection_me(
@@ -406,36 +423,53 @@ async fn get_message_value_user(
 async fn patch_message_user(
     State(state): State<AppState>,
     Path((user, message_id)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    patch_message_impl(state, &account_id, &message_id, body).await
+    patch_message_impl(
+        state,
+        &account_id,
+        &message_id,
+        if_match_header(&headers),
+        body,
+    )
+    .await
 }
 
 async fn delete_message_user(
     State(state): State<AppState>,
     Path((user, message_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    delete_message_impl(state, &account_id, &message_id).await
+    delete_message_impl(state, &account_id, &message_id, if_match_header(&headers)).await
 }
 
 async fn move_message_user(
     State(state): State<AppState>,
     Path((user, message_id)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    move_message_impl(state, &account_id, &message_id, body).await
+    move_message_impl(
+        state,
+        &account_id,
+        &message_id,
+        if_match_header(&headers),
+        body,
+    )
+    .await
 }
 
 async fn list_messages_collection_user(
@@ -657,7 +691,7 @@ async fn list_messages_impl(
         .iter()
         .skip(offset as usize)
         .take(top as usize)
-        .map(|e| message_value(e, &m.id, expand))
+        .map(|e| message_value_for(&fixture, e, &m.id, expand))
         .collect();
 
     let path = if me_path {
@@ -729,7 +763,7 @@ async fn list_messages_collection_impl(
         .take(top as usize)
         .map(|e| {
             let parent = e.mailbox_ids.first().map(String::as_str).unwrap_or("");
-            message_value(e, parent, expand)
+            message_value_for(&fixture, e, parent, expand)
         })
         .collect();
 
@@ -834,7 +868,7 @@ async fn delta_messages_impl(
             let mut value: Vec<Value> = Vec::new();
             for id in delta.created.iter().chain(delta.updated.iter()) {
                 if let Some(e) = by_id.get(id.as_str()) {
-                    value.push(message_value(e, &m.id, expand));
+                    value.push(message_value_for(&fixture, e, &m.id, expand));
                 }
             }
             for id in &delta.destroyed {
@@ -872,7 +906,7 @@ async fn delta_messages_impl(
         .iter()
         .skip(offset as usize)
         .take(top as usize)
-        .map(|e| message_value(e, &m.id, expand))
+        .map(|e| message_value_for(&fixture, e, &m.id, expand))
         .collect();
 
     let (next_link, delta_link) = match next_offset(offset, top, total) {
@@ -1485,6 +1519,13 @@ async fn get_message_impl(
     let expand = expand_attachments(q.expand.as_deref());
     match message_get_value(&fixture, account_id, message_id, expand) {
         Some(mut v) => {
+            // Real Graph also returns the etag in an `ETag` HTTP header
+            // on a single-resource GET; mirror it alongside the
+            // `@odata.etag` body field bifrost actually reads.
+            let etag = v
+                .get("@odata.etag")
+                .and_then(Value::as_str)
+                .map(String::from);
             if let Value::Object(ref mut m) = v {
                 m.insert(
                     "@odata.context".to_string(),
@@ -1493,7 +1534,13 @@ async fn get_message_impl(
                     ),
                 );
             }
-            ok_json(v)
+            let mut resp = ok_json(v);
+            if let Some(etag) = etag
+                && let Ok(hv) = HeaderValue::from_str(&etag)
+            {
+                resp.headers_mut().insert(axum::http::header::ETAG, hv);
+            }
+            resp
         }
         None => error(
             StatusCode::NOT_FOUND,
@@ -1542,11 +1589,15 @@ async fn get_message_value_impl(state: AppState, account_id: &str, message_id: &
 /// `importance` is accepted but not durably stored (the fixture
 /// `Email` has no importance field; reads always project "normal").
 /// Records an `email_updated` transition so the change surfaces in
-/// the next `messages/delta`. `If-Match` is not enforced in v0.
+/// the next `messages/delta`. The optional `If-Match` precondition is
+/// honoured against the message's `@odata.etag` (see [`email_etag`] /
+/// [`check_if_match`]): a wildcard or matching etag proceeds, a
+/// mismatch returns 412 `ErrorPreconditionFailed`.
 async fn patch_message_impl(
     state: AppState,
     account_id: &str,
     message_id: &str,
+    if_match: Option<String>,
     body: Value,
 ) -> Response {
     let message_owned = message_id.to_string();
@@ -1555,16 +1606,33 @@ async fn patch_message_impl(
     }) {
         return o;
     }
-    let projected = {
+    let outcome = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        patch_message_core(&mut fix, account_id, message_id, &body)
+        patch_message_core(&mut fix, account_id, message_id, &body, if_match.as_deref())
     };
-    match projected {
-        Some(v) => ok_json(v),
-        None => error(
+    write_outcome_response(outcome, message_id, StatusCode::OK)
+}
+
+/// Shape a [`WriteOutcome`] into the direct-HTTP wire response.
+/// `success_status` is the 2xx the applied path returns when it
+/// carries a projected body (200 for PATCH, 201 for move).
+fn write_outcome_response(
+    outcome: WriteOutcome,
+    message_id: &str,
+    success_status: StatusCode,
+) -> Response {
+    match outcome {
+        WriteOutcome::Applied(Some(v)) => (success_status, Json(v)).into_response(),
+        WriteOutcome::Applied(None) => StatusCode::NO_CONTENT.into_response(),
+        WriteOutcome::NotFound => error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
             &format!("message {message_id:?} not found"),
+        ),
+        WriteOutcome::PreconditionFailed => error(
+            StatusCode::PRECONDITION_FAILED,
+            "ErrorPreconditionFailed",
+            &format!("If-Match precondition failed for message {message_id:?}"),
         ),
     }
 }
@@ -1579,14 +1647,76 @@ async fn patch_message_impl(
 // the projection (or a found flag) lets the caller shape the wire
 // response (direct HTTP vs batch sub-response).
 
-/// Apply a Graph message PATCH; returns the projected message, or
-/// `None` when the id is not in the account.
+/// Outcome of a Graph message mutation core after the optional
+/// `If-Match` precondition is evaluated.
+enum WriteOutcome {
+    /// Mutation applied. Carries the projected message body for PATCH
+    /// / move; `None` for DELETE (204, no body).
+    Applied(Option<Value>),
+    /// No message with that id in the account (404 `ErrorItemNotFound`).
+    NotFound,
+    /// `If-Match` was present and did not match the message's current
+    /// etag (Graph 412 `ErrorPreconditionFailed`). bifrost maps a 412
+    /// to a concurrency conflict (never a silent skip).
+    PreconditionFailed,
+}
+
+/// Read an `If-Match` value from an axum request header map. HTTP
+/// header names are case-insensitive, so `HeaderMap::get` already
+/// normalizes; an absent header means "no precondition".
+fn if_match_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Read an `If-Match` value from a `$batch` sub-request's `headers`
+/// JSON object. bifrost serializes the key as `"If-Match"`; match it
+/// case-insensitively to be liberal in what we accept.
+fn if_match_json(headers: Option<&Value>) -> Option<String> {
+    headers?
+        .as_object()?
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("if-match"))
+        .and_then(|(_, v)| v.as_str())
+        .map(str::to_string)
+}
+
+/// Evaluate an optional `If-Match` precondition against the message's
+/// current etag. `Some(_)` short-circuits the caller (NotFound /
+/// PreconditionFailed); `None` means "proceed with the mutation".
+/// `If-Match: *` matches any existing resource (RFC 7232 wildcard).
+fn check_if_match(
+    fix: &Fixture,
+    account_id: &str,
+    message_id: &str,
+    if_match: Option<&str>,
+) -> Option<WriteOutcome> {
+    if !fix.emails_for(account_id).any(|e| e.id == message_id) {
+        return Some(WriteOutcome::NotFound);
+    }
+    if let Some(req) = if_match {
+        let req = req.trim();
+        if req != "*" && req != email_etag(fix, account_id, message_id) {
+            return Some(WriteOutcome::PreconditionFailed);
+        }
+    }
+    None
+}
+
+/// Apply a Graph message PATCH, honouring the optional `If-Match`
+/// precondition bifrost's `SetFlags` mutation always supplies.
 fn patch_message_core(
     fix: &mut Fixture,
     account_id: &str,
     message_id: &str,
     body: &Value,
-) -> Option<Value> {
+    if_match: Option<&str>,
+) -> WriteOutcome {
+    if let Some(outcome) = check_if_match(fix, account_id, message_id, if_match) {
+        return outcome;
+    }
     let acct = account_id.to_string();
     let mid = message_id.to_string();
     let mut projected = None;
@@ -1601,19 +1731,30 @@ fn patch_message_core(
         let mut email = f.emails[idx].clone();
         apply_graph_message_patch(&mut email, body);
         let parent = email.mailbox_ids.first().cloned().unwrap_or_default();
-        projected = Some(message_value(&email, &parent, false));
+        let etag = email_etag(f, &acct, &mid);
+        projected = Some(message_value(&email, &parent, false, &etag));
         f.emails[idx] = email;
         MutationDiff {
             email_updated: vec![mid.clone()],
             ..Default::default()
         }
     });
-    projected
+    WriteOutcome::Applied(projected)
 }
 
-/// Permanently delete a message; returns `false` when not found.
-/// Retires the message's UID slots and records `email_destroyed`.
-fn delete_message_core(fix: &mut Fixture, account_id: &str, message_id: &str) -> bool {
+/// Permanently delete a message, honouring the optional `If-Match`
+/// precondition (bifrost's `Destroy` sends one only when it has a
+/// cached etag). Retires the message's UID slots and records
+/// `email_destroyed`.
+fn delete_message_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    message_id: &str,
+    if_match: Option<&str>,
+) -> WriteOutcome {
+    if let Some(outcome) = check_if_match(fix, account_id, message_id, if_match) {
+        return outcome;
+    }
     let acct = account_id.to_string();
     let mid = message_id.to_string();
     let Some((mailboxes, owner)) = fix
@@ -1622,7 +1763,7 @@ fn delete_message_core(fix: &mut Fixture, account_id: &str, message_id: &str) ->
         .find(|e| e.account_id == acct && e.id == mid)
         .map(|e| (e.mailbox_ids.clone(), e.account_id.clone()))
     else {
-        return false;
+        return WriteOutcome::NotFound;
     };
     let _ = fix.mutate(move |f| {
         f.emails.retain(|e| !(e.account_id == acct && e.id == mid));
@@ -1635,17 +1776,22 @@ fn delete_message_core(fix: &mut Fixture, account_id: &str, message_id: &str) ->
             ..Default::default()
         }
     });
-    true
+    WriteOutcome::Applied(None)
 }
 
-/// Move a message to `dest` (single-folder membership replace);
-/// returns the projected moved message, or `None` when not found.
+/// Move a message to `dest` (single-folder membership replace),
+/// honouring the optional `If-Match` precondition bifrost's `Move`
+/// mutation always supplies. Returns the projected moved message.
 fn move_message_core(
     fix: &mut Fixture,
     account_id: &str,
     message_id: &str,
     dest: &str,
-) -> Option<Value> {
+    if_match: Option<&str>,
+) -> WriteOutcome {
+    if let Some(outcome) = check_if_match(fix, account_id, message_id, if_match) {
+        return outcome;
+    }
     let acct = account_id.to_string();
     let mid = message_id.to_string();
     let dest = dest.to_string();
@@ -1662,13 +1808,14 @@ fn move_message_core(
         let new = vec![dest.clone()];
         f.emails[idx].mailbox_ids = new.clone();
         f.sync_mailbox_uids(&mid, &old, &new);
-        projected = Some(message_value(&f.emails[idx], &dest, false));
+        let etag = email_etag(f, &acct, &mid);
+        projected = Some(message_value(&f.emails[idx], &dest, false, &etag));
         MutationDiff {
             email_updated: vec![mid.clone()],
             ..Default::default()
         }
     });
-    projected
+    WriteOutcome::Applied(projected)
 }
 
 /// Apply the Graph message-PATCH fields bifrost sends to a fixture
@@ -1720,26 +1867,23 @@ fn set_keyword(keywords: &mut Vec<String>, kw: &str, present: bool) {
 /// so the next `messages/delta` emits the tombstone and a
 /// multi-account fixture's per-account delta filters correctly. 204
 /// on success, 404 `ErrorItemNotFound` on unknown id.
-async fn delete_message_impl(state: AppState, account_id: &str, message_id: &str) -> Response {
+async fn delete_message_impl(
+    state: AppState,
+    account_id: &str,
+    message_id: &str,
+    if_match: Option<String>,
+) -> Response {
     let message_owned = message_id.to_string();
     if let Some(o) = super::maybe_override(&state, "delete_message", move |s| {
         crate::lua::req_set_str(s, "message_id", &message_owned)
     }) {
         return o;
     }
-    let found = {
+    let outcome = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        delete_message_core(&mut fix, account_id, message_id)
+        delete_message_core(&mut fix, account_id, message_id, if_match.as_deref())
     };
-    if found {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        error(
-            StatusCode::NOT_FOUND,
-            "ErrorItemNotFound",
-            &format!("message {message_id:?} not found"),
-        )
-    }
+    write_outcome_response(outcome, message_id, StatusCode::NO_CONTENT)
 }
 
 /// `POST /v1.0/me/messages/{id}/move` - moves the message to the
@@ -1755,6 +1899,7 @@ async fn move_message_impl(
     state: AppState,
     account_id: &str,
     message_id: &str,
+    if_match: Option<String>,
     body: Value,
 ) -> Response {
     let message_owned = message_id.to_string();
@@ -1774,18 +1919,11 @@ async fn move_message_impl(
             "move requires a non-empty destinationId",
         );
     };
-    let projected = {
+    let outcome = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        move_message_core(&mut fix, account_id, message_id, dest)
+        move_message_core(&mut fix, account_id, message_id, dest, if_match.as_deref())
     };
-    match projected {
-        Some(v) => (StatusCode::CREATED, axum::Json(v)).into_response(),
-        None => error(
-            StatusCode::NOT_FOUND,
-            "ErrorItemNotFound",
-            &format!("message {message_id:?} not found"),
-        ),
-    }
+    write_outcome_response(outcome, message_id, StatusCode::CREATED)
 }
 
 // ── Draft create + send ─────────────────────────────────────────────
@@ -1945,7 +2083,8 @@ fn create_draft_core(fix: &mut Fixture, account_id: &str, folder_id: &str, body:
         };
         f.emails.push(email.clone());
         f.assign_uid(&fid, id.clone());
-        projected = message_value(&email, &fid, false);
+        let etag = email_etag(f, &acct, &id);
+        projected = message_value(&email, &fid, false, &etag);
         MutationDiff {
             email_created: vec![id],
             ..Default::default()
@@ -1988,7 +2127,7 @@ fn message_get_value(
         .emails_for(account_id)
         .find(|e| e.id == message_id)?;
     let parent = e.mailbox_ids.first().map(String::as_str).unwrap_or("");
-    Some(message_value(e, parent, expand))
+    Some(message_value_for(fixture, e, parent, expand))
 }
 
 /// `POST /v1.0/$batch` (Microsoft Graph JSON batching). bifrost
@@ -2032,7 +2171,8 @@ fn batch_sub_response(fix: &mut Fixture, req: &Value) -> Value {
         .unwrap_or("GET")
         .to_ascii_uppercase();
     let url = req.get("url").and_then(Value::as_str).unwrap_or("");
-    let (status, body) = dispatch_batch_request(fix, &method, url, req.get("body"));
+    let (status, body) =
+        dispatch_batch_request(fix, &method, url, req.get("body"), req.get("headers"));
     json!({
         "id": id,
         "status": status,
@@ -2051,7 +2191,9 @@ fn dispatch_batch_request(
     method: &str,
     url: &str,
     body: Option<&Value>,
+    headers: Option<&Value>,
 ) -> (u16, Value) {
+    let if_match = if_match_json(headers);
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (url, None),
@@ -2123,17 +2265,13 @@ fn dispatch_batch_request(
         }
         ("PATCH", None) => {
             let body = body.cloned().unwrap_or(Value::Null);
-            match patch_message_core(fix, &account_id, message_id, &body) {
-                Some(v) => (200, v),
-                None => not_found(),
-            }
+            let outcome =
+                patch_message_core(fix, &account_id, message_id, &body, if_match.as_deref());
+            batch_write_outcome(outcome, message_id, 200)
         }
         ("DELETE", None) => {
-            if delete_message_core(fix, &account_id, message_id) {
-                (204, Value::Null)
-            } else {
-                not_found()
-            }
+            let outcome = delete_message_core(fix, &account_id, message_id, if_match.as_deref());
+            batch_write_outcome(outcome, message_id, 204)
         }
         ("POST", Some("move")) => {
             let dest = body
@@ -2149,10 +2287,9 @@ fn dispatch_batch_request(
                     ),
                 );
             };
-            match move_message_core(fix, &account_id, message_id, dest) {
-                Some(v) => (201, v),
-                None => not_found(),
-            }
+            let outcome =
+                move_message_core(fix, &account_id, message_id, dest, if_match.as_deref());
+            batch_write_outcome(outcome, message_id, 201)
         }
         _ => (
             501,
@@ -2168,9 +2305,86 @@ fn batch_error(code: &str, message: &str) -> Value {
     json!({ "error": { "code": code, "message": message } })
 }
 
-fn message_value(e: &Email, parent_folder_id: &str, expand_attachments: bool) -> Value {
+/// Map a [`WriteOutcome`] into a `$batch` sub-response `(status, body)`
+/// pair. Mirrors [`write_outcome_response`] for the batched write path
+/// bifrost actually drives (it routes message mutations through
+/// `$batch`). A 412 degrades this one sub-request, not the whole batch.
+fn batch_write_outcome(
+    outcome: WriteOutcome,
+    message_id: &str,
+    success_status: u16,
+) -> (u16, Value) {
+    match outcome {
+        WriteOutcome::Applied(Some(v)) => (success_status, v),
+        WriteOutcome::Applied(None) => (204, Value::Null),
+        WriteOutcome::NotFound => (
+            404,
+            batch_error(
+                "ErrorItemNotFound",
+                &format!("message {message_id:?} not found"),
+            ),
+        ),
+        WriteOutcome::PreconditionFailed => (
+            412,
+            batch_error(
+                "ErrorPreconditionFailed",
+                &format!("If-Match precondition failed for message {message_id:?}"),
+            ),
+        ),
+    }
+}
+
+/// Deterministic Graph weak ETag for a message. bifrost's mutation
+/// pipeline reads this through `graph_etag` (which prefers `changeKey`,
+/// then `@odata.etag`) and gates its Graph SetFlags / Move / Delete
+/// `$batch` sub-requests on it via an `If-Match` precondition;
+/// `refresh_missing_etags` / hydration / inventory all hydrate the
+/// etag cache from the same projection field. Without an etag on the
+/// projection bifrost refuses to build any mutation request, so no
+/// Graph mutation reaches the mock. The mock emits only `@odata.etag`
+/// (not `changeKey`), so `graph_etag` falls through to it and the
+/// `If-Match` bifrost later sends is byte-equal to what
+/// [`check_if_match`] recomputes here.
+///
+/// The etag is derived from the message id alone, i.e. it is stable
+/// for the message's lifetime rather than bumping per mutation. That
+/// is deliberate: bifrost caches etags at sync time and does NOT
+/// refresh `etag_index` from a mutation's response, so two etag-gated
+/// ops on the same message within one sync window (e.g. SetFlags then
+/// Move for a "mark read + archive" action) both reuse the
+/// sync-time etag. A modseq-style etag that advanced on the first
+/// mutation would make the second `If-Match` stale and 412 - silently
+/// dropping the move. A stable etag still honours `If-Match` (a wrong
+/// or missing-message etag fails [`check_if_match`]) while never
+/// spuriously rejecting bifrost's cached value. `account_id` is part
+/// of the signature for symmetry with the read / check sites even
+/// though the id alone keys it. (Note: `Fixture::email_modseq` already
+/// backs the IMAP MODSEQ / CONDSTORE surface for the changes-driven
+/// case.)
+fn email_etag(_fixture: &Fixture, _account_id: &str, email_id: &str) -> String {
+    format!("W/\"etag-{email_id}\"")
+}
+
+/// Project a message with its `@odata.etag` resolved from the fixture.
+/// The read paths bifrost hydrates etags from (single GET, list,
+/// `messages/delta`, and the `$batch` GET sub-requests) all route
+/// through here so the etag is consistent everywhere.
+fn message_value_for(
+    fixture: &Fixture,
+    e: &Email,
+    parent_folder_id: &str,
+    expand_attachments: bool,
+) -> Value {
+    let etag = email_etag(fixture, &e.account_id, &e.id);
+    message_value(e, parent_folder_id, expand_attachments, &etag)
+}
+
+fn message_value(e: &Email, parent_folder_id: &str, expand_attachments: bool, etag: &str) -> Value {
     let mut obj = Map::new();
     obj.insert("id".to_string(), Value::String(e.id.clone()));
+    // `@odata.etag` is the `If-Match` precondition value bifrost's
+    // Graph mutations require; see [`email_etag`].
+    obj.insert("@odata.etag".to_string(), Value::String(etag.to_string()));
     obj.insert(
         "conversationId".to_string(),
         Value::String(e.thread_id.clone()),

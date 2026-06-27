@@ -36,7 +36,7 @@ pub const GREETING: &str = "* OK saehrimnir IMAP4rev1 ready\r\n";
 /// `OK [CAPABILITY ...]` resp-text. Authenticated set; the
 /// pre-auth set adds `LOGINDISABLED`-equivalents only if we ever grow
 /// real auth, which v0 does not.
-pub const CAPABILITIES: &str = "IMAP4REV1 IDLE CONDSTORE QRESYNC";
+pub const CAPABILITIES: &str = "IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE";
 
 /// Per-connection state machine, RFC 3501 sec 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +132,7 @@ where
         account_id: primary_account_id,
         connection_id: crate::connection_id::next(),
         push,
+        qresync_enabled: false,
     };
 
     conn.write_line(GREETING.trim_end_matches("\r\n")).await?;
@@ -195,6 +196,13 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     /// it so the idling client observes the change. Shared with the
     /// JMAP WebSocket / Gmail Pub/Sub / Graph webhook surfaces.
     push: crate::push::PushHub,
+    /// Whether the client has `ENABLE QRESYNC`d this session (RFC 7162
+    /// Section 3.1). Gates the expunge-report shape on `UID MOVE` /
+    /// `UID EXPUNGE`: a QRESYNC-enabled connection gets `* VANISHED`,
+    /// otherwise `* N EXPUNGE` (RFC 6851 Section 3 / RFC 7162 Section
+    /// 3.2.10). bifrost's `MoveConsumer` selects which it reads from
+    /// the same enabled state, so the two must agree.
+    qresync_enabled: bool,
 }
 
 enum ReadOutcome {
@@ -526,6 +534,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         for ext in args.split_whitespace() {
             if ext.eq_ignore_ascii_case("QRESYNC") {
                 enabled.push("QRESYNC");
+                // Latch QRESYNC so the expunge-report shape on a later
+                // UID MOVE / UID EXPUNGE switches to `* VANISHED`.
+                self.qresync_enabled = true;
             } else if ext.eq_ignore_ascii_case("CONDSTORE") {
                 enabled.push("CONDSTORE");
             }
@@ -872,6 +883,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "FETCH" => self.cmd_uid_fetch(tag, rest).await,
             "STORE" => self.cmd_uid_store(tag, rest).await,
             "COPY" => self.cmd_uid_copy(tag, rest).await,
+            "MOVE" => self.cmd_uid_move(tag, rest).await,
             "EXPUNGE" => self.cmd_uid_expunge(tag, rest).await,
             other => {
                 self.write_line(&format!("{tag} BAD UID {other} not implemented in v0"))
@@ -1213,6 +1225,176 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 self.write_line(&format!("{tag} NO [TRYCREATE] {reason}"))
                     .await
             }
+        }
+    }
+
+    /// `UID MOVE <set> <mailbox>` - RFC 6851 Section 3. Moves every
+    /// matched message out of the selected mailbox into the target:
+    /// it gains the target mailbox (with a fresh UID via
+    /// `Fixture::assign_uid`) and loses the source mailbox (its source
+    /// slot retired via `retire_uid`, never reused - RFC 3501 Section
+    /// 2.3.1.1 UID stability), so a resync reflects the move. Emits the
+    /// RFC 6851 untagged expunge report - `* VANISHED <uids>` when the
+    /// connection has `ENABLE QRESYNC`d, else `* N EXPUNGE`
+    /// highest-sequence-first - then a tagged `OK [COPYUID ...]`
+    /// (RFC 6851 Section 4.3 / RFC 4315 Section 3).
+    ///
+    /// bifrost prefers `UID MOVE` whenever the server advertises the
+    /// `MOVE` capability (which it now does); its `uid_move_messages`
+    /// otherwise falls back to COPY + STORE `\Deleted` + UID EXPUNGE,
+    /// but only when UIDPLUS is advertised. The mock advertised neither
+    /// MOVE nor UIDPLUS before this, so an IMAP move could not land at
+    /// all. Returns `NO [TRYCREATE]` when the target does not resolve.
+    async fn cmd_uid_move(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !matches!(self.state, State::Selected) {
+            return self
+                .write_line(&format!("{tag} BAD UID MOVE requires SELECT first"))
+                .await;
+        }
+        let (uid_set_str, target_raw) = match split_after_set(args) {
+            Some(p) => p,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID MOVE expects <set> <mailbox>"))
+                    .await;
+            }
+        };
+        let set = match parse_uid_set(uid_set_str) {
+            Some(s) => s,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID MOVE bad sequence-set"))
+                    .await;
+            }
+        };
+        let target_name = match parse_one_astring(target_raw) {
+            Some(n) => n,
+            None => {
+                return self
+                    .write_line(&format!("{tag} BAD UID MOVE expects \"mailbox\""))
+                    .await;
+            }
+        };
+        let selected_id = self
+            .selected
+            .clone()
+            .expect("Selected state requires selected mailbox");
+
+        // Collected for the wire report: `(src_uid, dst_uid)` pairs in
+        // ascending source-uid order (COPYUID's two lists correspond
+        // positionally), plus the expunged sequence numbers.
+        let mut src_uids: Vec<u32> = Vec::new();
+        let mut dst_uids: Vec<u32> = Vec::new();
+        let mut expunged_seqs: Vec<u32> = Vec::new();
+
+        let resolved: Result<(), String> = {
+            let mut fix = self.fixture.write().expect("fixture lock poisoned");
+            let target_id = list_mailboxes(&fix, &self.account_id)
+                .iter()
+                .find(|e| e.path.eq_ignore_ascii_case(&target_name))
+                .map(|e| e.fixture_id.clone());
+            match target_id {
+                None => Err(format!("unknown mailbox {target_name:?}")),
+                // Moving into the already-selected mailbox changes no
+                // slots; accept it as a no-op rather than erroring.
+                Some(target_id) if target_id == selected_id => Ok(()),
+                Some(target_id) => {
+                    let _ = fix.mutate(|f| {
+                        let mut diff = crate::fixture::MutationDiff::default();
+                        // Live (seq, uid, id) view of the source mailbox
+                        // (slot index + 1 = uid; seq = live-slot ordinal).
+                        let mut matched: Vec<(u32, u32, String)> = f
+                            .uid_history(&selected_id)
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, slot)| {
+                                slot.as_ref().map(|id| {
+                                    let uid = u32::try_from(i + 1).expect("uid fits in u32");
+                                    (uid, id.clone())
+                                })
+                            })
+                            .enumerate()
+                            .map(|(seq, (uid, id))| {
+                                let seq = u32::try_from(seq + 1).expect("seq fits in u32");
+                                (seq, uid, id)
+                            })
+                            .filter(|(_, uid, _)| set.matches(*uid))
+                            .collect();
+                        // Apply in ascending source-uid order so the
+                        // COPYUID source / dest lists line up.
+                        matched.sort_by_key(|(_, uid, _)| *uid);
+                        for (seq, uid, id) in &matched {
+                            let Some(idx) = f.emails.iter().position(|e| &e.id == id) else {
+                                continue;
+                            };
+                            // Gain the target (membership + fresh UID)
+                            // before dropping the source so the message
+                            // is never momentarily folder-less.
+                            if !f.emails[idx].mailbox_ids.iter().any(|m| m == &target_id) {
+                                f.emails[idx].mailbox_ids.push(target_id.clone());
+                            }
+                            let dst = f.assign_uid(&target_id, id.clone());
+                            f.emails[idx].mailbox_ids.retain(|m| m != &selected_id);
+                            f.retire_uid(&selected_id, id);
+                            src_uids.push(*uid);
+                            dst_uids.push(dst);
+                            expunged_seqs.push(*seq);
+                            diff.email_updated.push(id.clone());
+                        }
+                        diff
+                    });
+                    Ok(())
+                }
+            }
+        };
+
+        if let Err(reason) = resolved {
+            return self
+                .write_line(&format!("{tag} NO [TRYCREATE] {reason}"))
+                .await;
+        }
+
+        // Untagged expunge report (RFC 6851 Section 3): VANISHED when
+        // QRESYNC is enabled (RFC 7162 Section 3.2.10), else EXPUNGE
+        // highest-sequence-first so earlier (higher) removals never
+        // renumber the ones still to come.
+        if self.qresync_enabled {
+            if !src_uids.is_empty() {
+                let uids = src_uids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.write_line(&format!("* VANISHED {uids}")).await?;
+            }
+        } else {
+            expunged_seqs.sort_by_key(|s| std::cmp::Reverse(*s));
+            for seq in &expunged_seqs {
+                self.write_line(&format!("* {seq} EXPUNGE")).await?;
+            }
+        }
+
+        // Tagged OK carries COPYUID (RFC 6851 Section 4.3); UIDVALIDITY
+        // is pinned at 1 across the fixture lifetime. Omit COPYUID when
+        // nothing moved.
+        if src_uids.is_empty() {
+            self.write_line(&format!("{tag} OK UID MOVE completed"))
+                .await
+        } else {
+            let src = src_uids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let dst = dst_uids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            self.write_line(&format!(
+                "{tag} OK [COPYUID 1 {src} {dst}] UID MOVE completed"
+            ))
+            .await
         }
     }
 
@@ -3159,7 +3341,7 @@ mod tests {
         let out = run_script(b"a1 CAPABILITY\r\n").await;
         assert!(out.contains(GREETING));
         assert!(
-            out.contains("* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC\r\n"),
+            out.contains("* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE\r\n"),
             "got: {out:?}"
         );
         assert!(out.contains("a1 OK CAPABILITY completed\r\n"));
@@ -3210,7 +3392,7 @@ mod tests {
     async fn login_accepts_any_credential() {
         let out = run_script(b"a LOGIN \"alice\" \"hunter2\"\r\n").await;
         assert!(
-            out.contains("a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC] LOGIN completed"),
+            out.contains("a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE] LOGIN completed"),
             "got: {out:?}"
         );
     }
@@ -3229,7 +3411,7 @@ mod tests {
         let out = run_script(b"a AUTHENTICATE PLAIN AGFsaWNlAGh1bnRlcg==\r\n").await;
         assert!(
             out.contains(
-                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC] PLAIN authentication accepted"
+                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE] PLAIN authentication accepted"
             ),
             "got: {out:?}"
         );
