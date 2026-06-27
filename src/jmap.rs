@@ -1474,31 +1474,103 @@ fn build_email_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
         .find(|m| mailbox_ids.iter().any(|id| id == &m.id))
         .map(|m| m.account_id.clone())
         .unwrap_or_else(|| fix.primary_account().id.clone());
+    // Project the structured compose properties bifrost's client-send path
+    // sets on the `Email/set` create (RFC 8621 §4.6): subject, the address
+    // lists, and the body. Without this a sent message round-trips with an
+    // empty subject / no sender, so a send-writeback gate cannot identify it.
+    let subject = body
+        .get("subject")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string);
+    let from = jmap_address_list(body, "from").into_iter().next();
+    let to = jmap_address_list(body, "to");
+    let cc = jmap_address_list(body, "cc");
+    let bcc = jmap_address_list(body, "bcc");
+    let reply_to = jmap_address_list(body, "replyTo");
+    let message_id = body
+        .get("messageId")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(std::string::ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let body_text = jmap_text_body(body);
+
     let email = Email {
         id: server_id.clone(),
         account_id,
         thread_id: server_id.clone(),
         mailbox_ids,
         keywords,
-        size: 0,
+        size: i64::try_from(body_text.len()).unwrap_or(i64::MAX),
         received_at,
         sent_at: received_at,
-        from: None,
-        to: vec![],
-        cc: vec![],
-        bcc: vec![],
-        reply_to: vec![],
-        subject: None,
+        from,
+        to,
+        cc,
+        bcc,
+        reply_to,
+        subject,
         preview: None,
-        message_id: vec![],
+        message_id,
         in_reply_to: vec![],
         references: vec![],
         has_attachment: false,
-        body: crate::fixture::Body::Text(String::new()),
+        body: crate::fixture::Body::Text(body_text),
         attachments: vec![],
         raw_bytes: None,
     };
     Ok((server_id, email))
+}
+
+/// Parse a JMAP `EmailAddress[]` property (`from` / `to` / `cc` / `bcc` /
+/// `replyTo`) - each entry `{ "name": <string|null>, "email": <string> }`
+/// (RFC 8621 §4.1.2) - into the fixture address shape, dropping entries with
+/// no `email`.
+fn jmap_address_list(body: &Map<String, Value>, key: &str) -> Vec<Address> {
+    body.get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let email = entry.get("email").and_then(Value::as_str)?;
+                    Some(Address {
+                        name: entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(std::string::ToString::to_string),
+                        email: email.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the plain-text body of an `Email/set` create. The compose path
+/// carries `bodyValues` keyed by partId plus a `textBody` part list; prefer
+/// the part `textBody[0]` references, else the first available value.
+fn jmap_text_body(body: &Map<String, Value>) -> String {
+    let Some(values) = body.get("bodyValues").and_then(Value::as_object) else {
+        return String::new();
+    };
+    let part_id = body
+        .get("textBody")
+        .and_then(Value::as_array)
+        .and_then(|parts| parts.first())
+        .and_then(|part| part.get("partId"))
+        .and_then(Value::as_str);
+    part_id
+        .and_then(|pid| values.get(pid))
+        .or_else(|| values.values().next())
+        .and_then(|value| value.get("value"))
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+        .unwrap_or_default()
 }
 
 pub(crate) fn apply_email_patch(email: &mut Email, patch: &Value) -> Result<(), Value> {
