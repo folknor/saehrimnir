@@ -1213,3 +1213,82 @@ fn base64_encode(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// IMAP container-CRUD round-trip mirroring ratatoskr's
+/// `imap-container-crud` gate at the mock's own request layer: a single
+/// connection drives CREATE -> LIST -> RENAME -> LIST -> DELETE -> LIST,
+/// and each `LIST` block must reflect the preceding mutation, since the
+/// gate's `containers_list` is exactly a follow-up mailbox `LIST`.
+#[tokio::test]
+async fn create_rename_delete_round_trips_through_list() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"hunter2\"\r\n\
+        c1 CREATE \"HarnessBox\"\r\n\
+        l1 LIST \"\" \"*\"\r\n\
+        r1 RENAME \"HarnessBox\" \"HarnessBoxRenamed\"\r\n\
+        l2 LIST \"\" \"*\"\r\n\
+        d1 DELETE \"HarnessBoxRenamed\"\r\n\
+        l3 LIST \"\" \"*\"\r\n\
+        a9 LOGOUT\r\n";
+    let out = run_with_fixture(script).await;
+
+    assert!(out.contains("c1 OK CREATE completed"), "create failed: {out}");
+    assert!(out.contains("r1 OK RENAME completed"), "rename failed: {out}");
+    assert!(out.contains("d1 OK DELETE completed"), "delete failed: {out}");
+
+    // Slice the transcript into the three LIST blocks by their tagged
+    // completions (untagged `* LIST` lines precede each tag).
+    let i1 = out.find("l1 OK LIST").expect("l1");
+    let i2 = out.find("l2 OK LIST").expect("l2");
+    let i3 = out.find("l3 OK LIST").expect("l3");
+    let after_create = &out[..i1];
+    let after_rename = &out[i1..i2];
+    let after_delete = &out[i2..i3];
+
+    // CREATE is reflected.
+    assert!(
+        after_create.contains("\"HarnessBox\"\r\n"),
+        "created mailbox missing from LIST: {after_create}"
+    );
+    // RENAME is reflected: new name present, old name gone.
+    assert!(
+        after_rename.contains("\"HarnessBoxRenamed\"\r\n"),
+        "renamed mailbox missing from LIST: {after_rename}"
+    );
+    assert!(
+        !after_rename.contains("\"HarnessBox\"\r\n"),
+        "old mailbox name still listed after rename: {after_rename}"
+    );
+    // DELETE is reflected: neither name present.
+    assert!(
+        !after_delete.contains("HarnessBox"),
+        "deleted mailbox still listed: {after_delete}"
+    );
+}
+
+/// IMAP RENAME doubles as a re-parent (a move under a new parent), the
+/// path bifrost's `container_move` drives. Create a parent and a child
+/// at top level, then RENAME the child to `Parent/Child` and assert the
+/// follow-up LIST nests it under the parent.
+#[tokio::test]
+async fn rename_reparents_child_under_parent_in_list() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"hunter2\"\r\n\
+        c1 CREATE \"HParent\"\r\n\
+        c2 CREATE \"HChild\"\r\n\
+        r1 RENAME \"HChild\" \"HParent/HChild\"\r\n\
+        l1 LIST \"\" \"*\"\r\n\
+        a9 LOGOUT\r\n";
+    let out = run_with_fixture(script).await;
+    assert!(out.contains("r1 OK RENAME completed"), "reparent failed: {out}");
+    let i1 = out.find("l1 OK LIST").expect("l1");
+    let after = &out[..i1];
+    assert!(
+        after.contains("\"HParent/HChild\"\r\n"),
+        "child not reparented under parent in LIST: {after}"
+    );
+    assert!(
+        !after.contains("\"HChild\"\r\n"),
+        "child still listed at top level after reparent: {after}"
+    );
+}

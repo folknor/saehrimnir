@@ -801,7 +801,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 match parent_resolved {
                     Err(e) => Err(e),
                     Ok(parent_id) => {
-                        let new_id = fresh_mailbox_id(&fix);
+                        let new_id = fix.fresh_mailbox_id();
                         let account_id = self.account_id.clone();
                         let leaf = leaf.to_string();
                         let created_id = new_id.clone();
@@ -1794,21 +1794,6 @@ fn split_parent_leaf(path: &str) -> (Option<&str>, &str) {
     match path.rsplit_once('/') {
         Some((parent, leaf)) => (Some(parent), leaf),
         None => (None, path),
-    }
-}
-
-/// Mint a fixture-unique mailbox id. Follows the JMAP create scheme
-/// (`mock-mailbox-<n>`) but probes for a free suffix so a create after
-/// a delete (which leaves `mailboxes.len()` reusable) never collides
-/// with a surviving id.
-fn fresh_mailbox_id(fixture: &Fixture) -> String {
-    let mut n = fixture.mailboxes.len() + 1;
-    loop {
-        let candidate = format!("mock-mailbox-{n}");
-        if !fixture.mailboxes.iter().any(|m| m.id == candidate) {
-            return candidate;
-        }
-        n += 1;
     }
 }
 

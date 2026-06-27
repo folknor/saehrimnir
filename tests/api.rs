@@ -3239,3 +3239,165 @@ async fn multi_account_oauth_userinfo_returns_primary_claims() {
     assert_eq!(v["sub"], "account-primary");
     assert_eq!(v["email"], "primary@example.com");
 }
+
+/// JMAP container-CRUD round-trip mirroring ratatoskr's
+/// `jmap-container-crud` gate at the mock's own request layer: a
+/// fresh mailbox is created (no parent), `Mailbox/set` updates its
+/// `parentId` to point at a second created mailbox, and a follow-up
+/// `Mailbox/get` must reflect the reparent. Drives the move patch
+/// exactly the way bifrost's `container_move` does - a lone
+/// `parentId` plus a `role: null` clear in the same update body.
+#[tokio::test]
+async fn mailbox_set_create_move_round_trips_through_mailbox_get() {
+    let app = router();
+
+    // Create the parent (no parentId).
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({
+            "accountId": "account-1",
+            "create": { "p0": { "name": "HarnessParent" } },
+        }),
+        "c0",
+    )
+    .await;
+    let parent_id = v["methodResponses"][0][1]["created"]["p0"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Create the child (no parentId).
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({
+            "accountId": "account-1",
+            "create": { "c0": { "name": "HarnessChild" } },
+        }),
+        "c1",
+    )
+    .await;
+    let child_id = v["methodResponses"][0][1]["created"]["c0"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Before the move the child has no parent.
+    let v = jmap_call_on(&app, "Mailbox/get", json!({ "accountId": "account-1" }), "g0").await;
+    let pre_move_state = v["methodResponses"][0][1]["state"]
+        .as_str()
+        .expect("Mailbox/get carries a state token")
+        .to_string();
+    let child = v["methodResponses"][0][1]["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == json!(child_id.as_str()))
+        .unwrap();
+    assert_eq!(child["parentId"], Value::Null);
+
+    // Move the child under the parent. bifrost's `container_move`
+    // serializes the lone `parentId` change plus a `role: null` (and,
+    // depending on builder state, a `shareWith: null`) clear that the
+    // mock must tolerate as a no-op. Replicate the full patch shape so
+    // the move is honest about what the wire carries.
+    let mut move_update = serde_json::Map::new();
+    move_update.insert(
+        child_id.clone(),
+        json!({ "parentId": parent_id.clone(), "role": Value::Null, "shareWith": Value::Null }),
+    );
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({ "accountId": "account-1", "update": Value::Object(move_update) }),
+        "c2",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][0], "Mailbox/set");
+    assert_eq!(v["methodResponses"][0][1]["updated"][&child_id], Value::Null);
+    assert!(v["methodResponses"][0][1]["notUpdated"]
+        .as_object()
+        .is_none_or(serde_json::Map::is_empty));
+
+    // The follow-up Mailbox/get must reflect the reparent - this is the
+    // exact readback ratatoskr's `containers_list` performs.
+    let v = jmap_call_on(&app, "Mailbox/get", json!({ "accountId": "account-1" }), "g1").await;
+    let child = v["methodResponses"][0][1]["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == json!(child_id.as_str()))
+        .unwrap();
+    assert_eq!(
+        child["parentId"], parent_id,
+        "child mailbox did not reparent on the server after Mailbox/set parentId move"
+    );
+
+    // The reparent must ALSO surface in the `Mailbox/changes` delta as an
+    // `updated` id. This is the path bifrost's resync actually consumes: a
+    // steady-state delta cycle walks `Mailbox/changes` and only re-fetches the
+    // ids it reports, rather than re-running a full `Mailbox/get` inventory. A
+    // parentId-only move is a property change, so it is an `updated` (not a
+    // `created`/`destroyed`); if the mock failed to record the update in the
+    // per-account change log, the delta would come back empty and the new
+    // parent would never reach the client even though the server-side state is
+    // correct. Pin both halves of the contract here.
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/changes",
+        json!({ "accountId": "account-1", "sinceState": pre_move_state }),
+        "ch0",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][0], "Mailbox/changes");
+    let updated = v["methodResponses"][0][1]["updated"].as_array().unwrap();
+    assert!(
+        updated.iter().any(|id| id == &json!(child_id.as_str())),
+        "Mailbox/changes did not surface the reparented child as `updated`: {updated:?}"
+    );
+
+    // Rename the child (lone `name` change).
+    let mut rename_update = serde_json::Map::new();
+    rename_update.insert(child_id.clone(), json!({ "name": "HarnessRenamed" }));
+    jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({ "accountId": "account-1", "update": Value::Object(rename_update) }),
+        "c3",
+    )
+    .await;
+    let v = jmap_call_on(&app, "Mailbox/get", json!({ "accountId": "account-1" }), "g2").await;
+    let list = v["methodResponses"][0][1]["list"].as_array().unwrap();
+    let child = list
+        .iter()
+        .find(|m| m["id"] == json!(child_id.as_str()))
+        .unwrap();
+    assert_eq!(child["name"], "HarnessRenamed");
+    // The rename preserved the parent.
+    assert_eq!(child["parentId"], parent_id);
+    assert!(list.iter().all(|m| m["name"] != json!("HarnessChild")));
+
+    // Destroy the (empty) child, then the parent.
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({ "accountId": "account-1", "destroy": [child_id.clone()] }),
+        "c4",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["destroyed"], json!([child_id]));
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/set",
+        json!({ "accountId": "account-1", "destroy": [parent_id.clone()] }),
+        "c5",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["destroyed"], json!([parent_id]));
+
+    let v = jmap_call_on(&app, "Mailbox/get", json!({ "accountId": "account-1" }), "g3").await;
+    let list = v["methodResponses"][0][1]["list"].as_array().unwrap();
+    assert!(list.iter().all(|m| m["name"] != json!("HarnessRenamed")));
+    assert!(list.iter().all(|m| m["name"] != json!("HarnessParent")));
+}

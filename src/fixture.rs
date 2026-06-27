@@ -645,6 +645,24 @@ impl Fixture {
     /// by id); per-protocol handlers should go through this
     /// helper so a future per-account route addition reads as a
     /// one-line argument change rather than a rewrite.
+    /// Mint a fixture-unique mailbox id (`mock-mailbox-<n>`), probing
+    /// for a free suffix so a create after a delete never collides with
+    /// a surviving id. The bare `mailboxes.len() + 1` scheme is unsafe:
+    /// deleting a low-numbered mailbox while a higher one survives lets
+    /// the next create reuse the survivor's id. Every protocol's
+    /// container-create path goes through here so the id space stays
+    /// collision-free across CRUD interleavings.
+    pub fn fresh_mailbox_id(&self) -> String {
+        let mut n = self.mailboxes.len() + 1;
+        loop {
+            let candidate = format!("mock-mailbox-{n}");
+            if !self.mailboxes.iter().any(|m| m.id == candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
     pub fn mailboxes_for<'a>(
         &'a self,
         account_id: &'a str,

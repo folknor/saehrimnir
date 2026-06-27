@@ -853,3 +853,209 @@ async fn gmail_unknown_bearer_falls_back_to_primary() {
     .await;
     assert_eq!(v["emailAddress"], "primary@example.com");
 }
+
+/// Drive an arbitrary-method JSON request (PATCH / DELETE) against a
+/// reusable Gmail router so a stateful CRUD sequence shares one fixture.
+async fn send_method(
+    router: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, "Bearer doesnt-matter");
+    let req = match body {
+        Some(b) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            builder.body(Body::from(serde_json::to_vec(&b).unwrap())).unwrap()
+        }
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, v)
+}
+
+fn label_by_name<'a>(list: &'a Value, name: &str) -> Option<&'a Value> {
+    list["labels"]
+        .as_array()?
+        .iter()
+        .find(|l| l["name"] == serde_json::json!(name))
+}
+
+/// Gmail label-CRUD round-trip mirroring ratatoskr's
+/// `gmail-container-crud` gate at the mock's own request layer: a user
+/// label is created, renamed, recolored, and deleted, and every
+/// `labels.list` readback (the gate's `containers_list`) must reflect
+/// the mutation - including the recolor's `backgroundColor`, which the
+/// gate asserts as `server_color_bg`.
+#[tokio::test]
+async fn label_create_rename_recolor_delete_round_trips_through_list() {
+    let app = router();
+
+    // Create a user label (no color, matching the gate's first step).
+    let (status, created) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/labels",
+        serde_json::json!({ "name": "HarnessTag" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let label_id = created["id"].as_str().unwrap().to_string();
+
+    let (_, list) = get_json_with(app.clone(), "/gmail/v1/users/me/labels").await;
+    assert!(label_by_name(&list, "HarnessTag").is_some(), "label missing after create");
+
+    // Rename.
+    let (status, _) = send_method(
+        app.clone(),
+        "PATCH",
+        &format!("/gmail/v1/users/me/labels/{label_id}"),
+        Some(serde_json::json!({ "name": "HarnessTagRenamed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, list) = get_json_with(app.clone(), "/gmail/v1/users/me/labels").await;
+    assert!(label_by_name(&list, "HarnessTagRenamed").is_some(), "renamed label missing");
+    assert!(label_by_name(&list, "HarnessTag").is_none(), "old label name still present");
+
+    // Recolor: the color must round-trip into labels.list.
+    let (status, _) = send_method(
+        app.clone(),
+        "PATCH",
+        &format!("/gmail/v1/users/me/labels/{label_id}"),
+        Some(serde_json::json!({
+            "name": "HarnessTagRenamed",
+            "color": { "textColor": "#ffffff", "backgroundColor": "#fb4c2f" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, list) = get_json_with(app.clone(), "/gmail/v1/users/me/labels").await;
+    let recolored = label_by_name(&list, "HarnessTagRenamed").expect("label missing after recolor");
+    assert_eq!(
+        recolored["color"]["backgroundColor"], "#fb4c2f",
+        "label recolor did not round-trip in labels.list"
+    );
+    assert_eq!(recolored["color"]["textColor"], "#ffffff");
+
+    // Delete.
+    let (status, _) = send_method(
+        app.clone(),
+        "DELETE",
+        &format!("/gmail/v1/users/me/labels/{label_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = get_json_with(app.clone(), "/gmail/v1/users/me/labels").await;
+    assert!(
+        label_by_name(&list, "HarnessTagRenamed").is_none(),
+        "label still present after delete"
+    );
+}
+
+fn repro_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/gmail-initial-repro.toml")).unwrap();
+    gmail::router(gmail::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+/// Replays bifrost's exact Gmail initial-sync endpoint sequence against
+/// a fixture that carries a roleless "user label" mailbox (the shape the
+/// Gmail label-CRUD work models user labels with). Mirrors
+/// ratatoskr's `gmail-initial` gate at the mock's own request layer:
+///
+///   profile -> labels.list -> messages.list (no `q`) -> per-message
+///   `messages.get` (metadata / raw / full).
+///
+/// The load-bearing invariant is bifrost's membership-scope resolution:
+/// `discover_memberships` learns the valid label scopes from
+/// `labels.list`, and every `labelId` a message carries must be one of
+/// those scopes. A message whose `labelIds` reference a label absent
+/// from `labels.list` cannot resolve its membership, so initial sync
+/// drops it (or terminates) - the "returns 0 messages" symptom.
+#[tokio::test]
+async fn gmail_initial_sync_replay_message_labels_are_known_scopes() {
+    let app = repro_router();
+
+    // 1. profile: emailAddress + numeric historyId, real message count.
+    let (status, profile) = get_json_with(app.clone(), "/gmail/v1/users/me/profile").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(profile["emailAddress"], "test@example.com");
+    assert!(
+        profile["historyId"].as_str().unwrap().parse::<u64>().is_ok(),
+        "historyId must parse as u64: {:?}",
+        profile["historyId"]
+    );
+    assert_eq!(profile["messagesTotal"], 2, "profile message count");
+
+    // 2. labels.list: collect the known label-scope ids (what bifrost's
+    //    discover_memberships treats as the valid membership universe).
+    let (status, labels) = get_json_with(app.clone(), "/gmail/v1/users/me/labels").await;
+    assert_eq!(status, StatusCode::OK);
+    let known_labels: std::collections::BTreeSet<String> = labels["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["id"].as_str().unwrap().to_string())
+        .collect();
+    // System folders bifrost maps (INBOX + IMPORTANT) must be present.
+    assert!(known_labels.contains("INBOX"), "labels: {known_labels:?}");
+    assert!(known_labels.contains("IMPORTANT"), "labels: {known_labels:?}");
+
+    // 3. messages.list with no `q` (bifrost's inventory backfill).
+    let (status, list) =
+        get_json_with(app.clone(), "/gmail/v1/users/me/messages?maxResults=500").await;
+    assert_eq!(status, StatusCode::OK);
+    let stubs = list["messages"].as_array().unwrap();
+    assert_eq!(stubs.len(), 2, "messages.list must return the fixture's mail");
+
+    // 4. per-message metadata hydration: every labelId the message
+    //    carries must be a known label scope from labels.list.
+    let mut hydrated = 0;
+    for stub in stubs {
+        let id = stub["id"].as_str().unwrap();
+        let (status, msg) = get_json_with(
+            app.clone(),
+            &format!("/gmail/v1/users/me/messages/{id}?format=metadata"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "metadata get for {id}");
+        for label in msg["labelIds"].as_array().unwrap() {
+            let label = label.as_str().unwrap();
+            assert!(
+                known_labels.contains(label),
+                "message {id} carries label {label:?} not advertised by labels.list \
+                 (bifrost cannot resolve the membership scope, so the message is dropped); \
+                 known labels: {known_labels:?}"
+            );
+        }
+
+        // 5. raw + full hydration must both succeed (body fetch path).
+        let (status, raw) = get_json_with(
+            app.clone(),
+            &format!("/gmail/v1/users/me/messages/{id}?format=raw"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "raw get for {id}");
+        assert!(raw["raw"].is_string(), "raw projection missing for {id}");
+
+        let (status, full) = get_json_with(
+            app.clone(),
+            &format!("/gmail/v1/users/me/messages/{id}?format=full"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "full get for {id}");
+        assert!(full["payload"].is_object(), "full payload missing for {id}");
+        hydrated += 1;
+    }
+    assert_eq!(hydrated, 2, "both fixture messages hydrate end to end");
+}

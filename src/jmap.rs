@@ -2162,7 +2162,7 @@ fn build_mailbox_from_create(
         .map(crate::fixture::Role::parse)
         .transpose()
         .map_err(|e: String| set_error("invalidProperties", &e))?;
-    let id = format!("mock-mailbox-{}", fix.mailboxes.len() + 1);
+    let id = fix.fresh_mailbox_id();
     Ok(Mailbox {
         id,
         account_id: request_account_id.to_string(),

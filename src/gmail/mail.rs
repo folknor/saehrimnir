@@ -281,20 +281,6 @@ fn parse_label_color(body: &Value) -> Option<GmailLabelColor> {
     })
 }
 
-/// Mint a fixture-unique mailbox id for a Gmail user label. Follows the
-/// `mock-mailbox-<n>` scheme, probing for a free suffix so a create
-/// after a delete never collides with a surviving id.
-fn fresh_label_mailbox_id(fix: &Fixture) -> String {
-    let mut n = fix.mailboxes.len() + 1;
-    loop {
-        let candidate = format!("mock-mailbox-{n}");
-        if !fix.mailboxes.iter().any(|m| m.id == candidate) {
-            return candidate;
-        }
-        n += 1;
-    }
-}
-
 /// `POST /gmail/v1/users/me/labels` (`labels.create`). Creates a Gmail
 /// user label, modelled as a roleless fixture `Mailbox` (the same
 /// projection `list_labels` reads), so a follow-up `labels.list`
@@ -322,7 +308,7 @@ async fn create_label(
     let color = parse_label_color(&body);
     let new_id = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        let new_id = fresh_label_mailbox_id(&fix);
+        let new_id = fix.fresh_mailbox_id();
         if let Some(c) = color.clone() {
             fix.gmail_label_colors.insert(new_id.clone(), c);
         }

@@ -2423,3 +2423,134 @@ async fn graph_patch_recurrence_clears_with_null() {
         "expected recurrence cleared: {v}"
     );
 }
+
+/// Graph container-CRUD round-trip mirroring ratatoskr's
+/// `graph-container-crud` gate at the mock's own request layer: a parent
+/// and a child folder are created top-level, the child is MOVED under
+/// the parent, and the reparent must surface in a follow-up read. The
+/// gate's `containers_list` enumerates folders the way bifrost's Graph
+/// account does - the flat `/mailFolders` for top-level folders, then a
+/// recursive walk into each folder's `/childFolders` - so the moved
+/// (now-nested) child is read back through the parent's `childFolders`,
+/// not the top-level list. The existing folder-CRUD test only checks the
+/// move *response*, never the list readback the gate asserts on.
+#[tokio::test]
+async fn folder_move_reparent_round_trips_through_list() {
+    let app = router();
+
+    let (status, parent) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/mailFolders",
+        Some(json!({ "displayName": "HarnessParent" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    assert_eq!(parent["parentFolderId"], Value::Null);
+
+    let (status, child) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/mailFolders",
+        Some(json!({ "displayName": "HarnessChild" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let child_id = child["id"].as_str().unwrap().to_string();
+
+    // Before the move the child is a top-level folder.
+    let top_level_ids = |v: &Value| -> Vec<String> {
+        v["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let (_, list) = get_json_with(app.clone(), "/v1.0/me/mailFolders").await;
+    assert!(top_level_ids(&list).contains(&child_id), "child should start top-level");
+
+    // Move the child under the parent.
+    let (status, _) = send_json(
+        &app,
+        "POST",
+        &format!("/v1.0/me/mailFolders/{child_id}/move"),
+        Some(json!({ "destinationId": parent_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The reparent surfaces through the parent's childFolders (bifrost's
+    // recursive enumeration), and the child leaves the top-level list.
+    let find_child = |v: &Value| -> Option<Value> {
+        v["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == json!(child_id))
+            .cloned()
+    };
+    let (_, list) = get_json_with(app.clone(), "/v1.0/me/mailFolders").await;
+    assert!(
+        !top_level_ids(&list).contains(&child_id),
+        "moved child still listed at top level"
+    );
+    let (status, children) = get_json_with(
+        app.clone(),
+        &format!("/v1.0/me/mailFolders/{parent_id}/childFolders"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = find_child(&children).expect("child folder missing from parent's childFolders after move");
+    assert_eq!(
+        listed["parentFolderId"], parent_id,
+        "child folder did not reparent on the server after move"
+    );
+
+    // Rename is reflected too (still nested under the parent).
+    let (status, _) = send_json(
+        &app,
+        "PATCH",
+        &format!("/v1.0/me/mailFolders/{child_id}"),
+        Some(json!({ "displayName": "HarnessRenamed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, children) = get_json_with(
+        app.clone(),
+        &format!("/v1.0/me/mailFolders/{parent_id}/childFolders"),
+    )
+    .await;
+    let listed = find_child(&children).expect("renamed child folder missing from childFolders");
+    assert_eq!(listed["displayName"], "HarnessRenamed");
+    assert_eq!(listed["parentFolderId"], parent_id, "rename dropped the parent");
+
+    // Delete both; neither appears in the top-level list.
+    let (status, _) = send_json(
+        &app,
+        "DELETE",
+        &format!("/v1.0/me/mailFolders/{child_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send_json(
+        &app,
+        "DELETE",
+        &format!("/v1.0/me/mailFolders/{parent_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, list) = get_json_with(app, "/v1.0/me/mailFolders").await;
+    let ids: Vec<&str> = list["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert!(!ids.contains(&child_id.as_str()), "deleted child still listed");
+    assert!(!ids.contains(&parent_id.as_str()), "deleted parent still listed");
+}

@@ -1327,7 +1327,7 @@ fn create_folder_core(
     parent_id: Option<String>,
     name: String,
 ) -> Value {
-    let new_id = format!("mock-mailbox-{}", fix.mailboxes.len() + 1);
+    let new_id = fix.fresh_mailbox_id();
     let mailbox = Mailbox {
         id: new_id.clone(),
         account_id: account_id.to_string(),

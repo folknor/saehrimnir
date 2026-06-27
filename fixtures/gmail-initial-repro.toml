@@ -1,0 +1,55 @@
+name = "gmail-initial-repro"
+
+# Mirrors ratatoskr's `crates/app/tests/sync-fixtures/jmap-small.toml`
+# gate fixture, plus a roleless "user label" mailbox (the shape the
+# Gmail label-CRUD work models user labels with). Used by the initial-
+# sync replay test to exercise bifrost's exact endpoint sequence.
+
+[[account]]
+id = "account-1"
+name = "test@example.com"
+is_personal = true
+
+[[mailbox]]
+id = "mbx-inbox"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+[[mailbox]]
+id = "mbx-archive"
+name = "Archive"
+role = "archive"
+sort_order = 1
+
+# A roleless mailbox that projects to a Gmail user label.
+[[mailbox]]
+id = "harness-label"
+name = "Harness"
+sort_order = 2
+
+[[email]]
+id = "email-001"
+thread_id = "thread-hello"
+mailbox_ids = ["mbx-inbox"]
+keywords = ["project"]
+from = "alice@example.com"
+to = ["bob@example.com"]
+subject = "Hello"
+received_at = "2026-01-15T10:00:00Z"
+message_id = ["<email-001@example.com>"]
+body_text = "First message body."
+
+# A message that carries the user label (member of the roleless mailbox).
+[[email]]
+id = "email-002"
+thread_id = "thread-hello"
+mailbox_ids = ["mbx-inbox", "harness-label"]
+from = "carol@example.com"
+to = ["bob@example.com"]
+subject = "Re: Hello"
+received_at = "2026-01-15T11:00:00Z"
+message_id = ["<email-002@example.com>"]
+in_reply_to = ["<email-001@example.com>"]
+references = ["<email-001@example.com>"]
+body_text = "Reply body."
