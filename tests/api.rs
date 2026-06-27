@@ -47,6 +47,121 @@ async fn jmap_call(method: &str, args: Value, call_id: &str) -> Value {
     body_json(resp).await
 }
 
+fn send_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/send-small.toml")).unwrap();
+    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+#[tokio::test]
+async fn session_advertises_submission_capability_and_max_delayed_send() {
+    let resp = send_router()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    let caps = v["capabilities"].as_object().unwrap();
+    let submission = caps
+        .get("urn:ietf:params:jmap:submission")
+        .expect("submission capability advertised");
+    assert!(submission["maxDelayedSend"].as_u64().unwrap() > 0);
+    // The submission account is resolvable from primaryAccounts.
+    assert_eq!(
+        v["primaryAccounts"]["urn:ietf:params:jmap:submission"],
+        "account-1"
+    );
+}
+
+#[tokio::test]
+async fn jmap_raw_send_uploads_imports_and_submits_into_sent() {
+    let app = send_router();
+
+    // 1. Upload the assembled RFC 822 octets (Blob/upload).
+    let raw = b"From: test@example.com\r\nTo: bob@example.com\r\nSubject: Raw send\r\nDisposition-Notification-To: test@example.com\r\n\r\nRaw body.\r\n";
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/upload/account-1")
+                .header(header::CONTENT_TYPE, "message/rfc822")
+                .body(Body::from(raw.to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::CREATED);
+    let upload = body_json(upload).await;
+    let blob_id = upload["blobId"].as_str().unwrap().to_string();
+    assert_eq!(upload["accountId"], "account-1");
+
+    // 2. Email/import into Drafts, then EmailSubmission/set with an
+    //    `#emailId` back-reference and an onSuccessUpdateEmail moving
+    //    the message into Sent. One envelope, two method calls.
+    let envelope = json!({
+        "using": [
+            "urn:ietf:params:jmap:core",
+            "urn:ietf:params:jmap:mail",
+            "urn:ietf:params:jmap:submission"
+        ],
+        "methodCalls": [
+            ["Email/import", {
+                "accountId": "account-1",
+                "emails": {
+                    "i0": {
+                        "blobId": blob_id,
+                        "mailboxIds": { "mbx-drafts": true },
+                        "keywords": { "$draft": true }
+                    }
+                }
+            }, "c0"],
+            ["EmailSubmission/set", {
+                "accountId": "account-1",
+                "create": {
+                    "submit0": {
+                        "#emailId": { "resultOf": "c0", "name": "Email/import", "path": "/created/i0/id" },
+                        "undoStatus": "final"
+                    }
+                },
+                "onSuccessUpdateEmail": {
+                    "#submit0": { "mailboxIds": { "mbx-sent": true } }
+                }
+            }, "c1"]
+        ]
+    });
+    let v = post_jmap(app.clone(), envelope).await;
+    let mr = v["methodResponses"].as_array().unwrap();
+    assert_eq!(mr[0][0], "Email/import");
+    let imported_id = mr[0][1]["created"]["i0"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(mr[1][0], "EmailSubmission/set");
+    assert_eq!(
+        mr[1][1]["created"]["submit0"]["id"],
+        format!("submission-{imported_id}")
+    );
+
+    // 3. A follow-up Email/get reflects the sent message in Sent with
+    //    the parsed subject, no longer in Drafts.
+    let got = post_jmap(
+        app.clone(),
+        json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [["Email/get", { "accountId": "account-1", "ids": [imported_id] }, "g0"]],
+        }),
+    )
+    .await;
+    let email = &got["methodResponses"][0][1]["list"][0];
+    assert_eq!(email["subject"], "Raw send");
+    assert_eq!(email["mailboxIds"]["mbx-sent"], true);
+    assert!(email["mailboxIds"].get("mbx-drafts").is_none());
+}
+
 #[tokio::test]
 async fn session_resource_advertises_core_and_mail_only() {
     let resp = router()
@@ -937,7 +1052,9 @@ async fn unknown_account_lands_in_response_not_http() {
 
 #[tokio::test]
 async fn unknown_method_lands_in_response_not_http() {
-    let v = jmap_call("Email/import", json!({}), "c0").await;
+    // `Email/copy` stays out of scope in v0 (Email/import and
+    // EmailSubmission/set are now implemented for the send cut).
+    let v = jmap_call("Email/copy", json!({}), "c0").await;
     let entry = &v["methodResponses"][0];
     assert_eq!(entry[0], "error");
     assert_eq!(entry[1]["type"], "unknownMethod");
@@ -1319,11 +1436,26 @@ async fn test_smtp_submissions_returns_parsed_view() {
     // exact values - the harness scripts care about attachments.
     assert!(parsed["text_body_count"].is_number());
     assert!(parsed["html_body_count"].is_number());
+    // The projection now exposes the top-level headers and each
+    // attachment's content-id (null when absent).
+    let headers = parsed["headers"].as_array().unwrap();
+    assert!(
+        headers
+            .iter()
+            .any(|h| h["name"] == "Subject" && h["value"] == "hello"),
+        "headers: {headers:?}"
+    );
     let attachments = parsed["attachments"].as_array().unwrap();
     assert_eq!(attachments.len(), 1);
     assert_eq!(attachments[0]["filename"], "big.pdf");
     assert_eq!(attachments[0]["content_type"], "application/pdf");
     assert!(attachments[0]["size"].as_u64().unwrap() > 0);
+    assert!(
+        attachments[0]
+            .as_object()
+            .unwrap()
+            .contains_key("content_id")
+    );
 }
 
 #[tokio::test]

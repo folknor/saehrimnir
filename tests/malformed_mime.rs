@@ -275,15 +275,14 @@ fn base64url_round_trip() {
 fn encode_for_check(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
-    let mut chunks = bytes.chunks_exact(3);
-    for c in &mut chunks {
-        let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+    let (chunks, rem) = bytes.as_chunks::<3>();
+    for &[c0, c1, c2] in chunks {
+        let n = (u32::from(c0) << 16) | (u32::from(c1) << 8) | u32::from(c2);
         out.push(A[((n >> 18) & 63) as usize] as char);
         out.push(A[((n >> 12) & 63) as usize] as char);
         out.push(A[((n >> 6) & 63) as usize] as char);
         out.push(A[(n & 63) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = u32::from(rem[0]) << 16;

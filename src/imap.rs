@@ -2863,15 +2863,14 @@ fn part_mime_attachment(a: &crate::fixture::Attachment) -> String {
 fn base64_wrapped(input: &[u8]) -> String {
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for c in chunks.by_ref() {
-        let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+    let (chunks, rem) = input.as_chunks::<3>();
+    for &[c0, c1, c2] in chunks {
+        let n = (u32::from(c0) << 16) | (u32::from(c1) << 8) | u32::from(c2);
         encoded.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
         encoded.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
         encoded.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
         encoded.push(ALPHA[(n & 0x3f) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = u32::from(rem[0]) << 16;
@@ -3170,6 +3169,7 @@ mod tests {
             synthetic_email_seq: 0,
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
+            uploaded_blobs: std::collections::BTreeMap::new(),
         })
     }
 
@@ -3267,6 +3267,7 @@ mod tests {
             synthetic_email_seq: 0,
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
+            uploaded_blobs: std::collections::BTreeMap::new(),
         };
         // Test fixture - rebuild as if loaded.
         fix.rebuild_uid_history();

@@ -137,6 +137,24 @@ pub struct Fixture {
     /// produced by JMAP `ContactCard/set` create. Same shape as
     /// `synthetic_event_seq`.
     pub synthetic_contact_seq: u64,
+    /// Volatile blob store backing JMAP `Blob/upload`. Keyed by the
+    /// minted `blobId` (`uploadblob-N`), each entry holds the uploaded
+    /// content type and bytes. JMAP `Email/import` reads from here to
+    /// project the uploaded RFC 822 message into a fixture `Email`,
+    /// so bifrost's raw-send path (upload -> import-into-Drafts ->
+    /// `EmailSubmission/set`) round-trips. Empty at load; not part of
+    /// the authored fixture, so `RawFixture` / `normalize` never touch
+    /// it, and `POST /test/fixture/reset` clears it back to the
+    /// post-load baseline (also empty).
+    pub uploaded_blobs: BTreeMap<String, UploadedBlob>,
+}
+
+/// One blob uploaded via JMAP `Blob/upload`. Held in
+/// [`Fixture::uploaded_blobs`] until an `Email/import` consumes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedBlob {
+    pub content_type: String,
+    pub data: Vec<u8>,
 }
 
 /// Bounded ring of recent state transitions.
@@ -811,6 +829,18 @@ impl Fixture {
     pub fn mint_contact_id(&mut self) -> String {
         self.synthetic_contact_seq += 1;
         format!("mock-contact-{}", self.synthetic_contact_seq)
+    }
+
+    /// Store an uploaded blob and return its minted `blobId`. The id
+    /// is `uploadblob-N` where N is one past the current store size,
+    /// so it is deterministic for a given request sequence and never
+    /// collides within a run (the store is insert-only short of
+    /// `/test/fixture/reset`). Drives JMAP `Blob/upload`.
+    pub fn store_uploaded_blob(&mut self, content_type: String, data: Vec<u8>) -> String {
+        let blob_id = format!("uploadblob-{}", self.uploaded_blobs.len() + 1);
+        self.uploaded_blobs
+            .insert(blob_id.clone(), UploadedBlob { content_type, data });
+        blob_id
     }
 
     /// Apply a mutation, record its transition, and bump `state`.
@@ -2114,6 +2144,55 @@ pub enum Body {
     Text(String),
 }
 
+/// Structured fields projected from an uploaded / sent RFC 822 message.
+/// Shared by the JMAP `Email/import` and Gmail `messages.send` delivery
+/// paths so a client send lands in the fixture with real metadata.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedRfc822 {
+    pub subject: Option<String>,
+    pub from: Option<Address>,
+    pub to: Vec<Address>,
+    pub message_id: Vec<String>,
+    pub body_text: Option<String>,
+}
+
+/// Project an RFC 822 message into [`ParsedRfc822`]. Best-effort:
+/// anything `mail-parser` can't read is left empty, so a delivery path
+/// stays total (a malformed message still lands, just sparser). Only
+/// the first `From` / `To` address is captured (the fixture `Email`'s
+/// envelope fidelity is coarse in v0).
+pub fn parse_rfc822_email(raw: &[u8]) -> ParsedRfc822 {
+    let parser = mail_parser::MessageParser::default();
+    let Some(msg) = parser.parse(raw) else {
+        return ParsedRfc822::default();
+    };
+    let address_of = |addr: &mail_parser::Addr| Address {
+        name: addr.name.as_ref().map(std::string::ToString::to_string),
+        email: addr
+            .address
+            .as_ref()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default(),
+    };
+    let from = msg.from().and_then(|a| a.first()).map(address_of);
+    let to = msg
+        .to()
+        .and_then(|a| a.first())
+        .map(|a| vec![address_of(a)])
+        .unwrap_or_default();
+    let message_id = msg
+        .message_id()
+        .map(|m| vec![m.to_string()])
+        .unwrap_or_default();
+    ParsedRfc822 {
+        subject: msg.subject().map(std::string::ToString::to_string),
+        from,
+        to,
+        message_id,
+        body_text: msg.body_text(0).map(std::borrow::Cow::into_owned),
+    }
+}
+
 // ── Raw types for serde deserialization ─────────────────────────────
 //
 // These also serve as the in-memory shape the Lua loader builds up
@@ -3136,6 +3215,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         synthetic_email_seq,
         synthetic_category_seq,
         synthetic_contact_seq,
+        uploaded_blobs: BTreeMap::new(),
     })
 }
 

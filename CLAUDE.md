@@ -135,10 +135,22 @@ checking whether the fact is already in `notes/`.
   contact). RFC 8620 §5.2 dominance applies after the walk
   (created+destroyed cancels, created+updated collapses, etc.).
   Unknown / evicted `sinceState` returns `cannotCalculateChanges`.
-  Out-of-scope JMAP methods (`EmailSubmission/set`, push,
-  `Email/copy`, etc.) still return `unknownMethod`. Out-of-scope
-  IMAP commands (NOTIFY, COMPRESS, etc.) return `BAD`. (`IDLE` is
-  implemented - see the IMAP status section.)
+  Out-of-scope JMAP methods (`Email/copy`, etc.) still return
+  `unknownMethod`. The send surface is implemented: the
+  `Blob/upload` HTTP route (`POST /jmap/upload/{accountId}`,
+  stashing bytes in `Fixture::uploaded_blobs`), `Email/import`
+  (projecting an uploaded RFC 822 message into a fixture `Email`),
+  and `EmailSubmission/set` (delivering a referenced email - moving
+  it to Sent via `onSuccessUpdateEmail` or discarding it via
+  `onSuccessDestroyEmail`, with `#emailId` back-reference resolution
+  against an earlier `Email/set` / `Email/import` response and
+  acceptance of a `holduntil` FUTURERELEASE envelope parameter for
+  scheduled send). The session advertises
+  `urn:ietf:params:jmap:submission` (with a non-zero
+  `maxDelayedSend`) at top level and in `primaryAccounts` /
+  `accountCapabilities`. Out-of-scope IMAP commands (NOTIFY,
+  COMPRESS, etc.) return `BAD`. (`IDLE` is implemented - see the
+  IMAP status section.)
 - The session must NOT advertise `urn:ietf:params:jmap:principals`.
   It would pull the client into `Principal/get` and
   `ShareNotification` paths the mock cannot satisfy.

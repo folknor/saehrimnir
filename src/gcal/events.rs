@@ -703,6 +703,9 @@ fn parse_address(v: &Value) -> Option<Address> {
     Some(Address { email, name })
 }
 
+// Err is an axum `Response` (large); boxing would force every `?`
+// caller to unbox. Allow rather than reshape the helper.
+#[allow(clippy::result_large_err)]
 async fn parse_json_body(body: axum::body::Body) -> Result<Value, Response> {
     let bytes = match axum::body::to_bytes(body, 1_048_576).await {
         Ok(b) => b,

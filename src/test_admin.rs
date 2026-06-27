@@ -199,6 +199,18 @@ pub struct ParsedJson {
     pub text_body_count: usize,
     pub html_body_count: usize,
     pub attachments: Vec<AttachmentJson>,
+    /// Every top-level RFC 822 header on the submitted message as
+    /// `{ name, value }` objects, in document order. Lets a harness
+    /// gate assert the outgoing `Disposition-Notification-To` (or any
+    /// other header) bifrost emits without the projection enumerating
+    /// a fixed allowlist.
+    pub headers: Vec<HeaderJson>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HeaderJson {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,6 +218,9 @@ pub struct AttachmentJson {
     pub filename: Option<String>,
     pub content_type: String,
     pub size: usize,
+    /// The attachment part's `Content-ID` (angle brackets stripped),
+    /// when present. An inline-attachment gate asserts this is set.
+    pub content_id: Option<String>,
 }
 
 impl SubmissionJson {
@@ -221,7 +236,13 @@ impl SubmissionJson {
                     filename: a.filename,
                     content_type: a.content_type,
                     size: a.data.len(),
+                    content_id: a.content_id,
                 })
+                .collect(),
+            headers: p
+                .headers
+                .into_iter()
+                .map(|(name, value)| HeaderJson { name, value })
                 .collect(),
         });
         SubmissionJson {

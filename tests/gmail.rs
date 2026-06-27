@@ -47,6 +47,95 @@ fn attach_router() -> axum::Router {
     gmail::router(gmail::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
+fn send_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/send-small.toml")).unwrap();
+    gmail::router(gmail::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+async fn post_json(router: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, v)
+}
+
+/// base64url-no-pad encode for building a `messages.send` `raw` body.
+fn b64url(input: &[u8]) -> String {
+    gmail::mail::base64url_no_pad(input)
+}
+
+#[tokio::test]
+async fn gmail_messages_send_delivers_to_sent_and_history_reflects_it() {
+    let app = send_router();
+
+    // History baseline before the send (startHistoryId = 1).
+    let raw =
+        b"From: test@example.com\r\nTo: bob@example.com\r\nSubject: Sent via API\r\n\r\nHello body.\r\n";
+    let (status, v) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/send",
+        serde_json::json!({ "raw": b64url(raw) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent_id = v["id"].as_str().unwrap().to_string();
+    // The delivered copy carries the SENT label and the parsed subject.
+    let labels: Vec<&str> = v["labelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(labels.contains(&"SENT"), "labelIds: {labels:?}");
+
+    // A follow-up message GET finds the delivered message with subject.
+    let (status, msg) = get_json_with(
+        app.clone(),
+        &format!("/gmail/v1/users/me/messages/{sent_id}?format=metadata"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let subject = msg["payload"]["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["name"] == "Subject")
+        .and_then(|h| h["value"].as_str());
+    assert_eq!(subject, Some("Sent via API"));
+
+    // history.list from the pre-send historyId surfaces the add.
+    let (status, hist) = get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let added = hist["history"]
+        .as_array()
+        .map(|records| {
+            records.iter().any(|r| {
+                r["messagesAdded"]
+                    .as_array()
+                    .map(|m| m.iter().any(|x| x["message"]["id"] == sent_id))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(added, "history did not reflect the sent message: {hist:?}");
+}
+
 #[tokio::test]
 async fn gmail_get_thread_emits_multipart_payload_with_attachment_ref() {
     let (status, v) = get_json_with(

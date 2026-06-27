@@ -1084,6 +1084,9 @@ fn parse_graph_attendee(v: &Value) -> Option<Address> {
     })
 }
 
+// Err is an axum `Response` (large); allow rather than box (every `?`
+// caller would otherwise have to unbox).
+#[allow(clippy::result_large_err)]
 async fn parse_json_body(body: AxumBody) -> Result<Value, Response> {
     let bytes = match axum::body::to_bytes(body, 1_048_576).await {
         Ok(b) => b,

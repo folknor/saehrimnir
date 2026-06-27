@@ -65,7 +65,12 @@ outbound message. That makes the surface small.
   extension.
 - Capabilities the mock advertises (just enough for `lettre` to be
   happy):
-  - `SIZE 52428800` - large enough for any fixture.
+  - `SIZE 268435456` (256 MiB) - well above any message a gate
+    sends. bifrost-smtp parses the advertised SIZE limit and refuses
+    (client-side, before DATA) any message larger than it, so the
+    old 50MB limit fast-failed a ~67MB send (50MB attachment) with a
+    transport.network error. The mock never enforces this; it buffers
+    and accepts the full DATA regardless.
   - `8BITMIME` - so we don't have to advertise a quoted-printable
     transformation.
   - `AUTH PLAIN LOGIN XOAUTH2` - for the three mechanisms above.
@@ -159,8 +164,8 @@ mock does not have to generate one.
 - CHUNKING / BDAT - client uses DATA.
 - DSN result codes back to the client (NOTIFY/ORCPT are captured but
   the mock never emits a DSN).
-- SIZE negotiation - we advertise `SIZE 52428800` and capture the
-  `SIZE=` param if sent, but do not enforce.
+- SIZE negotiation - we advertise `SIZE 268435456` (256 MiB) and
+  capture the `SIZE=` param if sent, but do not enforce.
 - PIPELINING - `lettre` sends sequentially.
 - VRFY / EXPN / HELP / NOOP (we'll accept NOOP for politeness, the
   others stay BAD).

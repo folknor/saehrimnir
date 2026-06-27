@@ -55,6 +55,10 @@ pub fn router() -> Router<AppState> {
             axum::routing::post(batch_delete),
         )
         .route(
+            "/gmail/v1/users/me/messages/send",
+            axum::routing::post(send_message),
+        )
+        .route(
             "/gmail/v1/users/me/messages/{message_id}/modify",
             axum::routing::post(modify_message),
         )
@@ -859,6 +863,137 @@ fn label_wrappers(items: &[(String, Vec<String>)], fixture: &Fixture) -> Vec<Val
 // returns 200 with the updated Message (matching real Gmail).
 
 /// `POST /gmail/v1/users/me/messages/{id}/modify`.
+// ── messages.send ───────────────────────────────────────────────────
+//
+// bifrost's Gmail send (`api.rs::send_message`) POSTs
+// `{ raw: <base64url RFC822>, threadId? }`. Real Gmail decodes the
+// octets, delivers the message, and files the sent copy under the SENT
+// label. v0 decodes the raw, projects it into a fixture `Email`, lands
+// it in the account's Sent-role mailbox (so `Fixture::gmail_label_ids`
+// surfaces the `SENT` label), and records an `email_created` transition
+// so a follow-up `history.list` (messagesAdded) and `messages` /
+// `threads` listing reflect it. Returns the projected message, of which
+// bifrost reads only `id`.
+async fn send_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let Some(raw_b64) = body.get("raw").and_then(Value::as_str) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "messages.send requires a base64url `raw` field",
+            "invalidArgument",
+        );
+    };
+    let Some(raw) = decode_base64url_no_pad(raw_b64) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "`raw` is not valid base64url",
+            "invalidArgument",
+        );
+    };
+    let thread_id = body
+        .get("threadId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // The Sent-role mailbox files the sent copy (and yields the SENT
+    // label). Without one the account has no Sent surface, which is a
+    // fixture-authoring gap for a send gate.
+    let sent_mailbox = {
+        let fixture = state.fixture();
+        fixture
+            .mailboxes_for(&account_id)
+            .find(|m| m.role == Some(Role::Sent))
+            .map(|m| m.id.clone())
+    };
+    let Some(sent_mailbox) = sent_mailbox else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "account has no Sent-role mailbox to file the sent message",
+            "notFound",
+        );
+    };
+
+    let message_id = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        deliver_sent_message(&mut fix, &account_id, &sent_mailbox, &raw, thread_id)
+    };
+
+    let fixture = state.fixture();
+    match fixture.emails_for(&account_id).find(|e| e.id == message_id) {
+        Some(e) => (StatusCode::OK, axum::Json(message_value(e, &fixture))).into_response(),
+        None => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delivered message vanished",
+            "internalError",
+        ),
+    }
+}
+
+/// Insert a delivered RFC 822 message into `sent_mailbox`, projecting
+/// its structured fields, and record the `email_created` transition.
+/// Returns the minted message id.
+fn deliver_sent_message(
+    fix: &mut Fixture,
+    account_id: &str,
+    sent_mailbox: &str,
+    raw: &[u8],
+    thread_id: Option<String>,
+) -> String {
+    let parsed = crate::fixture::parse_rfc822_email(raw);
+    let received_at = fix
+        .emails
+        .iter()
+        .map(|e| e.received_at)
+        .max()
+        .unwrap_or_else(|| {
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .expect("hardcoded RFC3339")
+                .with_timezone(&chrono::Utc)
+        });
+    let server_id = fix.mint_email_id();
+    let thread_id = thread_id.unwrap_or_else(|| server_id.clone());
+    let raw_string = String::from_utf8_lossy(raw).into_owned();
+    let email = Email {
+        id: server_id.clone(),
+        account_id: account_id.to_string(),
+        thread_id,
+        mailbox_ids: vec![sent_mailbox.to_string()],
+        keywords: vec!["$seen".to_string()],
+        size: i64::try_from(raw.len()).unwrap_or(i64::MAX),
+        received_at,
+        sent_at: received_at,
+        from: parsed.from,
+        to: parsed.to,
+        cc: vec![],
+        bcc: vec![],
+        reply_to: vec![],
+        subject: parsed.subject,
+        preview: None,
+        message_id: parsed.message_id,
+        in_reply_to: vec![],
+        references: vec![],
+        has_attachment: false,
+        body: Body::Text(parsed.body_text.unwrap_or_default()),
+        attachments: vec![],
+        raw_bytes: Some(raw_string),
+    };
+    let mb = sent_mailbox.to_string();
+    let id = server_id.clone();
+    let _ = fix.mutate(move |f| {
+        f.emails.push(email);
+        f.assign_uid(&mb, id.clone());
+        MutationDiff {
+            email_created: vec![id.clone()],
+            ..Default::default()
+        }
+    });
+    server_id
+}
+
 async fn modify_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1357,17 +1492,13 @@ const URL_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 
 pub fn base64url_no_pad(input: &[u8]) -> String {
     let mut out = String::with_capacity((input.len() * 4).div_ceil(3));
-    let mut iter = input.chunks_exact(3);
-    for chunk in iter.by_ref() {
-        let b0 = chunk[0];
-        let b1 = chunk[1];
-        let b2 = chunk[2];
+    let (chunks, rem) = input.as_chunks::<3>();
+    for &[b0, b1, b2] in chunks {
         out.push(URL_ALPHABET[(b0 >> 2) as usize] as char);
         out.push(URL_ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
         out.push(URL_ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
         out.push(URL_ALPHABET[(b2 & 0x3f) as usize] as char);
     }
-    let rem = iter.remainder();
     match rem.len() {
         0 => {}
         1 => {
@@ -1387,9 +1518,67 @@ pub fn base64url_no_pad(input: &[u8]) -> String {
     out
 }
 
+/// Decode a base64url (RFC 4648 §5) string with optional `=` padding.
+/// `messages.send` carries the RFC 822 octets this way. Standard
+/// base64 (`+` / `/`) characters are also accepted so a client that
+/// sends standard-alphabet bytes still round-trips. Returns `None` on
+/// an invalid character or a truncated final quantum.
+pub fn decode_base64url_no_pad(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'-' | b'+' => Some(62),
+            b'_' | b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in input.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        // Ignore CR/LF whitespace some encoders insert.
+        if c == b'\r' || c == b'\n' {
+            continue;
+        }
+        let v = val(c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64url_decode_round_trips() {
+        for sample in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"hello world, this is a message body\r\n",
+        ] {
+            let encoded = base64url_no_pad(sample);
+            assert_eq!(decode_base64url_no_pad(&encoded).as_deref(), Some(sample));
+        }
+        // Standard-alphabet input also decodes.
+        assert_eq!(
+            decode_base64url_no_pad("Zm9vYmFy").as_deref(),
+            Some(&b"foobar"[..])
+        );
+    }
 
     #[test]
     fn base64url_known_vectors() {

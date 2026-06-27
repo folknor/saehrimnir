@@ -339,6 +339,55 @@ async fn parse_mime_extracts_subject_and_attachment() {
     assert_eq!(att.data, b"Hello World");
 }
 
+/// The MIME projection exposes arbitrary top-level headers and a
+/// per-attachment Content-ID so harness gates can assert the
+/// `Disposition-Notification-To` (MDN request) header and an inline
+/// image's `Content-ID` round-trip on a submitted message.
+#[tokio::test]
+async fn parse_mime_exposes_headers_and_inline_content_id() {
+    let script = b"\
+        EHLO me\r\n\
+        MAIL FROM:<a@b>\r\n\
+        RCPT TO:<c@d>\r\n\
+        DATA\r\n\
+        From: a@b\r\n\
+        To: c@d\r\n\
+        Subject: mdn please\r\n\
+        Disposition-Notification-To: a@b\r\n\
+        MIME-Version: 1.0\r\n\
+        Content-Type: multipart/related; boundary=\"BND\"\r\n\
+        \r\n\
+        --BND\r\n\
+        Content-Type: text/html; charset=utf-8\r\n\
+        \r\n\
+        <img src=\"cid:logo-1\">\r\n\
+        --BND\r\n\
+        Content-Type: image/png\r\n\
+        Content-Disposition: inline; filename=\"logo.png\"\r\n\
+        Content-ID: <logo-1>\r\n\
+        Content-Transfer-Encoding: base64\r\n\
+        \r\n\
+        SGVsbG8gV29ybGQ=\r\n\
+        --BND--\r\n\
+        .\r\n\
+        QUIT\r\n";
+    let (_, log) = run_with_log(script).await;
+    let snap = log.snapshot();
+    let parsed = snap[0].parse_mime().expect("parse_mime");
+    // The arbitrary MDN header is present in the projected headers.
+    assert!(
+        parsed
+            .headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("Disposition-Notification-To") && v == "a@b"),
+        "headers: {:?}",
+        parsed.headers
+    );
+    // The inline image's Content-ID round-trips with brackets stripped.
+    assert_eq!(parsed.attachments.len(), 1);
+    assert_eq!(parsed.attachments[0].content_id.as_deref(), Some("logo-1"));
+}
+
 /// Each SMTP verb appends a `(protocol="smtp", command, detail)`
 /// entry. Verifies the dispatch hook fires for the full submission
 /// path and that an empty (whitespace-only) line surfaces as a `""`

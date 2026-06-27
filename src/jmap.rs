@@ -46,8 +46,16 @@ pub fn handle(
     req: JmapRequest,
 ) -> JmapResponse {
     let mut responses = Vec::with_capacity(req.method_calls.len());
+    // Prior results in this envelope, keyed by callId, so a later
+    // method can resolve an RFC 8620 §3.7 back-reference against an
+    // earlier response (e.g. `EmailSubmission/set`'s `#emailId`
+    // resolving `/created/<id>/id` from the preceding `Email/set` or
+    // `Email/import`). Cloned per call; envelopes are bounded at
+    // `maxCallsInRequest` (16) so this stays cheap.
+    let mut prior: Vec<(String, Value)> = Vec::with_capacity(req.method_calls.len());
     for (name, args, call_id) in req.method_calls {
-        let (out_name, out_args) = dispatch(fixture, dispatcher, &name, &args);
+        let (out_name, out_args) = dispatch(fixture, dispatcher, &name, &args, &prior);
+        prior.push((call_id.clone(), out_args.clone()));
         responses.push((out_name, out_args, call_id));
     }
     let session_state = fixture
@@ -67,6 +75,7 @@ fn dispatch(
     dispatcher: Option<&std::sync::Arc<crate::lua::Dispatcher>>,
     name: &str,
     args: &Value,
+    prior: &[(String, Value)],
 ) -> (String, Value) {
     // Reactive callback: a registered handler can override the
     // method response. Surfaced fields: `account_id` (when present),
@@ -108,7 +117,12 @@ fn dispatch(
     // mutually exclude per-call only.
     if matches!(
         name,
-        "Email/set" | "Mailbox/set" | "CalendarEvent/set" | "ContactCard/set"
+        "Email/set"
+            | "Mailbox/set"
+            | "CalendarEvent/set"
+            | "ContactCard/set"
+            | "Email/import"
+            | "EmailSubmission/set"
     ) {
         let mut fix = fixture.write().expect("fixture lock poisoned");
         let res = match name {
@@ -116,6 +130,8 @@ fn dispatch(
             "Mailbox/set" => mailbox_set(&mut fix, args),
             "CalendarEvent/set" => crate::jmap_calendar::calendar_event_set(&mut fix, args),
             "ContactCard/set" => crate::jmap_contacts::contact_card_set(&mut fix, args),
+            "Email/import" => email_import(&mut fix, args),
+            "EmailSubmission/set" => email_submission_set(&mut fix, args, prior),
             _ => unreachable!(),
         };
         return match res {
@@ -1544,6 +1560,327 @@ pub(crate) fn apply_email_patch(email: &mut Email, patch: &Value) -> Result<(), 
     Ok(())
 }
 
+// ── Email/import ────────────────────────────────────────────────────
+//
+// RFC 8621 §4.8. bifrost's raw-send path uploads the assembled RFC 822
+// octets as a blob (`Blob/upload`), imports them into the Drafts
+// mailbox here, then submits via `EmailSubmission/set`. The mock pulls
+// the uploaded bytes back out of `Fixture::uploaded_blobs`, parses them
+// with `mail-parser` to project subject / from / to / message-id / body
+// onto the new `Email`, and keeps the raw octets on the email's
+// `raw_bytes` so the IMAP + JMAP body surfaces echo exactly what was
+// sent. Response shape mirrors `Email/set`'s created map so bifrost's
+// `EmailImportResponse` deserializes (`created.<id>.id`).
+fn email_import(fixture: &mut Fixture, args: &Value) -> Result<Value, Value> {
+    let account_id = require_account(fixture, args)?.to_string();
+    let emails = args
+        .get("emails")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut created_out = Map::new();
+    let mut not_created = Map::new();
+
+    let old_state = fixture.state_for(&account_id).to_string();
+    fixture.mutate(|fix| {
+        let mut diff = crate::fixture::MutationDiff::default();
+        for (client_id, body) in &emails {
+            match build_email_from_import(fix, body) {
+                Ok((server_id, email)) => {
+                    let size = email.size;
+                    let mailboxes = email.mailbox_ids.clone();
+                    fix.emails.push(email);
+                    for mb in &mailboxes {
+                        fix.assign_uid(mb, server_id.clone());
+                    }
+                    diff.email_created.push(server_id.clone());
+                    created_out.insert(
+                        client_id.clone(),
+                        json!({
+                            "id": server_id,
+                            "blobId": format!("blob-{server_id}"),
+                            "threadId": server_id,
+                            "size": size,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    not_created.insert(client_id.clone(), err);
+                }
+            }
+        }
+        diff
+    });
+    let new_state = fixture.state_for(&account_id).to_string();
+
+    let mut out = Map::new();
+    out.insert("accountId".to_string(), Value::String(account_id.clone()));
+    out.insert("oldState".to_string(), Value::String(old_state));
+    out.insert("newState".to_string(), Value::String(new_state));
+    out.insert(
+        "created".to_string(),
+        if created_out.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(created_out)
+        },
+    );
+    out.insert(
+        "notCreated".to_string(),
+        if not_created.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(not_created)
+        },
+    );
+    Ok(Value::Object(out))
+}
+
+/// Build a fixture `Email` from an `Email/import` entry: resolve the
+/// `blobId` to previously-uploaded bytes, parse them, and project the
+/// structured fields. The mailboxIds / keywords come from the import
+/// entry (Drafts + `$draft` in bifrost's flow).
+fn build_email_from_import(fix: &mut Fixture, body: &Value) -> Result<(String, Email), Value> {
+    let body = body
+        .as_object()
+        .ok_or_else(|| set_error("invalidProperties", "import entry must be an object"))?;
+    let blob_id = body
+        .get("blobId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| set_error("invalidProperties", "missing blobId"))?;
+    let raw = fix
+        .uploaded_blobs
+        .get(blob_id)
+        .map(|b| b.data.clone())
+        .ok_or_else(|| set_error("blobNotFound", &format!("unknown blobId {blob_id:?}")))?;
+    let mailbox_ids: Vec<String> = body
+        .get("mailboxIds")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .ok_or_else(|| set_error("invalidProperties", "missing mailboxIds"))?;
+    for id in &mailbox_ids {
+        if !fix.mailboxes.iter().any(|m| &m.id == id) {
+            return Err(set_error(
+                "invalidProperties",
+                &format!("unknown mailboxId {id:?}"),
+            ));
+        }
+    }
+    let keywords: Vec<String> = body
+        .get("keywords")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let account_id = fix
+        .mailboxes
+        .iter()
+        .find(|m| mailbox_ids.iter().any(|id| id == &m.id))
+        .map(|m| m.account_id.clone())
+        .unwrap_or_else(|| fix.primary_account().id.clone());
+    let received_at = fix
+        .emails
+        .iter()
+        .map(|e| e.received_at)
+        .max()
+        .unwrap_or_else(|| {
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .expect("hardcoded RFC3339")
+                .with_timezone(&chrono::Utc)
+        });
+    let server_id = fix.mint_email_id();
+    let parsed = crate::fixture::parse_rfc822_email(&raw);
+    let raw_string = String::from_utf8_lossy(&raw).into_owned();
+    let email = Email {
+        id: server_id.clone(),
+        account_id,
+        thread_id: server_id.clone(),
+        mailbox_ids,
+        keywords,
+        size: i64::try_from(raw.len()).unwrap_or(i64::MAX),
+        received_at,
+        sent_at: received_at,
+        from: parsed.from,
+        to: parsed.to,
+        cc: vec![],
+        bcc: vec![],
+        reply_to: vec![],
+        subject: parsed.subject,
+        preview: None,
+        message_id: parsed.message_id,
+        in_reply_to: vec![],
+        references: vec![],
+        has_attachment: false,
+        body: crate::fixture::Body::Text(parsed.body_text.unwrap_or_default()),
+        attachments: vec![],
+        raw_bytes: Some(raw_string),
+    };
+    Ok((server_id, email))
+}
+
+// ── EmailSubmission/set ─────────────────────────────────────────────
+//
+// RFC 8621 §7. The submission-capable surface bifrost's B5 send cut
+// drives. A `create` marks a referenced `Email` submitted and delivers
+// it: the server-side `onSuccessUpdateEmail` patch files the message in
+// Sent (move out of Drafts), or `onSuccessDestroyEmail` discards it
+// when the caller opted out of saving. The `emailId` is either explicit
+// (draft-send) or an RFC 8620 §3.7 back-reference (`#emailId`) resolved
+// against the preceding `Email/set` (compose) / `Email/import` (raw)
+// response in the same envelope.
+//
+// Scheduled send (`scheduled_send`): the envelope's
+// `mailFrom.parameters.holduntil` (SMTP FUTURERELEASE) is accepted and
+// acknowledged - the mock has no clock, so delivery is immediate, but
+// the submission succeeds rather than erroring so the delegated
+// scheduled path is gateable. `update` (cancel / reschedule via
+// `undoStatus`) is accepted and echoed.
+//
+// The created submission id is deterministic (`submission-<emailId>`)
+// so a follow-up cancel/reschedule can address it. bifrost reads
+// `created.<createId>.id` (and, for a scheduled send, returns it as the
+// undo handle).
+fn email_submission_set(
+    fixture: &mut Fixture,
+    args: &Value,
+    prior: &[(String, Value)],
+) -> Result<Value, Value> {
+    let account_id = require_account(fixture, args)?.to_string();
+    let creates = args
+        .get("create")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let updates = args
+        .get("update")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let on_success_update = args
+        .get("onSuccessUpdateEmail")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let on_success_destroy: Vec<String> = args
+        .get("onSuccessDestroyEmail")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut created_out = Map::new();
+    let mut not_created = Map::new();
+    let mut updated_out = Map::new();
+
+    let old_state = fixture.state_for(&account_id).to_string();
+    fixture.mutate(|fix| {
+        let mut diff = crate::fixture::MutationDiff::default();
+        for (create_id, sub) in &creates {
+            let Some(email_id) = resolve_submission_email_id(sub, prior) else {
+                not_created.insert(
+                    create_id.clone(),
+                    set_error("invalidProperties", "missing or unresolvable emailId"),
+                );
+                continue;
+            };
+            if !fix.emails.iter().any(|e| e.id == email_id) {
+                not_created.insert(
+                    create_id.clone(),
+                    set_error(
+                        "invalidProperties",
+                        &format!("emailId {email_id:?} not found"),
+                    ),
+                );
+                continue;
+            }
+            // Server-side onSuccess action, keyed by this submission's
+            // create-id with the RFC 8621 `#` create-reference prefix.
+            let key = format!("#{create_id}");
+            if let Some(patch) = on_success_update.get(&key) {
+                if let Some(idx) = fix.emails.iter().position(|e| e.id == email_id) {
+                    let old_mailboxes = fix.emails[idx].mailbox_ids.clone();
+                    let mut clone = fix.emails[idx].clone();
+                    if apply_email_patch(&mut clone, patch).is_ok() {
+                        let new_mailboxes = clone.mailbox_ids.clone();
+                        fix.emails[idx] = clone;
+                        fix.sync_mailbox_uids(&email_id, &old_mailboxes, &new_mailboxes);
+                        diff.email_updated.push(email_id.clone());
+                    }
+                }
+            } else if on_success_destroy.contains(&key)
+                && let Some(idx) = fix.emails.iter().position(|e| e.id == email_id)
+            {
+                let mailboxes = fix.emails[idx].mailbox_ids.clone();
+                let owner = fix.emails[idx].account_id.clone();
+                fix.emails.remove(idx);
+                for mb in &mailboxes {
+                    fix.retire_uid(mb, &email_id);
+                }
+                diff.email_destroyed.push(email_id.clone());
+                diff.email_destroyed_accounts.push(owner);
+            }
+            let undo_status = sub
+                .get("undoStatus")
+                .and_then(Value::as_str)
+                .unwrap_or("final");
+            created_out.insert(
+                create_id.clone(),
+                json!({
+                    "id": format!("submission-{email_id}"),
+                    "emailId": email_id,
+                    "undoStatus": undo_status,
+                }),
+            );
+        }
+        diff
+    });
+    let new_state = fixture.state_for(&account_id).to_string();
+
+    // Cancel / reschedule come through as `update` blocks patching
+    // `undoStatus`; the mock has no real queue, so it acknowledges them
+    // without further state change.
+    for id in updates.keys() {
+        updated_out.insert(id.clone(), Value::Null);
+    }
+
+    Ok(set_response(
+        &account_id,
+        &old_state,
+        &new_state,
+        created_out,
+        not_created,
+        updated_out,
+        Map::new(),
+        vec![],
+        Map::new(),
+    ))
+}
+
+/// Resolve an `EmailSubmission` create's target email id: an explicit
+/// `emailId`, else the RFC 8620 §3.7 back-reference `#emailId`
+/// (`{ resultOf, name, path }`) evaluated as a JSON pointer against the
+/// referenced earlier response in this envelope.
+fn resolve_submission_email_id(sub: &Value, prior: &[(String, Value)]) -> Option<String> {
+    if let Some(id) = sub.get("emailId").and_then(Value::as_str) {
+        return Some(id.to_string());
+    }
+    let reference = sub.get("#emailId")?;
+    let result_of = reference.get("resultOf").and_then(Value::as_str)?;
+    let path = reference.get("path").and_then(Value::as_str)?;
+    let result = prior
+        .iter()
+        .find(|(call_id, _)| call_id == result_of)
+        .map(|(_, value)| value)?;
+    result
+        .pointer(path)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 // ── Mailbox/set ─────────────────────────────────────────────────────
 //
 // RFC 8621 §2.5. v0 supports the `name`, `parentId`, `sortOrder`,
@@ -2016,6 +2353,7 @@ mod tests {
             synthetic_email_seq: 0,
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
+            uploaded_blobs: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2084,7 +2422,9 @@ mod tests {
     #[test]
     fn dispatch_unknown_method_returns_error() {
         let f = crate::shared::handle(fix());
-        let (name, body) = dispatch(&f, None, "Email/import", &json!({}));
+        // `Email/copy` stays out of scope in v0; `Email/import` and
+        // `EmailSubmission/set` are now implemented for the send cut.
+        let (name, body) = dispatch(&f, None, "Email/copy", &json!({}), &[]);
         assert_eq!(name, "error");
         assert_eq!(body.get("type").unwrap(), "unknownMethod");
     }
@@ -2214,6 +2554,7 @@ mod tests {
             synthetic_email_seq: 0,
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
+            uploaded_blobs: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2509,6 +2850,7 @@ mod tests {
             synthetic_email_seq: 0,
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
+            uploaded_blobs: std::collections::BTreeMap::new(),
         }
     }
 

@@ -88,8 +88,9 @@ impl AppState {
 ///
 /// Gated when `fixture.oauth.enforce = true`:
 ///   - `GET /.well-known/jmap`, `GET /jmap/session`,
-///     `POST /jmap/api`, `GET /jmap/download/...` (each handler
-///     calls `enforce_bearer` directly).
+///     `POST /jmap/api`, `GET /jmap/download/...`,
+///     `POST /jmap/upload/{accountId}` (each handler calls
+///     `enforce_bearer` directly).
 ///
 /// Always reachable, even with enforcement on:
 ///   - `GET /` - static `"saehrimnir\n"` banner; intended health
@@ -104,8 +105,8 @@ impl AppState {
 ///     listener on `127.0.0.1` only.
 ///
 /// 404-via-axum-default (no bypass risk):
-///   - `/jmap/upload/{accountId}` and `/jmap/eventsource/...`
-///     are advertised in the session resource but unrouted here.
+///   - `/jmap/eventsource/...` is advertised in the session
+///     resource but unrouted here.
 ///
 /// SECURITY TODO (2026-05-09 review): if a future flag exposes a
 /// non-loopback bind, every `/test/*` route becomes a remote-
@@ -133,6 +134,7 @@ pub fn router(state: AppState) -> Router {
         .route("/.well-known/jmap", get(session))
         .route("/jmap/session", get(session))
         .route("/jmap/api", post(api))
+        .route("/jmap/upload/{account_id}", post(upload))
         .route("/jmap/ws", get(jmap_ws))
         .route(
             "/jmap/download/{account_id}/{blob_id}/{name}",
@@ -146,6 +148,13 @@ pub fn router(state: AppState) -> Router {
         .merge(oauth_invalidate_router)
 }
 
+/// Advertised JMAP `urn:ietf:params:jmap:submission` `maxDelayedSend`
+/// (seconds). Non-zero so bifrost enables `scheduled_send`; generous
+/// (365 days) so a harness can stage a hold-until well into the future
+/// without tripping bifrost's `validate_scheduled` window check. The
+/// mock has no clock, so it never actually defers delivery.
+const SUBMISSION_MAX_DELAYED_SEND: u64 = 31_536_000;
+
 async fn root() -> &'static str {
     "saehrimnir\n"
 }
@@ -156,6 +165,10 @@ async fn root() -> &'static str {
 /// `notes/ratatoskr-jmap-surface.md` - advertising `principals`
 /// pulls the client into `Principal/get` and `ShareNotification`
 /// paths the mock can't satisfy in v0).
+// The Err variant is an axum `Response` (large); boxing it would break
+// the handler's `IntoResponse` impl, so allow rather than shrink. This
+// mirrors `enforce_bearer`, which boxes `Response` where it can.
+#[allow(clippy::result_large_err)]
 async fn session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -202,6 +215,17 @@ async fn session(
     for acct in &fixture.accounts {
         let mut caps = serde_json::Map::new();
         caps.insert("urn:ietf:params:jmap:mail".to_string(), json!({}));
+        // Every fixture account is submission-capable in v0 (the send
+        // cut routes SEND / drafts / scheduled-send / raw-MDN through
+        // this surface). `maxDelayedSend` advertises the deferred-send
+        // window; bifrost gates `scheduled_send` on it being non-zero.
+        caps.insert(
+            "urn:ietf:params:jmap:submission".to_string(),
+            json!({
+                "maxDelayedSend": SUBMISSION_MAX_DELAYED_SEND,
+                "submissionExtensions": {},
+            }),
+        );
         let has_calendars = fixture.calendars_for(&acct.id).next().is_some();
         if has_calendars {
             caps.insert(
@@ -255,6 +279,12 @@ async fn session(
         "urn:ietf:params:jmap:mail".to_string(),
         Value::String(primary_id.clone()),
     );
+    // The submission account bifrost resolves
+    // (`client.primary_account::<Submission>()`) for every send path.
+    primary.insert(
+        "urn:ietf:params:jmap:submission".to_string(),
+        Value::String(primary_id.clone()),
+    );
     if primary_has_calendars {
         primary.insert(
             "urn:ietf:params:jmap:calendars".to_string(),
@@ -286,6 +316,16 @@ async fn session(
         }),
     );
     top_caps.insert("urn:ietf:params:jmap:mail".to_string(), json!({}));
+    // Session-level submission capability. bifrost reads
+    // `maxDelayedSend` here to decide whether scheduled send is
+    // supported (non-zero => enabled).
+    top_caps.insert(
+        "urn:ietf:params:jmap:submission".to_string(),
+        json!({
+            "maxDelayedSend": SUBMISSION_MAX_DELAYED_SEND,
+            "submissionExtensions": {},
+        }),
+    );
     // RFC 8887 WebSocket push capability. `url` carries the ws:// (or
     // wss://) endpoint a client upgrades for the StateChange channel;
     // `supportsPush` advertises that the server emits `StateChange`
@@ -331,6 +371,9 @@ async fn session(
 /// envelope's `methodResponses`. JSON parse failures bubble up as 400
 /// via axum's `Json` extractor, which is the right behaviour per RFC
 /// 8620 §3.6.1.
+// Err is an axum `Response` (large); boxing breaks `IntoResponse`. See
+// the note on `session`.
+#[allow(clippy::result_large_err)]
 async fn api(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -503,6 +546,54 @@ async fn download(
             "type": "urn:ietf:params:jmap:error:notFound",
             "status": 404,
             "detail": format!("blob {blob_id} not found"),
+        })),
+    )
+        .into_response()
+}
+
+/// Blob-upload endpoint per RFC 8620 §6.1. The session resource
+/// advertises the URL template `/jmap/upload/{accountId}`; the client
+/// POSTs raw octets with a `Content-Type` and receives
+/// `{ accountId, blobId, type, size }`. bifrost's raw-send path uploads
+/// the assembled RFC 822 message here, then references the returned
+/// `blobId` from an `Email/import`. The bytes are stashed in
+/// `Fixture::uploaded_blobs` so `Email/import` can project them. Bearer-
+/// gated under `[oauth] enforce`. Records a `("jmap", "Blob/upload")`
+/// request-log entry so a harness can assert the upload fired.
+async fn upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
+    Path(account_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(deny) = enforce_bearer(&state, &headers) {
+        return *deny;
+    }
+    state.shared.latency.sleep_for("jmap").await;
+    state.shared.request_log.record_with_conn(
+        "jmap",
+        "Blob/upload".to_string(),
+        json!({ "account_id": account_id }),
+        connection_id,
+    );
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let size = body.len();
+    let blob_id = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        fix.store_uploaded_blob(content_type.clone(), body.to_vec())
+    };
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "accountId": account_id,
+            "blobId": blob_id,
+            "type": content_type,
+            "size": size,
         })),
     )
         .into_response()

@@ -1606,6 +1606,20 @@ async fn patch_message_impl(
     }) {
         return o;
     }
+    // Scheduled-send acknowledgement: bifrost's Graph deferred send
+    // PATCHes `PidTagDeferredSendTime` (`SystemTime 0x3FEF`) onto the
+    // draft before sending. The mock has no scheduler, so it accepts and
+    // acknowledges the hold time, recording it as a distinct request-log
+    // entry so a harness can gate the delegated scheduled path on the
+    // exact hold-until value transmitted.
+    if let Some(hold_until) = deferred_send_time(&body) {
+        state.shared.request_log.record_with_conn(
+            "graph",
+            "deferred-send".to_string(),
+            json!({ "message_id": message_id, "hold_until": hold_until }),
+            None,
+        );
+    }
     let outcome = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
         patch_message_core(&mut fix, account_id, message_id, &body, if_match.as_deref())
@@ -1850,6 +1864,28 @@ fn apply_graph_message_patch(email: &mut Email, body: &Value) {
     // `importance` has no fixture slot; accepted and ignored.
 }
 
+/// Extract a `PidTagDeferredSendTime` hold-until value from a Graph
+/// message PATCH body, if present. bifrost's scheduled send stamps a
+/// `singleValueExtendedProperties` entry whose `id` is the MAPI proptag
+/// `SystemTime 0x3FEF`; the value is the ISO-8601 UTC release time. The
+/// proptag id is matched case-insensitively on the `0x3fef` suffix so a
+/// liberal client spelling still resolves.
+fn deferred_send_time(body: &Value) -> Option<String> {
+    let props = body
+        .get("singleValueExtendedProperties")
+        .and_then(Value::as_array)?;
+    for prop in props {
+        let id = prop.get("id").and_then(Value::as_str).unwrap_or("");
+        if id.to_ascii_lowercase().contains("0x3fef") {
+            return prop
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    None
+}
+
 /// Add or remove a single keyword, idempotently.
 fn set_keyword(keywords: &mut Vec<String>, kw: &str, present: bool) {
     let has = keywords.iter().any(|k| k == kw);
@@ -1934,8 +1970,9 @@ async fn move_message_impl(
 // as a `$draft`-keyworded Email in the account's Drafts folder (or
 // the first mailbox if none has the Drafts role), so the id is real,
 // GET/PATCH find it, and a harness can inspect the composed message.
-// Send returns 202 and leaves the draft in place - v0 does not model
-// the Sent-folder transition or actual delivery.
+// Send returns 202 and moves the draft into the Sent-role mailbox
+// (sentitems) so a follow-up messages/delta reflects the sent copy;
+// see `send_message_impl`.
 
 async fn create_draft_me(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
@@ -2013,15 +2050,40 @@ async fn send_message_impl(state: AppState, account_id: &str, message_id: &str) 
         let fixture = state.fixture();
         fixture.emails_for(account_id).any(|e| e.id == message_id)
     };
-    if exists {
-        StatusCode::ACCEPTED.into_response()
-    } else {
-        error(
+    if !exists {
+        return error(
             StatusCode::NOT_FOUND,
             "ErrorItemNotFound",
             &format!("message {message_id:?} not found"),
-        )
+        );
     }
+    // Real Graph delivers the draft and files the sent copy in
+    // sentitems; v0 models that as a move into the Sent-role mailbox so
+    // a follow-up `messages/delta` reflects the sent message (and the
+    // draft leaves Drafts). Records an `email_updated` transition. When
+    // the account has no Sent-role mailbox the draft stays put (the
+    // pre-cut behaviour); the send still acknowledges 202.
+    let sent_mailbox = {
+        let fixture = state.fixture();
+        fixture
+            .mailboxes_for(account_id)
+            .find(|m| m.role == Some(Role::Sent))
+            .map(|m| m.id.clone())
+    };
+    if let Some(sent) = sent_mailbox {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        // `None` If-Match: send has no precondition. Drops the `$draft`
+        // keyword so the filed copy reads as a normal sent message.
+        let _ = move_message_core(&mut fix, account_id, message_id, &sent, None);
+        if let Some(idx) = fix
+            .emails
+            .iter()
+            .position(|e| e.account_id == account_id && e.id == message_id)
+        {
+            fix.emails[idx].keywords.retain(|k| k != "$draft");
+        }
+    }
+    StatusCode::ACCEPTED.into_response()
 }
 
 fn create_draft_core(fix: &mut Fixture, account_id: &str, folder_id: &str, body: &Value) -> Value {
@@ -2625,15 +2687,14 @@ fn find_email_with_attachment<'a>(
 fn base64_standard(input: &[u8]) -> String {
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for c in chunks.by_ref() {
-        let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+    let (chunks, rem) = input.as_chunks::<3>();
+    for &[c0, c1, c2] in chunks {
+        let n = (u32::from(c0) << 16) | (u32::from(c1) << 8) | u32::from(c2);
         out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
         out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
         out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
         out.push(ALPHA[(n & 0x3f) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = u32::from(rem[0]) << 16;

@@ -76,6 +76,15 @@ pub struct ParsedSubmission {
     pub text_bodies: Vec<String>,
     pub html_bodies: Vec<String>,
     pub attachments: Vec<ParsedAttachment>,
+    /// Every top-level RFC 822 header on the root message part, in
+    /// document order, as `(name, value)` pairs. Lets harness gates
+    /// assert arbitrary outgoing headers - e.g. the MDN
+    /// `Disposition-Notification-To` bifrost's raw-MDN send emits -
+    /// without the projection having to enumerate a fixed allowlist.
+    /// Values are the decoded header text (RFC 2047 unfolded by
+    /// `mail-parser`); duplicate header names appear once per
+    /// occurrence.
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +92,11 @@ pub struct ParsedAttachment {
     pub filename: Option<String>,
     pub content_type: String,
     pub data: Vec<u8>,
+    /// The attachment part's `Content-ID` header (angle brackets
+    /// stripped), when present. Inline images carry a `Content-ID`
+    /// that the HTML body references via `cid:`; a gate asserting an
+    /// inline-attachment round-trip checks this is populated.
+    pub content_id: Option<String>,
 }
 
 impl Submission {
@@ -95,6 +109,14 @@ impl Submission {
         let parser = mail_parser::MessageParser::default();
         let msg = parser.parse(&self.data)?;
         let subject = msg.subject().map(str::to_string);
+        // Project every top-level header (name, decoded value) in
+        // document order so a gate can assert arbitrary outgoing
+        // headers (e.g. `Disposition-Notification-To`) without the
+        // projection enumerating a fixed allowlist.
+        let headers = msg
+            .headers_raw()
+            .map(|(name, value)| (name.to_string(), value.trim().to_string()))
+            .collect::<Vec<_>>();
         let mut text_bodies = Vec::new();
         for i in 0..msg.text_body_count() {
             if let Some(t) = msg.body_text(i) {
@@ -117,10 +139,20 @@ impl Submission {
                 ),
                 None => "application/octet-stream".to_string(),
             };
+            // `Content-ID` round-trips with angle brackets stripped so
+            // a gate can match it against the `cid:` reference in the
+            // HTML body (which carries the bare token).
+            let content_id = a.content_id().map(|cid| {
+                cid.trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string()
+            });
             attachments.push(ParsedAttachment {
                 filename: a.attachment_name().map(str::to_string),
                 content_type,
                 data: a.contents().to_vec(),
+                content_id,
             });
         }
         Some(ParsedSubmission {
@@ -128,6 +160,7 @@ impl Submission {
             text_bodies,
             html_bodies,
             attachments,
+            headers,
         })
     }
 }
@@ -462,8 +495,16 @@ impl Conn {
         self.stream_mut()
             .write_all(b"250-saehrimnir greets you\r\n")
             .await?;
+        // Advertise a SIZE limit well above any message a harness gate
+        // sends. bifrost-smtp parses this advertised limit and refuses
+        // (client-side, before DATA) any message whose octet length
+        // exceeds it - so the old 50MB (52428800) limit fast-failed a
+        // ~67MB send with a transport.network error in ~500ms. 256 MiB
+        // clears the large-attachment regression while still modelling a
+        // real server that bounds message size. The mock buffers and
+        // accepts the full DATA regardless; it never enforces this.
         self.stream_mut()
-            .write_all(b"250-SIZE 52428800\r\n")
+            .write_all(b"250-SIZE 268435456\r\n")
             .await?;
         self.stream_mut().write_all(b"250-8BITMIME\r\n").await?;
         if advertise_starttls {
@@ -816,7 +857,7 @@ mod tests {
     async fn ehlo_emits_capability_list() {
         let (out, _) = run_script(b"EHLO me.local\r\nQUIT\r\n").await;
         assert!(out.contains("250-saehrimnir greets you\r\n"));
-        assert!(out.contains("250-SIZE 52428800\r\n"));
+        assert!(out.contains("250-SIZE 268435456\r\n"));
         assert!(out.contains("250-8BITMIME\r\n"));
         // Last line uses space, not dash, so lettre's parser stops.
         assert!(out.contains("250 AUTH PLAIN LOGIN XOAUTH2\r\n"));
@@ -962,6 +1003,40 @@ mod tests {
             Some("rfc822;c@d")
         );
         assert!(s.rcpt_params[1].is_empty());
+    }
+
+    #[tokio::test]
+    async fn large_size_param_is_accepted_and_buffered() {
+        // Regression for the bifrost-smtp large-message fast-fail: the
+        // mock must accept a `MAIL FROM ... SIZE=NN` for NN well above
+        // 67MB and buffer the full DATA. Here we assert the envelope-
+        // level acceptance (the EHLO advertises 256 MiB, so bifrost
+        // never refuses client-side) plus a multi-line DATA body that
+        // round-trips into the submission log.
+        let script = b"\
+            EHLO me\r\n\
+            AUTH PLAIN AGFsaWNlAGh1bnRlcg==\r\n\
+            MAIL FROM:<a@b> SIZE=70254592\r\n\
+            RCPT TO:<c@d>\r\n\
+            DATA\r\n\
+            Subject: big\r\n\
+            \r\n\
+            payload line one\r\n\
+            payload line two\r\n\
+            .\r\n\
+            QUIT\r\n";
+        let (out, log) = run_script(script).await;
+        assert!(out.contains("250-SIZE 268435456\r\n"));
+        assert!(out.contains("250 OK queued"));
+        let snap = log.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].from_params.get("SIZE").map(String::as_str),
+            Some("70254592")
+        );
+        let body = String::from_utf8(snap[0].data.clone()).unwrap();
+        assert!(body.contains("payload line one\r\n"));
+        assert!(body.contains("payload line two\r\n"));
     }
 
     #[tokio::test]
