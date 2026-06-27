@@ -36,7 +36,7 @@ pub const GREETING: &str = "* OK saehrimnir IMAP4rev1 ready\r\n";
 /// `OK [CAPABILITY ...]` resp-text. Authenticated set; the
 /// pre-auth set adds `LOGINDISABLED`-equivalents only if we ever grow
 /// real auth, which v0 does not.
-pub const CAPABILITIES: &str = "IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE";
+pub const CAPABILITIES: &str = "IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS";
 
 /// Per-connection state machine, RFC 3501 sec 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3342,7 +3342,7 @@ mod tests {
         let out = run_script(b"a1 CAPABILITY\r\n").await;
         assert!(out.contains(GREETING));
         assert!(
-            out.contains("* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE\r\n"),
+            out.contains("* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS\r\n"),
             "got: {out:?}"
         );
         assert!(out.contains("a1 OK CAPABILITY completed\r\n"));
@@ -3393,7 +3393,9 @@ mod tests {
     async fn login_accepts_any_credential() {
         let out = run_script(b"a LOGIN \"alice\" \"hunter2\"\r\n").await;
         assert!(
-            out.contains("a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE] LOGIN completed"),
+            out.contains(
+                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS] LOGIN completed"
+            ),
             "got: {out:?}"
         );
     }
@@ -3412,7 +3414,7 @@ mod tests {
         let out = run_script(b"a AUTHENTICATE PLAIN AGFsaWNlAGh1bnRlcg==\r\n").await;
         assert!(
             out.contains(
-                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE] PLAIN authentication accepted"
+                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS] PLAIN authentication accepted"
             ),
             "got: {out:?}"
         );
