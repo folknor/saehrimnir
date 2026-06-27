@@ -533,7 +533,7 @@ breaking initial mail sync. Single-part text emails stay byte-
 identical to the pre-attachment wire format; multipart kicks in only
 when `email.attachments` is non-empty (boundary is
 `=_saehrimnir_<email-id>_=`). Plus a persistent mutation surface:
-`UID STORE`, `UID COPY`, and `UID EXPUNGE`. Each takes a brief
+`UID STORE`, `UID COPY`, `UID EXPUNGE`, and the mailbox-CRUD commands `CREATE` / `RENAME` / `DELETE` (`RENAME` re-parents to serve bifrost's container move; `DELETE` refuses a non-empty mailbox). Each takes a brief
 write guard, mutates the shared `Fixture`, bumps `state`, and
 records a transition so the change surfaces in the next JMAP
 `Email/changes`. `UID STORE` translates IMAP wire flags
@@ -747,7 +747,7 @@ Remaining bifrost gap: `GET /v1/contactGroups` (drives bifrost's
 `address_books_list`); not yet implemented (see `gaps.md`).
 
 Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`
-+ `/labels` + `/threads` (list paginated by `nextPageToken`, with
++ `/labels` (list, plus `create` / `patch` / `delete` for user-label CRUD, the created label's `color` stored and echoed back in `labels.list` for the color round-trip) + `/threads` (list paginated by `nextPageToken`, with
 `q=after:YYYY/M/D` filtering) + `/threads/{id}` (full MIME payload
 projection of fixture emails into Gmail's nested mimePart shape) +
 `/messages` (message-centric list - bifrost's `GoogleAccount`

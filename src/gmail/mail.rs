@@ -15,7 +15,9 @@ use axum::{
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
-use crate::fixture::{Address, Attachment, Body, Email, Fixture, MutationDiff, Role};
+use crate::fixture::{
+    Address, Attachment, Body, Email, Fixture, GmailLabelColor, Mailbox, MutationDiff, Role,
+};
 
 /// Resolve the request's bearer to the account it authorizes.
 /// Falls back to the fixture's primary account when no bearer is
@@ -39,7 +41,14 @@ const WATCH_EXPIRATION_MS: &str = "4102444800000";
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/gmail/v1/users/me/profile", get(profile))
-        .route("/gmail/v1/users/me/labels", get(list_labels))
+        .route(
+            "/gmail/v1/users/me/labels",
+            get(list_labels).post(create_label),
+        )
+        .route(
+            "/gmail/v1/users/me/labels/{label_id}",
+            axum::routing::patch(patch_label).delete(delete_label),
+        )
         .route("/gmail/v1/users/me/threads", get(list_threads))
         .route("/gmail/v1/users/me/threads/{thread_id}", get(get_thread))
         .route("/gmail/v1/users/me/messages", get(list_messages))
@@ -167,7 +176,7 @@ async fn list_labels(State(state): State<AppState>, headers: HeaderMap) -> Respo
     // System labels are always present, even if no fixture mailbox
     // carries the corresponding role - matches Gmail's behaviour.
     for sys in SYSTEM_LABELS {
-        labels.push(label_value(sys, sys, "system", &fixture, &account_id));
+        labels.push(label_value(sys, sys, "system", &fixture, &account_id, None));
     }
 
     // User labels: fixture mailboxes without a role become user
@@ -177,7 +186,19 @@ async fn list_labels(State(state): State<AppState>, headers: HeaderMap) -> Respo
             continue;
         }
         let id = format!("Label_{}", m.id);
-        labels.push(label_value(&id, &m.name, "user", &fixture, &account_id));
+        // A label minted via `labels.create` (or recolored via
+        // `labels.patch`) carries a color in the side-map; echo it on
+        // `labels.list` so bifrost's `containers_list` reads the
+        // color back and the create-color round-trip survives resync.
+        let color = fixture.gmail_label_colors.get(&m.id);
+        labels.push(label_value(
+            &id,
+            &m.name,
+            "user",
+            &fixture,
+            &account_id,
+            color,
+        ));
     }
 
     // Custom keywords (non-`$` prefixed) on any email become user
@@ -190,7 +211,14 @@ async fn list_labels(State(state): State<AppState>, headers: HeaderMap) -> Respo
     custom.dedup();
     for keyword in custom {
         let id = format!("Label_{keyword}");
-        labels.push(label_value(&id, &keyword, "user", &fixture, &account_id));
+        labels.push(label_value(
+            &id,
+            &keyword,
+            "user",
+            &fixture,
+            &account_id,
+            None,
+        ));
     }
 
     ok_json(json!({"labels": labels}))
@@ -207,10 +235,17 @@ const SYSTEM_LABELS: &[&str] = &[
     "UNREAD",
 ];
 
-fn label_value(id: &str, name: &str, kind: &str, fixture: &Fixture, account_id: &str) -> Value {
+fn label_value(
+    id: &str,
+    name: &str,
+    kind: &str,
+    fixture: &Fixture,
+    account_id: &str,
+    color: Option<&GmailLabelColor>,
+) -> Value {
     let (msg_total, msg_unread, thread_total, thread_unread) =
         label_counts(fixture, id, account_id);
-    json!({
+    let mut obj = json!({
         "id": id,
         "name": name,
         "type": kind,
@@ -220,7 +255,246 @@ fn label_value(id: &str, name: &str, kind: &str, fixture: &Fixture, account_id: 
         "messagesUnread": msg_unread,
         "threadsTotal": thread_total,
         "threadsUnread": thread_unread,
+    });
+    if let Some(c) = color {
+        obj["color"] = json!({
+            "textColor": c.text_color,
+            "backgroundColor": c.background_color,
+        });
+    }
+    obj
+}
+
+/// Parse the Gmail `color` object (`{ textColor, backgroundColor }`)
+/// off a `labels.create` / `labels.patch` body. Yields `None` when the
+/// key is absent, null, or the pair is incomplete.
+fn parse_label_color(body: &Value) -> Option<GmailLabelColor> {
+    let color = body.get("color")?;
+    if color.is_null() {
+        return None;
+    }
+    let text = color.get("textColor").and_then(Value::as_str)?;
+    let bg = color.get("backgroundColor").and_then(Value::as_str)?;
+    Some(GmailLabelColor {
+        text_color: text.to_string(),
+        background_color: bg.to_string(),
     })
+}
+
+/// Mint a fixture-unique mailbox id for a Gmail user label. Follows the
+/// `mock-mailbox-<n>` scheme, probing for a free suffix so a create
+/// after a delete never collides with a surviving id.
+fn fresh_label_mailbox_id(fix: &Fixture) -> String {
+    let mut n = fix.mailboxes.len() + 1;
+    loop {
+        let candidate = format!("mock-mailbox-{n}");
+        if !fix.mailboxes.iter().any(|m| m.id == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// `POST /gmail/v1/users/me/labels` (`labels.create`). Creates a Gmail
+/// user label, modelled as a roleless fixture `Mailbox` (the same
+/// projection `list_labels` reads), so a follow-up `labels.list`
+/// reflects it. An optional `color` is stashed in
+/// `Fixture::gmail_label_colors` keyed by the backing mailbox id so the
+/// color survives a resync - bifrost's `containers_list` reads it back
+/// off `labels.list`. bifrost sends `{ name, labelListVisibility,
+/// messageListVisibility, color? }`.
+async fn create_label(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let name = match body.get("name").and_then(Value::as_str) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "label create requires a non-empty name",
+                "invalidArgument",
+            );
+        }
+    };
+    let color = parse_label_color(&body);
+    let new_id = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        let new_id = fresh_label_mailbox_id(&fix);
+        if let Some(c) = color.clone() {
+            fix.gmail_label_colors.insert(new_id.clone(), c);
+        }
+        let mailbox = Mailbox {
+            id: new_id.clone(),
+            account_id: account_id.clone(),
+            name: name.clone(),
+            role: None,
+            parent_id: None,
+            sort_order: None,
+            is_subscribed: true,
+        };
+        let created_id = new_id.clone();
+        let _ = fix.mutate(move |f| {
+            f.mailboxes.push(mailbox);
+            MutationDiff {
+                mailbox_created: vec![created_id],
+                ..Default::default()
+            }
+        });
+        new_id
+    };
+    let fixture = state.fixture();
+    let id = format!("Label_{new_id}");
+    ok_json(label_value(
+        &id,
+        &name,
+        "user",
+        &fixture,
+        &account_id,
+        color.as_ref(),
+    ))
+}
+
+/// `PATCH /gmail/v1/users/me/labels/{id}` (`labels.patch`). The id is
+/// the `Label_<mailbox-id>` form `labels.list` emits. Applies a name
+/// change and/or a color change: an absent `color` key leaves the
+/// color untouched, an explicit `null` clears it, an object recolors.
+/// Persists into the fixture so a subsequent `labels.list` reflects
+/// both. 404 when the id is not a known user label.
+async fn patch_label(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(label_id): Path<String>,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let Some(mailbox_id) = label_id.strip_prefix("Label_").map(str::to_string) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("label {label_id:?} not found"),
+            "notFound",
+        );
+    };
+    let new_name = body.get("name").and_then(Value::as_str).map(str::to_string);
+    // Tri-state: absent (leave), null (clear), object (set).
+    let color_update: Option<Option<GmailLabelColor>> = match body.get("color") {
+        None => None,
+        Some(v) if v.is_null() => Some(None),
+        Some(_) => Some(parse_label_color(&body)),
+    };
+    let found = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        let exists = fix
+            .mailboxes
+            .iter()
+            .any(|m| m.account_id == account_id && m.id == mailbox_id && m.role.is_none());
+        if exists {
+            if let Some(c) = color_update {
+                match c {
+                    Some(color) => {
+                        fix.gmail_label_colors.insert(mailbox_id.clone(), color);
+                    }
+                    None => {
+                        fix.gmail_label_colors.remove(&mailbox_id);
+                    }
+                }
+            }
+            let mid = mailbox_id.clone();
+            let _ = fix.mutate(move |f| {
+                if let (Some(m), Some(n)) = (f.mailboxes.iter_mut().find(|m| m.id == mid), new_name)
+                {
+                    m.name = n;
+                }
+                MutationDiff {
+                    mailbox_updated: vec![mid.clone()],
+                    ..Default::default()
+                }
+            });
+            true
+        } else {
+            false
+        }
+    };
+    if !found {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("label {label_id:?} not found"),
+            "notFound",
+        );
+    }
+    let fixture = state.fixture();
+    let color = fixture.gmail_label_colors.get(&mailbox_id);
+    match fixture
+        .mailboxes_for(&account_id)
+        .find(|m| m.id == mailbox_id)
+    {
+        Some(m) => ok_json(label_value(
+            &label_id,
+            &m.name,
+            "user",
+            &fixture,
+            &account_id,
+            color,
+        )),
+        None => error(
+            StatusCode::NOT_FOUND,
+            &format!("label {label_id:?} not found"),
+            "notFound",
+        ),
+    }
+}
+
+/// `DELETE /gmail/v1/users/me/labels/{id}` (`labels.delete`). Drops the
+/// backing mailbox (and any stored color) so a subsequent
+/// `labels.list` no longer reports it. Returns 204. 404 when the id is
+/// not a known user label.
+async fn delete_label(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(label_id): Path<String>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let Some(mailbox_id) = label_id.strip_prefix("Label_").map(str::to_string) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("label {label_id:?} not found"),
+            "notFound",
+        );
+    };
+    let removed = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        let exists = fix
+            .mailboxes
+            .iter()
+            .any(|m| m.account_id == account_id && m.id == mailbox_id && m.role.is_none());
+        if exists {
+            fix.gmail_label_colors.remove(&mailbox_id);
+            let mid = mailbox_id.clone();
+            let acct = account_id.clone();
+            let _ = fix.mutate(move |f| {
+                f.mailboxes.retain(|m| m.id != mid);
+                MutationDiff {
+                    mailbox_destroyed: vec![mid.clone()],
+                    mailbox_destroyed_accounts: vec![acct.clone()],
+                    ..Default::default()
+                }
+            });
+            true
+        } else {
+            false
+        }
+    };
+    if removed {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error(
+            StatusCode::NOT_FOUND,
+            &format!("label {label_id:?} not found"),
+            "notFound",
+        )
+    }
 }
 
 fn label_counts(fixture: &Fixture, label_id: &str, account_id: &str) -> (u64, u64, u64, u64) {

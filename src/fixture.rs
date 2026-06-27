@@ -147,6 +147,28 @@ pub struct Fixture {
     /// it, and `POST /test/fixture/reset` clears it back to the
     /// post-load baseline (also empty).
     pub uploaded_blobs: BTreeMap<String, UploadedBlob>,
+    /// Gmail user-label colors, keyed by the backing mailbox id (the
+    /// roleless fixture `Mailbox` a Gmail user label projects from).
+    /// The canonical `Mailbox` carries no color slot, but Gmail's
+    /// `labels.create` / `labels.patch` accept a `{ textColor,
+    /// backgroundColor }` object that `labels.list` (the endpoint
+    /// bifrost's `containers_list` reads) must echo back so a created
+    /// label's color survives a resync. Stored here rather than on
+    /// `Mailbox` to keep the cross-protocol canonical type and its TOML
+    /// / Lua loaders untouched. Volatile: empty at load, not part of
+    /// `RawFixture` / `normalize`, and restored to empty on
+    /// `POST /test/fixture/reset` (the baseline clone carries an empty
+    /// map). Same lifecycle as `uploaded_blobs`.
+    pub gmail_label_colors: BTreeMap<String, GmailLabelColor>,
+}
+
+/// A Gmail user-label color pair. Mirrors the Gmail API `color` object
+/// (`{ textColor, backgroundColor }`). Stored in
+/// [`Fixture::gmail_label_colors`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmailLabelColor {
+    pub text_color: String,
+    pub background_color: String,
 }
 
 /// One blob uploaded via JMAP `Blob/upload`. Held in
@@ -3216,6 +3238,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         synthetic_category_seq,
         synthetic_contact_seq,
         uploaded_blobs: BTreeMap::new(),
+        gmail_label_colors: BTreeMap::new(),
     })
 }
 

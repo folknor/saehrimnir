@@ -2231,11 +2231,17 @@ pub(crate) fn apply_mailbox_patch(mailbox: &mut Mailbox, patch: &Value) -> Resul
                     ));
                 }
             }
-            other => {
-                return Err(set_error(
-                    "invalidProperties",
-                    &format!("v0 mock does not implement patch path {other:?}"),
-                ));
+            _other => {
+                // A real JMAP server ignores patch keys it does not
+                // model (and null-valued keys clearing absent
+                // properties). bifrost's `Mailbox/set` update patch
+                // serializes `role: null` and `shareWith: null`
+                // alongside the property it actually changes
+                // (`name` / `parentId`); rejecting the unknown
+                // `shareWith` key surfaced to bifrost as
+                // `request.malformed` and broke rename / move. Accept
+                // any other key as a no-op so the modelled keys above
+                // still apply.
             }
         }
     }
@@ -2426,6 +2432,7 @@ mod tests {
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
             uploaded_blobs: std::collections::BTreeMap::new(),
+            gmail_label_colors: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2627,6 +2634,7 @@ mod tests {
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
             uploaded_blobs: std::collections::BTreeMap::new(),
+            gmail_label_colors: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2923,6 +2931,7 @@ mod tests {
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
             uploaded_blobs: std::collections::BTreeMap::new(),
+            gmail_label_colors: std::collections::BTreeMap::new(),
         }
     }
 

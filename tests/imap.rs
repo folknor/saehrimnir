@@ -93,11 +93,9 @@ async fn full_initial_sync_transcript() {
     // Capability + auth.
     assert!(out.contains("* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS\r\n"));
     assert!(out.contains("a1 OK CAPABILITY completed\r\n"));
-    assert!(
-        out.contains(
-            "a2 OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS] LOGIN completed\r\n"
-        )
-    );
+    assert!(out.contains(
+        "a2 OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS] LOGIN completed\r\n"
+    ));
     assert!(out.contains("* ENABLED QRESYNC\r\n"));
     assert!(out.contains("a3 OK ENABLE completed\r\n"));
 

@@ -374,6 +374,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "AUTHENTICATE" => self.cmd_authenticate(parsed.tag, parsed.args).await,
             "ENABLE" => self.cmd_enable(parsed.tag, parsed.args).await,
             "LIST" => self.cmd_list(parsed.tag, parsed.args).await,
+            "CREATE" => self.cmd_create(parsed.tag, parsed.args).await,
+            "RENAME" => self.cmd_rename(parsed.tag, parsed.args).await,
+            "DELETE" => self.cmd_delete(parsed.tag, parsed.args).await,
             "STATUS" => self.cmd_status(parsed.tag, parsed.args).await,
             "SELECT" => self.cmd_select(parsed.tag, parsed.args, true).await,
             "EXAMINE" => self.cmd_select(parsed.tag, parsed.args, false).await,
@@ -753,6 +756,213 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         self.selected = None;
         self.state = State::Authenticated;
         self.write_line(&format!("{tag} OK CLOSE completed")).await
+    }
+
+    /// `CREATE <mailbox>` (RFC 3501 6.3.3). Creates a mailbox in the
+    /// requesting account, persisting it into the shared fixture so a
+    /// subsequent `LIST` reflects it. `/` is the hierarchy delimiter
+    /// (matching our `LIST` output): the all-but-last segments resolve
+    /// to the parent mailbox, the final segment is the new leaf name.
+    /// bifrost's `container_create` sends the fully qualified path.
+    async fn cmd_create(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !self.is_authenticated() {
+            return self
+                .write_line(&format!("{tag} BAD CREATE requires authentication"))
+                .await;
+        }
+        let Some(name) = parse_one_astring(args) else {
+            return self
+                .write_line(&format!("{tag} BAD CREATE expects \"mailbox\""))
+                .await;
+        };
+        // RFC 3501: a trailing hierarchy delimiter requests a
+        // superior-only mailbox; treat it as the same leaf name.
+        let name = name.trim_end_matches('/').to_string();
+        if name.is_empty() {
+            return self
+                .write_line(&format!("{tag} NO CREATE empty mailbox name"))
+                .await;
+        }
+        let outcome: Result<(), String> = {
+            let mut fix = self.fixture.write().expect("fixture lock poisoned");
+            let entries = list_mailboxes(&fix, &self.account_id);
+            if entries.iter().any(|e| e.path.eq_ignore_ascii_case(&name)) {
+                Err(format!("CREATE mailbox {name:?} already exists"))
+            } else {
+                let (parent_path, leaf) = split_parent_leaf(&name);
+                let parent_resolved = match parent_path {
+                    None => Ok(None),
+                    Some(pp) => entries
+                        .iter()
+                        .find(|e| e.path.eq_ignore_ascii_case(pp))
+                        .map(|e| Some(e.fixture_id.clone()))
+                        .ok_or_else(|| format!("CREATE unknown parent for {name:?}")),
+                };
+                match parent_resolved {
+                    Err(e) => Err(e),
+                    Ok(parent_id) => {
+                        let new_id = fresh_mailbox_id(&fix);
+                        let account_id = self.account_id.clone();
+                        let leaf = leaf.to_string();
+                        let created_id = new_id.clone();
+                        let _ = fix.mutate(move |f| {
+                            let mut diff = crate::fixture::MutationDiff::default();
+                            f.mailboxes.push(Mailbox {
+                                id: new_id,
+                                account_id,
+                                name: leaf,
+                                role: None,
+                                parent_id,
+                                sort_order: None,
+                                is_subscribed: true,
+                            });
+                            diff.mailbox_created.push(created_id);
+                            diff
+                        });
+                        Ok(())
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(()) => self.write_line(&format!("{tag} OK CREATE completed")).await,
+            Err(reason) => self.write_line(&format!("{tag} NO {reason}")).await,
+        }
+    }
+
+    /// `RENAME <old> <new>` (RFC 3501 6.3.5). Resolves the existing
+    /// mailbox by path, then sets its leaf name and re-parents it to
+    /// match the new path - so RENAME doubles as a move when the new
+    /// path has a different parent (this is exactly how bifrost's
+    /// `container_move` re-targets a folder: a RENAME to a sibling
+    /// path under a new parent). Children follow automatically since
+    /// they reference the parent by id, not by path. Persisted into the
+    /// fixture so a subsequent `LIST` reflects the change.
+    async fn cmd_rename(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !self.is_authenticated() {
+            return self
+                .write_line(&format!("{tag} BAD RENAME requires authentication"))
+                .await;
+        }
+        let Some((old_name, new_name)) = parse_two_astrings(args) else {
+            return self
+                .write_line(&format!("{tag} BAD RENAME expects \"old\" \"new\""))
+                .await;
+        };
+        let new_name = new_name.trim_end_matches('/').to_string();
+        let outcome: Result<(), String> = {
+            let mut fix = self.fixture.write().expect("fixture lock poisoned");
+            let entries = list_mailboxes(&fix, &self.account_id);
+            let target = entries
+                .iter()
+                .find(|e| e.path.eq_ignore_ascii_case(&old_name))
+                .map(|e| e.fixture_id.clone());
+            match target {
+                None => Err(format!("RENAME unknown mailbox {old_name:?}")),
+                Some(id) => {
+                    if entries
+                        .iter()
+                        .any(|e| e.path.eq_ignore_ascii_case(&new_name))
+                    {
+                        Err(format!("RENAME target {new_name:?} already exists"))
+                    } else {
+                        let (parent_path, leaf) = split_parent_leaf(&new_name);
+                        let parent_resolved = match parent_path {
+                            None => Ok(None),
+                            Some(pp) => entries
+                                .iter()
+                                .find(|e| e.path.eq_ignore_ascii_case(pp))
+                                .map(|e| Some(e.fixture_id.clone()))
+                                .ok_or_else(|| format!("RENAME unknown parent for {new_name:?}")),
+                        };
+                        match parent_resolved {
+                            Err(e) => Err(e),
+                            Ok(parent_id) => {
+                                let leaf = leaf.to_string();
+                                let updated_id = id.clone();
+                                let _ = fix.mutate(move |f| {
+                                    let mut diff = crate::fixture::MutationDiff::default();
+                                    if let Some(m) = f.mailboxes.iter_mut().find(|m| m.id == id) {
+                                        m.name = leaf;
+                                        m.parent_id = parent_id;
+                                        diff.mailbox_updated.push(updated_id);
+                                    }
+                                    diff
+                                });
+                                Ok(())
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(()) => self.write_line(&format!("{tag} OK RENAME completed")).await,
+            Err(reason) => self.write_line(&format!("{tag} NO {reason}")).await,
+        }
+    }
+
+    /// `DELETE <mailbox>` (RFC 3501 6.3.4). Resolves by path and drops
+    /// the mailbox from the fixture set so a subsequent `LIST` no longer
+    /// reports it. bifrost guards with a `STATUS ... MESSAGES` first and
+    /// refuses to delete a non-empty mailbox, so v0 does not need to
+    /// cascade message deletion. A mailbox with children is refused
+    /// (RFC 3501: deleting a `\Noselect` parent is a `NO`).
+    async fn cmd_delete(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !self.is_authenticated() {
+            return self
+                .write_line(&format!("{tag} BAD DELETE requires authentication"))
+                .await;
+        }
+        let Some(name) = parse_one_astring(args) else {
+            return self
+                .write_line(&format!("{tag} BAD DELETE expects \"mailbox\""))
+                .await;
+        };
+        let name = name.trim_end_matches('/').to_string();
+        let outcome: Result<(), String> = {
+            let mut fix = self.fixture.write().expect("fixture lock poisoned");
+            let entries = list_mailboxes(&fix, &self.account_id);
+            let target = entries
+                .iter()
+                .find(|e| e.path.eq_ignore_ascii_case(&name))
+                .map(|e| e.fixture_id.clone());
+            match target {
+                None => Err(format!("DELETE unknown mailbox {name:?}")),
+                Some(id) => {
+                    let has_children = fix
+                        .mailboxes
+                        .iter()
+                        .any(|m| m.parent_id.as_deref() == Some(id.as_str()));
+                    if has_children {
+                        Err(format!("DELETE mailbox {name:?} has inferior mailboxes"))
+                    } else {
+                        let account_id = fix
+                            .mailboxes
+                            .iter()
+                            .find(|m| m.id == id)
+                            .map(|m| m.account_id.clone());
+                        let destroyed_id = id.clone();
+                        let _ = fix.mutate(move |f| {
+                            let mut diff = crate::fixture::MutationDiff::default();
+                            let len_before = f.mailboxes.len();
+                            f.mailboxes.retain(|m| m.id != id);
+                            if f.mailboxes.len() < len_before {
+                                diff.mailbox_destroyed.push(destroyed_id);
+                                diff.mailbox_destroyed_accounts
+                                    .push(account_id.expect("mailbox existed before retain"));
+                            }
+                            diff
+                        });
+                        Ok(())
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(()) => self.write_line(&format!("{tag} OK DELETE completed")).await,
+            Err(reason) => self.write_line(&format!("{tag} NO {reason}")).await,
+        }
     }
 
     /// `IDLE` (RFC 2177). Valid only in the Selected state. Replies
@@ -1575,6 +1785,31 @@ fn list_mailboxes(fixture: &Fixture, account_id: &str) -> Vec<ListEntry> {
             }
         })
         .collect()
+}
+
+/// Split a `/`-delimited mailbox path into `(parent_path, leaf)`. A
+/// single-segment path has no parent (`None`). Used by CREATE / RENAME
+/// to resolve the parent mailbox and the new leaf name.
+fn split_parent_leaf(path: &str) -> (Option<&str>, &str) {
+    match path.rsplit_once('/') {
+        Some((parent, leaf)) => (Some(parent), leaf),
+        None => (None, path),
+    }
+}
+
+/// Mint a fixture-unique mailbox id. Follows the JMAP create scheme
+/// (`mock-mailbox-<n>`) but probes for a free suffix so a create after
+/// a delete (which leaves `mailboxes.len()` reusable) never collides
+/// with a surviving id.
+fn fresh_mailbox_id(fixture: &Fixture) -> String {
+    let mut n = fixture.mailboxes.len() + 1;
+    loop {
+        let candidate = format!("mock-mailbox-{n}");
+        if !fixture.mailboxes.iter().any(|m| m.id == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 fn mailbox_path(m: &Mailbox, by_id: &HashMap<&str, &Mailbox>) -> String {
@@ -3170,6 +3405,7 @@ mod tests {
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
             uploaded_blobs: std::collections::BTreeMap::new(),
+            gmail_label_colors: std::collections::BTreeMap::new(),
         })
     }
 
@@ -3268,6 +3504,7 @@ mod tests {
             synthetic_category_seq: 0,
             synthetic_contact_seq: 0,
             uploaded_blobs: std::collections::BTreeMap::new(),
+            gmail_label_colors: std::collections::BTreeMap::new(),
         };
         // Test fixture - rebuild as if loaded.
         fix.rebuild_uid_history();
