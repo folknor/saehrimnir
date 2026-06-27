@@ -1232,9 +1232,18 @@ async fn create_rename_delete_round_trips_through_list() {
         a9 LOGOUT\r\n";
     let out = run_with_fixture(script).await;
 
-    assert!(out.contains("c1 OK CREATE completed"), "create failed: {out}");
-    assert!(out.contains("r1 OK RENAME completed"), "rename failed: {out}");
-    assert!(out.contains("d1 OK DELETE completed"), "delete failed: {out}");
+    assert!(
+        out.contains("c1 OK CREATE completed"),
+        "create failed: {out}"
+    );
+    assert!(
+        out.contains("r1 OK RENAME completed"),
+        "rename failed: {out}"
+    );
+    assert!(
+        out.contains("d1 OK DELETE completed"),
+        "delete failed: {out}"
+    );
 
     // Slice the transcript into the three LIST blocks by their tagged
     // completions (untagged `* LIST` lines precede each tag).
@@ -1280,7 +1289,10 @@ async fn rename_reparents_child_under_parent_in_list() {
         l1 LIST \"\" \"*\"\r\n\
         a9 LOGOUT\r\n";
     let out = run_with_fixture(script).await;
-    assert!(out.contains("r1 OK RENAME completed"), "reparent failed: {out}");
+    assert!(
+        out.contains("r1 OK RENAME completed"),
+        "reparent failed: {out}"
+    );
     let i1 = out.find("l1 OK LIST").expect("l1");
     let after = &out[..i1];
     assert!(

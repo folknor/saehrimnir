@@ -117,8 +117,16 @@ fn gmail_initial_sync_over_http_returns_fixture_mail() {
         .args(["--fixture"])
         .arg(fixture_path("gmail-initial-repro.toml"))
         .args([
-            "--jmap-port", "0", "--imap-port", "0", "--smtp-port", "0", "--graph-port", "0",
-            "--gmail-port", "0",
+            "--jmap-port",
+            "0",
+            "--imap-port",
+            "0",
+            "--smtp-port",
+            "0",
+            "--graph-port",
+            "0",
+            "--gmail-port",
+            "0",
         ])
         .spawn()
         .expect("spawn saehrimnir");
@@ -162,7 +170,11 @@ fn gmail_initial_sync_over_http_returns_fixture_mail() {
     assert_eq!(status, 200, "profile status");
     assert_eq!(profile["emailAddress"], "test@example.com");
     assert!(
-        profile["historyId"].as_str().unwrap().parse::<u64>().is_ok(),
+        profile["historyId"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok(),
         "historyId must parse: {:?}",
         profile["historyId"]
     );
@@ -176,7 +188,10 @@ fn gmail_initial_sync_over_http_returns_fixture_mail() {
         .iter()
         .map(|l| l["id"].as_str().unwrap().to_string())
         .collect();
-    assert!(known.contains("INBOX") && known.contains("IMPORTANT"), "labels: {known:?}");
+    assert!(
+        known.contains("INBOX") && known.contains("IMPORTANT"),
+        "labels: {known:?}"
+    );
 
     // 4. messages.list with no `q` (bifrost's inventory backfill).
     let (status, list) = get_json(

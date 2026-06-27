@@ -63,7 +63,7 @@ capability we deliberately never advertise, so it is never sent.
 
 | Method | bifrost evidence | sæhrimnir status | Effort |
 |---|---|---|---|
-| Whole-message blob download (`blob-{id}` / `blob-{id}-text`) | `sync/blob.rs:55-113` (`Email/get` BlobId -> `download(blob-{id})`); cap `open_raw_rfc822` unconditional | PARTIAL - `download` (`src/routes.rs`) only matches `attachments[].blob_id`; whole-message + text-part blobs 404 | S - also match `blob-{id}` / `blob-{id}-text` |
+| Whole-message blob download (`blob-{id}` / `blob-{id}-text`) | `sync/blob.rs:55-113` (`Email/get` BlobId -> `download(blob-{id})`); cap `open_raw_rfc822` unconditional | **DONE** - `download` (`src/routes.rs`) now serves the assembled RFC822 (`crate::imap::assembled_rfc822`) for `blob-{id}` and the body text for `blob-{id}-text`, before the `attachments[].blob_id` scan. Unblocks the JMAP MDN read-receipt detect path (`Disposition-Notification-To` scan over the whole raw) | S (shipped) |
 | `Blob/upload` (`uploadUrl`) | `sync/pim.rs:344`; reached only via send-with-attachment (submission-gated) | MISSING - session advertises `uploadUrl` but no `/jmap/upload/{accountId}` route | M - inert until submission lands |
 | `Email/queryChanges` | `sync/changes.rs:298-308`, only for `CursorScope::Query` which JMAP inventory never registers | MISSING (catchall) - not driven in v0 | - |
 
@@ -196,9 +196,16 @@ None durably stored - no fixture slot.
 
 **DONE:** mail draft create + send - `POST /me/messages` stores a
 `$draft` Email in the Drafts-role mailbox (or first mailbox) and
-`POST /me/messages/{id}/send` returns 202 (the draft stays; v0 does
-not model the Sent transition). bifrost's send path is
-create-draft-then-send, not `/sendMail`. `src/graph/mail.rs`.
+`POST /me/messages/{id}/send` files it into the Sent-role mailbox
+(drops `$draft`) so a follow-up `messages/delta` reflects the sent
+copy. bifrost's send path is create-draft-then-send, not `/sendMail`.
+`src/graph/mail.rs`. The draft-create handler branches on
+`Content-Type`: `application/json` is bifrost's structured compose;
+`text/plain` is its raw-MIME import (`send_raw_message`, the channel
+ratatoskr's MDN read-receipt dispatch uses) carrying the STANDARD
+base64 of the RFC822 octets, which `create_draft_mime_core` parses
+into the draft (addressed per the MIME `To:`). The shared send path
+then files it into Sent.
 
 The Graph write tier is now complete - every gap the audit
 identified (P0 / P1 read+sync AND the P2 write surface) is closed.

@@ -1974,21 +1974,26 @@ async fn move_message_impl(
 // (sentitems) so a follow-up messages/delta reflects the sent copy;
 // see `send_message_impl`.
 
-async fn create_draft_me(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+async fn create_draft_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    create_draft_impl(state, &account_id, body).await
+    create_draft_impl(state, &account_id, &headers, &body).await
 }
 
 async fn create_draft_user(
     State(state): State<AppState>,
     Path(user): Path<String>,
-    Json(body): Json<Value>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    create_draft_impl(state, &account_id, body).await
+    create_draft_impl(state, &account_id, &headers, &body).await
 }
 
 async fn send_message_me(
@@ -2010,7 +2015,12 @@ async fn send_message_user(
     send_message_impl(state, &account_id, &message_id).await
 }
 
-async fn create_draft_impl(state: AppState, account_id: &str, body: Value) -> Response {
+async fn create_draft_impl(
+    state: AppState,
+    account_id: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
     if let Some(o) = super::maybe_override(&state, "create_draft", |_| Ok(())) {
         return o;
     }
@@ -2032,11 +2042,128 @@ async fn create_draft_impl(state: AppState, account_id: &str, body: Value) -> Re
             }
         }
     };
+
+    // bifrost has two POST /messages bodies. The structured-compose path
+    // (`Content-Type: application/json`) carries a JSON Message. The
+    // raw-MIME import path (`send_raw_message`, the channel ratatoskr's
+    // MDN read-receipt dispatch uses) carries `Content-Type: text/plain`
+    // with the STANDARD base64 of the RFC822 octets, which Graph imports
+    // as a draft the caller then sends. Branch on the content type.
+    let is_raw_mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.trim().to_ascii_lowercase().starts_with("text/plain"));
+
+    if is_raw_mime {
+        let Ok(b64) = std::str::from_utf8(body) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "raw MIME draft body is not UTF-8",
+            );
+        };
+        // `decode_base64url_no_pad` accepts the standard alphabet
+        // (`+`/`/`) and stops at `=` padding, so it round-trips Graph's
+        // STANDARD base64 as well as Gmail's base64url.
+        let Some(raw) = crate::gmail::mail::decode_base64url_no_pad(b64) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "raw MIME draft body is not valid base64",
+            );
+        };
+        let projected = {
+            let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+            create_draft_mime_core(&mut fix, account_id, &folder_id, &raw)
+        };
+        return (StatusCode::CREATED, axum::Json(projected)).into_response();
+    }
+
+    let body: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "draft body is not valid JSON",
+            );
+        }
+    };
     let projected = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
         create_draft_core(&mut fix, account_id, &folder_id, &body)
     };
     (StatusCode::CREATED, axum::Json(projected)).into_response()
+}
+
+/// Build a `$draft`-keyworded `Email` from raw RFC822 octets and file it
+/// in `folder_id` (Drafts), projecting the Graph message shape. This is
+/// the raw-MIME import half of bifrost's Graph `send_raw_message`: it
+/// creates the draft; a follow-up `POST /messages/{id}/send`
+/// (`send_message_impl`) moves it into the Sent-role mailbox and drops
+/// the `$draft` keyword, so the sent copy (addressed per the MIME `To:`,
+/// e.g. the MDN's original sender) surfaces on the next `messages/delta`.
+/// Mirrors the JMAP `Email/import` projection (`build_email_from_import`).
+fn create_draft_mime_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    folder_id: &str,
+    raw: &[u8],
+) -> Value {
+    let parsed = crate::fixture::parse_rfc822_email(raw);
+    let raw_string = String::from_utf8_lossy(raw).into_owned();
+    let acct = account_id.to_string();
+    let fid = folder_id.to_string();
+    let mut projected = Value::Null;
+    let _ = fix.mutate(|f| {
+        let id = f.mint_email_id();
+        // Determinism: anchor to the newest existing message, or a fixed
+        // epoch in an empty fixture (mirrors JMAP Email/import + the
+        // structured Graph draft path).
+        let received_at = f
+            .emails
+            .iter()
+            .map(|e| e.received_at)
+            .max()
+            .unwrap_or_else(|| {
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                    .expect("hardcoded RFC3339")
+                    .with_timezone(&chrono::Utc)
+            });
+        let email = Email {
+            id: id.clone(),
+            account_id: acct.clone(),
+            thread_id: id.clone(),
+            mailbox_ids: vec![fid.clone()],
+            keywords: vec!["$draft".to_string()],
+            size: i64::try_from(raw.len()).unwrap_or(i64::MAX),
+            received_at,
+            sent_at: received_at,
+            from: parsed.from.clone(),
+            to: parsed.to.clone(),
+            cc: vec![],
+            bcc: vec![],
+            reply_to: vec![],
+            subject: parsed.subject.clone(),
+            preview: None,
+            message_id: parsed.message_id.clone(),
+            in_reply_to: vec![],
+            references: vec![],
+            has_attachment: false,
+            body: Body::Text(parsed.body_text.clone().unwrap_or_default()),
+            attachments: vec![],
+            raw_bytes: Some(raw_string.clone()),
+        };
+        f.emails.push(email.clone());
+        f.assign_uid(&fid, id.clone());
+        let etag = email_etag(f, &acct, &id);
+        projected = message_value(&email, &fid, false, &etag);
+        MutationDiff {
+            email_created: vec![id],
+            ..Default::default()
+        }
+    });
+    projected
 }
 
 async fn send_message_impl(state: AppState, account_id: &str, message_id: &str) -> Response {

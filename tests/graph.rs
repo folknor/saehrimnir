@@ -140,6 +140,62 @@ async fn graph_create_draft_then_send() {
 }
 
 #[tokio::test]
+async fn graph_raw_mime_draft_create_then_send() {
+    // bifrost's Graph `send_raw_message` (the raw-MIME import path
+    // ratatoskr's MDN read-receipt dispatch uses) POSTs the base64 of the
+    // RFC822 octets to `/me/messages` with `Content-Type: text/plain`,
+    // creating a draft it then sends. The mock must accept that body
+    // shape (the `Json` extractor rejected it) and project the parsed
+    // MIME into the draft, addressed per the MIME `To:`.
+    let app = router();
+    let raw = "From: test@example.com\r\n\
+               To: alice@example.com\r\n\
+               Subject: Read: your message\r\n\
+               Message-ID: <mdn-1@example.com>\r\n\
+               Content-Type: text/plain\r\n\r\n\
+               Your message was displayed.\r\n";
+    // The server's base64 decoder accepts both the standard alphabet
+    // (what bifrost emits) and base64url, so encoding either way drives
+    // the same code path.
+    let b64 = saehrimnir::gmail::mail::base64url_no_pad(raw.as_bytes());
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1.0/me/messages")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(b64))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["subject"], "Read: your message");
+    assert_eq!(
+        v["toRecipients"][0]["emailAddress"]["address"],
+        "alice@example.com"
+    );
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // Stored as a draft: a follow-up GET finds it.
+    let (status, got) = get_json_with(app.clone(), &format!("/v1.0/me/messages/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got["isDraft"], true);
+
+    // Send it (bifrost POSTs an empty body to `.../send`). jmap-small has
+    // no Sent-role mailbox, so the send acknowledges 202 without a Sent
+    // transition; the ratatoskr-side MDN gate exercises the Sent filing
+    // against a fixture that declares one.
+    let (status, _) = send_json(&app, "POST", &format!("/v1.0/me/messages/{id}/send"), None).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
 async fn graph_settings_stubs() {
     let app = router();
 
@@ -2469,7 +2525,10 @@ async fn folder_move_reparent_round_trips_through_list() {
             .collect()
     };
     let (_, list) = get_json_with(app.clone(), "/v1.0/me/mailFolders").await;
-    assert!(top_level_ids(&list).contains(&child_id), "child should start top-level");
+    assert!(
+        top_level_ids(&list).contains(&child_id),
+        "child should start top-level"
+    );
 
     // Move the child under the parent.
     let (status, _) = send_json(
@@ -2502,7 +2561,8 @@ async fn folder_move_reparent_round_trips_through_list() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let listed = find_child(&children).expect("child folder missing from parent's childFolders after move");
+    let listed =
+        find_child(&children).expect("child folder missing from parent's childFolders after move");
     assert_eq!(
         listed["parentFolderId"], parent_id,
         "child folder did not reparent on the server after move"
@@ -2524,7 +2584,10 @@ async fn folder_move_reparent_round_trips_through_list() {
     .await;
     let listed = find_child(&children).expect("renamed child folder missing from childFolders");
     assert_eq!(listed["displayName"], "HarnessRenamed");
-    assert_eq!(listed["parentFolderId"], parent_id, "rename dropped the parent");
+    assert_eq!(
+        listed["parentFolderId"], parent_id,
+        "rename dropped the parent"
+    );
 
     // Delete both; neither appears in the top-level list.
     let (status, _) = send_json(
@@ -2551,6 +2614,12 @@ async fn folder_move_reparent_round_trips_through_list() {
         .iter()
         .filter_map(|f| f["id"].as_str())
         .collect();
-    assert!(!ids.contains(&child_id.as_str()), "deleted child still listed");
-    assert!(!ids.contains(&parent_id.as_str()), "deleted parent still listed");
+    assert!(
+        !ids.contains(&child_id.as_str()),
+        "deleted child still listed"
+    );
+    assert!(
+        !ids.contains(&parent_id.as_str()),
+        "deleted parent still listed"
+    );
 }

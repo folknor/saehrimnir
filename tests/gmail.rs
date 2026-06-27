@@ -869,7 +869,9 @@ async fn send_method(
     let req = match body {
         Some(b) => {
             builder = builder.header(header::CONTENT_TYPE, "application/json");
-            builder.body(Body::from(serde_json::to_vec(&b).unwrap())).unwrap()
+            builder
+                .body(Body::from(serde_json::to_vec(&b).unwrap()))
+                .unwrap()
         }
         None => builder.body(Body::empty()).unwrap(),
     };
@@ -912,7 +914,10 @@ async fn label_create_rename_recolor_delete_round_trips_through_list() {
     let label_id = created["id"].as_str().unwrap().to_string();
 
     let (_, list) = get_json_with(app.clone(), "/gmail/v1/users/me/labels").await;
-    assert!(label_by_name(&list, "HarnessTag").is_some(), "label missing after create");
+    assert!(
+        label_by_name(&list, "HarnessTag").is_some(),
+        "label missing after create"
+    );
 
     // Rename.
     let (status, _) = send_method(
@@ -924,8 +929,14 @@ async fn label_create_rename_recolor_delete_round_trips_through_list() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let (_, list) = get_json_with(app.clone(), "/gmail/v1/users/me/labels").await;
-    assert!(label_by_name(&list, "HarnessTagRenamed").is_some(), "renamed label missing");
-    assert!(label_by_name(&list, "HarnessTag").is_none(), "old label name still present");
+    assert!(
+        label_by_name(&list, "HarnessTagRenamed").is_some(),
+        "renamed label missing"
+    );
+    assert!(
+        label_by_name(&list, "HarnessTag").is_none(),
+        "old label name still present"
+    );
 
     // Recolor: the color must round-trip into labels.list.
     let (status, _) = send_method(
@@ -991,7 +1002,11 @@ async fn gmail_initial_sync_replay_message_labels_are_known_scopes() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(profile["emailAddress"], "test@example.com");
     assert!(
-        profile["historyId"].as_str().unwrap().parse::<u64>().is_ok(),
+        profile["historyId"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok(),
         "historyId must parse as u64: {:?}",
         profile["historyId"]
     );
@@ -1009,14 +1024,21 @@ async fn gmail_initial_sync_replay_message_labels_are_known_scopes() {
         .collect();
     // System folders bifrost maps (INBOX + IMPORTANT) must be present.
     assert!(known_labels.contains("INBOX"), "labels: {known_labels:?}");
-    assert!(known_labels.contains("IMPORTANT"), "labels: {known_labels:?}");
+    assert!(
+        known_labels.contains("IMPORTANT"),
+        "labels: {known_labels:?}"
+    );
 
     // 3. messages.list with no `q` (bifrost's inventory backfill).
     let (status, list) =
         get_json_with(app.clone(), "/gmail/v1/users/me/messages?maxResults=500").await;
     assert_eq!(status, StatusCode::OK);
     let stubs = list["messages"].as_array().unwrap();
-    assert_eq!(stubs.len(), 2, "messages.list must return the fixture's mail");
+    assert_eq!(
+        stubs.len(),
+        2,
+        "messages.list must return the fixture's mail"
+    );
 
     // 4. per-message metadata hydration: every labelId the message
     //    carries must be a known label scope from labels.list.

@@ -515,6 +515,37 @@ async fn download(
     state.shared.latency.sleep_for_attachment(&blob_id).await;
     let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
     for email in &fixture.emails {
+        // Whole-message raw RFC822 blob. The `Email` object reports its
+        // own `blobId` as `blob-<id>` (see `src/jmap.rs`); bifrost's
+        // `open_raw_rfc822` (`crates/jmap/src/sync/blob.rs`) reads that
+        // `blobId` off an `Email/get` and downloads it to scan the
+        // assembled message (e.g. for a `Disposition-Notification-To`
+        // MDN request). Serve the same byte stream the IMAP `BODY[]` /
+        // Graph `$value` surfaces emit so all three agree.
+        if blob_id == format!("blob-{}", email.id) {
+            let raw = crate::imap::assembled_rfc822(email);
+            return (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "message/rfc822".to_string()),
+                    (header::CONTENT_DISPOSITION, "attachment".to_string()),
+                ],
+                Body::from(raw.into_bytes()),
+            )
+                .into_response();
+        }
+        // Text body-part blob (`blob-<id>-text`), the part-level blob the
+        // `Email/get` `textBody` projection advertises. Cheap to serve and
+        // flagged alongside the whole-message blob in `gaps.md`.
+        if blob_id == format!("blob-{}-text", email.id) {
+            let crate::fixture::Body::Text(text) = &email.body;
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain".to_string())],
+                Body::from(text.clone().into_bytes()),
+            )
+                .into_response();
+        }
         for att in &email.attachments {
             if att.blob_id == blob_id {
                 // RFC 5987 `filename*=UTF-8''<percent-encoded>`

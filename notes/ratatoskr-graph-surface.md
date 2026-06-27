@@ -267,14 +267,22 @@ v0 serves:
   Returns 201 with the moved message; 400 on missing `destinationId`,
   404 on unknown message.
 - `POST /v1.0/me/messages` (draft create) + `POST
-  /v1.0/me/messages/{id}/send` (+ `/users/{u}` twins) - bifrost's
-  send path is create-draft-then-send (`pim.rs::send_message`), not
-  `/sendMail`. Create stores a `$draft`-keyworded Email (subject /
-  from / to / cc / bcc / body parsed from the Graph shape) in the
-  Drafts-role mailbox, or the first mailbox if none, recording
-  `email_created`; returns 201 with the message so the id is real
-  (GET/PATCH then find it). Send returns 202 and leaves the draft -
-  v0 models neither the Sent-folder transition nor delivery.
+  /v1.0/me/messages/{id}/send` (+ `/users/{u}` twins) - bifrost has
+  TWO send paths, both create-draft-then-send (`pim.rs`), not
+  `/sendMail`. The structured compose (`send_message`) POSTs a JSON
+  Message (`Content-Type: application/json`); the raw-MIME import
+  (`send_raw_message`, used by ratatoskr's MDN read-receipt dispatch
+  and any `send_raw`) POSTs `Content-Type: text/plain` with the
+  STANDARD base64 of the RFC822 octets. The create handler branches on
+  the content type: JSON parses the Graph shape, text/plain decodes the
+  base64 and parses the MIME (subject / from / to / message-id / body),
+  filing either as a `$draft`-keyworded Email in the Drafts-role
+  mailbox (or the first mailbox if none), recording `email_created`;
+  returns 201 with a real id (GET/PATCH find it). Send returns 202 and
+  moves the draft into the Sent-role mailbox (dropping `$draft`) when
+  one exists, so a follow-up `messages/delta` returns the sent copy
+  addressed per the MIME `To:`; with no Sent-role mailbox the draft
+  stays put.
 - `GET /v1.0/me/messages/{id}/$value` (+ `/users/{u}` twin) -
   assembled RFC 822 bytes (`text/plain`), bifrost's `open_raw_rfc822`
   body-fetch path. Reuses `crate::imap::assembled_rfc822`, so the

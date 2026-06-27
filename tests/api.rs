@@ -1013,6 +1013,33 @@ async fn attachment_latency_per_blob_override_targets_one_attachment() {
 }
 
 #[tokio::test]
+async fn jmap_download_serves_whole_message_rfc822() {
+    // bifrost's `open_raw_rfc822` reads the `Email` object's own blobId
+    // (`blob-<id>`) and downloads it to scan the assembled message (e.g.
+    // for `Disposition-Notification-To` MDN detection). The mock must
+    // serve the assembled RFC822 for that blob, not 404 (it previously
+    // matched only attachment blobs).
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/download/account-1/blob-email-001/raw.eml")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "message/rfc822"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(body.contains("Subject: Hello"), "got: {body}");
+    assert!(body.contains("First message body."), "got: {body}");
+}
+
+#[tokio::test]
 async fn jmap_download_unknown_blob_returns_404_envelope() {
     let resp = attach_router()
         .oneshot(
@@ -3284,7 +3311,13 @@ async fn mailbox_set_create_move_round_trips_through_mailbox_get() {
         .to_string();
 
     // Before the move the child has no parent.
-    let v = jmap_call_on(&app, "Mailbox/get", json!({ "accountId": "account-1" }), "g0").await;
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/get",
+        json!({ "accountId": "account-1" }),
+        "g0",
+    )
+    .await;
     let pre_move_state = v["methodResponses"][0][1]["state"]
         .as_str()
         .expect("Mailbox/get carries a state token")
@@ -3315,14 +3348,25 @@ async fn mailbox_set_create_move_round_trips_through_mailbox_get() {
     )
     .await;
     assert_eq!(v["methodResponses"][0][0], "Mailbox/set");
-    assert_eq!(v["methodResponses"][0][1]["updated"][&child_id], Value::Null);
-    assert!(v["methodResponses"][0][1]["notUpdated"]
-        .as_object()
-        .is_none_or(serde_json::Map::is_empty));
+    assert_eq!(
+        v["methodResponses"][0][1]["updated"][&child_id],
+        Value::Null
+    );
+    assert!(
+        v["methodResponses"][0][1]["notUpdated"]
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty)
+    );
 
     // The follow-up Mailbox/get must reflect the reparent - this is the
     // exact readback ratatoskr's `containers_list` performs.
-    let v = jmap_call_on(&app, "Mailbox/get", json!({ "accountId": "account-1" }), "g1").await;
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/get",
+        json!({ "accountId": "account-1" }),
+        "g1",
+    )
+    .await;
     let child = v["methodResponses"][0][1]["list"]
         .as_array()
         .unwrap()
@@ -3367,7 +3411,13 @@ async fn mailbox_set_create_move_round_trips_through_mailbox_get() {
         "c3",
     )
     .await;
-    let v = jmap_call_on(&app, "Mailbox/get", json!({ "accountId": "account-1" }), "g2").await;
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/get",
+        json!({ "accountId": "account-1" }),
+        "g2",
+    )
+    .await;
     let list = v["methodResponses"][0][1]["list"].as_array().unwrap();
     let child = list
         .iter()
@@ -3396,7 +3446,13 @@ async fn mailbox_set_create_move_round_trips_through_mailbox_get() {
     .await;
     assert_eq!(v["methodResponses"][0][1]["destroyed"], json!([parent_id]));
 
-    let v = jmap_call_on(&app, "Mailbox/get", json!({ "accountId": "account-1" }), "g3").await;
+    let v = jmap_call_on(
+        &app,
+        "Mailbox/get",
+        json!({ "accountId": "account-1" }),
+        "g3",
+    )
+    .await;
     let list = v["methodResponses"][0][1]["list"].as_array().unwrap();
     assert!(list.iter().all(|m| m["name"] != json!("HarnessRenamed")));
     assert!(list.iter().all(|m| m["name"] != json!("HarnessParent")));

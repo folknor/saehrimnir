@@ -633,10 +633,16 @@ rather than batch-wide),
 `$filter=conversationId eq '...'` for bifrost's thread fetch, with
 `$top` / `$skiptoken` paging; non-`conversationId` filters and
 `$search` fall through to the full list; plus POST = draft create -
-stores a `$draft` Email in the Drafts-role mailbox [or the first
-mailbox], so GET/PATCH find it), `POST /v1.0/me/messages/{id}/send`
-(202; the draft stays put - v0 doesn't model the Sent-folder
-transition). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
+the handler branches on `Content-Type`: `application/json` stores a
+`$draft` Email from the structured Message [Drafts-role mailbox, or
+the first mailbox], while `text/plain` is bifrost's raw-MIME import
+(`send_raw_message` - the channel ratatoskr's MDN read-receipt
+dispatch uses) carrying STANDARD base64 of the RFC822 octets, parsed
+into the `$draft` via `create_draft_mime_core` and addressed per the
+MIME `To:`; either way GET/PATCH find it),
+`POST /v1.0/me/messages/{id}/send` (202; files the draft into the
+Sent-role mailbox and drops `$draft`, so a follow-up `messages/delta`
+returns the sent copy). Calendar: `/v1.0/me/calendars` (list + by-id + `default`
 alias + events list with `$top`/`$skiptoken` pagination + delta
 view + non-delta `calendarView?startDateTime=&endDateTime=` range
 read bifrost's `events_in_range` drives, coarse overlap filter),

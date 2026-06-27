@@ -1,0 +1,1 @@
+[brokkr] could not read /proc/1107538/stack: Permission denied (os error 13)
