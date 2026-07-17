@@ -9,6 +9,7 @@ version = "0.0.0"
 edition = "2024"
 description = "Deterministic mock JMAP server for testing ratatoskr's sync code."
 license = "Apache-2.0 OR MIT"
+rust-version = "1.97"
 
 [[bin]]
 name = "saehrimnir"

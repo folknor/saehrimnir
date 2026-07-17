@@ -1,1 +1,4 @@
 project = "saehrimnir"
+
+[test]
+debug = true
