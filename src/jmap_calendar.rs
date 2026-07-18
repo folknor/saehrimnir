@@ -198,7 +198,15 @@ fn serialize_event(e: &Event) -> Value {
     let (start_str, duration_str) = format_jscalendar_times(e.start, e.end, e.is_all_day);
     out.insert("start".into(), Value::String(start_str));
     out.insert("duration".into(), Value::String(duration_str));
-    out.insert("timeZone".into(), Value::String("UTC".into()));
+    // A per-event `time_zone` projects as the JSCalendar `timeZone`
+    // with the bare local `start` above (`format_jscalendar_times`
+    // already emits a `Z`-less LocalDateTime), so a TZID-bearing event
+    // reads as a wall-clock in its zone rather than a UTC instant.
+    // Falls back to UTC when unset.
+    out.insert(
+        "timeZone".into(),
+        Value::String(e.time_zone.clone().unwrap_or_else(|| "UTC".into())),
+    );
     if e.is_all_day {
         out.insert("showWithoutTime".into(), Value::Bool(true));
     }
@@ -228,7 +236,69 @@ fn serialize_event(e: &Event) -> Value {
         }
     }
 
+    if !e.reminders.is_empty() {
+        let mut alerts = Map::new();
+        for (idx, r) in e.reminders.iter().enumerate() {
+            alerts.insert(format!("alert{}", idx + 1), serialize_alert(r));
+        }
+        out.insert("alerts".into(), Value::Object(alerts));
+    }
+
     Value::Object(out)
+}
+
+/// Project a fixture [`crate::fixture::Reminder`] into a JSCalendar
+/// `Alert` (RFC 8984 sec 4.5.2): an `OffsetTrigger` (relative
+/// duration plus `relativeTo` start/end) or an `AbsoluteTrigger`
+/// (`when` UTCDate). `action` is emitted only when it maps to the
+/// JSCalendar-modelled set (`display` / `email`); an unmodelled
+/// action (e.g. `AUDIO`) is omitted rather than emitted, since a
+/// JSCalendar reader that only knows `display` / `email` would
+/// reject an unknown action value.
+fn serialize_alert(r: &crate::fixture::Reminder) -> Value {
+    let trigger = if r.absolute {
+        json!({
+            "@type": "AbsoluteTrigger",
+            "when": ical_utc_to_rfc3339(&r.trigger),
+        })
+    } else {
+        json!({
+            "@type": "OffsetTrigger",
+            "offset": r.trigger,
+            "relativeTo": if r.related_end { "end" } else { "start" },
+        })
+    };
+    let mut alert = Map::new();
+    alert.insert("@type".into(), Value::String("Alert".into()));
+    alert.insert("trigger".into(), trigger);
+    if let Some(action) = jscalendar_alert_action(r.action.as_deref()) {
+        alert.insert("action".into(), Value::String(action.into()));
+    }
+    Value::Object(alert)
+}
+
+/// Map an iCalendar-style action to the JSCalendar `Alert.action`
+/// enum. Absent defaults to `display`; anything outside
+/// `display` / `email` returns None (omit the field).
+fn jscalendar_alert_action(action: Option<&str>) -> Option<&'static str> {
+    match action {
+        None => Some("display"),
+        Some(a) if a.eq_ignore_ascii_case("display") => Some("display"),
+        Some(a) if a.eq_ignore_ascii_case("email") => Some("email"),
+        Some(_) => None,
+    }
+}
+
+/// Reformat an iCalendar UTC date-time (`YYYYMMDDTHHMMSSZ`) as an RFC
+/// 3339 UTCDate (`YYYY-MM-DDTHH:MM:SSZ`) for a JSCalendar
+/// `AbsoluteTrigger.when`. Passes an unrecognised value through
+/// verbatim.
+fn ical_utc_to_rfc3339(value: &str) -> String {
+    let trimmed = value.trim_end_matches('Z');
+    match NaiveDateTime::parse_from_str(trimmed, "%Y%m%dT%H%M%S") {
+        Ok(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        Err(_) => value.to_string(),
+    }
 }
 
 /// Translate a parsed RRULE into a single JSCalendar
@@ -829,6 +899,12 @@ fn build_event_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
             // the write path; the fixture's static authoring shape
             // keeps the field accessible if needed.
             recurrence_exdates: vec![],
+            // `CalendarEvent/set` does not author a per-event zone,
+            // reminders, or a raw CalDAV body in v0; the static
+            // `[[event]]` fixture shape stages those for reads.
+            time_zone: None,
+            reminders: Vec::new(),
+            raw_ical: None,
         },
     ))
 }
@@ -1136,6 +1212,54 @@ mod tests {
         let (s2, e2) = parse_jscalendar_times(&s, &d, false).unwrap();
         assert_eq!(s2, start);
         assert_eq!(e2, end);
+    }
+
+    #[test]
+    fn serialize_event_emits_alerts_and_timezone() {
+        let event = Event {
+            id: "ev1".into(),
+            account_id: "acct".into(),
+            calendar_id: "cal".into(),
+            subject: "Sync".into(),
+            body_preview: None,
+            body_text: None,
+            start: Utc.with_ymd_and_hms(2026, 6, 2, 9, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 6, 2, 9, 30, 0).unwrap(),
+            location: None,
+            organizer: None,
+            attendees: vec![],
+            is_all_day: false,
+            recurrence_rule: None,
+            recurrence_exdates: vec![],
+            time_zone: Some("Europe/Oslo".into()),
+            reminders: vec![
+                crate::fixture::Reminder {
+                    trigger: "-PT15M".into(),
+                    absolute: false,
+                    related_end: false,
+                    action: Some("DISPLAY".into()),
+                },
+                crate::fixture::Reminder {
+                    trigger: "20260602T083000Z".into(),
+                    absolute: true,
+                    related_end: false,
+                    action: None,
+                },
+            ],
+            raw_ical: None,
+        };
+        let v = serialize_event(&event);
+        assert_eq!(v["timeZone"], "Europe/Oslo");
+        // TZID-bearing start is a bare LocalDateTime (no Z).
+        assert_eq!(v["start"], "2026-06-02T09:00:00");
+        let alerts = v["alerts"].as_object().expect("alerts object");
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts["alert1"]["trigger"]["@type"], "OffsetTrigger");
+        assert_eq!(alerts["alert1"]["trigger"]["offset"], "-PT15M");
+        assert_eq!(alerts["alert1"]["trigger"]["relativeTo"], "start");
+        assert_eq!(alerts["alert1"]["action"], "display");
+        assert_eq!(alerts["alert2"]["trigger"]["@type"], "AbsoluteTrigger");
+        assert_eq!(alerts["alert2"]["trigger"]["when"], "2026-06-02T08:30:00Z");
     }
 
     #[test]

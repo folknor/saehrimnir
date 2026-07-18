@@ -1810,6 +1810,12 @@ fn read_event_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
             is_all_day: read_bool_opt(state, entry_idx, "is_all_day")?.unwrap_or(false),
             recurrence_rule: read_string_opt(state, entry_idx, "recurrence_rule")?,
             recurrence_exdates: read_string_array_opt(state, entry_idx, "recurrence_exdates")?,
+            time_zone: read_string_opt(state, entry_idx, "time_zone")?,
+            // Reminders are a static-fixture ([[event]]) authoring
+            // affordance in v0; the Lua change-script create path
+            // leaves them empty rather than parsing a table-of-tables.
+            reminders: Vec::new(),
+            raw_ical: read_string_opt(state, entry_idx, "raw_ical")?,
             account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
         state.pop(1);

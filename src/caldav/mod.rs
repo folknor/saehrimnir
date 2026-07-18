@@ -879,7 +879,7 @@ fn report_multiget(
         match event {
             Some(ev) => {
                 let etag = event_etag(fixture, &ev.id);
-                let ical = ical::event_to_ical(ev);
+                let ical = event_body(ev);
                 out.push_str("<D:response>");
                 out.push_str(&format!("<D:href>{}</D:href>", xml::escape(&href)));
                 out.push_str("<D:propstat><D:prop>");
@@ -923,10 +923,20 @@ fn report_calendar_query(
     out.push('\n');
     out.push_str(r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">"#);
 
+    // Empty-207 mode: a calendar flagged `caldav_empty_report` returns
+    // an empty-but-successful multistatus (zero `<D:response>` rows)
+    // regardless of the events it holds, exercising the consumer's
+    // empty-pull deletion guard (a populated previous snapshot diffed
+    // against an empty current one must not mass-delete).
+    let empty_mode = fixture
+        .calendars_for(user)
+        .find(|c| c.id == calendar_id)
+        .is_some_and(|c| c.caldav_empty_report);
+
     for ev in fixture
         .events
         .iter()
-        .filter(|e| e.calendar_id == calendar_id)
+        .filter(|e| !empty_mode && e.calendar_id == calendar_id)
     {
         if let Some((start, end)) = range
             && !overlaps(ev, start, end)
@@ -935,7 +945,7 @@ fn report_calendar_query(
         }
         let href = format!("/calendars/{user}/{calendar_id}/{}.ics", ev.id);
         let etag = event_etag(fixture, &ev.id);
-        let ical = ical::event_to_ical(ev);
+        let ical = event_body(ev);
         out.push_str("<D:response>");
         out.push_str(&format!("<D:href>{}</D:href>", xml::escape(&href)));
         out.push_str("<D:propstat><D:prop>");
@@ -985,6 +995,17 @@ fn extract_attr(s: &str, name: &str) -> Option<String> {
     None
 }
 
+/// The iCalendar body a CalDAV read serves for `ev`: the fixture's
+/// verbatim `raw_ical` override when present (a multi-VEVENT resource,
+/// or a deliberately malformed body staging a per-resource parse
+/// failure), otherwise the structured projection through
+/// `ical::event_to_ical`.
+fn event_body(ev: &crate::fixture::Event) -> String {
+    ev.raw_ical
+        .clone()
+        .unwrap_or_else(|| ical::event_to_ical(ev))
+}
+
 /// Half-open time-range overlap test: an event with `[ev.start,
 /// ev.end)` overlaps `[range_start, range_end)` iff
 /// `ev.start < range_end && ev.end > range_start`.
@@ -1009,7 +1030,7 @@ async fn handle_get(state: &AppState, path: &str, _headers: &HeaderMap) -> Respo
             .find(|e| e.id == event_id && e.calendar_id == calendar_id && e.account_id == user)
         {
             Some(ev) => {
-                let body = ical::event_to_ical(ev);
+                let body = event_body(ev);
                 let etag = event_etag(&fixture, &ev.id);
                 Response::builder()
                     .status(StatusCode::OK)
@@ -1136,6 +1157,15 @@ async fn handle_put(state: &AppState, path: &str, headers: &HeaderMap, body: &[u
         is_all_day: parsed.is_all_day,
         recurrence_rule: parsed.recurrence_rule,
         recurrence_exdates: parsed.recurrence_exdates,
+        // The v0 PUT parser (`ical::parse_vevent`) does not extract
+        // per-event timezone, VALARM reminders, or preserve a raw
+        // multi-VEVENT body, so a PUT-written event drops those.
+        // Reads of the structured fields still round-trip; the
+        // static `[[event]]` shape is the authoring path for the
+        // TZID / reminder / multi-VEVENT read affordances.
+        time_zone: None,
+        reminders: Vec::new(),
+        raw_ical: None,
     };
     let was_create = existing_idx.is_none();
     fixture.mutate(|f| match existing_idx {
@@ -1290,6 +1320,7 @@ async fn handle_mkcalendar(state: &AppState, path: &str, body: &[u8]) -> Respons
         color,
         is_default: false,
         account_id: user.clone(),
+        caldav_empty_report: false,
     };
     let cal_id_for_diff = calendar_id.clone();
     fixture.mutate(|f| {

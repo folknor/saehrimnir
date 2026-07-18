@@ -308,6 +308,64 @@ gcal / JMAP currently ignore inbound recurrence (writes leave
 `recurrence_rule` / `recurrence_exdates` empty). CalDAV PUT
 round-trips automatically.
 
+### Calendar PULL read affordances
+
+Additional optional keys stage the shapes the windowed calendar
+PULL surface exercises (Google `events.list` timeMin/timeMax,
+Graph `calendarView`, JMAP `CalendarEvent/query`, CalDAV
+`calendar-query` REPORT):
+
+```toml
+[[calendar]]
+caldav_empty_report = true   # optional; the CalDAV calendar-query
+                             # REPORT returns an empty-but-successful
+                             # 207 multistatus regardless of the
+                             # events the calendar holds (exercises a
+                             # consumer's empty-pull deletion guard).
+
+[[event]]
+time_zone = "Europe/Oslo"    # optional; timed values project as a
+                             # TZID-bearing wall-clock: CalDAV emits
+                             # DTSTART;TZID=<zone>:<local> and JMAP a
+                             # bare `start` + `timeZone`. The stored
+                             # UTC clock-face digits become the local
+                             # wall-clock under the zone (no tz-db
+                             # conversion). Ignored for all-day and by
+                             # Graph / Google (which keep UTC).
+reminders = [                # optional; VALARM (CalDAV) + JSCalendar
+                             # `alerts` (JMAP). Graph / Google omit.
+    { trigger = "-PT15M" },                       # relative-to-start
+    { trigger = "-PT5M", related_end = true,      # relative-to-end
+      action = "EMAIL" },
+    { trigger = "20260602T133000Z",               # absolute (iCal UTC)
+      absolute = true },
+]
+raw_ical = """..."""         # optional; verbatim iCalendar body served
+                             # by CalDAV GET / REPORT instead of the
+                             # structured projection. Stages a
+                             # multi-VEVENT resource (master +
+                             # RECURRENCE-ID overrides + STATUS:CANCELLED
+                             # in one .ics) or a deliberately malformed
+                             # body (a per-resource parse failure the
+                             # consumer surfaces in Page.failed_ids
+                             # rather than deleting). `start` / `end`
+                             # still drive the calendar-query time-range
+                             # overlap. Graph / JMAP / Google ignore it.
+```
+
+All-day events emit a `VALUE=DATE` DTSTART/DTEND on CalDAV (not a
+bare `X-MICROSOFT-CDO-ALLDAYEVENT` hint) with an exclusive end
+date (author `end` as the day *after* the last covered day, e.g. a
+one-day event on 2026-06-02 uses `end = "2026-06-03T00:00:00Z"`),
+matching the uniform exclusive all-day end contract.
+
+The Google `events.list` no-token path honours `timeMin` /
+`timeMax` (half-open overlap) and `orderBy=startTime`, and a
+per-event GET (`.../events/{id}`) serves the event-detail read.
+Graph `calendarView` accepts spans up to its ~1095-day maximum
+with no clamp. `fixtures/calendar-pull-small.toml` is a worked
+example covering every affordance above.
+
 Validation rules:
 
 - `calendar.id` is unique within the fixture.

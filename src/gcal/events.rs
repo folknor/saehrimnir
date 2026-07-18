@@ -24,7 +24,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete as delete_route, get, patch},
+    routing::{delete as delete_route, get},
 };
 use chrono::SecondsFormat;
 use serde::Deserialize;
@@ -52,7 +52,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/calendar/v3/calendars/{calendar}/events/{event}",
-            patch(patch_event).delete(delete_event_route()),
+            get(get_event).patch(patch_event).delete(delete_event_route()),
         )
 }
 
@@ -70,15 +70,15 @@ struct ListParams {
     #[serde(default, rename = "pageToken")]
     page_token: Option<String>,
     #[serde(default, rename = "timeMin")]
-    _time_min: Option<String>,
+    time_min: Option<String>,
     #[serde(default, rename = "timeMax")]
-    _time_max: Option<String>,
+    time_max: Option<String>,
     #[serde(default, rename = "singleEvents")]
     _single_events: Option<bool>,
     #[serde(default, rename = "maxResults")]
     max_results: Option<usize>,
     #[serde(default, rename = "orderBy")]
-    _order_by: Option<String>,
+    order_by: Option<String>,
 }
 
 // ── calendarList ────────────────────────────────────────────────────
@@ -196,11 +196,24 @@ async fn list_events(
         }));
     }
 
+    // Non-delta windowed pull (bifrost's `events_in_range`): no
+    // syncToken, `timeMin` / `timeMax` bound the window and
+    // `orderBy=startTime` requests start-ordered results. Keep events
+    // overlapping `[timeMin, timeMax)`; an absent bound is open on that
+    // side. The overlap stays coarse (bifrost re-filters client-side),
+    // matching the Graph / JMAP calendar mocks.
+    let time_min = params.time_min.as_deref().and_then(parse_range_bound);
+    let time_max = params.time_max.as_deref().and_then(parse_range_bound);
     let mut all: Vec<&Event> = fixture
         .events_for(&account_id)
         .filter(|e| e.calendar_id == calendar)
+        .filter(|e| event_in_window(e, time_min, time_max))
         .collect();
-    all.sort_by(|a, b| a.id.cmp(&b.id));
+    if params.order_by.as_deref() == Some("startTime") {
+        all.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
+    } else {
+        all.sort_by(|a, b| a.id.cmp(&b.id));
+    }
     let total = all.len();
     let page_size = params
         .max_results
@@ -333,6 +346,63 @@ fn serialize_event_times(e: &Event) -> (Value, Value) {
             "timeZone": "UTC",
         });
         (start, end)
+    }
+}
+
+/// Parse a Google Calendar range bound (`timeMin` / `timeMax`) as an
+/// RFC 3339 instant. bifrost always sends these with an offset (`Z` or
+/// `+HH:MM`), so a bare offsetless value returns None (open bound).
+fn parse_range_bound(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// Half-open overlap test against `[min, max)`; an absent bound is open
+/// on that side.
+fn event_in_window(
+    e: &Event,
+    min: Option<chrono::DateTime<chrono::Utc>>,
+    max: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    if let Some(m) = min
+        && e.end <= m
+    {
+        return false;
+    }
+    if let Some(m) = max
+        && e.start >= m
+    {
+        return false;
+    }
+    true
+}
+
+// ── single-event get ────────────────────────────────────────────────
+
+/// `GET /calendar/v3/calendars/{calendar}/events/{event}` - the
+/// per-event read bifrost's `event_get` drives. 404 (`notFound`) when
+/// the event is absent from the calendar.
+async fn get_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((calendar, event_id)): Path<(String, String)>,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "get_event", |_| Ok(())) {
+        return o;
+    }
+    let account_id = bearer_account(&state, &headers);
+    let fixture = state.fixture();
+    match fixture
+        .events_for(&account_id)
+        .find(|e| e.id == event_id && e.calendar_id == calendar)
+    {
+        Some(e) => ok_json(serialize_event(e)),
+        None => error(
+            StatusCode::NOT_FOUND,
+            &format!("event {event_id:?} not in calendar {calendar:?}"),
+            "notFound",
+        ),
     }
 }
 
@@ -562,6 +632,12 @@ fn build_event_from_create(
         is_all_day,
         recurrence_rule,
         recurrence_exdates,
+        // Google Calendar create carries no timezone / reminder /
+        // raw-ical authoring on this path; the static `[[event]]`
+        // fixture shape is the way to stage those.
+        time_zone: None,
+        reminders: Vec::new(),
+        raw_ical: None,
     })
 }
 

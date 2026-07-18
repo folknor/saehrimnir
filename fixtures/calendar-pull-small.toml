@@ -1,0 +1,178 @@
+name = "calendar-pull-small"
+
+# Exercises the windowed calendar PULL surface (Google events.list
+# timeMin/timeMax, Graph calendarView, JMAP CalendarEvent/query, CalDAV
+# calendar-query REPORT) plus the read affordances the B7a gates need:
+# reminders (VALARM + JMAP alerts), TZID-bearing timed values, one-day
+# all-day events, multi-VEVENT resources, per-resource CalDAV parse
+# failure, an empty-207 calendar, and events older than one year (5-year
+# backfill window slices) spread across a >1000-day span (Graph's ~1095
+# day max window).
+
+[[account]]
+id = "account-1"
+name = "test@example.com"
+is_personal = true
+
+[[mailbox]]
+id = "mbx-inbox"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+# Primary pull calendar.
+[[calendar]]
+id = "cal-work"
+name = "Work"
+color = "lightBlue"
+is_default = true
+
+# Empty-207 calendar: its CalDAV calendar-query REPORT returns an
+# empty-but-successful multistatus regardless of the events below, so a
+# consumer's empty-pull deletion guard can be exercised without the
+# calendar actually being empty.
+[[calendar]]
+id = "cal-empty207"
+name = "Flaky"
+color = "lightGreen"
+caldav_empty_report = true
+
+# Event living in the empty-207 calendar: the calendar holds it, but the
+# CalDAV calendar-query REPORT reports zero rows, so a consumer polling
+# cal-empty207 sees an empty pull despite the resource existing.
+[[event]]
+id = "ev-hidden"
+calendar_id = "cal-empty207"
+subject = "Hidden by empty-207"
+start = "2026-06-04T09:00:00Z"
+end = "2026-06-04T10:00:00Z"
+attendees = []
+
+# ── Events older than one year (5-year backfill slices) ──────────────
+# "today" for these fixtures is 2026; these sit 1-2 years back and, with
+# the 2027 event below, span >1000 days for the Graph calendarView max
+# window.
+
+[[event]]
+id = "ev-old-2024"
+calendar_id = "cal-work"
+subject = "Kickoff 2024"
+start = "2024-06-03T09:00:00Z"
+end = "2024-06-03T10:00:00Z"
+attendees = []
+
+[[event]]
+id = "ev-2027"
+calendar_id = "cal-work"
+subject = "Roadmap 2027"
+start = "2027-01-11T09:00:00Z"
+end = "2027-01-11T10:00:00Z"
+attendees = []
+
+# ── Reminders: relative-to-start, relative-to-end, absolute ──────────
+
+[[event]]
+id = "ev-reminders"
+calendar_id = "cal-work"
+subject = "Board meeting"
+body_text = "Quarterly board meeting."
+start = "2026-06-02T14:00:00Z"
+end = "2026-06-02T15:00:00Z"
+location = "Room 1"
+attendees = []
+reminders = [
+    { trigger = "-PT15M" },
+    { trigger = "-PT5M", related_end = true, action = "EMAIL" },
+    { trigger = "20260602T133000Z", absolute = true },
+]
+
+# ── TZID-bearing timed values (bare wall-clock plus a zone) ──────────
+
+[[event]]
+id = "ev-tzid"
+calendar_id = "cal-work"
+subject = "Oslo standup"
+start = "2026-06-02T09:00:00Z"
+end = "2026-06-02T09:30:00Z"
+time_zone = "Europe/Oslo"
+attendees = []
+
+# ── One-day all-day event (exclusive end contract) ───────────────────
+# start 2026-06-02 (inclusive), end 2026-06-03 (exclusive day-after).
+
+[[event]]
+id = "ev-allday"
+calendar_id = "cal-work"
+subject = "Company holiday"
+start = "2026-06-02T00:00:00Z"
+end = "2026-06-03T00:00:00Z"
+is_all_day = true
+attendees = []
+
+# ── Multi-VEVENT CalDAV resource: master + moved override + cancelled ─
+# raw_ical is served verbatim on CalDAV GET / REPORT; start/end below
+# still drive the calendar-query time-range overlap.
+
+[[event]]
+id = "ev-series"
+calendar_id = "cal-work"
+subject = "Weekly sync"
+start = "2026-06-01T09:00:00Z"
+end = "2026-06-01T09:30:00Z"
+attendees = []
+raw_ical = """\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//saehrimnir//mock CalDAV//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:ev-series\r\n\
+SUMMARY:Weekly sync\r\n\
+DTSTART:20260601T090000Z\r\n\
+DTEND:20260601T093000Z\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+BEGIN:VALARM\r\n\
+ACTION:DISPLAY\r\n\
+DESCRIPTION:Reminder\r\n\
+TRIGGER:-PT10M\r\n\
+END:VALARM\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:ev-series\r\n\
+RECURRENCE-ID:20260608T090000Z\r\n\
+SUMMARY:Weekly sync (moved)\r\n\
+DTSTART:20260608T100000Z\r\n\
+DTEND:20260608T103000Z\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:ev-series\r\n\
+RECURRENCE-ID:20260615T090000Z\r\n\
+STATUS:CANCELLED\r\n\
+DTSTART:20260615T090000Z\r\n\
+DTEND:20260615T093000Z\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n"""
+
+# ── Per-resource CalDAV parse failure ────────────────────────────────
+# A resource that fetches with a 200 propstat but whose body is a
+# malformed VEVENT (unterminated quoted TZID param). bifrost fetches it
+# successfully, fails to tokenize it, and surfaces the href in
+# Page.failed_ids instead of treating it as a remote deletion. Sibling
+# events in the same 207 still project.
+
+[[event]]
+id = "ev-broken"
+calendar_id = "cal-work"
+subject = "Broken resource"
+start = "2026-06-02T11:00:00Z"
+end = "2026-06-02T12:00:00Z"
+attendees = []
+raw_ical = """\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:ev-broken\r\n\
+SUMMARY:Broken resource\r\n\
+DTSTART;TZID="unterminated:20260602T110000\r\n\
+DTEND:20260602T120000Z\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n"""

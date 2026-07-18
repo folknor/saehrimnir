@@ -982,6 +982,12 @@ fn build_event_from_create(
         // place to author EXDATEs. The fixture's static authoring
         // shape keeps the field accessible if needed.
         recurrence_exdates: vec![],
+        // Graph keeps UTC on the shared read surface and carries no
+        // reminders / raw-ical; the static `[[event]]` shape stages
+        // those for the CalDAV / JMAP projections.
+        time_zone: None,
+        reminders: Vec::new(),
+        raw_ical: None,
     })
 }
 

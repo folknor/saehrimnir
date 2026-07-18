@@ -1894,6 +1894,38 @@ pub struct Calendar {
     pub is_default: bool,
     /// Account this calendar belongs to. See `Mailbox::account_id`.
     pub account_id: String,
+    /// CalDAV empty-207 mode. When true, the CalDAV `calendar-query`
+    /// REPORT returns an empty-but-successful 207 multistatus (zero
+    /// `<D:response>` rows) regardless of the events the calendar
+    /// holds. Exercises the consumer's empty-pull deletion guard
+    /// (bifrost's `diff_event_snapshots` suppresses a mass-delete when
+    /// a populated previous snapshot diffs against an empty current
+    /// one). Other protocols ignore it. False by default.
+    pub caldav_empty_report: bool,
+}
+
+/// A reminder / alarm attached to an [`Event`]. Projected as an
+/// iCalendar `VALARM` on CalDAV and a JSCalendar `Alert` on JMAP;
+/// Graph and Google do not carry reminders on the shared read
+/// surface, so those projections omit it. Read-only in v0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reminder {
+    /// The trigger value. For a relative reminder this is an RFC 5545
+    /// signed duration (`"-PT15M"` = fifteen minutes before the
+    /// reference point); for an absolute reminder it is an iCalendar
+    /// UTC date-time (`"20260602T110000Z"`).
+    pub trigger: String,
+    /// True when `trigger` is an absolute date-time; false when it is a
+    /// relative duration offset. Selects `VALUE=DATE-TIME` on CalDAV
+    /// and `AbsoluteTrigger` vs `OffsetTrigger` on JMAP.
+    pub absolute: bool,
+    /// Relative reminders only: when true the offset is measured from
+    /// the event end (`RELATED=END` on CalDAV, `relativeTo: "end"` on
+    /// JMAP) rather than the start. Ignored for absolute reminders.
+    pub related_end: bool,
+    /// Provider action (`DISPLAY` / `EMAIL` / `AUDIO`). Defaults to
+    /// `DISPLAY` on emit when absent.
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1928,6 +1960,35 @@ pub struct Event {
     /// schemas want a per-date override object the v0 fixture
     /// can't author yet). Empty by default.
     pub recurrence_exdates: Vec<DateTime<Utc>>,
+    /// Optional IANA/named timezone for the event's timed values. When
+    /// set, CalDAV emits `DTSTART;TZID=<zone>:<wall-clock>` and JMAP
+    /// emits `timeZone: "<zone>"` with a bare local `start`, so the
+    /// event carries a TZID-bearing wall-clock rather than a UTC `Z`
+    /// instant. The stored `start` / `end` clock-face digits are used
+    /// verbatim as the local wall-clock under the zone (dependency-free,
+    /// deterministic - no tz-database conversion). Ignored for all-day
+    /// events and by Graph / Google (which keep UTC). None keeps the
+    /// pre-existing UTC projection.
+    pub time_zone: Option<String>,
+    /// Reminders / alarms. Projected as `VALARM` on CalDAV and JMAP
+    /// `alerts`. Empty by default.
+    pub reminders: Vec<Reminder>,
+    /// Optional verbatim iCalendar body override for the CalDAV read
+    /// path. When set, CalDAV `GET` / `REPORT calendar-multiget` /
+    /// `REPORT calendar-query` serve this string as the resource's
+    /// `text/calendar` / `<C:calendar-data>` instead of projecting the
+    /// structured fields through `event_to_ical`. This is how a fixture
+    /// authors shapes the canonical single-VEVENT `Event` cannot
+    /// represent: a multi-VEVENT resource (master + `RECURRENCE-ID`
+    /// override instances + a `STATUS:CANCELLED` instance in one
+    /// `.ics`), or a deliberately malformed body that bifrost fetches
+    /// successfully but fails to parse (surfacing the resource in
+    /// `Page.failed_ids` rather than deleting it). The structured
+    /// `start` / `end` are still used for the calendar-query time-range
+    /// overlap test, so author them to match the master VEVENT. Graph /
+    /// JMAP / Google ignore this field and project structurally. None
+    /// keeps the structured projection.
+    pub raw_ical: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2506,6 +2567,33 @@ pub(crate) struct RawCalendar {
     pub(crate) is_default: bool,
     #[serde(default)]
     pub(crate) account_id: Option<String>,
+    /// CalDAV empty-207 mode. See [`Calendar::caldav_empty_report`].
+    #[serde(default)]
+    pub(crate) caldav_empty_report: bool,
+}
+
+/// Authoring form for [`Reminder`]. `trigger` is required; the rest
+/// default (relative offset, related-to-start, `DISPLAY` action).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawReminder {
+    pub(crate) trigger: String,
+    #[serde(default)]
+    pub(crate) absolute: bool,
+    #[serde(default)]
+    pub(crate) related_end: bool,
+    #[serde(default)]
+    pub(crate) action: Option<String>,
+}
+
+impl From<RawReminder> for Reminder {
+    fn from(raw: RawReminder) -> Self {
+        Self {
+            trigger: raw.trigger,
+            absolute: raw.absolute,
+            related_end: raw.related_end,
+            action: raw.action,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2534,6 +2622,17 @@ pub(crate) struct RawEvent {
     /// timestamp; parsed via `parse_ts` at normalize time.
     #[serde(default)]
     pub(crate) recurrence_exdates: Vec<String>,
+    /// Optional named timezone for timed values. See
+    /// [`Event::time_zone`].
+    #[serde(default)]
+    pub(crate) time_zone: Option<String>,
+    /// Reminders / alarms. See [`Event::reminders`].
+    #[serde(default)]
+    pub(crate) reminders: Vec<RawReminder>,
+    /// Optional verbatim CalDAV iCalendar body. See
+    /// [`Event::raw_ical`].
+    #[serde(default)]
+    pub(crate) raw_ical: Option<String>,
     /// Optional override. If absent the event inherits its parent
     /// calendar's `account_id`; if present it must match the
     /// parent's account or the loader rejects the cross-account
@@ -2953,6 +3052,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             name: cal.name,
             color: cal.color,
             is_default: cal.is_default,
+            caldav_empty_report: cal.caldav_empty_report,
         });
     }
     let mut event_ids: HashMap<String, ()> = HashMap::new();
@@ -3009,6 +3109,9 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             is_all_day: ev.is_all_day,
             recurrence_rule: ev.recurrence_rule,
             recurrence_exdates,
+            time_zone: ev.time_zone,
+            reminders: ev.reminders.into_iter().map(Reminder::from).collect(),
+            raw_ical: ev.raw_ical,
         });
     }
 
@@ -3456,6 +3559,9 @@ pub(crate) fn event_create_op(raw: RawEvent) -> Result<ChangeOp, String> {
         is_all_day: raw.is_all_day,
         recurrence_rule: raw.recurrence_rule,
         recurrence_exdates,
+        time_zone: raw.time_zone,
+        reminders: raw.reminders.into_iter().map(Reminder::from).collect(),
+        raw_ical: raw.raw_ical,
     })))
 }
 

@@ -37,6 +37,11 @@ pub(crate) fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }
+    // Date-only form (`YYYYMMDD`), as emitted for an all-day
+    // `DTSTART;VALUE=DATE` / `DTEND;VALUE=DATE`: midnight UTC.
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y%m%d") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
     None
 }
 
@@ -55,11 +60,9 @@ pub(crate) fn event_to_ical(event: &Event) -> String {
     if let Some(loc) = &event.location {
         write_line(&mut out, "LOCATION", loc);
     }
-    write_line(&mut out, "DTSTART", &format_dt(event.start));
-    write_line(&mut out, "DTEND", &format_dt(event.end));
-    if event.is_all_day {
-        write_line(&mut out, "X-MICROSOFT-CDO-ALLDAYEVENT", "TRUE");
-    }
+    let tzid = event.time_zone.as_deref();
+    write_datetime(&mut out, "DTSTART", event.start, event.is_all_day, tzid);
+    write_datetime(&mut out, "DTEND", event.end, event.is_all_day, tzid);
     if let Some(rrule) = &event.recurrence_rule {
         // RRULE values are emitted unescaped: RFC 5545 §3.3.10 says
         // the value is a structured RECUR (semicolon-separated
@@ -83,9 +86,89 @@ pub(crate) fn event_to_ical(event: &Event) -> String {
     for attendee in &event.attendees {
         write_address_line(&mut out, "ATTENDEE", attendee);
     }
+    for reminder in &event.reminders {
+        write_valarm(&mut out, reminder);
+    }
     out.push_str("END:VEVENT\r\n");
     out.push_str("END:VCALENDAR\r\n");
     out
+}
+
+/// Emit a `DTSTART` / `DTEND` property.
+///
+/// - All-day: `NAME;VALUE=DATE:YYYYMMDD`. The stored `end` is already
+///   the exclusive day-after per `EventTime`'s all-day contract, so the
+///   date serializes verbatim (no decrement). This is the shape a
+///   consumer needs to detect an all-day event (a `VALUE=DATE` DTSTART),
+///   not a bare `X-MICROSOFT-CDO-ALLDAYEVENT` hint.
+/// - TZID-bearing timed: `NAME;TZID=<zone>:YYYYMMDDTHHMMSS`. The stored
+///   UTC clock-face digits become the local wall-clock under the zone
+///   (no trailing `Z`), so the value is a wall-clock the reader resolves
+///   against `<zone>` rather than a UTC instant.
+/// - Plain timed: `NAME:YYYYMMDDTHHMMSSZ` (UTC).
+fn write_datetime(out: &mut String, name: &str, dt: DateTime<Utc>, is_all_day: bool, tzid: Option<&str>) {
+    if is_all_day {
+        out.push_str(name);
+        out.push_str(";VALUE=DATE:");
+        out.push_str(&dt.format("%Y%m%d").to_string());
+        out.push_str("\r\n");
+    } else if let Some(tz) = tzid {
+        out.push_str(name);
+        out.push_str(";TZID=");
+        out.push_str(&tzid_param(tz));
+        out.push(':');
+        out.push_str(&dt.format("%Y%m%dT%H%M%S").to_string());
+        out.push_str("\r\n");
+    } else {
+        write_line(out, name, &format_dt(dt));
+    }
+}
+
+/// Frame a TZID parameter value. RFC 5545 param values carrying `:`,
+/// `;`, or `,` must be double-quoted; CR/LF are stripped defensively so
+/// an authored zone string cannot inject a second property line.
+fn tzid_param(tz: &str) -> String {
+    let clean: String = tz.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    if clean.contains([':', ';', ',']) {
+        format!("\"{clean}\"")
+    } else {
+        clean
+    }
+}
+
+/// Emit a `VALARM` sub-component for a reminder. The consumer reads the
+/// `TRIGGER` (default value type DURATION, relative to start; `RELATED=END`
+/// for end-relative; `VALUE=DATE-TIME` or a bare UTC date-time for an
+/// absolute trigger) and the optional `ACTION`.
+fn write_valarm(out: &mut String, reminder: &crate::fixture::Reminder) {
+    out.push_str("BEGIN:VALARM\r\n");
+    let action = reminder.action.as_deref().unwrap_or("DISPLAY");
+    write_line(out, "ACTION", action);
+    // DISPLAY alarms require a DESCRIPTION per RFC 5545; emit a stable
+    // one so a strict client accepts the component.
+    if action.eq_ignore_ascii_case("DISPLAY") {
+        write_line(out, "DESCRIPTION", "Reminder");
+    }
+    let trigger = sanitize_line_value(&reminder.trigger);
+    if reminder.absolute {
+        out.push_str("TRIGGER;VALUE=DATE-TIME:");
+        out.push_str(&trigger);
+        out.push_str("\r\n");
+    } else if reminder.related_end {
+        out.push_str("TRIGGER;RELATED=END:");
+        out.push_str(&trigger);
+        out.push_str("\r\n");
+    } else {
+        write_line(out, "TRIGGER", &reminder.trigger);
+    }
+    out.push_str("END:VALARM\r\n");
+}
+
+/// Strip CR/LF from a structured (non-TEXT) property value so an
+/// authored value cannot inject a second property line. Used for
+/// TRIGGER durations / date-times, which are not TEXT-escaped.
+fn sanitize_line_value(value: &str) -> String {
+    value.chars().filter(|c| *c != '\r' && *c != '\n').collect()
 }
 
 fn write_line(out: &mut String, name: &str, value: &str) {
@@ -217,7 +300,16 @@ pub(crate) fn parse_vevent(body: &str) -> Result<ParsedEvent, &'static str> {
             "SUMMARY" => parsed.summary = Some(unescape_text(value)),
             "DESCRIPTION" => parsed.description = Some(unescape_text(value)),
             "LOCATION" => parsed.location = Some(unescape_text(value)),
-            "DTSTART" => parsed.start = parse_dt(value),
+            "DTSTART" => {
+                parsed.start = parse_dt(value);
+                // A date-only DTSTART (`YYYYMMDD`, emitted under
+                // `VALUE=DATE`) marks the event all-day. The param is
+                // dropped by `split_property`, so infer from the value
+                // length rather than the `VALUE=DATE` parameter.
+                if value.trim().len() == 8 {
+                    parsed.is_all_day = true;
+                }
+            }
             "DTEND" => parsed.end = parse_dt(value),
             "ORGANIZER" => parsed.organizer = parse_address(line),
             "ATTENDEE" => {
@@ -334,6 +426,100 @@ mod tests {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
     }
 
+    fn base_event() -> Event {
+        Event {
+            id: "ev".into(),
+            account_id: "acct".into(),
+            calendar_id: "cal".into(),
+            subject: "Sync".into(),
+            body_preview: None,
+            body_text: None,
+            start: dt(2026, 6, 2, 12, 0, 0),
+            end: dt(2026, 6, 2, 13, 0, 0),
+            location: None,
+            organizer: None,
+            attendees: vec![],
+            is_all_day: false,
+            recurrence_rule: None,
+            recurrence_exdates: vec![],
+            time_zone: None,
+            reminders: vec![],
+            raw_ical: None,
+        }
+    }
+
+    #[test]
+    fn tzid_event_emits_tzid_wall_clock_not_utc() {
+        let event = Event {
+            time_zone: Some("Europe/Oslo".into()),
+            ..base_event()
+        };
+        let ical = event_to_ical(&event);
+        assert!(
+            ical.contains("DTSTART;TZID=Europe/Oslo:20260602T120000\r\n"),
+            "{ical}"
+        );
+        assert!(
+            ical.contains("DTEND;TZID=Europe/Oslo:20260602T130000\r\n"),
+            "{ical}"
+        );
+        assert!(!ical.contains("DTSTART:20260602T120000Z"), "{ical}");
+    }
+
+    #[test]
+    fn all_day_event_emits_value_date_with_exclusive_end() {
+        let event = Event {
+            start: dt(2026, 6, 2, 0, 0, 0),
+            end: dt(2026, 6, 3, 0, 0, 0),
+            is_all_day: true,
+            ..base_event()
+        };
+        let ical = event_to_ical(&event);
+        assert!(ical.contains("DTSTART;VALUE=DATE:20260602\r\n"), "{ical}");
+        assert!(ical.contains("DTEND;VALUE=DATE:20260603\r\n"), "{ical}");
+        // Round-trips back to all-day via the value-length inference.
+        let parsed = parse_vevent(&ical).expect("parse");
+        assert!(parsed.is_all_day);
+        assert_eq!(parsed.start, Some(dt(2026, 6, 2, 0, 0, 0)));
+        assert_eq!(parsed.end, Some(dt(2026, 6, 3, 0, 0, 0)));
+    }
+
+    #[test]
+    fn reminders_emit_valarm_components() {
+        let event = Event {
+            reminders: vec![
+                crate::fixture::Reminder {
+                    trigger: "-PT15M".into(),
+                    absolute: false,
+                    related_end: false,
+                    action: None,
+                },
+                crate::fixture::Reminder {
+                    trigger: "-PT5M".into(),
+                    absolute: false,
+                    related_end: true,
+                    action: Some("EMAIL".into()),
+                },
+                crate::fixture::Reminder {
+                    trigger: "20260602T113000Z".into(),
+                    absolute: true,
+                    related_end: false,
+                    action: Some("DISPLAY".into()),
+                },
+            ],
+            ..base_event()
+        };
+        let ical = event_to_ical(&event);
+        assert_eq!(ical.matches("BEGIN:VALARM").count(), 3, "{ical}");
+        assert!(ical.contains("TRIGGER:-PT15M\r\n"), "{ical}");
+        assert!(ical.contains("TRIGGER;RELATED=END:-PT5M\r\n"), "{ical}");
+        assert!(ical.contains("ACTION:EMAIL\r\n"), "{ical}");
+        assert!(
+            ical.contains("TRIGGER;VALUE=DATE-TIME:20260602T113000Z\r\n"),
+            "{ical}"
+        );
+    }
+
     #[test]
     fn round_trip_minimal_event() {
         let event = Event {
@@ -357,6 +543,9 @@ mod tests {
             is_all_day: false,
             recurrence_rule: None,
             recurrence_exdates: vec![],
+            time_zone: None,
+            reminders: vec![],
+            raw_ical: None,
         };
         let ical = event_to_ical(&event);
         let parsed = parse_vevent(&ical).expect("parse");
@@ -390,6 +579,9 @@ mod tests {
             is_all_day: false,
             recurrence_rule: None,
             recurrence_exdates: vec![],
+            time_zone: None,
+            reminders: vec![],
+            raw_ical: None,
         };
         let ical = event_to_ical(&event);
         assert!(ical.contains("Q1\\; budget review"));
@@ -459,6 +651,9 @@ mod tests {
             is_all_day: false,
             recurrence_rule: None,
             recurrence_exdates: vec![],
+            time_zone: None,
+            reminders: vec![],
+            raw_ical: None,
         };
         let ical = event_to_ical(&event);
         // The injected payload is concatenated into the ORGANIZER
