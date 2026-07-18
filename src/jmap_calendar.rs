@@ -599,16 +599,23 @@ impl EventFilter {
         {
             return false;
         }
-        // `after` is the range start: keep events that end after it.
-        if let Some(a) = self.after
-            && e.end.timestamp() <= a
-        {
-            return false;
-        }
-        // `before` is the range end: keep events that start before it.
-        if let Some(b) = self.before
-            && e.start.timestamp() >= b
-        {
+        // `after` is the range start, `before` the range end. Delegate
+        // to the shared recurrence-aware matcher so a recurring master
+        // whose DTSTART predates the window still matches when its rule
+        // recurs into it (and an UNTIL-ended series drops out).
+        let range_start = self
+            .after
+            .and_then(|a| DateTime::<Utc>::from_timestamp(a, 0));
+        let range_end = self
+            .before
+            .and_then(|b| DateTime::<Utc>::from_timestamp(b, 0));
+        if !crate::recurrence::event_matches_range(
+            e.start,
+            e.end,
+            e.recurrence_rule.as_deref(),
+            range_start,
+            range_end,
+        ) {
             return false;
         }
         if let Some(t) = &self.text {

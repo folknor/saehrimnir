@@ -1006,15 +1006,24 @@ fn event_body(ev: &crate::fixture::Event) -> String {
         .unwrap_or_else(|| ical::event_to_ical(ev))
 }
 
-/// Half-open time-range overlap test: an event with `[ev.start,
-/// ev.end)` overlaps `[range_start, range_end)` iff
-/// `ev.start < range_end && ev.end > range_start`.
+/// Recurrence-aware time-range overlap test. A non-recurring event
+/// overlaps `[range_start, range_end)` iff `ev.start < range_end &&
+/// ev.end > range_start`; a recurring event (one carrying a structured
+/// `recurrence_rule`) matches iff its DTSTART falls before the window
+/// closes and its RRULE `UNTIL` (when present) does not end the series
+/// before the window opens. See [`crate::recurrence::event_matches_range`].
 fn overlaps(
     ev: &crate::fixture::Event,
     range_start: chrono::DateTime<chrono::Utc>,
     range_end: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    ev.start < range_end && ev.end > range_start
+    crate::recurrence::event_matches_range(
+        ev.start,
+        ev.end,
+        ev.recurrence_rule.as_deref(),
+        Some(range_start),
+        Some(range_end),
+    )
 }
 
 async fn handle_get(state: &AppState, path: &str, _headers: &HeaderMap) -> Response {

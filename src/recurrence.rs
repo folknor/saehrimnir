@@ -291,6 +291,67 @@ fn parse_by_day(s: &str) -> Option<ByDay> {
     Some(ByDay { ordinal, weekday })
 }
 
+/// Recurrence-aware time-range match, shared by all three calendar
+/// read surfaces: the CalDAV `time-range` REPORT filter, the JMAP
+/// `CalendarEvent/query` `after` / `before` filter, and the Graph
+/// `calendarView` range read. Real servers (JMAP, CalDAV RFC 4791,
+/// Graph) expand a recurring event's occurrences before testing a
+/// range; we approximate that expansion without materialising every
+/// instance:
+///
+/// - A NON-recurring event matches iff its own `[start, end)` interval
+///   overlaps `[range_start, range_end)` (half-open): `start < range_end
+///   && end > range_start`.
+/// - A RECURRING event (any non-`None` `recurrence_rule`) matches iff
+///   `start < range_end` (the series' DTSTART falls before the window
+///   closes) AND the recurrence is not terminated before `range_start`.
+///   Termination is read from the RRULE `UNTIL` (the series spans
+///   `[DTSTART, UNTIL]`): a rule with `UNTIL < range_start` has ended
+///   and does not match. COUNT-bounded and unbounded rules are treated
+///   as not-terminated (a documented approximation - we do not expand
+///   COUNT to find its true last occurrence).
+///
+/// An absent bound is open on that side.
+pub fn event_matches_range(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    recurrence_rule: Option<&str>,
+    range_start: Option<DateTime<Utc>>,
+    range_end: Option<DateTime<Utc>>,
+) -> bool {
+    // DTSTART must fall before the window closes, for both recurring and
+    // non-recurring events (a series' first occurrence is its DTSTART).
+    if let Some(re) = range_end
+        && start >= re
+    {
+        return false;
+    }
+    match recurrence_rule {
+        // Single instance: its own interval must reach past the window's
+        // start.
+        None => {
+            if let Some(rs) = range_start
+                && end <= rs
+            {
+                return false;
+            }
+            true
+        }
+        // Recurring: matches unless an explicit UNTIL ends the series
+        // before the window opens. COUNT / unbounded rules never
+        // terminate for this test.
+        Some(rule) => {
+            if let Some(rs) = range_start
+                && let Some(until) = ParsedRule::parse(rule).until
+                && until < rs
+            {
+                return false;
+            }
+            true
+        }
+    }
+}
+
 /// Parse an UNTIL value. RFC 5545 lets UNTIL be either a `DATE`
 /// (`YYYYMMDD`) or a UTC `DATE-TIME` (`YYYYMMDDTHHMMSSZ`). Fixtures
 /// today only need the UTC form, but accepting the date form too
@@ -443,5 +504,125 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(format_rrule(&r), None);
+    }
+
+    fn dt(y: i32, mo: u32, d: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, 0, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn non_recurring_uses_exact_half_open_overlap() {
+        // Event [Jan 15 09:00, Jan 15 09:30) vs a January window.
+        let s = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2026, 1, 15, 9, 30, 0).unwrap();
+        assert!(event_matches_range(
+            s,
+            e,
+            None,
+            Some(dt(2026, 1, 1)),
+            Some(dt(2026, 2, 1))
+        ));
+        // A February window does not overlap the single January instance.
+        assert!(!event_matches_range(
+            s,
+            e,
+            None,
+            Some(dt(2026, 2, 1)),
+            Some(dt(2026, 3, 1))
+        ));
+        // Touching at the exclusive end (event.end == range_start) is no
+        // overlap.
+        assert!(!event_matches_range(
+            s,
+            e,
+            None,
+            Some(e),
+            Some(dt(2026, 2, 1))
+        ));
+    }
+
+    #[test]
+    fn recurring_unbounded_matches_window_after_dtstart() {
+        // Weekly series starting Jan 2024, unbounded: matches a 2026
+        // window even though its own [start, end) is years earlier.
+        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        assert!(event_matches_range(
+            s,
+            e,
+            Some("FREQ=WEEKLY;BYDAY=MO"),
+            Some(dt(2026, 6, 1)),
+            Some(dt(2026, 7, 1))
+        ));
+    }
+
+    #[test]
+    fn recurring_count_bounded_treated_as_not_terminated() {
+        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        assert!(event_matches_range(
+            s,
+            e,
+            Some("FREQ=WEEKLY;BYDAY=MO;COUNT=10"),
+            Some(dt(2026, 6, 1)),
+            Some(dt(2026, 7, 1))
+        ));
+    }
+
+    #[test]
+    fn recurring_until_in_past_drops_out() {
+        // Series ends 2025-06; a 2026 window must not match it.
+        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        assert!(!event_matches_range(
+            s,
+            e,
+            Some("FREQ=WEEKLY;BYDAY=MO;UNTIL=20250601T090000Z"),
+            Some(dt(2026, 6, 1)),
+            Some(dt(2026, 7, 1))
+        ));
+    }
+
+    #[test]
+    fn recurring_until_after_window_start_matches() {
+        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        assert!(event_matches_range(
+            s,
+            e,
+            Some("FREQ=MONTHLY;BYMONTHDAY=15;UNTIL=20261215T170000Z"),
+            Some(dt(2026, 11, 1)),
+            Some(dt(2026, 12, 1))
+        ));
+    }
+
+    #[test]
+    fn recurring_dtstart_after_window_end_drops_out() {
+        // A series that does not begin until after the window closes
+        // cannot have an in-window occurrence.
+        let s = Utc.with_ymd_and_hms(2027, 1, 1, 9, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2027, 1, 1, 9, 30, 0).unwrap();
+        assert!(!event_matches_range(
+            s,
+            e,
+            Some("FREQ=WEEKLY;BYDAY=MO"),
+            Some(dt(2026, 6, 1)),
+            Some(dt(2026, 7, 1))
+        ));
+    }
+
+    #[test]
+    fn open_bounds_are_permissive() {
+        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        // No bounds at all: everything matches.
+        assert!(event_matches_range(s, e, None, None, None));
+        assert!(event_matches_range(
+            s,
+            e,
+            Some("FREQ=WEEKLY;BYDAY=MO;UNTIL=20250101T000000Z"),
+            None,
+            None
+        ));
     }
 }

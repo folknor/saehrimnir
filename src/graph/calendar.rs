@@ -539,24 +539,19 @@ fn parse_view_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|n| n.and_utc())
 }
 
-/// An event overlaps `[start, end)` when it ends after `start` and
-/// begins before `end`; an absent bound is open on that side.
+/// Recurrence-aware range match. A non-recurring event overlaps
+/// `[start, end)` when it ends after `start` and begins before `end`;
+/// a recurring event (one carrying a structured `recurrence_rule`)
+/// matches when its DTSTART falls before `end` and its RRULE `UNTIL`
+/// (when present) does not end the series before `start`. An absent
+/// bound is open on that side. See
+/// [`crate::recurrence::event_matches_range`].
 fn event_overlaps_range(
     e: &Event,
     start: Option<chrono::DateTime<chrono::Utc>>,
     end: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
-    if let Some(s) = start
-        && e.end <= s
-    {
-        return false;
-    }
-    if let Some(en) = end
-        && e.start >= en
-    {
-        return false;
-    }
-    true
+    crate::recurrence::event_matches_range(e.start, e.end, e.recurrence_rule.as_deref(), start, end)
 }
 
 async fn delta_events_impl(
