@@ -52,7 +52,9 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/calendar/v3/calendars/{calendar}/events/{event}",
-            get(get_event).patch(patch_event).delete(delete_event_route()),
+            get(get_event)
+                .patch(patch_event)
+                .delete(delete_event_route()),
         )
 }
 

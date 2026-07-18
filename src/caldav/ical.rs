@@ -106,7 +106,13 @@ pub(crate) fn event_to_ical(event: &Event) -> String {
 ///   (no trailing `Z`), so the value is a wall-clock the reader resolves
 ///   against `<zone>` rather than a UTC instant.
 /// - Plain timed: `NAME:YYYYMMDDTHHMMSSZ` (UTC).
-fn write_datetime(out: &mut String, name: &str, dt: DateTime<Utc>, is_all_day: bool, tzid: Option<&str>) {
+fn write_datetime(
+    out: &mut String,
+    name: &str,
+    dt: DateTime<Utc>,
+    is_all_day: bool,
+    tzid: Option<&str>,
+) {
     if is_all_day {
         out.push_str(name);
         out.push_str(";VALUE=DATE:");

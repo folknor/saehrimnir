@@ -685,19 +685,28 @@ fn apply_event_condition(f: &mut EventFilter, c: &Value) -> Result<(), Value> {
     Ok(())
 }
 
-/// Accept a JSCalendar `UTCDate` (RFC3339, e.g. `"2026-01-15T09:00:00Z"`)
-/// or a unix-seconds integer, returning the unix timestamp.
+/// Accept a JSCalendar `UTCDate`, a bare JSCalendar local date-time, or a
+/// unix-seconds integer, returning the unix timestamp. The bifrost pull
+/// surface intentionally serializes its UTC range boundary as a bare
+/// JSCalendar date-time, so the mock treats that form as UTC too.
 fn parse_event_utc(val: &Value) -> Result<i64, Value> {
     if let Some(i) = val.as_i64() {
         return Ok(i);
     }
     if let Some(s) = val.as_str() {
-        return DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.timestamp())
-            .map_err(|_| invalid_args("after/before must be an RFC3339 UTCDate or unix seconds"));
+        if let Ok(value) = DateTime::parse_from_rfc3339(s) {
+            return Ok(value.timestamp());
+        }
+        return NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+            .map(|value| value.and_utc().timestamp())
+            .map_err(|_| {
+                invalid_args(
+                    "after/before must be an RFC3339 UTCDate, bare JSCalendar date-time, or unix seconds",
+                )
+            });
     }
     Err(invalid_args(
-        "after/before must be an RFC3339 UTCDate or unix seconds",
+        "after/before must be a date-time or unix seconds",
     ))
 }
 
