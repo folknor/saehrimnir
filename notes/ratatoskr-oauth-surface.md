@@ -26,6 +26,15 @@ Accepts both `application/x-www-form-urlencoded` and
 Any other `grant_type` -> 400 with
 `{"error": "unsupported_grant_type", ...}`.
 
+A `refresh_token` grant whose `refresh_token` has been REVOKED (see
+`/test/oauth/invalidate` below) -> 400 with
+`{"error": "invalid_grant", "error_description": "refresh token has
+been revoked"}`, minting nothing. This is the only way a refresh
+fails: an unknown-but-not-revoked refresh token still succeeds (it
+falls back to the primary account, matching the permissive baseline).
+The rejection is what makes an unrecoverable provider auth failure
+reachable - without it, bifrost's OAuthRefresher always recovers.
+
 Optional `account_id` field (form or JSON) binds the minted token
 to a specific declared `[[account]]`. Absent / empty defaults to
 the primary account. An unknown id -> 400 with
@@ -82,6 +91,21 @@ requests reject it.
 
 - 204 on success
 - 404 if the token wasn't active
+
+Revocation cascade: invalidating a token also REVOKES the associated
+refresh token(s). Invalidating an access token revokes the refresh
+token minted alongside it on the same `/oauth/token` response;
+invalidating a refresh token revokes it directly. A revoked refresh
+token is rejected by the `refresh_token` grant with
+`400 invalid_grant` (see `/oauth/token` above). This is what lets a
+gate force an unrecoverable auth failure: the gate invalidates the
+account's access token, bifrost's OAuthRefresher then tries a
+`refresh_token` grant, and that grant now fails instead of silently
+minting a fresh access token. Only explicitly invalidated refresh
+tokens are revoked; an unknown-but-not-revoked refresh token keeps
+the primary fallback, so the token-rotation flows other tests rely
+on are undisturbed. `POST /test/fixture/reset` clears the revoked
+set along with the active tokens.
 
 ## Bearer enforcement on mail listeners
 

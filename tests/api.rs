@@ -2127,6 +2127,107 @@ async fn oauth_refresh_grant_resolves_account_from_refresh_token() {
 }
 
 #[tokio::test]
+async fn oauth_invalidate_revokes_paired_refresh_so_refresh_grant_returns_invalid_grant() {
+    // The unrecoverable-auth-failure gate: after a harness invalidates
+    // the access token, bifrost's OAuthRefresher tries a refresh_token
+    // grant. That grant must FAIL (400 invalid_grant) because the
+    // paired refresh token was revoked alongside the access token -
+    // otherwise the mock silently mints a fresh access token and the
+    // provider call recovers, making the auth-failure scenario
+    // unreachable.
+    let store = saehrimnir::oauth::TokenStore::default();
+    let app = router_with_token_store(store.clone());
+
+    // Mint an access + refresh pair.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "grant_type=authorization_code&code=abc&client_id=test",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let access = v["access_token"].as_str().unwrap().to_string();
+    let refresh = v["refresh_token"].as_str().unwrap().to_string();
+
+    // Harness invalidates the ACCESS token (what the gate sends).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/oauth/invalidate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "token": access }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Refresh with the (now revoked) refresh token -> 400 invalid_grant.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=refresh_token&refresh_token={refresh}&client_id=test"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp).await;
+    assert_eq!(v["error"], "invalid_grant");
+    // The revoked refresh minted nothing.
+    assert!(v.get("access_token").is_none());
+}
+
+#[tokio::test]
+async fn oauth_refresh_grant_with_unknown_not_revoked_token_still_mints() {
+    // Guards the blast radius: only an EXPLICITLY invalidated refresh
+    // token is rejected. A refresh token that was never issued (and
+    // never revoked) keeps the permissive "unknown token falls back to
+    // primary" behaviour, so the token-rotation flows other tests rely
+    // on are undisturbed.
+    let store = saehrimnir::oauth::TokenStore::default();
+    let app = router_with_token_store(store);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "grant_type=refresh_token&refresh_token=never-issued&client_id=test",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert!(
+        v["access_token"]
+            .as_str()
+            .unwrap()
+            .starts_with("mock-access-")
+    );
+}
+
+#[tokio::test]
 async fn oauth_token_rejects_unsupported_grant_type() {
     let store = saehrimnir::oauth::TokenStore::default();
     let app = router_with_token_store(store);

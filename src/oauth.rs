@@ -27,7 +27,15 @@
 //!   - `POST /test/oauth/invalidate` - admin route. Body
 //!     `{"token": "..."}`. Removes the token from the store so
 //!     subsequent userinfo / bearer-validated requests 401. 204 on
-//!     success; 404 if the token wasn't issued.
+//!     success; 404 if the token wasn't issued. Also REVOKES the
+//!     associated refresh token: invalidating an access token
+//!     revokes the refresh token it was minted with, and
+//!     invalidating a refresh token revokes it directly. A revoked
+//!     refresh token makes the `refresh_token` grant return
+//!     `400 invalid_grant` instead of minting a fresh access token,
+//!     so a gate can force an UNRECOVERABLE provider auth failure.
+//!     An unknown-but-not-revoked refresh token keeps the primary
+//!     fallback.
 //!
 //! Bearer enforcement on the mail-protocol HTTP listeners (JMAP,
 //! Graph, Gmail) is gated by `fixture.oauth.enforce`. When `false`
@@ -44,7 +52,7 @@
 //! of the request body. Same body in -> same token out within one
 //! reset window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -69,6 +77,18 @@ struct TokenStoreInner {
     /// Active tokens. Key = token string, value = arbitrary metadata
     /// (currently only the originating grant type).
     tokens: HashMap<String, TokenMetadata>,
+    /// Refresh tokens that have been EXPLICITLY revoked (via
+    /// `/test/oauth/invalidate`, either directly or as the refresh
+    /// token paired with an invalidated access token). A refresh
+    /// token in this set is rejected by the `refresh_token` grant
+    /// with `400 invalid_grant`, instead of the default
+    /// "unknown-token falls back to primary" behaviour. This is what
+    /// makes an UNRECOVERABLE provider auth failure reachable: a
+    /// revoked refresh can never mint a fresh access token. Only
+    /// tokens explicitly invalidated land here; a merely
+    /// unknown-but-not-revoked refresh token keeps the primary
+    /// fallback.
+    revoked_refresh: HashSet<String>,
     /// Monotonic counter for token suffixes. Resets to 0 on
     /// `clear()`.
     counter: u64,
@@ -83,6 +103,13 @@ pub struct TokenMetadata {
     /// to it. `/oauth/token` defaults to the fixture's primary
     /// account when the client doesn't specify one.
     pub account_id: String,
+    /// For an access token: the refresh token minted alongside it
+    /// on the same `/oauth/token` response, if any. Lets
+    /// `invalidate()` revoke the paired refresh so a subsequent
+    /// `refresh_token` grant cannot silently recover the session.
+    /// `None` for refresh tokens and for tokens minted directly via
+    /// `mint()` (which has no paired refresh to record).
+    pub paired_refresh: Option<String>,
 }
 
 impl TokenStore {
@@ -109,9 +136,34 @@ impl TokenStore {
             TokenMetadata {
                 grant_type: grant_type.to_string(),
                 account_id: account_id.to_string(),
+                paired_refresh: None,
             },
         );
         token
+    }
+
+    /// Record that `access` was issued together with `refresh` on the
+    /// same token response. `token_endpoint` calls this right after
+    /// minting both halves so a later `invalidate(access)` can revoke
+    /// the paired refresh. No-op if `access` is not (or no longer) in
+    /// the store.
+    pub fn pair_refresh(&self, access: &str, refresh: &str) {
+        let mut inner = self.0.lock().expect("oauth token store poisoned");
+        if let Some(meta) = inner.tokens.get_mut(access) {
+            meta.paired_refresh = Some(refresh.to_string());
+        }
+    }
+
+    /// True iff `token` is a refresh token that has been explicitly
+    /// revoked. The `refresh_token` grant consults this to reject a
+    /// revoked refresh with `invalid_grant` rather than falling back
+    /// to primary.
+    pub fn is_refresh_revoked(&self, token: &str) -> bool {
+        self.0
+            .lock()
+            .expect("oauth token store poisoned")
+            .revoked_refresh
+            .contains(token)
     }
 
     pub fn is_active(&self, token: &str) -> bool {
@@ -136,14 +188,37 @@ impl TokenStore {
             .map(|m| m.account_id.clone())
     }
 
-    /// Remove a token. Returns `true` if it was present.
+    /// Remove a token, marking any associated refresh token(s) as
+    /// revoked. Returns `true` if `token` was present.
+    ///
+    /// Revocation cascade:
+    /// - If `token` is an access token with a paired refresh (the
+    ///   common case: the gate invalidates the access token it
+    ///   received from `/oauth/token`), the paired refresh is removed
+    ///   from the active set AND added to `revoked_refresh`, so a
+    ///   follow-up `refresh_token` grant is rejected instead of
+    ///   silently minting a new access token.
+    /// - If `token` is itself a refresh token, it is likewise marked
+    ///   revoked.
+    ///
+    /// A refresh token that was never explicitly invalidated is NOT
+    /// revoked, so the "unknown token falls back to primary" mock
+    /// behaviour other tests rely on is untouched.
     pub fn invalidate(&self, token: &str) -> bool {
-        self.0
-            .lock()
-            .expect("oauth token store poisoned")
-            .tokens
-            .remove(token)
-            .is_some()
+        let mut inner = self.0.lock().expect("oauth token store poisoned");
+        let removed = inner.tokens.remove(token);
+        if let Some(meta) = &removed {
+            // Invalidating a refresh token directly revokes it.
+            if meta.grant_type == "refresh" {
+                inner.revoked_refresh.insert(token.to_string());
+            }
+            // Invalidating an access token revokes its paired refresh.
+            if let Some(rt) = meta.paired_refresh.clone() {
+                inner.tokens.remove(&rt);
+                inner.revoked_refresh.insert(rt);
+            }
+        }
+        removed.is_some()
     }
 
     /// Reset to the post-load baseline: no tokens, counter back to
@@ -163,6 +238,7 @@ impl TokenStore {
     pub fn clear(&self) {
         let mut inner = self.0.lock().expect("oauth token store poisoned");
         inner.tokens.clear();
+        inner.revoked_refresh.clear();
         inner.counter = 0;
     }
 
@@ -230,6 +306,28 @@ pub async fn token_endpoint(
             .into_response();
     }
 
+    // A refresh token that was EXPLICITLY invalidated (revoked via
+    // `/test/oauth/invalidate`, directly or as the paired refresh of
+    // an invalidated access token) can never mint a fresh access
+    // token: reject with the OAuth `invalid_grant` error. This is the
+    // one path that makes an UNRECOVERABLE provider auth failure
+    // reachable. An unknown-but-not-revoked refresh token is NOT
+    // rejected here; it flows on to the primary fallback below,
+    // preserving the permissive "any token works" mock baseline.
+    if grant_type == "refresh_token"
+        && let Some(rt) = form.get("refresh_token")
+        && state.store.is_refresh_revoked(rt)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_grant",
+                "error_description": "refresh token has been revoked",
+            })),
+        )
+            .into_response();
+    }
+
     // Resolve the account the token is for. An explicit `account_id`
     // (form or JSON) wins and selects a non-primary account; unknown
     // account_id rejects with 400. Real OAuth providers don't expose
@@ -283,6 +381,9 @@ pub async fn token_endpoint(
     let refresh_token = state
         .store
         .mint("refresh", &account_id, body_hash.rotate_left(1));
+    // Record the pairing so invalidating this access token also
+    // revokes the refresh token it was issued with.
+    state.store.pair_refresh(&access_token, &refresh_token);
 
     (
         StatusCode::OK,
@@ -534,5 +635,63 @@ impl TokenStore {
                 account_id: v.account_id.clone(),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Invalidating an access token whose paired refresh has been
+    /// recorded revokes that refresh token; a refresh token that was
+    /// never explicitly invalidated stays un-revoked (so the primary
+    /// fallback in `token_endpoint` still applies to it).
+    #[test]
+    fn invalidate_access_revokes_only_the_paired_refresh() {
+        let store = TokenStore::new();
+        let access = store.mint("authorization_code", "acct", 1);
+        let refresh = store.mint("refresh", "acct", 2);
+        store.pair_refresh(&access, &refresh);
+
+        // A second, independent refresh token that is never invalidated.
+        let other_refresh = store.mint("refresh", "acct", 3);
+
+        assert!(!store.is_refresh_revoked(&refresh));
+
+        assert!(store.invalidate(&access));
+
+        // The paired refresh is now revoked and no longer active.
+        assert!(store.is_refresh_revoked(&refresh));
+        assert!(!store.is_active(&refresh));
+        // The unrelated refresh token is untouched.
+        assert!(!store.is_refresh_revoked(&other_refresh));
+        assert!(store.is_active(&other_refresh));
+    }
+
+    /// Directly invalidating a refresh token revokes it too.
+    #[test]
+    fn invalidate_refresh_token_directly_revokes_it() {
+        let store = TokenStore::new();
+        let refresh = store.mint("refresh", "acct", 1);
+        assert!(store.invalidate(&refresh));
+        assert!(store.is_refresh_revoked(&refresh));
+    }
+
+    /// A never-issued refresh token is not considered revoked, and
+    /// `clear()` wipes the revoked set so byte-stable resets stay
+    /// clean.
+    #[test]
+    fn unknown_refresh_not_revoked_and_clear_resets_revocations() {
+        let store = TokenStore::new();
+        assert!(!store.is_refresh_revoked("never-issued"));
+
+        let access = store.mint("authorization_code", "acct", 1);
+        let refresh = store.mint("refresh", "acct", 2);
+        store.pair_refresh(&access, &refresh);
+        store.invalidate(&access);
+        assert!(store.is_refresh_revoked(&refresh));
+
+        store.clear();
+        assert!(!store.is_refresh_revoked(&refresh));
     }
 }
