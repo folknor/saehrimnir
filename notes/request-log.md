@@ -165,6 +165,17 @@ their own row carrying the parsed body:
   JSON body the client sent.
 - `DELETE /v1.0/me/events/{event}`: `detail.id` is the path id
   the client targeted.
+- `POST /v1.0/me/events/{event}/{accept|decline|tentativelyAccept}`
+  (and the calendar-scoped
+  `/v1.0/me/calendars/{cal}/events/{event}/{action}` form): the RSVP
+  row carries `detail.event`, `detail.action`, and `detail.response`
+  (the resolved Graph `responseStatus.response` value the mock durably
+  recorded against the authenticated user's attendee).
+
+The calendar-scoped GET / PATCH / DELETE
+(`/v1.0/me/calendars/{cal}/events/{event}`) and their
+`/v1.0/users/{user}/...` forms record the same `detail.body` /
+`detail.id` rows as the mailbox-scoped variants.
 
 A 404 from PATCH / DELETE on an unknown event short-circuits
 before the body is parsed, so the second-row body / id detail is
@@ -180,6 +191,26 @@ Same shape as the Graph middleware:
 
 Gmail's mutating endpoints are stubs in v0, so no
 body-recording rows are emitted.
+
+### CalDAV (`src/caldav/mod.rs::dispatch`)
+
+Every CalDAV request records a middleware-style row:
+
+- `command`: `"<METHOD> <path>"` (the extension verbs `PROPFIND` /
+  `REPORT` / `MKCALENDAR` included).
+- `detail.query`: the raw query string (or `null`).
+
+The RFC 6638 scheduling-outbox POST
+(`POST /calendars/{user}/outbox/`, the iTIP REPLY bifrost submits
+during an RSVP) additionally appends a second row:
+
+- `detail.schedule_reply`: `true`.
+- `detail.originator` / `detail.recipient`: the `Originator` /
+  `Recipient` headers (the replying user and the organizer).
+- `detail.itip`: the raw `text/calendar` iTIP REPLY body.
+
+The durable per-attendee `PARTSTAT` change lands via the follow-up
+PUT (a normal event write), not the outbox POST.
 
 ## Adding a new protocol or detail key
 

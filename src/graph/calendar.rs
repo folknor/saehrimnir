@@ -38,7 +38,9 @@ use chrono::SecondsFormat;
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, odata, ok_json};
-use crate::fixture::{Address, Calendar, Event, Fixture, MutationDiff};
+use crate::fixture::{
+    Address, Calendar, Event, EventAttendee, Fixture, MutationDiff, ParticipationStatus,
+};
 
 const EVENTS_DEFAULT_TOP: u32 = 50;
 const EVENTS_MAX_TOP: u32 = 256;
@@ -67,6 +69,22 @@ pub fn router() -> Router<AppState> {
                 .delete(delete_event_me),
         )
         .route("/v1.0/me/events/{event}/{action}", post(rsvp_me))
+        // Calendar-scoped event addressing. bifrost's Graph client
+        // (`event_update` / `event_delete` / `event_rsvp`) targets the
+        // calendar-scoped URL, so these mirror the mailbox-scoped
+        // routes above. The inner handlers resolve the event by id
+        // within the account, so the `{calendar}` segment is
+        // informational.
+        .route(
+            "/v1.0/me/calendars/{calendar}/events/{event}",
+            get(get_event_cal_me)
+                .patch(patch_event_cal_me)
+                .delete(delete_event_cal_me),
+        )
+        .route(
+            "/v1.0/me/calendars/{calendar}/events/{event}/{action}",
+            post(rsvp_cal_me),
+        )
         // /users/{user}/...
         .route("/v1.0/users/{user}/calendars", get(list_calendars_user))
         .route(
@@ -94,6 +112,16 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1.0/users/{user}/events/{event}/{action}",
             post(rsvp_user),
+        )
+        .route(
+            "/v1.0/users/{user}/calendars/{calendar}/events/{event}",
+            get(get_event_cal_user)
+                .patch(patch_event_cal_user)
+                .delete(delete_event_cal_user),
+        )
+        .route(
+            "/v1.0/users/{user}/calendars/{calendar}/events/{event}/{action}",
+            post(rsvp_cal_user),
         )
 }
 
@@ -144,52 +172,140 @@ async fn delta_events_me(
 async fn rsvp_me(
     State(state): State<AppState>,
     Path((event, action)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
-    rsvp_impl(state, &account_id, &event, &action).await
+    rsvp_impl(state, &account_id, &event, &action, true, connection_id).await
 }
 
 async fn rsvp_user(
     State(state): State<AppState>,
     Path((user, event, action)): Path<(String, String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
         Ok(id) => id,
         Err(r) => return r,
     };
-    rsvp_impl(state, &account_id, &event, &action).await
+    rsvp_impl(state, &account_id, &event, &action, false, connection_id).await
 }
 
-/// `POST /v1.0/me/events/{id}/{accept|decline|tentativelyAccept}` -
-/// RSVP to a meeting invite (bifrost `calendar.rs::rsvp`). The fixture
-/// `Event` has no per-attendee response-status slot, so v0
-/// accept-and-ignores: it validates the action + event and returns
-/// 202 Accepted without recording a transition (nothing durably
-/// changes). Unknown action -> 400, unknown event -> 404.
-async fn rsvp_impl(state: AppState, account_id: &str, event: &str, action: &str) -> Response {
-    if !matches!(action, "accept" | "decline" | "tentativelyAccept") {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "ErrorInvalidRequest",
-            &format!("unsupported event action {action:?}"),
-        );
-    }
+/// Calendar-scoped RSVP wrapper. bifrost's Graph client addresses
+/// event actions at the calendar-scoped URL
+/// (`/calendars/{cal}/events/{id}/{action}`), not the mailbox-scoped
+/// one. The `{calendar}` segment is validated against the event's
+/// membership only implicitly (the inner handler resolves the event
+/// by id within the account); it is otherwise informational.
+async fn rsvp_cal_me(
+    State(state): State<AppState>,
+    Path((_calendar, event, action)): Path<(String, String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    rsvp_impl(state, &account_id, &event, &action, true, connection_id).await
+}
+
+async fn rsvp_cal_user(
+    State(state): State<AppState>,
+    Path((user, _calendar, event, action)): Path<(String, String, String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    rsvp_impl(state, &account_id, &event, &action, false, connection_id).await
+}
+
+/// `POST /v1.0/me/events/{id}/{accept|decline|tentativelyAccept}` (and
+/// the calendar-scoped `/calendars/{cal}/events/{id}/{action}` form) -
+/// RSVP to a meeting invite (bifrost `calendar.rs::rsvp`). Durably
+/// records the authenticated user's participation status against its
+/// own attendee record (the attendee whose address is the account's
+/// own, `account.name` per the Graph `mail` convention), so a
+/// follow-up read observes `attendees[].status.response`. Records an
+/// `event_updated` transition when the status actually moves. Returns
+/// 202 Accepted. Unknown action -> 400, unknown event -> 404.
+async fn rsvp_impl(
+    state: AppState,
+    account_id: &str,
+    event: &str,
+    action: &str,
+    me_path: bool,
+    connection_id: Option<u64>,
+) -> Response {
+    let target = match action {
+        "accept" => ParticipationStatus::Accepted,
+        "decline" => ParticipationStatus::Declined,
+        "tentativelyAccept" => ParticipationStatus::Tentative,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "ErrorInvalidRequest",
+                &format!("unsupported event action {action:?}"),
+            );
+        }
+    };
     let event_owned = event.to_string();
     if let Some(o) = super::maybe_override(&state, "rsvp", move |s| {
         crate::lua::req_set_str(s, "event", &event_owned)
     }) {
         return o;
     }
-    let exists = {
-        let fixture = state.fixture();
-        fixture.events_for(account_id).any(|e| e.id == event)
+
+    let log_path = if me_path {
+        format!("POST /v1.0/me/events/{event}/{action}")
+    } else {
+        format!("POST /v1.0/users/{account_id}/events/{event}/{action}")
     };
-    if !exists {
+    state.shared.request_log.record_with_conn(
+        "graph",
+        log_path,
+        json!({ "event": event, "action": action, "response": target.as_graph() }),
+        connection_id,
+    );
+
+    let self_email = state
+        .fixture()
+        .account(account_id)
+        .map(|a| a.name.clone())
+        .unwrap_or_default();
+
+    let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+    let Some(idx) = fix
+        .events
+        .iter()
+        .position(|e| e.account_id == account_id && e.id == event)
+    else {
         return error(
             StatusCode::NOT_FOUND,
             "ResourceNotFound",
             &format!("event {event:?} not declared in fixture"),
         );
+    };
+    // Set the authenticated user's own attendee status. Real Graph
+    // applies the action to the caller's attendee record; the mock
+    // matches the attendee by the account's own address.
+    let mut clone = fix.events[idx].clone();
+    let mut changed = false;
+    for att in &mut clone.attendees {
+        if att.email().eq_ignore_ascii_case(&self_email) {
+            if att.status != target {
+                att.status = target;
+                changed = true;
+            }
+            break;
+        }
+    }
+    if changed {
+        let id = clone.id.clone();
+        let _ = fix.mutate(|f| {
+            f.events[idx] = clone;
+            MutationDiff {
+                event_updated: vec![id.clone()],
+                ..Default::default()
+            }
+        });
     }
     StatusCode::ACCEPTED.into_response()
 }
@@ -222,6 +338,41 @@ async fn patch_event_me(
 async fn delete_event_me(
     State(state): State<AppState>,
     Path(event): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    delete_event_impl(state, &account_id, &event, true, connection_id).await
+}
+
+// ── Calendar-scoped /me/ wrappers ───────────────────────────────────
+//
+// The `{calendar}` path segment is accepted (bifrost addresses events
+// this way) but not otherwise used: the inner handlers resolve the
+// event by id within the account. The calendar-scoped GET serves the
+// same body the mailbox-scoped GET does, which is what the
+// update/delete pre-read (etag) expects.
+
+async fn get_event_cal_me(
+    State(state): State<AppState>,
+    Path((_calendar, event)): Path<(String, String)>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_event_impl(state, &account_id, &event).await
+}
+
+async fn patch_event_cal_me(
+    State(state): State<AppState>,
+    Path((_calendar, event)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
+    body: AxumBody,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    patch_event_impl(state, &account_id, &event, body, true, connection_id).await
+}
+
+async fn delete_event_cal_me(
+    State(state): State<AppState>,
+    Path((_calendar, event)): Path<(String, String)>,
     crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
@@ -331,6 +482,44 @@ async fn patch_event_user(
 async fn delete_event_user(
     State(state): State<AppState>,
     Path((user, event)): Path<(String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    delete_event_impl(state, &account_id, &event, false, connection_id).await
+}
+
+// ── Calendar-scoped /users/{user}/ wrappers ─────────────────────────
+
+async fn get_event_cal_user(
+    State(state): State<AppState>,
+    Path((user, _calendar, event)): Path<(String, String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_event_impl(state, &account_id, &event).await
+}
+
+async fn patch_event_cal_user(
+    State(state): State<AppState>,
+    Path((user, _calendar, event)): Path<(String, String, String)>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
+    body: AxumBody,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    patch_event_impl(state, &account_id, &event, body, false, connection_id).await
+}
+
+async fn delete_event_cal_user(
+    State(state): State<AppState>,
+    Path((user, _calendar, event)): Path<(String, String, String)>,
     crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = match super::resolve_user_account(&state.fixture(), &user) {
@@ -1068,7 +1257,7 @@ fn parse_graph_datetime(v: Option<&Value>) -> Option<chrono::DateTime<chrono::Ut
     crate::fixture::parse_ts(&normalised).ok()
 }
 
-fn parse_graph_attendee(v: &Value) -> Option<Address> {
+fn parse_graph_attendee(v: &Value) -> Option<EventAttendee> {
     let email = v
         .get("emailAddress")
         .and_then(|e| e.get("address"))
@@ -1079,9 +1268,21 @@ fn parse_graph_attendee(v: &Value) -> Option<Address> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|n| !n.is_empty());
-    Some(Address {
-        email: email.to_string(),
-        name,
+    // Graph carries the attendee's RSVP under `status.response`
+    // (`notResponded` / `accepted` / `declined` / `tentativelyAccepted`).
+    // An absent / unrecognised value defaults to needs-action.
+    let status = v
+        .get("status")
+        .and_then(|s| s.get("response"))
+        .and_then(Value::as_str)
+        .and_then(ParticipationStatus::parse)
+        .unwrap_or_default();
+    Some(EventAttendee {
+        address: Address {
+            email: email.to_string(),
+            name,
+        },
+        status,
     })
 }
 
@@ -1199,10 +1400,14 @@ fn serialize_event(_fixture: &Fixture, e: &Event) -> Value {
         .map(|a| {
             json!({
                 "emailAddress": {
-                    "name": a.name.clone().unwrap_or_default(),
-                    "address": a.email,
+                    "name": a.address.name.clone().unwrap_or_default(),
+                    "address": a.address.email,
                 },
                 "type": "required",
+                "status": {
+                    "response": a.status.as_graph(),
+                    "time": "0001-01-01T00:00:00Z",
+                },
             })
         })
         .collect();

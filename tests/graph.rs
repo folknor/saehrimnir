@@ -962,6 +962,19 @@ fn calendar_router() -> axum::Router {
     graph::router(graph::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
+/// Router over the RSVP fixture (`calendar-rsvp-small.toml`), whose
+/// account address (`self@example.test`) is itself an attendee of
+/// `ev-rsvp`. Optionally wires a shared request log.
+fn rsvp_router_with_log(log: Option<saehrimnir::request_log::RequestLog>) -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/calendar-rsvp-small.toml")).unwrap();
+    let state = graph::AppState::for_test(saehrimnir::shared::handle(fix));
+    let state = match log {
+        Some(l) => state.with_request_log(l),
+        None => state,
+    };
+    graph::router(state)
+}
+
 async fn json_request(
     router: axum::Router,
     method: &str,
@@ -1135,7 +1148,9 @@ async fn graph_calendar_view_filters_by_range() {
 #[tokio::test]
 async fn graph_event_rsvp() {
     let app = calendar_router();
-    // accept -> 202 Accepted (no durable status slot in v0).
+    // accept -> 202 Accepted. On this fixture the account address is
+    // not among ev-001's attendees, so the RSVP is a no-op durably;
+    // the status-code contract still holds.
     let (status, _) = send_json(
         &app,
         "POST",
@@ -1162,6 +1177,122 @@ async fn graph_event_rsvp() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Look up an attendee's `status.response` in a serialized Graph event
+/// by address.
+fn graph_attendee_response(event: &Value, email: &str) -> Option<String> {
+    event["attendees"].as_array()?.iter().find_map(|a| {
+        (a["emailAddress"]["address"] == email)
+            .then(|| a["status"]["response"].as_str().map(str::to_string))
+            .flatten()
+    })
+}
+
+/// The calendar-scoped event routes bifrost's Graph client actually
+/// addresses (`/calendars/{cal}/events/{id}` for GET / PATCH / DELETE)
+/// exist alongside the mailbox-scoped ones. The calendar-scoped GET
+/// serves the same body the update/delete pre-read (etag) expects.
+#[tokio::test]
+async fn graph_calendar_scoped_event_routes_get_patch_delete() {
+    let app = calendar_router();
+
+    // GET is calendar-scoped and returns the same event the
+    // mailbox-scoped GET does.
+    let (status, v) = get_json_with(app.clone(), "/v1.0/me/calendars/cal-work/events/ev-001").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "ev-001");
+    assert_eq!(v["subject"], "Standup");
+
+    // PATCH is calendar-scoped and mutates the event.
+    let (status, v) = send_json(
+        &app,
+        "PATCH",
+        "/v1.0/me/calendars/cal-work/events/ev-001",
+        Some(json!({ "subject": "Standup (cal-scoped)" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["subject"], "Standup (cal-scoped)");
+
+    // DELETE is calendar-scoped; a follow-up GET 404s.
+    let (status, _) = send_json(
+        &app,
+        "DELETE",
+        "/v1.0/me/calendars/cal-work/events/ev-001",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = get_json_with(app, "/v1.0/me/calendars/cal-work/events/ev-001").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Graph RSVP durably records the authenticated user's participation
+/// status against its own attendee record, and the read projection
+/// serves it back under `attendees[].status.response`. The action
+/// touches only the self attendee - the other attendee's authored
+/// status is untouched.
+#[tokio::test]
+async fn graph_rsvp_records_participation_status() {
+    let log = saehrimnir::request_log::RequestLog::default();
+    let app = rsvp_router_with_log(Some(log.clone()));
+
+    // Baseline: self is needs-action (notResponded), other is declined.
+    let (status, v) = get_json_with(app.clone(), "/v1.0/me/calendars/cal-1/events/ev-rsvp").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        graph_attendee_response(&v, "self@example.test").as_deref(),
+        Some("notResponded")
+    );
+    assert_eq!(
+        graph_attendee_response(&v, "other@example.test").as_deref(),
+        Some("declined")
+    );
+
+    // Mailbox-scoped accept flips self to accepted, leaves other.
+    let (status, _) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/events/ev-rsvp/accept",
+        Some(json!({ "sendResponse": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (_, v) = get_json_with(app.clone(), "/v1.0/me/calendars/cal-1/events/ev-rsvp").await;
+    assert_eq!(
+        graph_attendee_response(&v, "self@example.test").as_deref(),
+        Some("accepted")
+    );
+    assert_eq!(
+        graph_attendee_response(&v, "other@example.test").as_deref(),
+        Some("declined")
+    );
+
+    // Calendar-scoped tentativelyAccept moves self again.
+    let (status, _) = send_json(
+        &app,
+        "POST",
+        "/v1.0/me/calendars/cal-1/events/ev-rsvp/tentativelyAccept",
+        Some(json!({ "sendResponse": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (_, v) = get_json_with(app, "/v1.0/me/calendars/cal-1/events/ev-rsvp").await;
+    assert_eq!(
+        graph_attendee_response(&v, "self@example.test").as_deref(),
+        Some("tentativelyAccepted")
+    );
+
+    // The RSVP is recorded in the request log with the resolved status.
+    let snap = log.snapshot();
+    assert!(
+        snap.iter()
+            .any(|e| e.command == "POST /v1.0/me/events/ev-rsvp/accept"
+                && e.detail["response"] == "accepted"),
+        "rsvp accept row missing: {:?}",
+        snap.iter().map(|e| &e.command).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

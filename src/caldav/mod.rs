@@ -195,6 +195,7 @@ async fn dispatch(
         Method::GET => handle_get(&state, &path, &headers).await,
         Method::PUT => handle_put(&state, &path, &headers, &body).await,
         Method::DELETE => handle_delete(&state, &path, &headers).await,
+        Method::POST => handle_post(&state, &path, &headers, &body, connection_id).await,
         Method::OPTIONS => handle_options(),
         _ => not_found(&format!("{method} {path}")),
     }
@@ -231,6 +232,9 @@ async fn handle_propfind(
             calendar_id,
             event_id,
         } => propfind_event(&fixture, &user, &calendar_id, &event_id, body_str),
+        // A PROPFIND on the outbox collection itself is not part of the
+        // RSVP flow (bifrost only POSTs there); v0 treats it as absent.
+        ResourcePath::ScheduleOutbox { .. } => not_found(path),
         ResourcePath::Unknown => not_found(path),
     }
 }
@@ -256,6 +260,11 @@ enum ResourcePath {
         user: String,
         calendar_id: String,
         event_id: String,
+    },
+    /// RFC 6638 scheduling outbox (`/calendars/{user}/outbox/`).
+    /// bifrost POSTs the iTIP REPLY here during an RSVP.
+    ScheduleOutbox {
+        user: String,
     },
     Unknown,
 }
@@ -300,6 +309,15 @@ fn parse_path(fixture: &crate::fixture::Fixture, path: &str) -> ResourcePath {
         ["calendars", u] if fixture.account(u).is_some() => ResourcePath::CalendarHome {
             user: (*u).to_string(),
         },
+        // The scheduling outbox lives at `/calendars/{user}/outbox/`.
+        // Match it before the generic calendar arm so a POST there
+        // routes to the schedule-reply handler rather than being read
+        // as a calendar named "outbox" (no fixture declares one).
+        ["calendars", u, "outbox"] if fixture.account(u).is_some() => {
+            ResourcePath::ScheduleOutbox {
+                user: (*u).to_string(),
+            }
+        }
         ["calendars", u, cal] if fixture.account(u).is_some() => ResourcePath::Calendar {
             user: (*u).to_string(),
             calendar_id: (*cal).to_string(),
@@ -416,10 +434,39 @@ fn propfind_principal(fixture: &crate::fixture::Fixture, user: &str, body: &str)
             xml::escape(&fixture.primary_account().name),
         ));
     }
+    // RFC 6638 scheduling discovery. `calendar-user-address-set` is the
+    // principal's own address (a `mailto:` of the account's email, which
+    // is `account.name` by the fixture convention); `schedule-outbox-URL`
+    // points at the collection bifrost POSTs the iTIP REPLY to during an
+    // RSVP. Both must be present for bifrost's `event_rsvp` to proceed
+    // (a missing schedule-outbox-URL makes it return unsupported).
+    if requested.contains("calendar-user-address-set") {
+        props.push_str(&format!(
+            "<C:calendar-user-address-set><D:href>mailto:{}</D:href></C:calendar-user-address-set>",
+            xml::escape(&principal_email(fixture, user)),
+        ));
+    }
+    if requested.contains("schedule-outbox-URL") {
+        props.push_str(&format!(
+            "<C:schedule-outbox-URL><D:href>/calendars/{user}/outbox/</D:href></C:schedule-outbox-URL>",
+        ));
+    }
     multistatus(wrap_responses(&[Response207 {
         href: &format!("/principals/{user}/"),
         ok_props: &props,
     }]))
+}
+
+/// The principal's own email address for `calendar-user-address-set`.
+/// The fixture convention is that `account.name` is the account's
+/// email (the Graph `mail` projection derives from it too); fall back
+/// to a deterministic `<id>@saehrimnir.test` when the account is
+/// unknown or its name is not email-shaped.
+fn principal_email(fixture: &crate::fixture::Fixture, user: &str) -> String {
+    match fixture.account(user) {
+        Some(a) if a.name.contains('@') => a.name.clone(),
+        _ => format!("{user}@saehrimnir.test"),
+    }
 }
 
 /// PROPFIND on `/calendars/{user}/`. Depth=0 returns just the home
@@ -1260,6 +1307,71 @@ async fn handle_delete(state: &AppState, path: &str, headers: &HeaderMap) -> Res
         .expect("static DELETE response builds")
 }
 
+/// POST dispatch. The only POST target v0 models is the RFC 6638
+/// scheduling outbox (`/calendars/{user}/outbox/`), where bifrost
+/// submits an iTIP REPLY during an RSVP.
+async fn handle_post(
+    state: &AppState,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    connection_id: Option<u64>,
+) -> Response {
+    let is_outbox = {
+        let fixture = state.shared.fixture.read().expect("fixture lock poisoned");
+        matches!(
+            parse_path(&fixture, path),
+            ResourcePath::ScheduleOutbox { .. }
+        )
+    };
+    if is_outbox {
+        return handle_schedule_outbox(state, path, headers, body, connection_id);
+    }
+    not_found(path)
+}
+
+/// Accept an iTIP REPLY POSTed to the scheduling outbox. bifrost's
+/// CalDAV RSVP posts a `text/calendar` REPLY here carrying `Originator`
+/// (the replying user) and `Recipient` (the organizer) headers, and
+/// checks the HTTP status only - no schedule-response XML, no inbox, no
+/// free-busy. v0 records the reply (headers + iTIP body) in the request
+/// log for observability and returns a bare 200. The durable
+/// participation-status change lands via the follow-up PUT, not here.
+fn handle_schedule_outbox(
+    state: &AppState,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    connection_id: Option<u64>,
+) -> Response {
+    let header_str = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let itip = std::str::from_utf8(body).unwrap_or("");
+    state.shared.request_log.record_with_conn(
+        "caldav",
+        format!("POST {path}"),
+        json!({
+            "schedule_reply": true,
+            "originator": header_str("originator"),
+            "recipient": header_str("recipient"),
+            "itip": itip,
+        }),
+        connection_id,
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/xml; charset=utf-8"),
+        )
+        .body(Body::empty())
+        .expect("static schedule-outbox response builds")
+}
+
 fn precondition_failed(msg: &str) -> Response {
     (StatusCode::PRECONDITION_FAILED, msg.to_string()).into_response()
 }
@@ -1275,7 +1387,7 @@ fn handle_options() -> Response {
         .header("DAV", "1, calendar-access")
         .header(
             "Allow",
-            "OPTIONS, PROPFIND, REPORT, GET, PUT, DELETE, MKCALENDAR",
+            "OPTIONS, PROPFIND, REPORT, GET, PUT, POST, DELETE, MKCALENDAR",
         )
         .body(Body::empty())
         .expect("static OPTIONS response builds")

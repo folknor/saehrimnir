@@ -31,7 +31,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
-use crate::fixture::{Address, Calendar, Event, Fixture, MutationDiff};
+use crate::fixture::{
+    Address, Calendar, Event, EventAttendee, Fixture, MutationDiff, ParticipationStatus,
+};
 
 /// Resolve the request's bearer to the account it authorizes,
 /// falling back to primary. See `gmail::mail::bearer_account` for
@@ -302,11 +304,14 @@ fn serialize_event(e: &Event) -> Value {
             .iter()
             .map(|a| {
                 let mut m = Map::new();
-                m.insert("email".into(), Value::String(a.email.clone()));
-                if let Some(n) = &a.name {
+                m.insert("email".into(), Value::String(a.address.email.clone()));
+                if let Some(n) = &a.address.name {
                     m.insert("displayName".into(), Value::String(n.clone()));
                 }
-                m.insert("responseStatus".into(), Value::String("needsAction".into()));
+                m.insert(
+                    "responseStatus".into(),
+                    Value::String(a.status.as_google().into()),
+                );
                 Value::Object(m)
             })
             .collect();
@@ -602,10 +607,10 @@ fn build_event_from_create(
         })?;
 
     let organizer = obj.get("organizer").and_then(parse_address);
-    let attendees: Vec<Address> = obj
+    let attendees: Vec<EventAttendee> = obj
         .get("attendees")
         .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(parse_address).collect())
+        .map(|arr| arr.iter().filter_map(parse_attendee).collect())
         .unwrap_or_default();
 
     let id = fix.mint_event_id();
@@ -710,7 +715,7 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
         event.is_all_day = all_day;
     }
     if let Some(arr) = obj.get("attendees").and_then(Value::as_array) {
-        event.attendees = arr.iter().filter_map(parse_address).collect();
+        event.attendees = arr.iter().filter_map(parse_attendee).collect();
     }
     // Real Google Calendar clients can repoint `organizer` on a
     // PATCH (with appropriate ACLs); ratatoskr does not currently
@@ -779,6 +784,21 @@ fn parse_address(v: &Value) -> Option<Address> {
         .and_then(Value::as_str)
         .map(str::to_string);
     Some(Address { email, name })
+}
+
+/// Parse a Google Calendar attendee: the `{email, displayName}`
+/// address plus `responseStatus` (`needsAction` / `accepted` /
+/// `declined` / `tentative`). This is the slot bifrost's RSVP round
+/// trip mutates: it GETs the event, flips the self attendee's
+/// `responseStatus`, and PATCHes the whole `attendees[]` back.
+fn parse_attendee(v: &Value) -> Option<EventAttendee> {
+    let address = parse_address(v)?;
+    let status = v
+        .get("responseStatus")
+        .and_then(Value::as_str)
+        .and_then(ParticipationStatus::parse)
+        .unwrap_or_default();
+    Some(EventAttendee { address, status })
 }
 
 // Err is an axum `Response` (large); boxing would force every `?`

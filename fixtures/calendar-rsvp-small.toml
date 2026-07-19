@@ -1,0 +1,43 @@
+name = "calendar-rsvp-small"
+
+# A single-account calendar fixture whose account address
+# (`self@example.test`) is itself an attendee of the meeting, so every
+# provider's RSVP round-trip has a "self" attendee to mutate. The
+# second attendee carries an authored non-default status (`declined`)
+# so tests can assert that an RSVP moves only the self attendee and
+# leaves the others untouched, and that per-attendee status authors
+# correctly from TOML.
+
+[[account]]
+id = "self"
+name = "self@example.test"
+is_personal = true
+
+[[mailbox]]
+id = "mbx-inbox"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+[[calendar]]
+id = "cal-1"
+name = "Work"
+color = "lightBlue"
+is_default = true
+
+[[event]]
+id = "ev-rsvp"
+calendar_id = "cal-1"
+subject = "Planning"
+body_text = "Quarterly planning session."
+start = "2026-03-02T09:00:00Z"
+end = "2026-03-02T10:00:00Z"
+location = "Conf Room B"
+organizer = { name = "Organizer", email = "organizer@example.test" }
+# att1 is the account's own address (defaults to needs-action); att2
+# carries an authored status that RSVP writes must not disturb.
+attendees = [
+    "self@example.test",
+    { name = "Other", email = "other@example.test", status = "declined" },
+]
+is_all_day = false

@@ -23,7 +23,7 @@ use rand::rngs::SmallRng;
 
 use crate::fixture::{
     self, ChangeOp, ChangeStep, ContactEmail, Fixture, RawAccount, RawAddress, RawAttachment,
-    RawEmail, RawFixture, RawMailbox, RawOAuth,
+    RawEmail, RawEventAttendee, RawFixture, RawMailbox, RawOAuth,
 };
 use crate::templates;
 
@@ -1806,7 +1806,7 @@ fn read_event_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
             end: read_string(state, entry_idx, "end")?,
             location: read_string_opt(state, entry_idx, "location")?,
             organizer: read_address_opt(state, entry_idx, "organizer")?,
-            attendees: read_address_array_opt(state, entry_idx, "attendees")?,
+            attendees: read_event_attendee_array_opt(state, entry_idx, "attendees")?,
             is_all_day: read_bool_opt(state, entry_idx, "is_all_day")?.unwrap_or(false),
             recurrence_rule: read_string_opt(state, entry_idx, "recurrence_rule")?,
             recurrence_exdates: read_string_array_opt(state, entry_idx, "recurrence_exdates")?,
@@ -2154,6 +2154,81 @@ fn read_address_table_at_top(state: &mut State, key: &str) -> dellingr::Result<R
     let email = state.to_string(-1)?;
     state.pop(1);
     Ok(RawAddress::Full { name, email })
+}
+
+/// Read an `attendees = { ... }` array into `Vec<RawEventAttendee>`.
+/// Each entry is either a bare email string or a `{name = ?, email =
+/// ..., status = ?}` table; `status` carries the RSVP participation
+/// status (`needs-action` / `accepted` / `declined` / `tentative`).
+fn read_event_attendee_array_opt(
+    state: &mut State,
+    t: isize,
+    key: &str,
+) -> dellingr::Result<Vec<RawEventAttendee>> {
+    let typ = lookup(state, t, key)?;
+    let result = match typ {
+        LuaType::Nil => Ok(Vec::new()),
+        LuaType::Table => read_event_attendee_array_at_top(state, key),
+        _ => fail(state, format!("field {key:?} must be an array")),
+    };
+    state.pop(1);
+    result
+}
+
+// Same stack-top cast story as `read_address_array_at_top`.
+#[allow(clippy::cast_possible_wrap)]
+fn read_event_attendee_array_at_top(
+    state: &mut State,
+    key: &str,
+) -> dellingr::Result<Vec<RawEventAttendee>> {
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    let mut out = Vec::with_capacity(len);
+    for i in 1..=len {
+        state.push_number(i as f64);
+        state.get_table_raw(arr)?;
+        let typ = state.typ(-1);
+        let entry = match typ {
+            LuaType::String => RawEventAttendee::Bare(state.to_string(-1)?),
+            LuaType::Table => read_event_attendee_table_at_top(state, key)?,
+            _ => {
+                state.pop(1);
+                return fail(state, format!("field {key:?} entry {i} bad shape"));
+            }
+        };
+        state.pop(1);
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// Read a `{name = ?, email = ..., status = ?}` table at the stack top
+/// into a `RawEventAttendee::Full`. Does not pop the table; caller pops.
+//
+// Same stack-top cast story as `read_string_array_at_top`.
+#[allow(clippy::cast_possible_wrap)]
+fn read_event_attendee_table_at_top(
+    state: &mut State,
+    key: &str,
+) -> dellingr::Result<RawEventAttendee> {
+    let t = state.get_top() as isize;
+    let name = read_string_opt(state, t, "name")?;
+    let status = read_string_opt(state, t, "status")?;
+    let typ = lookup(state, t, "email")?;
+    if typ != LuaType::String {
+        state.pop(1);
+        return fail(
+            state,
+            format!("field {key:?} attendee table needs a string `email`"),
+        );
+    }
+    let email = state.to_string(-1)?;
+    state.pop(1);
+    Ok(RawEventAttendee::Full {
+        name,
+        email,
+        status,
+    })
 }
 
 // ── Reactive callback dispatcher ────────────────────────────────────

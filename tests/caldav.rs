@@ -1447,3 +1447,137 @@ async fn multi_account_put_under_secondary_principal_binds_event_to_secondary() 
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ── RSVP / scheduling (RFC 6638 slice) ──────────────────────────────
+
+const PROPFIND_SCHEDULING: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <C:calendar-user-address-set/>
+    <C:schedule-outbox-URL/>
+  </D:prop>
+</D:propfind>"#;
+
+fn rsvp_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/calendar-rsvp-small.toml")).unwrap();
+    caldav::router(caldav::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+fn rsvp_router_with_log(log: saehrimnir::request_log::RequestLog) -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/calendar-rsvp-small.toml")).unwrap();
+    let shared = saehrimnir::shared::SharedHandles::for_test(saehrimnir::shared::handle(fix))
+        .with_request_log(log);
+    caldav::router(caldav::AppState { shared })
+}
+
+/// The principal PROPFIND additionally serves the RFC 6638 scheduling
+/// props bifrost discovers before an RSVP: `calendar-user-address-set`
+/// (the principal's `mailto:` address) and `schedule-outbox-URL`.
+#[tokio::test]
+async fn propfind_principal_serves_scheduling_props() {
+    let (status, body) = send_with(
+        rsvp_router(),
+        "PROPFIND",
+        "/principals/self/",
+        Some("0"),
+        PROPFIND_SCHEDULING,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        body.contains("calendar-user-address-set"),
+        "missing address-set: {body}"
+    );
+    assert!(
+        body.contains("mailto:self@example.test"),
+        "missing self mailto: {body}"
+    );
+    assert!(
+        body.contains("schedule-outbox-URL"),
+        "missing outbox prop: {body}"
+    );
+    assert!(
+        body.contains("/calendars/self/outbox/"),
+        "missing outbox href: {body}"
+    );
+}
+
+/// A POST of an iTIP REPLY to the schedule outbox is accepted (bare
+/// 2xx) and recorded in the request log with the Originator / Recipient
+/// headers - bifrost checks the HTTP status only.
+#[tokio::test]
+async fn schedule_outbox_post_accepts_itip_reply_and_logs_it() {
+    let log = saehrimnir::request_log::RequestLog::default();
+    let app = rsvp_router_with_log(log.clone());
+    let itip = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\nUID:ev-rsvp\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:self@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/calendars/self/outbox/")
+                .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+                .header("Originator", "mailto:self@example.test")
+                .header("Recipient", "mailto:organizer@example.test")
+                .body(Body::from(itip))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "status: {}", resp.status());
+
+    let snap = log.snapshot();
+    let reply = snap
+        .iter()
+        .find(|e| e.detail["schedule_reply"] == true)
+        .expect("schedule reply row recorded");
+    assert_eq!(reply.detail["originator"], "mailto:self@example.test");
+    assert_eq!(reply.detail["recipient"], "mailto:organizer@example.test");
+    assert!(
+        reply.detail["itip"]
+            .as_str()
+            .unwrap()
+            .contains("METHOD:REPLY")
+    );
+}
+
+/// CalDAV RSVP round trip: the ATTENDEE line carries PARTSTAT on read,
+/// and a PUT with the self attendee's PARTSTAT patched durably updates
+/// the stored status - a follow-up GET observes the change while the
+/// other attendee's status is untouched.
+#[tokio::test]
+async fn caldav_rsvp_partstat_round_trip() {
+    let app = rsvp_router();
+    let uri = "/calendars/self/cal-1/ev-rsvp.ics";
+
+    // Read: the ATTENDEE lines carry the authored PARTSTAT values.
+    let (status, body) = send_with(app.clone(), "GET", uri, None, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("PARTSTAT=NEEDS-ACTION:mailto:self@example.test"),
+        "self PARTSTAT missing: {body}"
+    );
+    assert!(
+        body.contains("PARTSTAT=DECLINED:mailto:other@example.test"),
+        "other PARTSTAT missing: {body}"
+    );
+
+    // PUT the event back with the self attendee accepted (bifrost's
+    // rsvp PUT patches only the self PARTSTAT).
+    let put_body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ev-rsvp\r\nSUMMARY:Planning\r\nDTSTART:20260302T090000Z\r\nDTEND:20260302T100000Z\r\nORGANIZER;CN=Organizer:mailto:organizer@example.test\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:self@example.test\r\nATTENDEE;CN=Other;PARTSTAT=DECLINED:mailto:other@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let (status, _) = send_with(app.clone(), "PUT", uri, None, put_body).await;
+    assert!(
+        status == StatusCode::NO_CONTENT || status == StatusCode::CREATED,
+        "PUT status: {status}"
+    );
+
+    // Follow-up GET observes self ACCEPTED, other still DECLINED.
+    let (_, body) = send_with(app, "GET", uri, None, "").await;
+    assert!(
+        body.contains("PARTSTAT=ACCEPTED:mailto:self@example.test"),
+        "self not accepted: {body}"
+    );
+    assert!(
+        body.contains("PARTSTAT=DECLINED:mailto:other@example.test"),
+        "other status disturbed: {body}"
+    );
+}

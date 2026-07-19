@@ -1944,7 +1944,7 @@ pub struct Event {
     pub end: DateTime<Utc>,
     pub location: Option<String>,
     pub organizer: Option<Address>,
-    pub attendees: Vec<Address>,
+    pub attendees: Vec<EventAttendee>,
     pub is_all_day: bool,
     /// RFC 5545 RRULE value (no `RRULE:` prefix - just the body,
     /// e.g. `"FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=10"`). None means
@@ -2237,6 +2237,110 @@ impl Disposition {
 pub struct Address {
     pub name: Option<String>,
     pub email: String,
+}
+
+/// An event attendee's RSVP participation status. This is the single
+/// canonical slot every calendar protocol projects its own RSVP
+/// spelling from (Graph `responseStatus.response`, Google
+/// `responseStatus`, JMAP JSCalendar `participationStatus`, CalDAV
+/// iCalendar `PARTSTAT`), and the observable each provider's RSVP
+/// write mutates and reads back. `NeedsAction` is the default an
+/// attendee carries until it responds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParticipationStatus {
+    #[default]
+    NeedsAction,
+    Accepted,
+    Declined,
+    Tentative,
+}
+
+impl ParticipationStatus {
+    /// Canonical authoring spelling (also the JSCalendar RFC 8984
+    /// `participationStatus` value). This is the string a fixture
+    /// authors in the `status` field of an event attendee.
+    pub fn as_jscalendar(self) -> &'static str {
+        match self {
+            Self::NeedsAction => "needs-action",
+            Self::Accepted => "accepted",
+            Self::Declined => "declined",
+            Self::Tentative => "tentative",
+        }
+    }
+
+    /// Google Calendar v3 `attendees[].responseStatus` value.
+    pub fn as_google(self) -> &'static str {
+        match self {
+            Self::NeedsAction => "needsAction",
+            Self::Accepted => "accepted",
+            Self::Declined => "declined",
+            Self::Tentative => "tentative",
+        }
+    }
+
+    /// Microsoft Graph `attendees[].status.response` value. Graph
+    /// spells "needs action" as `notResponded` and "tentative" as
+    /// `tentativelyAccepted`.
+    pub fn as_graph(self) -> &'static str {
+        match self {
+            Self::NeedsAction => "notResponded",
+            Self::Accepted => "accepted",
+            Self::Declined => "declined",
+            Self::Tentative => "tentativelyAccepted",
+        }
+    }
+
+    /// iCalendar (RFC 5545) `ATTENDEE;PARTSTAT=` value.
+    pub fn as_partstat(self) -> &'static str {
+        match self {
+            Self::NeedsAction => "NEEDS-ACTION",
+            Self::Accepted => "ACCEPTED",
+            Self::Declined => "DECLINED",
+            Self::Tentative => "TENTATIVE",
+        }
+    }
+
+    /// Parse any of the provider spellings (case-insensitive):
+    /// JSCalendar `needs-action` / `accepted` / `declined` /
+    /// `tentative`, Google `needsAction`, Graph `notResponded` /
+    /// `tentativelyAccepted` / `none` / `organizer`, and iCalendar
+    /// `NEEDS-ACTION` / ... Unknown values return `None` so callers
+    /// can keep the existing status rather than silently resetting.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
+            "needsaction" | "notresponded" | "none" | "organizer" => Some(Self::NeedsAction),
+            "accepted" => Some(Self::Accepted),
+            "declined" => Some(Self::Declined),
+            "tentative" | "tentativelyaccepted" => Some(Self::Tentative),
+            _ => None,
+        }
+    }
+}
+
+/// An event attendee: an email/name [`Address`] plus its RSVP
+/// [`ParticipationStatus`]. The status is event-specific and must not
+/// leak onto the shared [`Address`] type (which also backs email
+/// from/to/cc), so attendees carry their own shape rather than a bare
+/// `Address`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventAttendee {
+    pub address: Address,
+    pub status: ParticipationStatus,
+}
+
+impl EventAttendee {
+    /// Wrap an address with the default (`NeedsAction`) status.
+    pub fn new(address: Address) -> Self {
+        Self {
+            address,
+            status: ParticipationStatus::default(),
+        }
+    }
+
+    /// The attendee's email address.
+    pub fn email(&self) -> &str {
+        &self.address.email
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2612,7 +2716,7 @@ pub(crate) struct RawEvent {
     #[serde(default)]
     pub(crate) organizer: Option<RawAddress>,
     #[serde(default)]
-    pub(crate) attendees: Vec<RawAddress>,
+    pub(crate) attendees: Vec<RawEventAttendee>,
     #[serde(default)]
     pub(crate) is_all_day: bool,
     /// Raw RRULE value (no `RRULE:` prefix). Optional.
@@ -2832,6 +2936,54 @@ impl From<RawAddress> for Address {
         match raw {
             RawAddress::Bare(email) => Self { name: None, email },
             RawAddress::Full { name, email } => Self { name, email },
+        }
+    }
+}
+
+/// Authoring form for an event attendee. Accepts the same bare-string
+/// / `{ name, email }` sugar as [`RawAddress`], plus an optional
+/// `status` field carrying the RSVP participation status
+/// (`needs-action` / `accepted` / `declined` / `tentative`,
+/// case-insensitive; other provider spellings are accepted too). A
+/// bare string or a table without `status` defaults to `needs-action`.
+///
+/// TOML:
+/// ```toml
+/// attendees = [
+///     "carol@example.com",
+///     { name = "Bob", email = "bob@example.com", status = "accepted" },
+/// ]
+/// ```
+/// Lua: `attendees = { "carol@example.com", { name = "Bob", email =
+/// "bob@example.com", status = "accepted" } }`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RawEventAttendee {
+    Bare(String),
+    Full {
+        #[serde(default)]
+        name: Option<String>,
+        email: String,
+        #[serde(default)]
+        status: Option<String>,
+    },
+}
+
+impl From<RawEventAttendee> for EventAttendee {
+    fn from(raw: RawEventAttendee) -> Self {
+        match raw {
+            RawEventAttendee::Bare(email) => Self::new(Address { name: None, email }),
+            RawEventAttendee::Full {
+                name,
+                email,
+                status,
+            } => Self {
+                address: Address { name, email },
+                status: status
+                    .as_deref()
+                    .and_then(ParticipationStatus::parse)
+                    .unwrap_or_default(),
+            },
         }
     }
 }
@@ -3105,7 +3257,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             end,
             location: ev.location,
             organizer: ev.organizer.map(Address::from),
-            attendees: ev.attendees.into_iter().map(Address::from).collect(),
+            attendees: ev.attendees.into_iter().map(EventAttendee::from).collect(),
             is_all_day: ev.is_all_day,
             recurrence_rule: ev.recurrence_rule,
             recurrence_exdates,
@@ -3555,7 +3707,7 @@ pub(crate) fn event_create_op(raw: RawEvent) -> Result<ChangeOp, String> {
         end,
         location: raw.location,
         organizer: raw.organizer.map(Address::from),
-        attendees: raw.attendees.into_iter().map(Address::from).collect(),
+        attendees: raw.attendees.into_iter().map(EventAttendee::from).collect(),
         is_all_day: raw.is_all_day,
         recurrence_rule: raw.recurrence_rule,
         recurrence_exdates,

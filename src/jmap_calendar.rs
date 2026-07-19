@@ -23,7 +23,9 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde_json::{Map, Value, json};
 
-use crate::fixture::{Address, Calendar, Event, Fixture, MutationDiff};
+use crate::fixture::{
+    Address, Calendar, Event, EventAttendee, Fixture, MutationDiff, ParticipationStatus,
+};
 
 // ── Calendar/get ────────────────────────────────────────────────────
 
@@ -220,10 +222,18 @@ fn serialize_event(e: &Event) -> Value {
 
     let mut participants = Map::new();
     if let Some(org) = &e.organizer {
-        participants.insert("org".into(), serialize_participant(org, true));
+        // The organizer is implicitly accepted; JSCalendar carries no
+        // separate organizer-status slot on the fixture side.
+        participants.insert(
+            "org".into(),
+            serialize_participant(org, true, ParticipationStatus::Accepted),
+        );
     }
     for (idx, att) in e.attendees.iter().enumerate() {
-        participants.insert(format!("att{}", idx + 1), serialize_participant(att, false));
+        participants.insert(
+            format!("att{}", idx + 1),
+            serialize_participant(&att.address, false, att.status),
+        );
     }
     if !participants.is_empty() {
         out.insert("participants".into(), Value::Object(participants));
@@ -447,7 +457,7 @@ fn parse_jscalendar_recurrence_rules(v: &Value) -> Option<String> {
     crate::recurrence::format_rrule(&rule)
 }
 
-fn serialize_participant(addr: &Address, is_owner: bool) -> Value {
+fn serialize_participant(addr: &Address, is_owner: bool, status: ParticipationStatus) -> Value {
     let mut p = Map::new();
     p.insert("@type".into(), Value::String("Participant".into()));
     if let Some(n) = &addr.name {
@@ -468,7 +478,7 @@ fn serialize_participant(addr: &Address, is_owner: bool) -> Value {
     p.insert("roles".into(), Value::Object(roles));
     p.insert(
         "participationStatus".into(),
-        Value::String("needs-action".into()),
+        Value::String(status.as_jscalendar().into()),
     );
     Value::Object(p)
 }
@@ -955,6 +965,19 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Value> {
                 event.organizer = org;
                 event.attendees = atts;
             }
+            // Path-based participant patch. bifrost's JMAP RSVP does
+            // NOT replace the whole `participants` object; it sends a
+            // single path-keyed property
+            // `participants/{id}/participationStatus` per RFC 8620
+            // §5.3 (a PatchObject). The whole-object arm above would
+            // never see it, and the catch-all below silently ignores
+            // unknown keys - so without this arm the mock would report
+            // `updated` success while recording nothing (a false
+            // success). Apply the path patch to the addressed
+            // attendee's status.
+            key if key.starts_with("participants/") => {
+                apply_participant_path_patch(event, key, v);
+            }
             "calendarIds" => {
                 if let Some(new_cal) = v.as_object().and_then(|m| {
                     m.iter()
@@ -1022,12 +1045,12 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Value> {
     Ok(())
 }
 
-fn parse_participants(v: Option<&Value>) -> (Option<Address>, Vec<Address>) {
+fn parse_participants(v: Option<&Value>) -> (Option<Address>, Vec<EventAttendee>) {
     let Some(obj) = v.and_then(Value::as_object) else {
         return (None, vec![]);
     };
     let mut organizer: Option<Address> = None;
-    let mut attendees: Vec<Address> = Vec::new();
+    let mut attendees: Vec<EventAttendee> = Vec::new();
     for (_id, p) in obj {
         let Some(p_obj) = p.as_object() else { continue };
         let email = p_obj
@@ -1055,10 +1078,56 @@ fn parse_participants(v: Option<&Value>) -> (Option<Address>, Vec<Address>) {
         if is_owner && organizer.is_none() {
             organizer = Some(addr);
         } else {
-            attendees.push(addr);
+            let status = p_obj
+                .get("participationStatus")
+                .and_then(Value::as_str)
+                .and_then(ParticipationStatus::parse)
+                .unwrap_or_default();
+            attendees.push(EventAttendee {
+                address: addr,
+                status,
+            });
         }
     }
     (organizer, attendees)
+}
+
+/// Apply a JMAP path-based participant patch of the exact shape
+/// bifrost's RSVP sends: key `participants/{id}/participationStatus`,
+/// value a JSCalendar status string. The `{id}` is the participant id
+/// the mock minted on read (`att{N}` for the Nth attendee, `org` for
+/// the organizer); we resolve it back to the attendee vector and set
+/// its status. The organizer id and any unrecognised path are no-ops
+/// (the organizer has no fixture-side status slot).
+fn apply_participant_path_patch(event: &mut Event, key: &str, value: &Value) {
+    let mut segs = key.split('/');
+    // `participants` (already matched) / `{id}` / `participationStatus`.
+    let _ = segs.next();
+    let Some(pid) = segs.next() else { return };
+    let Some(field) = segs.next() else { return };
+    // Reject deeper paths (`participants/x/y/z`) we don't model.
+    if segs.next().is_some() || field != "participationStatus" {
+        return;
+    }
+    let Some(status) = value.as_str().and_then(ParticipationStatus::parse) else {
+        return;
+    };
+    if let Some(idx) = participant_index(pid)
+        && let Some(att) = event.attendees.get_mut(idx)
+    {
+        att.status = status;
+    }
+}
+
+/// Map a participant id the mock emits back to an attendee index. The
+/// read projection keys attendees `att1`, `att2`, ... (1-based), so
+/// `att{N}` resolves to index `N - 1`. The organizer id (`org`) and
+/// any other shape return None.
+fn participant_index(pid: &str) -> Option<usize> {
+    pid.strip_prefix("att")?
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
 }
 
 // ── JSCalendar time helpers ─────────────────────────────────────────

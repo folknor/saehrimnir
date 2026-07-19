@@ -12,7 +12,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::fixture::{Address, Event};
+use crate::fixture::{Address, Event, EventAttendee, ParticipationStatus};
 
 /// Format `dt` as an RFC 5545 UTC date-time:
 /// `YYYYMMDDTHHMMSSZ`.
@@ -84,7 +84,7 @@ pub(crate) fn event_to_ical(event: &Event) -> String {
         write_address_line(&mut out, "ORGANIZER", org);
     }
     for attendee in &event.attendees {
-        write_address_line(&mut out, "ATTENDEE", attendee);
+        write_attendee_line(&mut out, attendee);
     }
     for reminder in &event.reminders {
         write_valarm(&mut out, reminder);
@@ -195,6 +195,25 @@ fn write_address_line(out: &mut String, name: &str, addr: &Address) {
     out.push_str("\r\n");
 }
 
+/// Emit an `ATTENDEE` property. Same `CN` framing as
+/// [`write_address_line`], plus a `PARTSTAT` parameter carrying the
+/// attendee's RSVP participation status - the observable bifrost's
+/// CalDAV RSVP round-trip reads (it GETs the event, patches the self
+/// attendee's PARTSTAT, and PUTs it back). Shape:
+/// `ATTENDEE;CN=<name>;PARTSTAT=<status>:mailto:<email>`.
+fn write_attendee_line(out: &mut String, attendee: &EventAttendee) {
+    out.push_str("ATTENDEE");
+    if let Some(n) = &attendee.address.name {
+        out.push_str(";CN=");
+        out.push_str(&escape_text(n));
+    }
+    out.push_str(";PARTSTAT=");
+    out.push_str(attendee.status.as_partstat());
+    out.push_str(":mailto:");
+    out.push_str(&sanitize_address(&attendee.address.email));
+    out.push_str("\r\n");
+}
+
 /// Strip CR/LF/control bytes from an address before it lands in an
 /// iCal property line. Real email addresses (per RFC 5321) cannot
 /// contain those characters, but a hostile fixture could embed
@@ -262,7 +281,7 @@ pub(crate) struct ParsedEvent {
     pub end: Option<DateTime<Utc>>,
     pub is_all_day: bool,
     pub organizer: Option<Address>,
-    pub attendees: Vec<Address>,
+    pub attendees: Vec<EventAttendee>,
     pub recurrence_rule: Option<String>,
     pub recurrence_exdates: Vec<DateTime<Utc>>,
 }
@@ -319,7 +338,7 @@ pub(crate) fn parse_vevent(body: &str) -> Result<ParsedEvent, &'static str> {
             "DTEND" => parsed.end = parse_dt(value),
             "ORGANIZER" => parsed.organizer = parse_address(line),
             "ATTENDEE" => {
-                if let Some(a) = parse_address(line) {
+                if let Some(a) = parse_attendee_line(line) {
                     parsed.attendees.push(a);
                 }
             }
@@ -408,6 +427,27 @@ fn parse_address(line: &str) -> Option<Address> {
         }
     }
     Some(Address { email, name })
+}
+
+/// Parse an `ATTENDEE` line into an [`EventAttendee`]: the address
+/// (via [`parse_address`]) plus the `PARTSTAT` parameter carrying the
+/// RSVP status (`NEEDS-ACTION` / `ACCEPTED` / `DECLINED` /
+/// `TENTATIVE`). An absent / unrecognised PARTSTAT defaults to
+/// needs-action. This is the read half of the CalDAV RSVP round trip;
+/// a PUT with the self attendee's PARTSTAT patched lands here.
+fn parse_attendee_line(line: &str) -> Option<EventAttendee> {
+    let address = parse_address(line)?;
+    let colon = line.find(':')?;
+    let params_segment = &line[..colon];
+    let mut status = ParticipationStatus::default();
+    for param in params_segment.split(';').skip(1) {
+        if let Some(rest) = param.strip_prefix("PARTSTAT=")
+            && let Some(parsed) = ParticipationStatus::parse(rest.trim_matches('"'))
+        {
+            status = parsed;
+        }
+    }
+    Some(EventAttendee { address, status })
 }
 
 /// Case-insensitive `mailto:` prefix strip. Apple Calendar emits
@@ -542,10 +582,10 @@ mod tests {
                 email: "alice@example.com".into(),
                 name: Some("Alice".into()),
             }),
-            attendees: vec![Address {
+            attendees: vec![EventAttendee::new(Address {
                 email: "bob@example.com".into(),
                 name: None,
-            }],
+            })],
             is_all_day: false,
             recurrence_rule: None,
             recurrence_exdates: vec![],
@@ -565,7 +605,7 @@ mod tests {
         assert_eq!(org.email, "alice@example.com");
         assert_eq!(org.name.as_deref(), Some("Alice"));
         assert_eq!(parsed.attendees.len(), 1);
-        assert_eq!(parsed.attendees[0].email, "bob@example.com");
+        assert_eq!(parsed.attendees[0].email(), "bob@example.com");
     }
 
     #[test]

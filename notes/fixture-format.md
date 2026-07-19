@@ -268,9 +268,22 @@ end   = "2026-01-15T09:15:00Z"   # required, RFC3339
 location = "Conf Room A"   # optional
 organizer = { name = "Alice", email = "alice@example.com" }   # optional, address-shaped
 attendees = [
-    { name = "Bob", email = "bob@example.com" },
+    { name = "Bob", email = "bob@example.com", status = "accepted" },
     "carol@example.com",
-]                          # optional; addresses accept bare-string or table form
+]                          # optional; each attendee is a bare email string
+                           # or a { name?, email, status? } table. `status`
+                           # is the RSVP participation status - one of
+                           # `needs-action` (default) / `accepted` /
+                           # `declined` / `tentative` (case-insensitive;
+                           # the provider spellings `needsAction`,
+                           # `notResponded`, `tentativelyAccepted` are also
+                           # accepted). This single slot is what every
+                           # provider's RSVP write mutates and reads back:
+                           # Graph `attendees[].status.response`, Google
+                           # `attendees[].responseStatus`, JMAP
+                           # `participants[].participationStatus`, CalDAV
+                           # `ATTENDEE;PARTSTAT=`. The organizer carries no
+                           # status slot (implicitly accepted).
 is_all_day = false         # optional
 recurrence_rule = "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=10"   # optional;
                                                           # raw RFC 5545

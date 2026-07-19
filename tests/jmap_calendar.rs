@@ -215,6 +215,50 @@ async fn calendar_event_get_emits_jscalendar_shape() {
     assert_eq!(parts.len(), 3); // organizer + 2 attendees
 }
 
+/// The JMAP RSVP path-patch trap. bifrost's RSVP does NOT replace the
+/// whole `participants` object; it sends a single path-keyed property
+/// `participants/{id}/participationStatus` inside `CalendarEvent/set`
+/// `update`. The mock's update handler used to match only a whole
+/// `participants` key and silently ignore unknown keys - returning
+/// `updated` success while recording nothing (a false success). This
+/// pins that the path patch is applied and round-trips: the addressed
+/// participant's status moves, and the untouched one does not.
+#[tokio::test]
+async fn calendar_event_set_applies_participant_path_patch() {
+    let r = router();
+    // ev-001 has att1 = bob (needs-action), att2 = carol (needs-action).
+    let updated = jmap_call(
+        &r,
+        "CalendarEvent/set",
+        json!({
+            "accountId": "account-1",
+            "update": {
+                "ev-001": { "participants/att1/participationStatus": "accepted" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(updated[0], "CalendarEvent/set");
+    let updated_obj = updated[1]["updated"].as_object().unwrap();
+    assert!(
+        updated_obj.contains_key("ev-001"),
+        "ev-001 not reported updated: {:?}",
+        updated[1]
+    );
+
+    // The addressed participant (att1) is now accepted; att2 is not.
+    let resp = jmap_call(
+        &r,
+        "CalendarEvent/get",
+        json!({"accountId": "account-1", "ids": ["ev-001"]}),
+    )
+    .await;
+    let parts = resp[1]["list"][0]["participants"].as_object().unwrap();
+    assert_eq!(parts["att1"]["participationStatus"], "accepted");
+    assert_eq!(parts["att1"]["email"], "bob@example.com");
+    assert_eq!(parts["att2"]["participationStatus"], "needs-action");
+}
+
 #[tokio::test]
 async fn calendar_event_changes_returns_empty_at_seed_state() {
     let r = router();

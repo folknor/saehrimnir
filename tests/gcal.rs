@@ -62,6 +62,64 @@ async fn http(
     (status, v)
 }
 
+fn rsvp_router() -> axum::Router {
+    let fix = fixture::load(Path::new("fixtures/calendar-rsvp-small.toml")).unwrap();
+    gcal::router(gcal::AppState::for_test(shared::handle(fix)))
+}
+
+/// Find an attendee's `responseStatus` in a serialized gcal event.
+fn gcal_attendee_status(event: &Value, email: &str) -> Option<String> {
+    event["attendees"].as_array()?.iter().find_map(|a| {
+        (a["email"] == email)
+            .then(|| a["responseStatus"].as_str().map(str::to_string))
+            .flatten()
+    })
+}
+
+/// Google Calendar RSVP round trip: the read projection serializes the
+/// real per-attendee `responseStatus` (not a hardcoded `needsAction`),
+/// and bifrost's RSVP shape - GET the event, flip the self attendee's
+/// `responseStatus`, PATCH the whole `attendees[]` back - durably
+/// stores it so a follow-up read observes the change.
+#[tokio::test]
+async fn gcal_rsvp_round_trip_stores_response_status() {
+    let r = rsvp_router();
+    let uri = "/calendar/v3/calendars/cal-1/events/ev-rsvp";
+
+    // Read: self is needsAction, other is the authored declined.
+    let (status, ev) = http(&r, "GET", uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        gcal_attendee_status(&ev, "self@example.test").as_deref(),
+        Some("needsAction")
+    );
+    assert_eq!(
+        gcal_attendee_status(&ev, "other@example.test").as_deref(),
+        Some("declined")
+    );
+
+    // bifrost's rsvp: take current attendees, flip self, PATCH them back.
+    let mut attendees = ev["attendees"].as_array().unwrap().clone();
+    for a in &mut attendees {
+        if a["email"] == "self@example.test" {
+            a["responseStatus"] = json!("accepted");
+        }
+    }
+    let (status, _) = http(&r, "PATCH", uri, Some(json!({ "attendees": attendees }))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Follow-up read observes self accepted, other still declined.
+    let (_, ev) = http(&r, "GET", uri, None).await;
+    assert_eq!(
+        gcal_attendee_status(&ev, "self@example.test").as_deref(),
+        Some("accepted")
+    );
+    assert_eq!(
+        gcal_attendee_status(&ev, "other@example.test").as_deref(),
+        Some("declined")
+    );
+}
+
 #[tokio::test]
 async fn calendar_list_emits_calendar_list_entries() {
     let r = router();
