@@ -119,16 +119,19 @@ fresh `nextSyncToken` on the final page. The mock honours this:
 
 ratatoskr's contact editor pushes phone / company / notes back to
 Google through the People API custom verbs. The mock implements
-the request shape and bumps the change log; durable storage of
-the patched fields isn't there because the fixture `Contact`
-schema doesn't carry them.
+the request shape, durably stores the patched fields (the fixture
+`Contact` carries phones / company / job title / department /
+notes), and bumps the change log.
 
 - `PATCH /v1/people/{id}:updateContact?updatePersonFields=...`.
   Body is a partial `Person` (`{etag, phoneNumbers, organizations,
-  biographies}`). Mock validates the contact exists, records a
-  `contact_updated` transition, and echoes the (current) Person
-  back. The next `connections` delta surfaces the contact id in
-  the updated set.
+  biographies}`). Mock validates the contact exists, applies the
+  patch to the stored `Contact` via `apply_person_patch` (name /
+  emails / phones / organization / notes), records a
+  `contact_updated` transition, and echoes the updated Person
+  back. A follow-up `get_person` or `connections` read reflects
+  the new fields; the next delta surfaces the contact id in the
+  updated set.
 - `DELETE /v1/people/{id}:deleteContact`. Mock validates the
   contact exists, removes it from `Fixture::contacts`, records a
   `contact_destroyed` transition (with the contact's
@@ -140,6 +143,18 @@ The custom verbs arrive on `/v1/people/{id}:updateContact` /
 `/v1/people/{id}:deleteContact` - the colon-prefixed verb is part
 of the path segment, not a query string.
 
+**Resource-name prefix.** `serialize_person` projects each contact
+as `resourceName: "people/{id}"`, and bifrost stores that whole
+string as the contact's server id, then URL-encodes it into the
+request path for the read-back / update / delete (`bifrost-net`
+`encode_component` escapes `/` as `%2F`). So the wire path is
+`/v1/people/people%2F{id}[:verb]`; axum decodes the captured
+segment back to `people/{id}`. The `get_person` / `update_contact`
+/ `delete_contact` handlers strip the `people/` prefix
+(`fixture_contact_id`) so they resolve the same bare fixture id the
+read path serves. A bare id (older callers / hand-rolled requests)
+still resolves.
+
 ## bifrost note (the client we are migrating to)
 
 The sections above describe the OLD ratatoskr People client (delta
@@ -148,19 +163,22 @@ differs and the mock must serve:
 
 - `GET /v1/people/{resourceName}` (single Person) - `get_person`,
   used by `contact_get` AND the etag prefetch before `updateContact`.
-  Implemented: bare-id GET on `/v1/people/{spec}` (the `{id}:verb`
-  forms keep PATCH / DELETE). Reads `resourceName` + `etag` + the
+  Implemented on `/v1/people/{spec}` (the `{id}:verb` forms keep
+  PATCH / DELETE). bifrost sends the URL-encoded full server id
+  (`people%2F{id}`); the handler strips the `people/` prefix via
+  `fixture_contact_id`. Reads `resourceName` + `etag` + the
   projected fields. **Without it both the contact read and the
   contact write-back 404.**
 - bifrost full-pages `connections` (no `syncToken` / `requestSyncToken`
   - the mock's 410 sync-token recovery is unused by bifrost, but the
   plain paged list path still serves it).
-- STILL MISSING: `GET /v1/contactGroups?groupFields=...` drives
-  bifrost's `address_books_list` (each group is an address book
-  `contactGroups/{id}`, with per-Person `memberships[].
-  contactGroupMembership.contactGroupResourceName` used to filter
-  contacts by group). Project the fixture `ContactFolder`s as
-  contactGroups when implementing. See `gaps.md`.
+- `GET /v1/contactGroups` drives bifrost's `address_books_list`
+  (each group is an address book `contactGroups/{id}`, with
+  per-Person `memberships[].contactGroupMembership.
+  contactGroupResourceName` used to filter contacts by group).
+  Implemented: `list_contact_groups` projects the fixture's
+  `[[contact_group]]` rows and `serialize_person` emits the
+  `memberships[]`.
 
 ## What v0 doesn't surface
 

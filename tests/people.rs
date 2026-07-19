@@ -68,10 +68,14 @@ async fn get_single_person_returns_projection_and_404s_unknown() {
     let r = router();
 
     // bifrost's get_person drives this for contact_get AND the
-    // etag-prefetch before updateContact; without it both 404.
+    // etag-prefetch before updateContact; without it both 404. bifrost
+    // addresses the contact by its full server id (`people/contact-001`,
+    // read back from the connections listing) URL-encoded into the path,
+    // so the `/` arrives as `%2F` and the handler must strip the
+    // `people/` prefix to reach the bare fixture id.
     let (status, v) = get(
         &r,
-        "/v1/people/contact-001?personFields=names,emailAddresses",
+        "/v1/people/people%2Fcontact-001?personFields=names,emailAddresses",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -80,8 +84,17 @@ async fn get_single_person_returns_projection_and_404s_unknown() {
     assert_eq!(v["names"][0]["displayName"], "Alice Anderson");
     assert_eq!(v["emailAddresses"][0]["value"], "alice@example.com");
 
+    // A bare id (older callers / hand-rolled requests) still resolves.
+    let (status, v) = get(
+        &r,
+        "/v1/people/contact-001?personFields=names,emailAddresses",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["resourceName"], "people/contact-001");
+
     // Unknown resource name 404s.
-    let (status, _) = get(&r, "/v1/people/nope").await;
+    let (status, _) = get(&r, "/v1/people/people%2Fnope").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -322,19 +335,22 @@ async fn update_contact_records_transition_and_returns_person() {
     let token = bootstrap["nextSyncToken"].as_str().unwrap().to_string();
 
     // PATCH the first contact in the fixture (graph-contacts-small
-    // declares contact-001 ... contact-004).
+    // declares contact-001 ... contact-004). bifrost addresses it by
+    // the URL-encoded full server id `people%2Fcontact-001`, appending
+    // the literal `:updateContact` custom verb.
     let body = Body::from(
         serde_json::to_vec(&serde_json::json!({
             "etag": "*",
             "phoneNumbers": [{ "value": "+1-555-0100" }],
             "organizations": [{ "name": "Hammerworks" }],
+            "biographies": [{ "value": "prefers async" }],
         }))
         .unwrap(),
     );
     let (status, person) = request(
         &r,
         "PATCH",
-        "/v1/people/contact-001:updateContact?updatePersonFields=phoneNumbers,organizations",
+        "/v1/people/people%2Fcontact-001:updateContact?updatePersonFields=phoneNumbers,organizations,biographies",
         body,
         Some("application/json"),
     )
@@ -342,6 +358,18 @@ async fn update_contact_records_transition_and_returns_person() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(person["resourceName"], "people/contact-001");
     assert_eq!(person["metadata"]["deleted"], false);
+
+    // The patched fields are durably stored: a fresh read-back through
+    // get_person reflects the new phone / organization / notes.
+    let (status, reread) = get(
+        &r,
+        "/v1/people/people%2Fcontact-001?personFields=names,phoneNumbers,organizations,biographies",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reread["phoneNumbers"][0]["value"], "+1-555-0100");
+    assert_eq!(reread["organizations"][0]["name"], "Hammerworks");
+    assert_eq!(reread["biographies"][0]["value"], "prefers async");
 
     // Delta walk: contact-001 surfaces in the updated set.
     let (status, follow) = get(
@@ -366,7 +394,7 @@ async fn update_contact_unknown_id_returns_404() {
     let (status, v) = request(
         &r,
         "PATCH",
-        "/v1/people/contact-999:updateContact?updatePersonFields=phoneNumbers",
+        "/v1/people/people%2Fcontact-999:updateContact?updatePersonFields=phoneNumbers",
         body,
         Some("application/json"),
     )
@@ -390,7 +418,7 @@ async fn delete_contact_removes_and_emits_tombstone_in_delta() {
     let (status, _) = request(
         &r,
         "DELETE",
-        "/v1/people/contact-002:deleteContact",
+        "/v1/people/people%2Fcontact-002:deleteContact",
         Body::empty(),
         None,
     )
@@ -437,7 +465,7 @@ async fn delete_contact_unknown_id_returns_404() {
     let (status, _) = request(
         &r,
         "DELETE",
-        "/v1/people/contact-999:deleteContact",
+        "/v1/people/people%2Fcontact-999:deleteContact",
         Body::empty(),
         None,
     )
@@ -508,7 +536,7 @@ async fn people_update_cross_account_returns_404() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/v1/people/contact-primary-001:updateContact?updatePersonFields=displayName")
+                .uri("/v1/people/people%2Fcontact-primary-001:updateContact?updatePersonFields=displayName")
                 .header(
                     axum::http::header::AUTHORIZATION,
                     format!("Bearer {secondary_token}"),

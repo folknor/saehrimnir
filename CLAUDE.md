@@ -735,22 +735,28 @@ still route to PATCH / DELETE). Sync-token recovery: an unknown
 token returns 410 with the People error envelope, matching the
 substrings ratatoskr's recovery path checks for ("syncToken").
 A token matching the current fixture state returns an empty
-delta + the same token. Plus contact write-back:
+delta + the same token. bifrost addresses a single contact by the
+URL-encoded full server id it read back (`people%2F{id}`), so the
+`get_person` / `update_contact` / `delete_contact` handlers strip
+the `people/` prefix (`fixture_contact_id`) to reach the bare
+fixture id the read path serves (a bare id still resolves). Plus
+contact write-back:
 `PATCH /v1/people/{id}:updateContact?updatePersonFields=...` (validates
-the contact, records a `contact_updated` transition, echoes the
-Person back; the patched phone / company / notes fields land in
-the request log but aren't durably stored since the fixture
-`Contact` schema doesn't carry them) and
+the contact, applies the patch to the stored `Contact` via
+`apply_person_patch` so the patched name / emails / phone /
+organization / notes durably round-trip on the next read, records
+a `contact_updated` transition, echoes the updated Person back) and
 `DELETE /v1/people/{id}:deleteContact` (removes the contact and
 records `contact_destroyed` so the next delta emits a
-`metadata.deleted` tombstone). Catchall returns the People error
+`metadata.deleted` tombstone). `GET /v1/contactGroups` (drives
+bifrost's `address_books_list`) projects the fixture's
+`[[contact_group]]` rows; `serialize_person` emits the per-Person
+`memberships[]`. Catchall returns the People error
 envelope. Mounted on `--people-port`; sentinel grows a
 `PEOPLE <port>\n` line; brokkr orchestration plumbs
 `RATATOSKR_TEST_PEOPLE_ENDPOINT`. ratatoskr-side override
 (parallel to `RATATOSKR_TEST_GMAIL_ENDPOINT`) hasn't landed yet
 - when it does, sæhrimnir is already in place to receive it.
-Remaining bifrost gap: `GET /v1/contactGroups` (drives bifrost's
-`address_books_list`); not yet implemented (see `gaps.md`).
 
 Gmail: complete for v0's mail-sync path. `/gmail/v1/users/me/profile`
 + `/labels` (list, plus `create` / `patch` / `delete` for user-label CRUD, the created label's `color` stored and echoed back in `labels.list` for the color round-trip) + `/threads` (list paginated by `nextPageToken`, with

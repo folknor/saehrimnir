@@ -55,6 +55,33 @@ fn bearer_account(state: &AppState, headers: &HeaderMap) -> String {
 const MAX_PAGE_SIZE: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
 
+/// Map an inbound People resource name onto the bare fixture contact id.
+///
+/// `serialize_person` projects each contact outward as
+/// `resourceName: "people/{id}"`, and ratatoskr stores that whole
+/// string verbatim as the contact's server id. When bifrost addresses
+/// the contact for a read-back (`get_person`), an `updateContact`, or a
+/// `deleteContact`, it URL-encodes that server id into the request path
+/// (`bifrost-net`'s `encode_component` escapes `/` as `%2F`), so the
+/// wire path is `/v1/people/people%2F{id}[:verb]`. axum decodes the
+/// captured segment back to `people/{id}`, so the handler sees the
+/// `people/` prefix the fixture id does not carry. The read/pull path
+/// (`list_connections`) never hits this because it only ever projects
+/// resource names outward, so the prefix asymmetry surfaced only on the
+/// write-back paths.
+///
+/// Strip the `people/` prefix (decoded or still-percent-encoded, for
+/// robustness against any caller that doesn't decode) so the write path
+/// resolves exactly the contacts the read path serves. A bare id passes
+/// through unchanged.
+fn fixture_contact_id(resource_name: &str) -> &str {
+    resource_name
+        .strip_prefix("people/")
+        .or_else(|| resource_name.strip_prefix("people%2F"))
+        .or_else(|| resource_name.strip_prefix("people%2f"))
+        .unwrap_or(resource_name)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/people/me/connections", get(list_connections))
@@ -118,12 +145,13 @@ async fn get_person(
     }) {
         return o;
     }
+    let id = fixture_contact_id(&spec);
     let fixture = state.fixture();
-    match fixture.contacts_for(&account_id).find(|c| c.id == spec) {
+    match fixture.contacts_for(&account_id).find(|c| c.id == id) {
         Some(c) => ok_json(serialize_person(c)),
         None => error(
             StatusCode::NOT_FOUND,
-            &format!("person people/{spec} not found"),
+            &format!("person people/{id} not found"),
             "notFound",
         ),
     }
@@ -604,10 +632,11 @@ fn serialize_directory_person(p: &crate::fixture::DirectoryPerson) -> Value {
 struct UpdateParams {
     /// Comma-separated list of writable fields the client is touching
     /// (`phoneNumbers`, `organizations`, `biographies`, ...). Echoed
-    /// into the request log; the mock doesn't durably store these
-    /// fields (the fixture `Contact` only carries display name + email
-    /// list) but treats any non-empty mask as a contact_updated
-    /// transition so the next delta surfaces the contact.
+    /// into the request log. The patched name / email / phone /
+    /// organization / notes fields are applied to the stored `Contact`
+    /// (see `apply_person_patch`) so a re-read reflects them, and the
+    /// update records a `contact_updated` transition so the next delta
+    /// surfaces the contact.
     #[serde(default, rename = "updatePersonFields")]
     update_person_fields: Option<String>,
 }
@@ -621,14 +650,14 @@ async fn update_contact(
     body: axum::body::Body,
 ) -> Response {
     let account_id = bearer_account(&state, &headers);
-    let Some(id) = spec.strip_suffix(":updateContact") else {
+    let Some(resource_name) = spec.strip_suffix(":updateContact") else {
         return error(
             StatusCode::NOT_FOUND,
             &format!("v0 mock does not implement PATCH /v1/people/{spec}"),
             "notFound",
         );
     };
-    let id = id.to_string();
+    let id = fixture_contact_id(resource_name).to_string();
     let parsed = match parse_json_body(body).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -702,14 +731,14 @@ async fn delete_contact(
     crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
 ) -> Response {
     let account_id = bearer_account(&state, &headers);
-    let Some(id) = spec.strip_suffix(":deleteContact") else {
+    let Some(resource_name) = spec.strip_suffix(":deleteContact") else {
         return error(
             StatusCode::NOT_FOUND,
             &format!("v0 mock does not implement DELETE /v1/people/{spec}"),
             "notFound",
         );
     };
-    let id = id.to_string();
+    let id = fixture_contact_id(resource_name).to_string();
     state.shared.request_log.record_with_conn(
         "people",
         format!("DELETE /v1/people/{id}:deleteContact"),

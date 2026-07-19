@@ -234,8 +234,8 @@ all routed. Gaps are on the PIM / contacts / write paths.
 
 | METHOD path | sub-API | bifrost evidence | sæhrimnir status | Effort |
 |---|---|---|---|---|
-| `GET /v1/people/{resourceName}?personFields=...` (single) | People | `contacts.rs:213-227` (`get_person`); also the etag prefetch before `updateContact` | **DONE** - `src/people/contacts.rs::get_person` (bare-id GET on `/v1/people/{spec}`; `{id}:verb` forms keep PATCH/DELETE). Unblocks `contact_get` + the update etag prefetch | M (shipped) |
-| `GET /v1/contactGroups?groupFields=...` | People | `contacts.rs:42-43,490` (drives `address_books_list`) | MISSING -> catchall 404 | M |
+| `GET /v1/people/{resourceName}?personFields=...` (single) | People | `contacts.rs:213-227` (`get_person`); also the etag prefetch before `updateContact` | **DONE** - `src/people/contacts.rs::get_person` on `/v1/people/{spec}`; bifrost sends the URL-encoded full server id (`people%2F{id}`), handler strips the `people/` prefix via `fixture_contact_id` (a bare id still resolves); `{id}:verb` forms keep PATCH/DELETE. Unblocks `contact_get` + the update etag prefetch | M (shipped) |
+| `GET /v1/contactGroups?groupFields=...` | People | `contacts.rs` (drives `address_books_list`) | **DONE** - `src/people/contacts.rs::list_contact_groups` projects the fixture `[[contact_group]]` rows; `serialize_person` emits per-Person `memberships[]` | M (shipped) |
 | `GET /v1/people/me/connections` without syncToken (full-page) | People | `contacts.rs:74-81` | PARTIAL - route exists but is built around `syncToken`/410 delta recovery that bifrost never uses; verify the plain full-list (no-token) path returns all connections | S (verify) |
 
 ### P2
