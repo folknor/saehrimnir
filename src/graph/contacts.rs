@@ -30,7 +30,7 @@ use axum::{
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, odata, ok_json};
-use crate::fixture::{Contact, ContactEmail, ContactFolder, Fixture, MutationDiff};
+use crate::fixture::{Contact, ContactEmail, ContactFolder, ContactPhone, Fixture, MutationDiff};
 
 const CONTACTS_DEFAULT_TOP: u32 = 50;
 const CONTACTS_MAX_TOP: u32 = 999;
@@ -874,6 +874,23 @@ fn create_contact_core(
         .and_then(Value::as_str)
         .map(str::to_string);
     let emails = parse_graph_emails(body.get("emailAddresses"));
+    let phones = parse_graph_phones(body);
+    let company = body
+        .get("companyName")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let job_title = body
+        .get("jobTitle")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let department = body
+        .get("department")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let notes = body
+        .get("personalNotes")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let acct = account_id.to_string();
     let fid = folder_id.to_string();
     let mut projected = Value::Null;
@@ -885,6 +902,13 @@ fn create_contact_core(
             folder_id: fid.clone(),
             display_name,
             emails,
+            phones,
+            company,
+            job_title,
+            department,
+            notes,
+            groups: Vec::new(),
+            malformed_vcard: false,
         };
         f.contacts.push(contact.clone());
         projected = serialize_contact(&contact);
@@ -924,6 +948,42 @@ fn update_contact_core(
         }
         if let Some(ea) = body.get("emailAddresses") {
             c.emails = parse_graph_emails(Some(ea));
+        }
+        // Any of the three phone keys present -> recompute the whole
+        // phone set from the body (Graph PATCH replaces the collection).
+        if body.get("homePhones").is_some()
+            || body.get("businessPhones").is_some()
+            || body.get("mobilePhone").is_some()
+        {
+            c.phones = parse_graph_phones(body);
+        }
+        if let Some(v) = body.get("companyName") {
+            c.company = if v.is_null() {
+                None
+            } else {
+                v.as_str().map(str::to_string)
+            };
+        }
+        if let Some(v) = body.get("jobTitle") {
+            c.job_title = if v.is_null() {
+                None
+            } else {
+                v.as_str().map(str::to_string)
+            };
+        }
+        if let Some(v) = body.get("department") {
+            c.department = if v.is_null() {
+                None
+            } else {
+                v.as_str().map(str::to_string)
+            };
+        }
+        if let Some(v) = body.get("personalNotes") {
+            c.notes = if v.is_null() {
+                None
+            } else {
+                v.as_str().map(str::to_string)
+            };
         }
         f.contacts[idx] = c.clone();
         projected = Some(serialize_contact(&c));
@@ -1018,7 +1078,81 @@ fn serialize_contact(contact: &Contact) -> Value {
         })
         .collect();
     obj.insert("emailAddresses".to_string(), Value::Array(emails));
+
+    // Phones fan out by kind into the Outlook contact shape: `mobile`
+    // -> the single `mobilePhone`, `work`/`business` -> `businessPhones`,
+    // everything else -> `homePhones`. This is the inverse of
+    // `parse_graph_phones` so a written phone round-trips.
+    let mut home_phones: Vec<Value> = Vec::new();
+    let mut business_phones: Vec<Value> = Vec::new();
+    let mut mobile_phone: Option<String> = None;
+    for p in &contact.phones {
+        match p.kind.as_deref() {
+            Some("mobile" | "cell") => {
+                if mobile_phone.is_none() {
+                    mobile_phone = Some(p.number.clone());
+                }
+            }
+            Some("work" | "business") => {
+                business_phones.push(Value::String(p.number.clone()));
+            }
+            _ => home_phones.push(Value::String(p.number.clone())),
+        }
+    }
+    obj.insert("homePhones".to_string(), Value::Array(home_phones));
+    obj.insert("businessPhones".to_string(), Value::Array(business_phones));
+    if let Some(mobile) = mobile_phone {
+        obj.insert("mobilePhone".to_string(), Value::String(mobile));
+    }
+
+    if let Some(company) = &contact.company {
+        obj.insert("companyName".to_string(), Value::String(company.clone()));
+    }
+    if let Some(title) = &contact.job_title {
+        obj.insert("jobTitle".to_string(), Value::String(title.clone()));
+    }
+    if let Some(dept) = &contact.department {
+        obj.insert("department".to_string(), Value::String(dept.clone()));
+    }
+    if let Some(notes) = &contact.notes {
+        obj.insert("personalNotes".to_string(), Value::String(notes.clone()));
+    }
     Value::Object(obj)
+}
+
+/// Collect the Outlook contact phone shape (`homePhones` /
+/// `businessPhones` / `mobilePhone`) back into fixture `ContactPhone`s,
+/// stamping the kind so a Graph write round-trips through the fanning
+/// serializer above.
+fn parse_graph_phones(body: &Value) -> Vec<ContactPhone> {
+    let mut out = Vec::new();
+    if let Some(arr) = body.get("homePhones").and_then(Value::as_array) {
+        for v in arr {
+            if let Some(n) = v.as_str() {
+                out.push(ContactPhone {
+                    number: n.to_string(),
+                    kind: Some("home".to_string()),
+                });
+            }
+        }
+    }
+    if let Some(arr) = body.get("businessPhones").and_then(Value::as_array) {
+        for v in arr {
+            if let Some(n) = v.as_str() {
+                out.push(ContactPhone {
+                    number: n.to_string(),
+                    kind: Some("work".to_string()),
+                });
+            }
+        }
+    }
+    if let Some(n) = body.get("mobilePhone").and_then(Value::as_str) {
+        out.push(ContactPhone {
+            number: n.to_string(),
+            kind: Some("mobile".to_string()),
+        });
+    }
+    out
 }
 
 fn graph_contact_tombstone(id: &str) -> Value {

@@ -35,9 +35,9 @@ L = large (subsystem).
 | 3 | ~~`Thread/changes` MISSING -> first delta cycle after open fails~~ **DONE** (`src/jmap.rs`) | JMAP | P1 | S |
 | 4 | ~~Graph `POST /$batch` MISSING -> all message hydration + writes fail~~ **DONE** for the read/hydration path (`src/graph/mail.rs`); write sub-requests still per-item 501 | Graph | P0/P1 | L |
 | 5 | CalDAV `sync-collection` REPORT + `sync-token` PROPFIND prop MISSING (ship together) | CalDAV | P1 | M |
-| 6 | People `GET /v1/people/{id}` (single) **DONE** (`src/people/contacts.rs`); `contactGroups.list` STILL MISSING (drives `address_books_list`) | Google | P1 | M |
+| 6 | ~~People `GET /v1/people/{id}` (single) + `contactGroups.list` (drives `address_books_list`)~~ **DONE** (`src/people/contacts.rs`: single-GET, `GET /v1/contactGroups`, backed `otherContacts`, `people:listDirectoryPeople` / `searchDirectoryPeople` GAL) | Google | P1 | M |
 | 7 | ~~`CalendarEvent/query` MISSING -> JMAP calendar read path (query-based) cannot run~~ **DONE** (`src/jmap_calendar.rs`) | JMAP | P1 | M |
-| 8 | No CardDAV surface at all (latent: only when an IMAP fixture configures `carddav`) | CardDAV | P1 (latent) | M |
+| 8 | ~~No CardDAV surface at all~~ **DONE** (`src/carddav/`: discovery chain, addressbook listing + ctag, multiget/query REPORT, PUT/DELETE, malformed-vCard `failed_ids` affordance; `--carddav-port` + `CARDDAV` sentinel) | CardDAV | P1 | M |
 
 Items 1 and 2 are true open/initial-sync blockers and should land
 first. SMTP is essentially clean.
@@ -328,12 +328,16 @@ through `Fixture::mutate` so a CardDAV PUT surfaces in Graph
 already feeds Graph `calendarView/delta`). New `--carddav-port` +
 `CARDDAV <port>` sentinel line.
 
-**Fidelity caveat:** the fixture `Contact` carries only `display_name`
-+ `emails`; bifrost's vCard parser also reads phones/orgs/addresses/
-notes/photos. A read-path v0 round-trips fine (all optional), but a
-fixture cannot stage a CardDAV contact with a phone/org until `Contact`
-grows those fields - same limitation the People-API write-back already
-has.
+**Fidelity caveat (RESOLVED):** the fixture `Contact` now carries
+`phones` / `company` / `job_title` / `department` / `notes` (plus a
+`groups` list and a `malformed_vcard` affordance) alongside
+`display_name` + `emails`. These thread through every provider
+projection (JMAP JSContact, Graph Outlook contact, People Person,
+CardDAV vCard) AND each provider's write-back verbs, so an enriched
+phone / org / notes round-trips on the next read. Addresses / photos
+remain unmodeled (a future `Contact` growth). ORG department does not
+round-trip through the CardDAV vCard projection (no dedicated vCard
+slot in the mock's serializer).
 
 ---
 
@@ -356,10 +360,18 @@ shipped commits):
   accept-and-ignore stubs (mailboxSettings, messageRules,
   `/subscriptions`). Only deliberately-out-of-scope surfaces remain
   (EWS, public folders, OneDrive, Drive hosting).
-- **Google:** People single-GET shipped; `contactGroups.list`
-  (address-book enumeration) still open.
+- **Google:** People single-GET, `GET /v1/contactGroups`
+  (address-book enumeration), fixture-backed `otherContacts`, and
+  `people:listDirectoryPeople` / `searchDirectoryPeople` (GAL, with
+  personal-account 403 -> empty) all shipped. Contact write-back now
+  durably stores phone / org / notes.
 - **SMTP** is clean (one P2: `FUTURERELEASE`).
 - **CalDAV** discovery/write are correct; the sync-token +
   sync-collection pair is the one real gap (ship together).
-- **CardDAV** is an entire missing protocol, but latent until a fixture
-  wires it to an IMAP account.
+- **CardDAV** shipped (`src/carddav/`): the PROPFIND discovery chain,
+  addressbook collection listing with CS:getctag, Depth:0 ctag
+  short-circuit, `addressbook-multiget` + `addressbook-query` REPORTs,
+  and PUT (If-None-Match / If-Match) / DELETE, all routed through
+  `Fixture::mutate` so a CardDAV write surfaces in the cross-provider
+  change_log. A contact flagged `malformed_vcard` serves an
+  unparseable body to drive bifrost's `Page::failed_ids` path.

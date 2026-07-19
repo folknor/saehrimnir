@@ -77,6 +77,20 @@ pub struct Fixture {
     /// reuse the same address across accounts. Empty by default;
     /// fixtures that don't need sendAs coverage can omit the table.
     pub send_as: Vec<SendAs>,
+    /// Google People contact groups (`contactGroups/*`). Served by
+    /// `GET /v1/contactGroups`, which bifrost-google fetches
+    /// unconditionally during `address_books_list`. May be empty; the
+    /// endpoint must still answer 200, not 404. Empty by default.
+    pub contact_groups: Vec<ContactGroup>,
+    /// Google People `otherContacts` corpus (auto-collected
+    /// addresses). Served by `GET /v1/otherContacts`. Empty by
+    /// default.
+    pub other_contacts: Vec<OtherContact>,
+    /// Google directory (GAL) people. Served by
+    /// `people:listDirectoryPeople` / `searchDirectoryPeople`. Empty
+    /// by default (models a personal account with no directory: the
+    /// endpoint answers 403).
+    pub directory_people: Vec<DirectoryPerson>,
     /// Per-account mutation logs, keyed by `account_id`. Each log
     /// tracks its own monotonic counter / current state token and its
     /// own bounded ring of transitions, all sharing
@@ -714,6 +728,36 @@ impl Fixture {
         self.contacts
             .iter()
             .filter(move |c| c.account_id == account_id)
+    }
+
+    /// Google contact groups scoped to one account.
+    pub fn contact_groups_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a ContactGroup> + 'a {
+        self.contact_groups
+            .iter()
+            .filter(move |g| g.account_id == account_id)
+    }
+
+    /// Google `otherContacts` scoped to one account.
+    pub fn other_contacts_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a OtherContact> + 'a {
+        self.other_contacts
+            .iter()
+            .filter(move |c| c.account_id == account_id)
+    }
+
+    /// Google directory (GAL) people scoped to one account.
+    pub fn directory_people_for<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> impl Iterator<Item = &'a DirectoryPerson> + 'a {
+        self.directory_people
+            .iter()
+            .filter(move |p| p.account_id == account_id)
     }
 
     /// Categories scoped to one account.
@@ -2018,12 +2062,101 @@ pub struct Contact {
     pub folder_id: String,
     pub display_name: Option<String>,
     pub emails: Vec<ContactEmail>,
+    /// Phone numbers. Threaded through every provider projection
+    /// (JMAP JSContact `phones`, Graph `homePhones` /
+    /// `businessPhones` / `mobilePhone`, People `phoneNumbers`,
+    /// CardDAV `TEL`) so the enriched contact columns populate
+    /// rather than stay NULL.
+    pub phones: Vec<ContactPhone>,
+    /// Organization / company name (Graph `companyName`, People /
+    /// JSContact organization `name`, vCard `ORG`).
+    pub company: Option<String>,
+    /// Job title (Graph `jobTitle`, People / JSContact organization
+    /// `title`, vCard `TITLE`).
+    pub job_title: Option<String>,
+    /// Department (Graph `department`, People organization
+    /// `department`).
+    pub department: Option<String>,
+    /// Freeform notes (Graph `personalNotes`, People `biographies`,
+    /// JSContact `notes`, vCard `NOTE`).
+    pub notes: Option<String>,
+    /// Google People `contactGroups/*` resource names this contact
+    /// is a member of. Projected into a Person's `memberships` so a
+    /// group-scoped `contacts_list` filters correctly; empty for
+    /// non-Google fixtures.
+    pub groups: Vec<String>,
+    /// CardDAV affordance: when true the CardDAV mock serves a
+    /// deliberately unparseable vCard body for this resource, so
+    /// bifrost-carddav fetches it, fails to tokenize it, and records
+    /// its id in `Page::failed_ids` rather than treating the absence
+    /// as a deletion. Ignored by every non-CardDAV projection.
+    pub malformed_vcard: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContactEmail {
     pub address: String,
     pub name: Option<String>,
+}
+
+/// A contact phone number plus an optional wire kind
+/// (`mobile` / `home` / `work` / ...). The kind maps per protocol:
+/// Graph splits by kind into `homePhones` / `businessPhones` /
+/// `mobilePhone`; People / vCard / JSContact carry it as a type
+/// label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactPhone {
+    pub number: String,
+    pub kind: Option<String>,
+}
+
+/// A Google People contact group (`contactGroups/{id}`). Surfaced by
+/// `GET /v1/contactGroups`, which bifrost-google's `address_books_list`
+/// fetches unconditionally - so it must exist (empty-but-200 is fine)
+/// or the whole Google contact pull fails at step 1. Cross-account:
+/// scoped to the owning account like every other resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactGroup {
+    /// Resource name, e.g. `contactGroups/friends`.
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+}
+
+/// A Google People `otherContacts` entry: an auto-collected address
+/// harvested from mail traffic, surfaced by bifrost-google as a
+/// synthetic `OtherAutoCollected`-corpus address book. Served by
+/// `GET /v1/otherContacts` (read-mask limited to names / emails /
+/// phones / metadata).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherContact {
+    /// People resource name, e.g. `otherContacts/c1`.
+    pub id: String,
+    pub account_id: String,
+    pub display_name: Option<String>,
+    pub emails: Vec<ContactEmail>,
+    pub phones: Vec<ContactPhone>,
+}
+
+/// A Google directory (Global Address List) person, served by
+/// `people:listDirectoryPeople` / `people:searchDirectoryPeople`.
+/// Distinct from personal contacts: these are the organization
+/// directory bifrost-google's `directory_search` enumerates. Scoped
+/// to the account whose directory surfaces them; an account that
+/// declares zero directory people models a personal Gmail account
+/// with no directory (the endpoint answers 403 -> bifrost swallows to
+/// an empty page).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryPerson {
+    /// People resource name, e.g. `people/dir-1`.
+    pub id: String,
+    pub account_id: String,
+    pub display_name: Option<String>,
+    pub emails: Vec<ContactEmail>,
+    pub phones: Vec<ContactPhone>,
+    pub company: Option<String>,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
 }
 
 /// Outlook master category. Real Graph stores these flat on the
@@ -2438,6 +2571,12 @@ pub(crate) struct RawFixture {
     pub(crate) contact_folders: Vec<RawContactFolder>,
     #[serde(default, rename = "contact")]
     pub(crate) contacts: Vec<RawContact>,
+    #[serde(default, rename = "contact_group")]
+    pub(crate) contact_groups: Vec<RawContactGroup>,
+    #[serde(default, rename = "other_contact")]
+    pub(crate) other_contacts: Vec<RawOtherContact>,
+    #[serde(default, rename = "directory_person")]
+    pub(crate) directory_people: Vec<RawDirectoryPerson>,
     #[serde(default, rename = "category")]
     pub(crate) categories: Vec<RawCategory>,
     #[serde(default, rename = "group")]
@@ -2563,6 +2702,17 @@ pub(crate) struct RawContactUpdate {
     /// Full-replace email list when present.
     #[serde(default)]
     pub(crate) emails: Option<Vec<RawContactEmail>>,
+    /// Full-replace phone list when present.
+    #[serde(default)]
+    pub(crate) phones: Option<Vec<RawContactPhone>>,
+    #[serde(default)]
+    pub(crate) company: Option<String>,
+    #[serde(default)]
+    pub(crate) job_title: Option<String>,
+    #[serde(default)]
+    pub(crate) department: Option<String>,
+    #[serde(default)]
+    pub(crate) notes: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2585,8 +2735,65 @@ pub(crate) struct RawContact {
     pub(crate) display_name: Option<String>,
     #[serde(default)]
     pub(crate) emails: Vec<RawContactEmail>,
+    #[serde(default)]
+    pub(crate) phones: Vec<RawContactPhone>,
+    #[serde(default)]
+    pub(crate) company: Option<String>,
+    #[serde(default)]
+    pub(crate) job_title: Option<String>,
+    #[serde(default)]
+    pub(crate) department: Option<String>,
+    #[serde(default)]
+    pub(crate) notes: Option<String>,
+    /// Google `contactGroups/*` resource names this contact joins.
+    #[serde(default)]
+    pub(crate) groups: Vec<String>,
+    /// When true the CardDAV mock serves an unparseable vCard body
+    /// for this resource (drives the `failed_ids` gate).
+    #[serde(default)]
+    pub(crate) malformed_vcard: bool,
     /// Optional override; defaults to the parent folder's
     /// `account_id` and must match it when both are present.
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawContactGroup {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawOtherContact {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) emails: Vec<RawContactEmail>,
+    #[serde(default)]
+    pub(crate) phones: Vec<RawContactPhone>,
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawDirectoryPerson {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) emails: Vec<RawContactEmail>,
+    #[serde(default)]
+    pub(crate) phones: Vec<RawContactPhone>,
+    #[serde(default)]
+    pub(crate) company: Option<String>,
+    #[serde(default)]
+    pub(crate) job_title: Option<String>,
+    #[serde(default)]
+    pub(crate) department: Option<String>,
     #[serde(default)]
     pub(crate) account_id: Option<String>,
 }
@@ -2657,6 +2864,28 @@ impl From<RawContactEmail> for ContactEmail {
                 name: None,
             },
             RawContactEmail::Full { address, name } => Self { address, name },
+        }
+    }
+}
+
+/// Authoring form for [`ContactPhone`]: a bare number string, or a
+/// `{ number, kind }` table. Mirrors [`RawContactEmail`]'s sugar.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RawContactPhone {
+    Bare(String),
+    Full {
+        number: String,
+        #[serde(default)]
+        kind: Option<String>,
+    },
+}
+
+impl From<RawContactPhone> for ContactPhone {
+    fn from(raw: RawContactPhone) -> Self {
+        match raw {
+            RawContactPhone::Bare(number) => Self { number, kind: None },
+            RawContactPhone::Full { number, kind } => Self { number, kind },
         }
     }
 }
@@ -3352,6 +3581,69 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             folder_id: c.folder_id,
             display_name: c.display_name,
             emails: c.emails.into_iter().map(ContactEmail::from).collect(),
+            phones: c.phones.into_iter().map(ContactPhone::from).collect(),
+            company: c.company,
+            job_title: c.job_title,
+            department: c.department,
+            notes: c.notes,
+            groups: c.groups,
+            malformed_vcard: c.malformed_vcard,
+        });
+    }
+
+    // Google People contact groups (`contactGroups/*`). Cross-account
+    // like every other resource; the id namespace is the People
+    // resource name, distinct from contact folders.
+    let mut contact_group_ids: HashMap<String, ()> = HashMap::new();
+    let mut contact_groups = Vec::with_capacity(raw.contact_groups.len());
+    for g in raw.contact_groups {
+        if contact_group_ids.insert(g.id.clone(), ()).is_some() {
+            return Err(format!("duplicate contact_group id {:?}", g.id));
+        }
+        let acct = resolve_account(g.account_id.as_ref(), "contact_group", &g.id)?;
+        contact_groups.push(ContactGroup {
+            id: g.id,
+            account_id: acct,
+            name: g.name,
+        });
+    }
+
+    // Google `otherContacts` (auto-collected addresses). Own id
+    // namespace (`otherContacts/*` resource names).
+    let mut other_contact_ids: HashMap<String, ()> = HashMap::new();
+    let mut other_contacts = Vec::with_capacity(raw.other_contacts.len());
+    for c in raw.other_contacts {
+        if other_contact_ids.insert(c.id.clone(), ()).is_some() {
+            return Err(format!("duplicate other_contact id {:?}", c.id));
+        }
+        let acct = resolve_account(c.account_id.as_ref(), "other_contact", &c.id)?;
+        other_contacts.push(OtherContact {
+            id: c.id,
+            account_id: acct,
+            display_name: c.display_name,
+            emails: c.emails.into_iter().map(ContactEmail::from).collect(),
+            phones: c.phones.into_iter().map(ContactPhone::from).collect(),
+        });
+    }
+
+    // Google directory (GAL) people. Own id namespace
+    // (`people/*` resource names).
+    let mut directory_person_ids: HashMap<String, ()> = HashMap::new();
+    let mut directory_people = Vec::with_capacity(raw.directory_people.len());
+    for p in raw.directory_people {
+        if directory_person_ids.insert(p.id.clone(), ()).is_some() {
+            return Err(format!("duplicate directory_person id {:?}", p.id));
+        }
+        let acct = resolve_account(p.account_id.as_ref(), "directory_person", &p.id)?;
+        directory_people.push(DirectoryPerson {
+            id: p.id,
+            account_id: acct,
+            display_name: p.display_name,
+            emails: p.emails.into_iter().map(ContactEmail::from).collect(),
+            phones: p.phones.into_iter().map(ContactPhone::from).collect(),
+            company: p.company,
+            job_title: p.job_title,
+            department: p.department,
         });
     }
 
@@ -3500,6 +3792,9 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         events,
         contact_folders,
         contacts,
+        contact_groups,
+        other_contacts,
+        directory_people,
         categories,
         groups,
         send_as: send_as_entries,
@@ -3795,25 +4090,47 @@ pub(crate) fn contact_create_op(raw: RawContact) -> ChangeOp {
         folder_id: raw.folder_id,
         display_name: raw.display_name,
         emails: raw.emails.into_iter().map(ContactEmail::from).collect(),
+        phones: raw.phones.into_iter().map(ContactPhone::from).collect(),
+        company: raw.company,
+        job_title: raw.job_title,
+        department: raw.department,
+        notes: raw.notes,
+        groups: raw.groups,
+        malformed_vcard: raw.malformed_vcard,
     }))
 }
 
-/// Build a `ContactUpdate` op. The `emails` field, when provided,
-/// is a full-replace projection.
+/// Full-replace / set fields for a change-script `contact_update`.
+/// Every field is optional: `None` leaves the target untouched;
+/// `Some` sets (or replaces) it. All the enriched columns thread
+/// through here so a change-script mutation can populate them.
+#[derive(Debug, Default)]
+pub(crate) struct ContactUpdateFields {
+    pub display_name: Option<String>,
+    pub folder_id: Option<String>,
+    pub emails: Option<Vec<ContactEmail>>,
+    pub phones: Option<Vec<ContactPhone>>,
+    pub company: Option<String>,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// Build a `ContactUpdate` op. Each `Some` field is a full-replace /
+/// set projection carried in the snake_case patch shape
+/// [`apply_contact_patch`] consumes.
 pub(crate) fn contact_update_op(
     id: String,
-    display_name: Option<String>,
-    folder_id: Option<String>,
-    emails: Option<Vec<ContactEmail>>,
+    fields: ContactUpdateFields,
 ) -> Result<ChangeOp, &'static str> {
     let mut patch = serde_json::Map::new();
-    if let Some(n) = display_name {
+    if let Some(n) = fields.display_name {
         patch.insert("display_name".into(), serde_json::Value::String(n));
     }
-    if let Some(f) = folder_id {
+    if let Some(f) = fields.folder_id {
         patch.insert("folder_id".into(), serde_json::Value::String(f));
     }
-    if let Some(emails) = emails {
+    if let Some(emails) = fields.emails {
         let arr: Vec<serde_json::Value> = emails
             .into_iter()
             .map(|e| {
@@ -3827,6 +4144,33 @@ pub(crate) fn contact_update_op(
             })
             .collect();
         patch.insert("emails".into(), serde_json::Value::Array(arr));
+    }
+    if let Some(phones) = fields.phones {
+        let arr: Vec<serde_json::Value> = phones
+            .into_iter()
+            .map(|p| {
+                let ContactPhone { number, kind } = p;
+                let mut obj = serde_json::Map::new();
+                obj.insert("number".into(), serde_json::Value::String(number));
+                if let Some(k) = kind {
+                    obj.insert("kind".into(), serde_json::Value::String(k));
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        patch.insert("phones".into(), serde_json::Value::Array(arr));
+    }
+    if let Some(c) = fields.company {
+        patch.insert("company".into(), serde_json::Value::String(c));
+    }
+    if let Some(t) = fields.job_title {
+        patch.insert("job_title".into(), serde_json::Value::String(t));
+    }
+    if let Some(d) = fields.department {
+        patch.insert("department".into(), serde_json::Value::String(d));
+    }
+    if let Some(n) = fields.notes {
+        patch.insert("notes".into(), serde_json::Value::String(n));
     }
     if patch.is_empty() {
         return Err("at least one field must be set");
@@ -3898,6 +4242,16 @@ pub(crate) fn apply_contact_folder_patch(
 /// by current `folder_id` and would never see the moved contact.
 /// Real Microsoft Graph doesn't expose `folder_id` as a writable
 /// property either; clients destroy + create.
+/// Decode a snake_case scalar patch value: a JSON string sets the
+/// field, `null` clears it to `None`, anything else is an error.
+fn string_or_null(v: &serde_json::Value, field: &str) -> Result<Option<String>, String> {
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s.clone())),
+        _ => Err(format!("{field} must be a string or null")),
+    }
+}
+
 pub(crate) fn apply_contact_patch(
     contact: &mut Contact,
     patch: &serde_json::Value,
@@ -3949,6 +4303,37 @@ pub(crate) fn apply_contact_patch(
                     out.push(ContactEmail { address, name });
                 }
                 contact.emails = out;
+            }
+            "phones" => {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| "phones must be an array".to_string())?;
+                let mut out = Vec::with_capacity(arr.len());
+                for p in arr {
+                    let number = p
+                        .get("number")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "phones entry missing number".to_string())?
+                        .to_string();
+                    let kind = p
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    out.push(ContactPhone { number, kind });
+                }
+                contact.phones = out;
+            }
+            "company" => {
+                contact.company = string_or_null(v, "company")?;
+            }
+            "job_title" => {
+                contact.job_title = string_or_null(v, "job_title")?;
+            }
+            "department" => {
+                contact.department = string_or_null(v, "department")?;
+            }
+            "notes" => {
+                contact.notes = string_or_null(v, "notes")?;
             }
             other => return Err(format!("unknown patch field {other:?}")),
         }
@@ -4122,11 +4507,22 @@ fn normalize_change_step(
     }
     for u in raw.contact_update {
         let entry_id = u.id.clone();
-        let emails = u
-            .emails
-            .map(|v| v.into_iter().map(ContactEmail::from).collect());
+        let fields = ContactUpdateFields {
+            display_name: u.display_name,
+            folder_id: u.folder_id,
+            emails: u
+                .emails
+                .map(|v| v.into_iter().map(ContactEmail::from).collect()),
+            phones: u
+                .phones
+                .map(|v| v.into_iter().map(ContactPhone::from).collect()),
+            company: u.company,
+            job_title: u.job_title,
+            department: u.department,
+            notes: u.notes,
+        };
         ops.push(
-            contact_update_op(u.id, u.display_name, u.folder_id, emails).map_err(|e| {
+            contact_update_op(u.id, fields).map_err(|e| {
                 format!("change step {id:?}: contact_update entry {entry_id:?}: {e}")
             })?,
         );

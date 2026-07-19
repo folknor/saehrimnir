@@ -179,6 +179,12 @@ struct Builder {
     contact_folders: Vec<crate::fixture::RawContactFolder>,
     /// Contacts accumulated via `contact({...})`.
     contacts: Vec<crate::fixture::RawContact>,
+    /// Google contact groups accumulated via `contact_group({...})`.
+    contact_groups: Vec<crate::fixture::RawContactGroup>,
+    /// Google `otherContacts` accumulated via `other_contact({...})`.
+    other_contacts: Vec<crate::fixture::RawOtherContact>,
+    /// Google directory people accumulated via `directory_person({...})`.
+    directory_people: Vec<crate::fixture::RawDirectoryPerson>,
     /// Outlook master categories accumulated via `category({...})`.
     categories: Vec<crate::fixture::RawCategory>,
     /// Microsoft Graph groups accumulated via `group({...})`.
@@ -207,6 +213,9 @@ impl Builder {
             events: vec![],
             contact_folders: self.contact_folders,
             contacts: self.contacts,
+            contact_groups: self.contact_groups,
+            other_contacts: self.other_contacts,
+            directory_people: self.directory_people,
             categories: self.categories,
             groups: self.groups,
             send_as: self.send_as,
@@ -247,6 +256,12 @@ fn install_builders(state: &mut State) {
     state.set_global("contact_folder");
     state.push_rust_fn(builder_contact);
     state.set_global("contact");
+    state.push_rust_fn(builder_contact_group);
+    state.set_global("contact_group");
+    state.push_rust_fn(builder_other_contact);
+    state.set_global("other_contact");
+    state.push_rust_fn(builder_directory_person);
+    state.set_global("directory_person");
     state.push_rust_fn(builder_category);
     state.set_global("category");
     state.push_rust_fn(builder_group);
@@ -443,6 +458,13 @@ fn builder_contact(state: &mut State) -> dellingr::Result<u8> {
     let folder_id = read_string(state, 1, "folder_id")?;
     let display_name = read_string_opt(state, 1, "display_name")?;
     let emails = read_contact_email_array_opt(state, 1, "emails")?;
+    let phones = read_contact_phone_array_opt(state, 1, "phones")?;
+    let company = read_string_opt(state, 1, "company")?;
+    let job_title = read_string_opt(state, 1, "job_title")?;
+    let department = read_string_opt(state, 1, "department")?;
+    let notes = read_string_opt(state, 1, "notes")?;
+    let groups = read_string_array_opt(state, 1, "groups")?;
+    let malformed_vcard = read_bool_opt(state, 1, "malformed_vcard")?.unwrap_or(false);
     let account_id = read_string_opt(state, 1, "account_id")?;
     builder_mut(state)?
         .contacts
@@ -451,8 +473,62 @@ fn builder_contact(state: &mut State) -> dellingr::Result<u8> {
             folder_id,
             display_name,
             emails,
+            phones,
+            company,
+            job_title,
+            department,
+            notes,
+            groups,
+            malformed_vcard,
             account_id,
         });
+    Ok(0)
+}
+
+/// `contact_group { id, name, account_id? }`. Google People contact
+/// group; `id` is the `contactGroups/{id}` resource name.
+fn builder_contact_group(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "contact_group")?;
+    let g = crate::fixture::RawContactGroup {
+        id: read_string(state, 1, "id")?,
+        name: read_string(state, 1, "name")?,
+        account_id: read_string_opt(state, 1, "account_id")?,
+    };
+    builder_mut(state)?.contact_groups.push(g);
+    Ok(0)
+}
+
+/// `other_contact { id, display_name?, emails?, phones?, account_id? }`.
+/// Google People `otherContacts` (auto-collected) entry.
+fn builder_other_contact(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "other_contact")?;
+    let c = crate::fixture::RawOtherContact {
+        id: read_string(state, 1, "id")?,
+        display_name: read_string_opt(state, 1, "display_name")?,
+        emails: read_contact_email_array_opt(state, 1, "emails")?,
+        phones: read_contact_phone_array_opt(state, 1, "phones")?,
+        account_id: read_string_opt(state, 1, "account_id")?,
+    };
+    builder_mut(state)?.other_contacts.push(c);
+    Ok(0)
+}
+
+/// `directory_person { id, display_name?, emails?, phones?, company?,
+/// job_title?, department?, account_id? }`. Google directory (GAL)
+/// person for `people:listDirectoryPeople` / `searchDirectoryPeople`.
+fn builder_directory_person(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "directory_person")?;
+    let p = crate::fixture::RawDirectoryPerson {
+        id: read_string(state, 1, "id")?,
+        display_name: read_string_opt(state, 1, "display_name")?,
+        emails: read_contact_email_array_opt(state, 1, "emails")?,
+        phones: read_contact_phone_array_opt(state, 1, "phones")?,
+        company: read_string_opt(state, 1, "company")?,
+        job_title: read_string_opt(state, 1, "job_title")?,
+        department: read_string_opt(state, 1, "department")?,
+        account_id: read_string_opt(state, 1, "account_id")?,
+    };
+    builder_mut(state)?.directory_people.push(p);
     Ok(0)
 }
 
@@ -708,6 +784,74 @@ fn read_contact_email_array_opt_present(
     };
     state.pop(1);
     result
+}
+
+/// Read a phone array (`{ "+1", { number = "+2", kind = "mobile" }, ... }`).
+/// Each entry is a bare number string or a `{ number, kind }` table.
+#[allow(clippy::cast_possible_wrap)]
+fn read_contact_phone_array_opt(
+    state: &mut State,
+    t: isize,
+    key: &str,
+) -> dellingr::Result<Vec<crate::fixture::RawContactPhone>> {
+    let typ = lookup(state, t, key)?;
+    let result: dellingr::Result<Vec<crate::fixture::RawContactPhone>> = match typ {
+        LuaType::Nil => Ok(Vec::new()),
+        LuaType::Table => {
+            let arr = state.get_top() as isize;
+            let len = state.table_len(arr);
+            let mut out = Vec::with_capacity(len);
+            for i in 1..=len {
+                state.push_number(i as f64);
+                state.get_table_raw(arr)?;
+                let entry_typ = state.typ(-1);
+                match entry_typ {
+                    LuaType::String => {
+                        out.push(crate::fixture::RawContactPhone::Bare(state.to_string(-1)?));
+                        state.pop(1);
+                    }
+                    LuaType::Table => {
+                        let entry_idx = state.get_top() as isize;
+                        let number = read_string(state, entry_idx, "number")?;
+                        let kind = read_string_opt(state, entry_idx, "kind")?;
+                        state.pop(1);
+                        out.push(crate::fixture::RawContactPhone::Full { number, kind });
+                    }
+                    _ => {
+                        state.pop(1);
+                        return fail(
+                            state,
+                            format!(
+                                "field {key:?} entry {i} must be a string or {{number, kind}} table"
+                            ),
+                        );
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => fail(state, format!("field {key:?} must be an array")),
+    };
+    state.pop(1);
+    result
+}
+
+/// Present-distinguishing phone reader for `contact_update` (Nil ->
+/// None, any Table -> Some, even empty). Mirrors
+/// [`read_contact_email_array_opt_present`].
+#[allow(clippy::cast_possible_wrap)]
+fn read_contact_phone_array_opt_present(
+    state: &mut State,
+    t: isize,
+    key: &str,
+) -> dellingr::Result<Option<Vec<crate::fixture::RawContactPhone>>> {
+    let typ = lookup(state, t, key)?;
+    if typ == LuaType::Nil {
+        state.pop(1);
+        return Ok(None);
+    }
+    state.pop(1);
+    read_contact_phone_array_opt(state, t, key).map(Some)
 }
 
 #[allow(clippy::cast_possible_wrap)]
@@ -1396,6 +1540,13 @@ fn read_contact_create(
             folder_id: read_string(state, entry_idx, "folder_id")?,
             display_name: read_string_opt(state, entry_idx, "display_name")?,
             emails: read_contact_email_array_opt(state, entry_idx, "emails")?,
+            phones: read_contact_phone_array_opt(state, entry_idx, "phones")?,
+            company: read_string_opt(state, entry_idx, "company")?,
+            job_title: read_string_opt(state, entry_idx, "job_title")?,
+            department: read_string_opt(state, entry_idx, "department")?,
+            notes: read_string_opt(state, entry_idx, "notes")?,
+            groups: read_string_array_opt(state, entry_idx, "groups")?,
+            malformed_vcard: read_bool_opt(state, entry_idx, "malformed_vcard")?.unwrap_or(false),
             account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
         state.pop(1);
@@ -1438,14 +1589,32 @@ fn read_contact_update(
         let folder_id = read_string_opt(state, entry_idx, "folder_id")?;
         let emails = read_contact_email_array_opt_present(state, entry_idx, "emails")?
             .map(|raws| raws.into_iter().map(ContactEmail::from).collect());
+        let phones =
+            read_contact_phone_array_opt_present(state, entry_idx, "phones")?.map(|raws| {
+                raws.into_iter()
+                    .map(crate::fixture::ContactPhone::from)
+                    .collect()
+            });
+        let company = read_string_opt(state, entry_idx, "company")?;
+        let job_title = read_string_opt(state, entry_idx, "job_title")?;
+        let department = read_string_opt(state, entry_idx, "department")?;
+        let notes = read_string_opt(state, entry_idx, "notes")?;
         state.pop(1);
-        let op = crate::fixture::contact_update_op(id, display_name, folder_id, emails).map_err(
-            |e| {
-                state.error(ErrorKind::InternalError(format!(
-                    "contact_update entry {i}: {e}"
-                )))
-            },
-        )?;
+        let fields = crate::fixture::ContactUpdateFields {
+            display_name,
+            folder_id,
+            emails,
+            phones,
+            company,
+            job_title,
+            department,
+            notes,
+        };
+        let op = crate::fixture::contact_update_op(id, fields).map_err(|e| {
+            state.error(ErrorKind::InternalError(format!(
+                "contact_update entry {i}: {e}"
+            )))
+        })?;
         ops.push(op);
     }
     state.pop(1);

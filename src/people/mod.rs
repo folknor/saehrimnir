@@ -8,20 +8,26 @@
 //! and lets ratatoskr's eventual `RATATOSKR_TEST_PEOPLE_ENDPOINT`
 //! override point at exactly this listener.
 //!
-//! v0 surface scope:
+//! Surface scope:
 //!
 //! - `GET /v1/people/me/connections` (paged list with sync-token
-//!   recovery).
-//! - `GET /v1/otherContacts` (paged list; v0 always projects an
-//!   empty list since the fixture has no `other_contacts` field
-//!   yet - the route is here so ratatoskr's bootstrap path
-//!   doesn't 404).
+//!   recovery). Each Person carries the enriched fixture columns:
+//!   names, emails, `phoneNumbers`, `organizations`, `biographies`,
+//!   and `memberships` (contact-group membership).
+//! - `GET /v1/contactGroups` (the fixture's `[[contact_group]]`
+//!   rows; empty-but-200 when none). bifrost-google fetches this
+//!   unconditionally during `address_books_list`, so a 404 breaks
+//!   the entire Google contact pull.
+//! - `GET /v1/otherContacts` (pages the fixture's `[[other_contact]]`
+//!   auto-collected corpus with readMask / pageToken).
+//! - `people:listDirectoryPeople` / `people:searchDirectoryPeople`
+//!   (organization directory / GAL search over the fixture's
+//!   `[[directory_person]]` rows; an account with no directory
+//!   people answers 403, which bifrost swallows to an empty page).
 //! - `PATCH /v1/people/{id}:updateContact?updatePersonFields=...`
-//!   (write-back from ratatoskr's contact editor; bumps state +
-//!   records `contact_updated` so the next delta surfaces the
-//!   contact). The fixture `Contact` only carries display name +
-//!   email list, so phone / organization / notes from the patch
-//!   body land in the request log but aren't durably stored.
+//!   (write-back; durably stores the patched name / email / phone /
+//!   organization / notes fields so they round-trip on the next
+//!   read, plus records `contact_updated`).
 //! - `DELETE /v1/people/{id}:deleteContact` (write-back delete;
 //!   removes the contact and records a `contact_destroyed`
 //!   transition so the next delta emits a `metadata.deleted`

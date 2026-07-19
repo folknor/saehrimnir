@@ -27,7 +27,9 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::fixture::{Contact, ContactEmail, ContactFolder, DeltaSet, Fixture, MutationDiff};
+use crate::fixture::{
+    Contact, ContactEmail, ContactFolder, ContactPhone, DeltaSet, Fixture, MutationDiff,
+};
 
 /// Server-side cap on `ContactCard/query` `limit` (mirrors
 /// `Email/query`).
@@ -170,7 +172,63 @@ pub(crate) fn serialize_contact_card(c: &Contact) -> Value {
         obj.insert("emails".into(), Value::Object(emails));
     }
 
+    // JSContact `phones`: kind `home`/`work` project to a `contexts`
+    // map, any other kind to a `features` map (RFC 9553 §2.3.3), so a
+    // round-trip through bifrost's `phone_kind` (features-then-contexts)
+    // preserves the label.
+    if !c.phones.is_empty() {
+        let mut phones = Map::new();
+        for (i, p) in c.phones.iter().enumerate() {
+            let (contexts, features) = phone_kind_fields(p.kind.as_deref());
+            phones.insert(
+                format!("p{}", i + 1),
+                json!({
+                    "@type": "Phone",
+                    "number": p.number,
+                    "contexts": contexts,
+                    "features": features,
+                }),
+            );
+        }
+        obj.insert("phones".into(), Value::Object(phones));
+    }
+
+    // JSContact `organizations`: the fixture carries a single
+    // company/title/department, projected as one `Organization`.
+    if c.company.is_some() || c.job_title.is_some() {
+        let mut org = Map::new();
+        org.insert("@type".into(), Value::String("Organization".into()));
+        if let Some(company) = &c.company {
+            org.insert("name".into(), Value::String(company.clone()));
+        }
+        if let Some(title) = &c.job_title {
+            org.insert("title".into(), Value::String(title.clone()));
+        }
+        let mut orgs = Map::new();
+        orgs.insert("o1".into(), Value::Object(org));
+        obj.insert("organizations".into(), Value::Object(orgs));
+    }
+
+    if let Some(notes) = &c.notes {
+        obj.insert(
+            "notes".into(),
+            json!({ "n1": { "@type": "Note", "note": notes } }),
+        );
+    }
+
     Value::Object(obj)
+}
+
+/// JSContact context / feature maps for a phone `kind`. `home`/`work`
+/// are contexts; anything else (e.g. `mobile`, `fax`) is a feature.
+/// Absent kind yields two `null`s. Mirrors bifrost's `phone_kind_fields`
+/// inverse so a round-trip preserves the label.
+fn phone_kind_fields(kind: Option<&str>) -> (Value, Value) {
+    match kind {
+        Some(k @ ("home" | "work")) => (json!({ k: true }), Value::Null),
+        Some(k) => (Value::Null, json!({ k: true })),
+        None => (Value::Null, Value::Null),
+    }
 }
 
 // ── ContactCard/query ───────────────────────────────────────────────
@@ -536,6 +594,9 @@ fn build_contact_from_create(
     let account_id = folder.account_id.clone();
     let display_name = name_full(obj.get("name"));
     let emails = parse_emails(obj.get("emails"));
+    let phones = parse_phones(obj.get("phones"));
+    let (company, job_title) = parse_organization(obj.get("organizations"));
+    let notes = parse_notes(obj.get("notes"));
     let server_id = fix.mint_contact_id();
     Ok((
         server_id.clone(),
@@ -545,6 +606,13 @@ fn build_contact_from_create(
             folder_id,
             display_name,
             emails,
+            phones,
+            company,
+            job_title,
+            department: None,
+            notes,
+            groups: Vec::new(),
+            malformed_vcard: false,
         },
     ))
 }
@@ -564,6 +632,26 @@ fn apply_contact_patch(fix: &Fixture, contact: &mut Contact, patch: &Value) -> R
             }
             "emails" => {
                 contact.emails = parse_emails(Some(v));
+            }
+            "phones" => {
+                contact.phones = parse_phones(Some(v));
+            }
+            "organizations" => {
+                if v.is_null() {
+                    contact.company = None;
+                    contact.job_title = None;
+                } else {
+                    let (company, job_title) = parse_organization(Some(v));
+                    contact.company = company;
+                    contact.job_title = job_title;
+                }
+            }
+            "notes" => {
+                contact.notes = if v.is_null() {
+                    None
+                } else {
+                    parse_notes(Some(v))
+                };
             }
             "addressBookIds" => {
                 // Accept both the full-replace form (`{ id: true }`)
@@ -623,6 +711,54 @@ fn parse_emails(v: Option<&Value>) -> Vec<ContactEmail> {
             })
         })
         .collect()
+}
+
+/// JSContact `phones` map -> fixture `ContactPhone`s. The kind comes
+/// from `features` (first true key) then `contexts`, matching bifrost's
+/// `phone_kind`.
+fn parse_phones(v: Option<&Value>) -> Vec<ContactPhone> {
+    let Some(obj) = v.and_then(Value::as_object) else {
+        return vec![];
+    };
+    obj.values()
+        .filter_map(|p| {
+            let number = p.get("number").and_then(Value::as_str)?.to_string();
+            let kind =
+                first_true_key(p.get("features")).or_else(|| first_true_key(p.get("contexts")));
+            Some(ContactPhone { number, kind })
+        })
+        .collect()
+}
+
+/// JSContact `organizations` map -> the fixture's single company /
+/// title pair, taken from the first `Organization` entry.
+fn parse_organization(v: Option<&Value>) -> (Option<String>, Option<String>) {
+    let Some(obj) = v.and_then(Value::as_object) else {
+        return (None, None);
+    };
+    match obj.values().next().and_then(Value::as_object) {
+        Some(org) => (
+            org.get("name").and_then(Value::as_str).map(str::to_string),
+            org.get("title").and_then(Value::as_str).map(str::to_string),
+        ),
+        None => (None, None),
+    }
+}
+
+/// JSContact `notes` map -> the first entry's `note` string.
+fn parse_notes(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_object)?
+        .values()
+        .find_map(|n| n.get("note").and_then(Value::as_str).map(str::to_string))
+}
+
+/// First key mapped to `true` in a JSContact boolean map
+/// (`contexts` / `features`).
+fn first_true_key(v: Option<&Value>) -> Option<String> {
+    v?.as_object()?
+        .iter()
+        .find(|(_, val)| val.as_bool() == Some(true))
+        .map(|(k, _)| k.clone())
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────

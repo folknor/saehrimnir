@@ -61,6 +61,14 @@ pub struct Args {
     #[arg(long = "caldav-port", default_value_t = 0)]
     pub caldav_port: u16,
 
+    /// CardDAV mock port. `0` (default) picks an ephemeral port; the
+    /// chosen port lands in the readiness file under `CARDDAV <port>`.
+    /// Mounts the WebDAV/CardDAV verb surface (PROPFIND, REPORT, GET,
+    /// PUT, DELETE) under `/`, `/principals/{user}/`, and
+    /// `/addressbooks/{user}/...`.
+    #[arg(long = "carddav-port", default_value_t = 0)]
+    pub carddav_port: u16,
+
     /// Path to write the readiness sentinel once every listener is
     /// bound. One line per protocol, e.g.:
     /// `JMAP 12345\nIMAP 23456\nSMTP 34567\nGRAPH 45678\nGMAIL 56789\n`.

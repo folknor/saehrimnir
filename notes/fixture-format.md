@@ -417,6 +417,23 @@ emails = [
     "alice.anderson@example.org",  # bare-string sugar - same as
                                    # { address = "...", name = nil }
 ]
+# Enriched columns (all optional). These thread through EVERY provider
+# projection (JMAP JSContact, Graph Outlook contact, People Person,
+# CardDAV vCard) and each provider's write-back, so a written value
+# round-trips on the next read.
+phones = [
+    { number = "+15551234", kind = "mobile" },  # kind: mobile/home/work/...
+    "+15559999",                                # bare-string sugar (no kind)
+]
+company = "Analytical Engines"
+job_title = "Programmer"
+department = "R&D"            # note: no vCard slot, so it does NOT
+                             # round-trip through CardDAV write-back
+notes = "auto-collected note"
+groups = ["contactGroups/friends"]  # Google contactGroup membership
+malformed_vcard = false      # when true, the CardDAV mock serves an
+                             # unparseable vCard body for this contact
+                             # (drives bifrost's Page::failed_ids path)
 ```
 
 Validation:
@@ -429,14 +446,51 @@ Validation:
 - `contact.folder_id` references a declared folder.
 
 Contacts and folders project over the Graph
-`/v1.0/me/contactFolders/...` and `/v1.0/me/contacts/...` surfaces;
-the same canonical types feed any future People-API listener when
-that scout doc lands. The Graph mock supports the GET endpoints
-plus the `contacts/delta` walker driven by the change_log.
+`/v1.0/me/contactFolders/...` + `/v1.0/me/contacts/...`, the JMAP
+`AddressBook/*` + `ContactCard/*`, the Google People
+`/v1/people/me/connections`, and the CardDAV `/addressbooks/...`
+surfaces from one canonical type. Each contact-folder is also a
+CardDAV address book. Reads and change-log deltas cross all four
+providers; a write on any one surfaces on the others.
 
 The Lua loader exposes the same blocks via `contact_folder({...})`
-and `contact({...})` builders; the `emails` field accepts the same
+and `contact({...})` builders; `emails` and `phones` accept the same
 bare-string-or-table sugar as the TOML form.
+
+### Google-only contact surfaces (optional)
+
+```toml
+# Contact groups - GET /v1/contactGroups (bifrost-google fetches this
+# unconditionally during address_books_list, so it must exist).
+[[contact_group]]
+id = "contactGroups/friends"   # People resource name
+name = "Friends"
+
+# otherContacts - auto-collected addresses; GET /v1/otherContacts.
+[[other_contact]]
+id = "otherContacts/oc1"       # People resource name
+display_name = "Auto Collected"  # optional
+emails = ["auto@example.test"]
+phones = [{ number = "+15550000", kind = "work" }]  # optional
+
+# Directory (GAL) people - people:listDirectoryPeople /
+# searchDirectoryPeople. An account with ZERO directory_person rows
+# answers 403 (models a personal account with no directory; bifrost
+# swallows it to an empty page). Declare rows to make a GAL fetch
+# return results.
+[[directory_person]]
+id = "people/dir1"             # People resource name
+display_name = "Directory Person"
+emails = ["dir@corp.test"]
+phones = [{ number = "+15551111", kind = "work" }]
+company = "Corp"
+job_title = "Engineer"
+department = "Platform"
+```
+
+All three carry an optional `account_id` (defaults to primary).
+Lua builders: `contact_group({...})`, `other_contact({...})`,
+`directory_person({...})`.
 
 ## Master categories (optional)
 
@@ -677,14 +731,18 @@ Op contracts:
   (forces the script author to destroy the contained contacts
   first).
 - **`contact_create`**: array of `{ id, folder_id, display_name?,
-  emails }`. Same `emails` shape as the static builder. Folder
-  reference is validated at apply time so a step can create the
-  folder earlier in its op list and a contact later.
+  emails, phones?, company?, job_title?, department?, notes?,
+  groups?, malformed_vcard? }`. Same field shapes as the static
+  `contact` builder. Folder reference is validated at apply time so
+  a step can create the folder earlier in its op list and a contact
+  later.
 - **`contact_update`**: array of `{ id, display_name?,
-  folder_id?, emails? }`. `emails`, when present, is a
-  full-replace. `folder_id` validates against the current
-  fixture's folders at apply time (lets a step move a contact to
-  a folder created by an earlier op in the same step).
+  folder_id?, emails?, phones?, company?, job_title?, department?,
+  notes? }`. `emails` / `phones`, when present, are full-replaces;
+  the scalar enriched fields set the column. `folder_id` validates
+  against the current fixture's folders at apply time (lets a step
+  move a contact to a folder created by an earlier op in the same
+  step).
 - **`contact_destroy`**: array of contact-id strings.
 
 ### TOML projection

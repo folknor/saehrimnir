@@ -7,7 +7,7 @@ use saehrimnir::oauth::TokenStore;
 use saehrimnir::request_log::RequestLog;
 use saehrimnir::sentinel::ProtocolPort;
 use saehrimnir::{
-    caldav, cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp, tls,
+    caldav, carddav, cli, gmail, graph, imap, routes, scenario, sentinel, shutdown, smtp, tls,
 };
 use tokio::sync::watch;
 
@@ -73,6 +73,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let caldav_addr = caldav_listener.local_addr()?;
     eprintln!("saehrimnir: caldav listening on {caldav_addr}");
 
+    // CardDAV listener (sibling to CalDAV; own port because CardDAV
+    // uses the non-standard PROPFIND / REPORT verbs and clients
+    // identify it by its DAV-namespaced response shape).
+    let carddav_listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.carddav_port)).await?;
+    let carddav_addr = carddav_listener.local_addr()?;
+    eprintln!("saehrimnir: carddav listening on {carddav_addr}");
+
     // Google People API listener (sibling to Gmail; real People API
     // lives on a different host).
     let people_listener =
@@ -115,6 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProtocolPort {
                 name: "CALDAV",
                 port: caldav_addr.port(),
+            },
+            ProtocolPort {
+                name: "CARDDAV",
+                port: carddav_addr.port(),
             },
             ProtocolPort {
                 name: "PEOPLE",
@@ -301,6 +313,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         caldav::serve(caldav_listener, caldav_state, caldav_shutdown_rx).await
     });
 
+    // CardDAV server. Shares the same `SharedHandles` so the request
+    // log, latency knob, and fixture image match the other listeners.
+    let carddav_state = carddav::AppState {
+        shared: shared.clone(),
+    };
+    let carddav_shutdown_rx = shutdown_rx.clone();
+    let carddav_task = tokio::spawn(async move {
+        carddav::serve(carddav_listener, carddav_state, carddav_shutdown_rx).await
+    });
+
     // Google People API server.
     let people_state = saehrimnir::people::AppState {
         shared: shared.clone(),
@@ -356,6 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = graph_task.await;
         let _ = gmail_task.await;
         let _ = caldav_task.await;
+        let _ = carddav_task.await;
         let _ = people_task.await;
         let _ = gcal_task.await;
     };

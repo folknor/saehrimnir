@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod caldav;
+pub mod carddav;
 pub mod cli;
 pub mod connection_id;
 pub mod discovery;

@@ -14,6 +14,21 @@
 //! HTTP 410 with the standard People error envelope; ratatoskr's
 //! recovery path drops the saved token and re-bootstraps via a
 //! token-less call.
+//!
+//! Contact-group, directory, and otherContacts coverage:
+//! - `GET /v1/contactGroups` returns the fixture's `[[contact_group]]`
+//!   rows (empty-but-200 when none are declared). bifrost-google
+//!   fetches this unconditionally during `address_books_list`, so a
+//!   404 would break the whole Google contact pull.
+//! - `GET /v1/otherContacts` pages the fixture's `[[other_contact]]`
+//!   auto-collected corpus (readMask / pageToken).
+//! - `people:listDirectoryPeople` / `people:searchDirectoryPeople`
+//!   serve the fixture's `[[directory_person]]` GAL rows; an account
+//!   with no directory people answers 403 (`PermissionDenied`), which
+//!   bifrost swallows to an empty page (personal-account behavior).
+//! - `PATCH .../{id}:updateContact` durably stores the patched
+//!   phone / organization / notes / name / email fields, so a
+//!   write-back round-trips on the next read.
 
 use axum::{
     Router,
@@ -26,7 +41,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, ok_json};
-use crate::fixture::{Contact, Fixture, MutationDiff};
+use crate::fixture::{Contact, ContactEmail, ContactPhone, Fixture, MutationDiff, OtherContact};
 
 /// Resolve the request's bearer to the account it authorizes,
 /// falling back to primary.
@@ -44,6 +59,19 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/people/me/connections", get(list_connections))
         .route("/v1/otherContacts", get(list_other_contacts))
+        // Google People contact groups. bifrost-google's
+        // `address_books_list` fetches this UNCONDITIONALLY as step 1
+        // of the whole Google contact pull, so a 404 here breaks every
+        // downstream contact operation. An empty-but-200 groups list is
+        // acceptable when the fixture declares none.
+        .route("/v1/contactGroups", get(list_contact_groups))
+        // Organization directory (GAL) search. The custom-verb forms
+        // arrive as a single `people:{verb}` segment under `/v1/`.
+        .route("/v1/people:listDirectoryPeople", get(list_directory_people))
+        .route(
+            "/v1/people:searchDirectoryPeople",
+            get(search_directory_people),
+        )
         // Google's `:updateContact` / `:deleteContact` custom verbs
         // arrive as a single segment (`{id}:updateContact`) on the
         // `/v1/people/...` path. ratatoskr addresses contacts via
@@ -257,13 +285,317 @@ async fn list_other_contacts(
             "expired",
         );
     }
-    // v0: empty list. Reserved for a fixture-side `[other_contact]`
-    // shape if ratatoskr ever needs adversarial coverage there.
-    ok_json(json!({
-        "otherContacts": [],
-        "totalSize": 0,
-        "nextSyncToken": fixture.state_for(&account_id),
-    }))
+
+    // Page the fixture-declared otherContacts corpus (auto-collected
+    // addresses). Same pageSize / pageToken contract as connections;
+    // the final page carries `nextSyncToken`, earlier pages a
+    // `nextPageToken`.
+    let mut sorted: Vec<&OtherContact> = fixture.other_contacts_for(&account_id).collect();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    let total = sorted.len();
+    let page_size = clamp_page_size(params.page_size);
+    let offset = parse_page_token(params.page_token.as_deref()).unwrap_or(0);
+    if offset > total {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "pageToken offset exceeds total",
+            "badRequest",
+        );
+    }
+    let end = (offset + page_size).min(total);
+    let slice: Vec<Value> = sorted[offset..end]
+        .iter()
+        .map(|c| serialize_other_contact(c))
+        .collect();
+    let mut body = Map::new();
+    body.insert("otherContacts".into(), Value::Array(slice));
+    body.insert("totalSize".into(), Value::Number((total as u64).into()));
+    if end < total {
+        body.insert(
+            "nextPageToken".into(),
+            Value::String(encode_page_token(end)),
+        );
+    } else {
+        body.insert(
+            "nextSyncToken".into(),
+            Value::String(fixture.state_for(&account_id).to_string()),
+        );
+    }
+    ok_json(Value::Object(body))
+}
+
+/// `GET /v1/contactGroups` - the Google People contact groups list.
+/// bifrost fetches this unconditionally before any contact read, so it
+/// must answer 200 (an empty list is fine). Groups are minimal
+/// `{ resourceName, name }` projections; the fixture drives them.
+async fn list_contact_groups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ListParams>,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "list_contact_groups", |_| Ok(())) {
+        return o;
+    }
+    let account_id = bearer_account(&state, &headers);
+    let fixture = state.fixture();
+    let mut sorted: Vec<_> = fixture.contact_groups_for(&account_id).collect();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    let total = sorted.len();
+    let page_size = clamp_page_size(params.page_size);
+    let offset = parse_page_token(params.page_token.as_deref()).unwrap_or(0);
+    if offset > total {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "pageToken offset exceeds total",
+            "badRequest",
+        );
+    }
+    let end = (offset + page_size).min(total);
+    let groups: Vec<Value> = sorted[offset..end]
+        .iter()
+        .map(|g| {
+            json!({
+                "resourceName": g.id,
+                "name": g.name,
+                "formattedName": g.name,
+                "groupType": "USER_CONTACT_GROUP",
+            })
+        })
+        .collect();
+    let mut body = Map::new();
+    body.insert("contactGroups".into(), Value::Array(groups));
+    body.insert("totalItems".into(), Value::Number((total as u64).into()));
+    if end < total {
+        body.insert(
+            "nextPageToken".into(),
+            Value::String(encode_page_token(end)),
+        );
+    }
+    ok_json(Value::Object(body))
+}
+
+/// `GET /v1/people:listDirectoryPeople` - organization directory (GAL)
+/// enumeration (bifrost's empty-query directory path). An account that
+/// declares zero directory people models a personal Gmail account with
+/// no directory: it answers 403 (`PermissionDenied`), which bifrost
+/// swallows to an empty page. A corporate account returns its directory
+/// people, `pageSize` / `pageToken` paged.
+async fn list_directory_people(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ListParams>,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "list_directory_people", |_| Ok(())) {
+        return o;
+    }
+    let account_id = bearer_account(&state, &headers);
+    let fixture = state.fixture();
+    directory_page(&fixture, &account_id, &params, None)
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DirectoryParams {
+    #[serde(default, rename = "pageSize")]
+    page_size: Option<usize>,
+    #[serde(default, rename = "pageToken")]
+    page_token: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// `GET /v1/people:searchDirectoryPeople` - directory search. Filters
+/// the account's directory people by a case-insensitive substring over
+/// display name / email / organization. An empty `query` (bifrost's
+/// cache-priming warmup) matches everything. No-directory accounts 403
+/// exactly as `listDirectoryPeople` does, so the warmup's own 403 short-
+/// circuits bifrost to an empty page.
+async fn search_directory_people(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<DirectoryParams>,
+) -> Response {
+    if let Some(o) = super::maybe_override(&state, "search_directory_people", |s| {
+        if let Some(q) = &params.query {
+            crate::lua::req_set_str(s, "query", q)?;
+        }
+        Ok(())
+    }) {
+        return o;
+    }
+    let account_id = bearer_account(&state, &headers);
+    let fixture = state.fixture();
+    let list_params = ListParams {
+        page_size: params.page_size,
+        page_token: params.page_token.clone(),
+        ..Default::default()
+    };
+    let needle = params
+        .query
+        .as_deref()
+        .map(str::to_lowercase)
+        .filter(|q| !q.is_empty());
+    directory_page(&fixture, &account_id, &list_params, needle.as_deref())
+}
+
+/// Shared directory pagination + 403-absence rule for
+/// `listDirectoryPeople` / `searchDirectoryPeople`. `needle`, when set,
+/// filters by a case-insensitive substring across the projected fields.
+fn directory_page(
+    fixture: &Fixture,
+    account_id: &str,
+    params: &ListParams,
+    needle: Option<&str>,
+) -> Response {
+    // No directory declared for this account -> the account has no
+    // directory at all (personal Gmail). 403 PermissionDenied; bifrost
+    // swallows it to an empty page.
+    if fixture.directory_people_for(account_id).next().is_none() {
+        return error(
+            StatusCode::FORBIDDEN,
+            "account has no organization directory",
+            "forbidden",
+        );
+    }
+    let mut sorted: Vec<_> = fixture
+        .directory_people_for(account_id)
+        .filter(|p| match needle {
+            None => true,
+            Some(n) => directory_matches(p, n),
+        })
+        .collect();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    let total = sorted.len();
+    let page_size = clamp_page_size(params.page_size);
+    let offset = parse_page_token(params.page_token.as_deref()).unwrap_or(0);
+    if offset > total {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "pageToken offset exceeds total",
+            "badRequest",
+        );
+    }
+    let end = (offset + page_size).min(total);
+    let people: Vec<Value> = sorted[offset..end]
+        .iter()
+        .map(|p| serialize_directory_person(p))
+        .collect();
+    let mut body = Map::new();
+    body.insert("people".into(), Value::Array(people));
+    if end < total {
+        body.insert(
+            "nextPageToken".into(),
+            Value::String(encode_page_token(end)),
+        );
+    }
+    ok_json(Value::Object(body))
+}
+
+fn directory_matches(p: &crate::fixture::DirectoryPerson, needle: &str) -> bool {
+    p.display_name
+        .as_deref()
+        .is_some_and(|n| n.to_lowercase().contains(needle))
+        || p.emails
+            .iter()
+            .any(|e| e.address.to_lowercase().contains(needle))
+        || p.company
+            .as_deref()
+            .is_some_and(|c| c.to_lowercase().contains(needle))
+}
+
+/// Project an `OtherContact` into a People `Person`. otherContacts
+/// carry only names / emails / phones / metadata (the read-mask subset
+/// bifrost requests), and their resource name lives under
+/// `otherContacts/*`.
+fn serialize_other_contact(c: &OtherContact) -> Value {
+    let mut obj = Map::new();
+    obj.insert("resourceName".into(), Value::String(c.id.clone()));
+    obj.insert("etag".into(), Value::String(format!("etag-{}", c.id)));
+    let mut metadata = Map::new();
+    metadata.insert("deleted".into(), Value::Bool(false));
+    metadata.insert(
+        "sources".into(),
+        Value::Array(vec![json!({ "type": "OTHER_CONTACT", "id": c.id })]),
+    );
+    obj.insert("metadata".into(), Value::Object(metadata));
+    if let Some(name) = &c.display_name {
+        obj.insert(
+            "names".into(),
+            Value::Array(vec![json!({ "displayName": name })]),
+        );
+    }
+    let emails: Vec<Value> = c
+        .emails
+        .iter()
+        .map(|e| json!({ "value": e.address, "type": "other" }))
+        .collect();
+    obj.insert("emailAddresses".into(), Value::Array(emails));
+    if !c.phones.is_empty() {
+        let phones: Vec<Value> = c
+            .phones
+            .iter()
+            .map(|p| match &p.kind {
+                Some(k) => json!({ "value": p.number, "type": k }),
+                None => json!({ "value": p.number }),
+            })
+            .collect();
+        obj.insert("phoneNumbers".into(), Value::Array(phones));
+    }
+    Value::Object(obj)
+}
+
+/// Project a `DirectoryPerson` into a People `Person` for the directory
+/// endpoints (names / emails / phones / organizations read-mask).
+fn serialize_directory_person(p: &crate::fixture::DirectoryPerson) -> Value {
+    let mut obj = Map::new();
+    obj.insert("resourceName".into(), Value::String(p.id.clone()));
+    obj.insert("etag".into(), Value::String(format!("etag-{}", p.id)));
+    let mut metadata = Map::new();
+    metadata.insert("deleted".into(), Value::Bool(false));
+    metadata.insert(
+        "sources".into(),
+        Value::Array(vec![json!({ "type": "DIRECTORY", "id": p.id })]),
+    );
+    obj.insert("metadata".into(), Value::Object(metadata));
+    if let Some(name) = &p.display_name {
+        obj.insert(
+            "names".into(),
+            Value::Array(vec![json!({ "displayName": name })]),
+        );
+    }
+    let emails: Vec<Value> = p
+        .emails
+        .iter()
+        .map(|e| json!({ "value": e.address, "type": "work" }))
+        .collect();
+    obj.insert("emailAddresses".into(), Value::Array(emails));
+    if !p.phones.is_empty() {
+        let phones: Vec<Value> = p
+            .phones
+            .iter()
+            .map(|ph| match &ph.kind {
+                Some(k) => json!({ "value": ph.number, "type": k }),
+                None => json!({ "value": ph.number }),
+            })
+            .collect();
+        obj.insert("phoneNumbers".into(), Value::Array(phones));
+    }
+    if p.company.is_some() || p.job_title.is_some() || p.department.is_some() {
+        let mut org = Map::new();
+        if let Some(company) = &p.company {
+            org.insert("name".into(), Value::String(company.clone()));
+        }
+        if let Some(title) = &p.job_title {
+            org.insert("title".into(), Value::String(title.clone()));
+        }
+        if let Some(dept) = &p.department {
+            org.insert("department".into(), Value::String(dept.clone()));
+        }
+        obj.insert(
+            "organizations".into(),
+            Value::Array(vec![Value::Object(org)]),
+        );
+    }
+    Value::Object(obj)
 }
 
 // ── Mutations ───────────────────────────────────────────────────────
@@ -334,9 +666,20 @@ async fn update_contact(
         );
     }
     let id_for_diff = id.clone();
-    let _ = fix.mutate(|_| MutationDiff {
-        contact_updated: vec![id_for_diff.clone()],
-        ..Default::default()
+    let acct = account_id.clone();
+    let body = parsed.clone();
+    let _ = fix.mutate(|f| {
+        if let Some(idx) = f
+            .contacts
+            .iter()
+            .position(|c| c.account_id == acct && c.id == id_for_diff)
+        {
+            apply_person_patch(&mut f.contacts[idx], &body);
+        }
+        MutationDiff {
+            contact_updated: vec![id_for_diff.clone()],
+            ..Default::default()
+        }
     });
     let view = fix
         .contacts
@@ -484,6 +827,86 @@ fn tombstone_person(id: &str) -> Value {
     })
 }
 
+/// Apply a People `updateContact` Person body to a stored contact.
+/// bifrost sends the full modeled `Person` (it fetches, patches, and
+/// re-sends), so a field's presence in the body means "write it".
+/// Absent fields are left untouched.
+fn apply_person_patch(contact: &mut Contact, body: &Value) {
+    if let Some(names) = body.get("names").and_then(Value::as_array)
+        && let Some(name) = names.first()
+    {
+        let display = name
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                let given = name.get("givenName").and_then(Value::as_str).unwrap_or("");
+                let family = name.get("familyName").and_then(Value::as_str).unwrap_or("");
+                let joined = format!("{given} {family}");
+                let joined = joined.trim().to_string();
+                (!joined.is_empty()).then_some(joined)
+            });
+        contact.display_name = display;
+    }
+    if let Some(emails) = body.get("emailAddresses").and_then(Value::as_array) {
+        contact.emails = emails
+            .iter()
+            .filter_map(|e| {
+                let address = e.get("value").and_then(Value::as_str)?.to_string();
+                Some(ContactEmail {
+                    address,
+                    name: None,
+                })
+            })
+            .collect();
+    }
+    if let Some(phones) = body.get("phoneNumbers").and_then(Value::as_array) {
+        contact.phones = phones
+            .iter()
+            .filter_map(|p| {
+                let number = p.get("value").and_then(Value::as_str)?.to_string();
+                let kind = people_phone_kind(p);
+                Some(ContactPhone { number, kind })
+            })
+            .collect();
+    }
+    if let Some(orgs) = body.get("organizations").and_then(Value::as_array) {
+        let org = orgs.first();
+        contact.company = org
+            .and_then(|o| o.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        contact.job_title = org
+            .and_then(|o| o.get("title"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        contact.department = org
+            .and_then(|o| o.get("department"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    if let Some(bios) = body.get("biographies").and_then(Value::as_array) {
+        contact.notes = bios
+            .first()
+            .and_then(|b| b.get("value"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+}
+
+/// People phone `type` -> fixture kind. `custom` phones carry the label
+/// in `formattedType`; use that when present.
+fn people_phone_kind(p: &Value) -> Option<String> {
+    match (
+        p.get("type").and_then(Value::as_str),
+        p.get("formattedType").and_then(Value::as_str),
+    ) {
+        (Some("custom"), Some(label)) if !label.is_empty() => Some(label.to_string()),
+        (Some(t), _) => Some(t.to_string()),
+        _ => None,
+    }
+}
+
 fn serialize_person(c: &Contact) -> Value {
     let mut obj = Map::new();
     obj.insert(
@@ -529,6 +952,51 @@ fn serialize_person(c: &Contact) -> Value {
         })
         .collect();
     obj.insert("emailAddresses".into(), Value::Array(emails));
+
+    if !c.phones.is_empty() {
+        let phones: Vec<Value> = c
+            .phones
+            .iter()
+            .map(|p| match &p.kind {
+                Some(k) => json!({ "value": p.number, "type": k }),
+                None => json!({ "value": p.number }),
+            })
+            .collect();
+        obj.insert("phoneNumbers".into(), Value::Array(phones));
+    }
+
+    if c.company.is_some() || c.job_title.is_some() || c.department.is_some() {
+        let mut org = Map::new();
+        if let Some(company) = &c.company {
+            org.insert("name".into(), Value::String(company.clone()));
+        }
+        if let Some(title) = &c.job_title {
+            org.insert("title".into(), Value::String(title.clone()));
+        }
+        if let Some(dept) = &c.department {
+            org.insert("department".into(), Value::String(dept.clone()));
+        }
+        obj.insert(
+            "organizations".into(),
+            Value::Array(vec![Value::Object(org)]),
+        );
+    }
+
+    if let Some(notes) = &c.notes {
+        obj.insert(
+            "biographies".into(),
+            Value::Array(vec![json!({ "value": notes })]),
+        );
+    }
+
+    if !c.groups.is_empty() {
+        let memberships: Vec<Value> = c
+            .groups
+            .iter()
+            .map(|g| json!({ "contactGroupMembership": { "contactGroupResourceName": g } }))
+            .collect();
+        obj.insert("memberships".into(), Value::Array(memberships));
+    }
 
     Value::Object(obj)
 }
