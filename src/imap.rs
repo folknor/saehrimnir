@@ -38,6 +38,23 @@ pub const GREETING: &str = "* OK saehrimnir IMAP4rev1 ready\r\n";
 /// real auth, which v0 does not.
 pub const CAPABILITIES: &str = "IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS";
 
+/// Reserved sentinel password. v0 auth is opt-in accept-everything, so
+/// a harness script cannot otherwise provoke an authentication
+/// failure. When a `LOGIN` (or `AUTHENTICATE PLAIN`) presents THIS
+/// exact password, the server replies with a tagged `NO
+/// [AUTHENTICATIONFAILED]` completion instead of binding the account,
+/// letting a ratatoskr harness script prove a bad-password account
+/// verify surfaces an `AccountError`. Case-sensitive exact match, so
+/// the many existing sync-harness scripts that log in with arbitrary
+/// passwords keep succeeding - only this reserved literal is rejected.
+pub const REJECT_AUTH_PASSWORD: &str = "saehrimnir-reject-auth";
+
+/// True when a presented basic-auth password is the reserved
+/// rejection sentinel (see `REJECT_AUTH_PASSWORD`).
+pub(crate) fn is_reject_password(pass: &str) -> bool {
+    pass == REJECT_AUTH_PASSWORD
+}
+
 /// Per-connection state machine, RFC 3501 sec 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -417,14 +434,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 .write_line(&format!("{tag} BAD LOGIN only valid pre-auth"))
                 .await;
         }
-        // v0 accepts any credential. Parse the user name only so the
-        // connection can bind to the matching `[[account]]`. An
-        // unrecognised user stays on primary (matches the v0
-        // "no auth in v0" baseline).
-        if let Some((user, _pass)) = parse_two_astrings(args)
-            && let Some(id) = self.account_id_for_username(&user)
-        {
-            self.account_id = id;
+        // v0 accepts any credential EXCEPT the reserved rejection
+        // sentinel. Parse both astrings: the user name binds the
+        // connection to the matching `[[account]]` (an unrecognised
+        // user stays on primary, matching the v0 "no auth" baseline),
+        // and the password is checked against `REJECT_AUTH_PASSWORD`
+        // so a harness script can deterministically drive an auth
+        // failure.
+        if let Some((user, pass)) = parse_two_astrings(args) {
+            if is_reject_password(&pass) {
+                return self
+                    .write_line(&format!(
+                        "{tag} NO [AUTHENTICATIONFAILED] LOGIN failed: invalid credentials"
+                    ))
+                    .await;
+            }
+            if let Some(id) = self.account_id_for_username(&user) {
+                self.account_id = id;
+            }
         }
         self.state = State::Authenticated;
         self.write_line(&format!(
@@ -497,6 +524,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 if let Some(b64) = response_b64
                     && let Some(decoded) = sasl_decode_b64(&b64)
                 {
+                    // Reserved rejection sentinel: a PLAIN response
+                    // carrying `REJECT_AUTH_PASSWORD` fails auth so a
+                    // harness script can drive the same bad-password
+                    // failure over AUTHENTICATE that LOGIN exposes.
+                    if let Some(pass) = sasl_extract_password(mech.as_str(), &decoded)
+                        && is_reject_password(&pass)
+                    {
+                        return self
+                            .write_line(&format!(
+                                "{tag} NO [AUTHENTICATIONFAILED] {mech} failed: invalid credentials"
+                            ))
+                            .await;
+                    }
                     if let Some(token) = sasl_extract_bearer(&decoded)
                         && let Some(id) = self.account_id_for_bearer(&token)
                     {
@@ -2070,6 +2110,23 @@ pub(crate) fn sasl_extract_username(mech: &str, decoded: &[u8]) -> Option<String
             }
         }
         _ => None,
+    }
+}
+
+/// Extract the password from a decoded SASL `PLAIN` response
+/// (`authzid\0user\0pass`). Only `PLAIN` carries a basic-auth password
+/// in the clear; `XOAUTH2` / `OAUTHBEARER` carry bearer tokens (handled
+/// separately) and `LOGIN` models only the username round-trip in v0.
+/// Returns `None` for any other mechanism or a malformed response.
+pub(crate) fn sasl_extract_password(mech: &str, decoded: &[u8]) -> Option<String> {
+    if mech != "PLAIN" {
+        return None;
+    }
+    let parts: Vec<&[u8]> = decoded.split(|b| *b == 0).collect();
+    if parts.len() >= 3 {
+        std::str::from_utf8(parts[2]).ok().map(str::to_string)
+    } else {
+        None
     }
 }
 

@@ -1304,3 +1304,100 @@ async fn rename_reparents_child_under_parent_in_list() {
         "child still listed at top level after reparent: {after}"
     );
 }
+
+/// A LOGIN with an ordinary (non-sentinel) password still succeeds -
+/// the opt-in rejection must NOT disturb the v0 accept-everything
+/// baseline that the existing sync-harness scripts rely on.
+#[tokio::test]
+async fn login_with_ordinary_password_succeeds() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"any-old-password\"\r\n\
+        a2 SELECT \"INBOX\"\r\n\
+        a3 LOGOUT\r\n";
+    let out = run_with_fixture(script).await;
+    assert!(
+        out.contains("a1 OK [CAPABILITY"),
+        "ordinary LOGIN should still succeed: {out}"
+    );
+    assert!(
+        out.contains("a1 OK") && out.contains("LOGIN completed"),
+        "ordinary LOGIN should still succeed: {out}"
+    );
+    // The connection reached the Authenticated state (SELECT worked).
+    assert!(
+        out.contains("a2 OK [READ-WRITE] SELECT completed"),
+        "SELECT after ordinary LOGIN should work: {out}"
+    );
+}
+
+/// A LOGIN presenting the reserved rejection sentinel password fails
+/// with a tagged `NO [AUTHENTICATIONFAILED]`, and the connection stays
+/// unauthenticated (a following SELECT is refused). This is the trigger
+/// a ratatoskr harness script drives to prove a bad-password account
+/// verify surfaces an AccountError.
+#[tokio::test]
+async fn login_with_reject_sentinel_fails() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"saehrimnir-reject-auth\"\r\n\
+        a2 SELECT \"INBOX\"\r\n\
+        a3 LOGOUT\r\n";
+    let out = run_with_fixture(script).await;
+    assert!(
+        out.contains("a1 NO [AUTHENTICATIONFAILED]"),
+        "reject sentinel should fail auth: {out}"
+    );
+    assert!(
+        !out.contains("a1 OK"),
+        "rejected LOGIN must not also report OK: {out}"
+    );
+    // Still not authenticated: SELECT before auth is a BAD.
+    assert!(
+        out.contains("a2 BAD"),
+        "SELECT after a failed LOGIN should be refused: {out}"
+    );
+}
+
+/// The same reserved sentinel, presented over `AUTHENTICATE PLAIN`
+/// (`base64(\0user\0pass)`), also fails - so the trigger works whether
+/// ratatoskr's account verify uses LOGIN or SASL PLAIN.
+#[tokio::test]
+async fn authenticate_plain_with_reject_sentinel_fails() {
+    let payload = "\0alice\0saehrimnir-reject-auth";
+    let encoded = base64_encode(payload.as_bytes());
+    let script = format!(
+        "a1 AUTHENTICATE PLAIN {encoded}\r\n\
+         a2 SELECT \"INBOX\"\r\n\
+         a3 LOGOUT\r\n"
+    );
+    let out = run_with_fixture(script.as_bytes()).await;
+    assert!(
+        out.contains("a1 NO [AUTHENTICATIONFAILED]"),
+        "PLAIN reject sentinel should fail auth: {out}"
+    );
+    assert!(
+        out.contains("a2 BAD"),
+        "SELECT after a failed AUTHENTICATE should be refused: {out}"
+    );
+}
+
+/// A `AUTHENTICATE PLAIN` with an ordinary password still authenticates
+/// - the PLAIN rejection is opt-in on the sentinel only.
+#[tokio::test]
+async fn authenticate_plain_with_ordinary_password_succeeds() {
+    let payload = "\0alice\0hunter2";
+    let encoded = base64_encode(payload.as_bytes());
+    let script = format!(
+        "a1 AUTHENTICATE PLAIN {encoded}\r\n\
+         a2 SELECT \"INBOX\"\r\n\
+         a3 LOGOUT\r\n"
+    );
+    let out = run_with_fixture(script.as_bytes()).await;
+    assert!(
+        out.contains("a1 OK [CAPABILITY"),
+        "ordinary PLAIN auth should succeed: {out}"
+    );
+    assert!(
+        out.contains("a2 OK [READ-WRITE] SELECT completed"),
+        "SELECT after ordinary PLAIN auth should work: {out}"
+    );
+}
