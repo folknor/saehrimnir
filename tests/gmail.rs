@@ -636,6 +636,60 @@ async fn send_as_with_bearer_scoping_returns_each_accounts_identity() {
 }
 
 #[tokio::test]
+async fn send_as_patch_records_account_and_body_in_request_log() {
+    // The signature-writeback round-trip: a token minted for the
+    // secondary account PATCHes its own sendAs signature. The mock
+    // must record the resolved account, the sendAs target, and the
+    // request body so a multi-account harness can assert the write
+    // hit the right account with the right signature.
+    use saehrimnir::oauth::TokenStore;
+    use saehrimnir::request_log::RequestLog;
+
+    let store = TokenStore::default();
+    let token_secondary = store.mint("authorization_code", "account-secondary", 1);
+
+    let request_log = RequestLog::default();
+    let fix = fixture::load(std::path::Path::new("fixtures/multi-account-small.toml")).unwrap();
+    let shared = saehrimnir::shared::SharedHandles::for_test(saehrimnir::shared::handle(fix))
+        .with_token_store(store);
+    let app = gmail::router(gmail::AppState { shared }.with_request_log(request_log.clone()));
+
+    let patch = serde_json::json!({ "signature": "<p>secondary sig</p>" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/gmail/v1/users/me/settings/sendAs/secondary@example.com")
+                .header(header::AUTHORIZATION, format!("Bearer {token_secondary}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&patch).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["signature"], "<p>secondary sig</p>");
+
+    // The enriched handler entry carries account + sendAs target +
+    // body, alongside the middleware's bare `METHOD path` entry.
+    let snap = request_log.snapshot();
+    let enriched = snap
+        .iter()
+        .find(|e| {
+            e.command == "PATCH /gmail/v1/users/me/settings/sendAs/secondary@example.com"
+                && e.detail.get("account").is_some()
+        })
+        .expect("enriched sendAs PATCH entry recorded");
+    assert_eq!(enriched.protocol, "gmail");
+    assert_eq!(enriched.detail["account"], "account-secondary");
+    assert_eq!(enriched.detail["sendAsEmail"], "secondary@example.com");
+    assert_eq!(enriched.detail["body"]["signature"], "<p>secondary sig</p>");
+}
+
+#[tokio::test]
 async fn unimplemented_paths_return_gmail_shaped_404() {
     let (status, v) = get_json("/gmail/v1/users/me/drafts").await;
     assert_eq!(status, StatusCode::NOT_FOUND);

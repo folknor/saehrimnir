@@ -1568,6 +1568,7 @@ async fn patch_send_as(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(send_as_email): Path<String>,
+    crate::connection_id::OptConnId(connection_id): crate::connection_id::OptConnId,
     body: axum::body::Bytes,
 ) -> Response {
     let send_as_email_lua = send_as_email.clone();
@@ -1587,6 +1588,30 @@ async fn patch_send_as(
             );
         }
     };
+    // Record the mutation with the resolved account and the request
+    // body alongside the `METHOD path` entry the global middleware
+    // already logged. Gmail's sendAs path is always `/me/...`, so
+    // (unlike Graph, which carries the account in `/users/{id}/...`)
+    // the bearer-resolved account only surfaces to harness assertions
+    // if we stamp it into the detail here. This lets a multi-account
+    // signature-writeback script assert the PATCH hit the right
+    // account, targeted the right sendAs address, and carried the
+    // expected `signature` field. Recorded before the not-found check
+    // so a mis-targeted write is still observable.
+    let mut detail = crate::request_log::body_detail(&patch);
+    if let Value::Object(map) = &mut detail {
+        map.insert("account".to_string(), Value::String(account_id.clone()));
+        map.insert(
+            "sendAsEmail".to_string(),
+            Value::String(send_as_email.clone()),
+        );
+    }
+    state.shared.request_log.record_with_conn(
+        "gmail",
+        format!("PATCH /gmail/v1/users/me/settings/sendAs/{send_as_email}"),
+        detail,
+        connection_id,
+    );
     let mut fixture = state.shared.fixture.write().expect("fixture lock poisoned");
     let Some(idx) = fixture
         .send_as
