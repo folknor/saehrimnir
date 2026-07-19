@@ -1265,6 +1265,15 @@ async fn handle_delete(state: &AppState, path: &str, headers: &HeaderMap) -> Res
             calendar_id,
             event_id,
         } => (user, calendar_id, event_id),
+        // DELETE on a calendar-collection path (RFC 4791 permits it):
+        // unlist the calendar so a later discovery PROPFIND on the
+        // calendar-home-set no longer enumerates it - the "hide the
+        // stale calendar" instrument. Symmetric with MKCALENDAR, which
+        // restores it. Events under the calendar are left intact so a
+        // later MKCALENDAR restore surfaces them again.
+        ResourcePath::Calendar { user, calendar_id } => {
+            return delete_calendar(&mut fixture, path, &user, &calendar_id);
+        }
         _ => return not_found(path),
     };
     // Cross-account lookups under this principal's URL 404.
@@ -1305,6 +1314,53 @@ async fn handle_delete(state: &AppState, path: &str, headers: &HeaderMap) -> Res
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
         .expect("static DELETE response builds")
+}
+
+/// Remove a calendar collection from the fixture for the resolved
+/// principal. Mirrors the account-scoping of the event delete: a
+/// cross-principal reference (the calendar exists but under a
+/// different account) 404s, and an unknown calendar 404s. On success
+/// it records a `calendar_destroyed` transition so the same
+/// `Fixture::mutate` change-log that MKCALENDAR / event mutations feed
+/// lights up - Graph `/v1.0/me/calendars` (a live read) stops listing
+/// the calendar and JMAP `Calendar/changes` walks the destroy.
+///
+/// If-Match is not honoured on the collection: calendar collections
+/// carry a CTag, not an ETag, and the only existing collection-aware
+/// verb (MKCALENDAR) takes no precondition either, so a plain DELETE
+/// keeps parity. Returns 204 on success.
+fn delete_calendar(
+    fixture: &mut crate::fixture::Fixture,
+    path: &str,
+    user: &str,
+    calendar_id: &str,
+) -> Response {
+    // Cross-account lookups under this principal's URL 404, matching
+    // the event delete's isolation guarantee.
+    if !fixture.calendars_for(user).any(|c| c.id == calendar_id) {
+        return not_found(path);
+    }
+    let Some(idx) = fixture.calendars.iter().position(|c| c.id == calendar_id) else {
+        return not_found(path);
+    };
+    // Capture the owning account before removal. The change-log split
+    // resolves a destroyed calendar's account from the parallel
+    // `calendar_destroyed_accounts` vector (the calendar is gone from
+    // the fixture by split time, so a live lookup would miss it).
+    let account_id = fixture.calendars[idx].account_id.clone();
+    let cal_id = calendar_id.to_string();
+    fixture.mutate(|f| {
+        f.calendars.remove(idx);
+        crate::fixture::MutationDiff {
+            calendar_destroyed: vec![cal_id.clone()],
+            calendar_destroyed_accounts: vec![account_id.clone()],
+            ..Default::default()
+        }
+    });
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .expect("static calendar DELETE response builds")
 }
 
 /// POST dispatch. The only POST target v0 models is the RFC 6638

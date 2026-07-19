@@ -1581,3 +1581,149 @@ async fn caldav_rsvp_partstat_round_trip() {
         "other status disturbed: {body}"
     );
 }
+
+// ── Calendar-collection DELETE (unlist) + MKCALENDAR restore ────────
+
+#[tokio::test]
+async fn delete_calendar_collection_unlists_it_and_mkcalendar_restores_it() {
+    // The B7c hide-then-reap instrument: a DELETE on a calendar-
+    // collection path unlists the calendar so a later discovery
+    // PROPFIND on the calendar-home-set no longer enumerates it;
+    // MKCALENDAR on the same path restores it.
+    let app = router();
+
+    // Baseline: both fixture calendars enumerate under the home.
+    let (status, before) = send_with(
+        app.clone(),
+        "PROPFIND",
+        "/calendars/account-1/",
+        Some("1"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(before.contains("/calendars/account-1/cal-work/"));
+    assert!(before.contains("/calendars/account-1/cal-personal/"));
+
+    // DELETE the calendar collection -> 204, plain (no If-Match).
+    let (status, _) = send_with(
+        app.clone(),
+        "DELETE",
+        "/calendars/account-1/cal-personal/",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The home listing no longer enumerates the unlisted calendar;
+    // the sibling calendar is untouched.
+    let (status, after) = send_with(
+        app.clone(),
+        "PROPFIND",
+        "/calendars/account-1/",
+        Some("1"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        !after.contains("/calendars/account-1/cal-personal/"),
+        "unlisted calendar still enumerated: {after}"
+    );
+    assert!(
+        after.contains("/calendars/account-1/cal-work/"),
+        "sibling calendar disappeared: {after}"
+    );
+
+    // A PROPFIND directly on the unlisted calendar now 404s.
+    let (status, _) = send_with(
+        app.clone(),
+        "PROPFIND",
+        "/calendars/account-1/cal-personal/",
+        Some("0"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // RESTORE: MKCALENDAR on the same path re-creates it (201), and a
+    // subsequent PROPFIND lists it again - no dedicated restore verb
+    // needed.
+    let mk_body = r#"<?xml version="1.0" encoding="utf-8"?>
+<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:set><D:prop><D:displayname>Personal</D:displayname></D:prop></D:set>
+</C:mkcalendar>"#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("MKCALENDAR")
+                .uri("/calendars/account-1/cal-personal/")
+                .header(header::HOST, "127.0.0.1:0")
+                .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+                .body(Body::from(mk_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let (status, restored) = send_with(
+        app,
+        "PROPFIND",
+        "/calendars/account-1/",
+        Some("1"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        restored.contains("/calendars/account-1/cal-personal/"),
+        "restored calendar missing from listing: {restored}"
+    );
+}
+
+#[tokio::test]
+async fn delete_unknown_calendar_collection_returns_404() {
+    let (status, _) = send(
+        "DELETE",
+        "/calendars/account-1/cal-does-not-exist/",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_calendar_cross_principal_404s_and_leaves_it_listed() {
+    // Deleting the primary's calendar through the secondary's
+    // principal URL must 404 (same isolation the event delete
+    // enforces) and must not unlist it from its real owner.
+    let app = multi_account_router();
+    let (status, _) = send_with(
+        app.clone(),
+        "DELETE",
+        "/calendars/account-secondary/cal-primary/",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The primary principal still lists its calendar - the cross-
+    // principal DELETE was a no-op.
+    let (_, body) = send_with(
+        app,
+        "PROPFIND",
+        "/calendars/account-primary/",
+        Some("1"),
+        PROPFIND_CALENDARS,
+    )
+    .await;
+    assert!(
+        body.contains("/calendars/account-primary/cal-primary/"),
+        "cross-principal DELETE wrongly unlisted the calendar: {body}"
+    );
+}
