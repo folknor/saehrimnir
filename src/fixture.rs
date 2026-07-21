@@ -77,6 +77,13 @@ pub struct Fixture {
     /// shared-folder coverage omit the `[[acl]]` table. See
     /// `AclGrant` and `notes/ratatoskr-imap-surface.md`.
     pub acls: Vec<AclGrant>,
+    /// Org-wide EWS public-folder tree. Empty by default; fixtures
+    /// that don't exercise the EWS public-folder surface omit the
+    /// `[[public_folder]]` table. See `PublicFolder`.
+    pub public_folders: Vec<PublicFolder>,
+    /// Items inside the public folders, scoped to a `PublicFolder` by
+    /// `folder_id`. Empty by default. See `PublicItem`.
+    pub public_items: Vec<PublicItem>,
     /// Gmail SendAs identities. Flat per-account: an account may
     /// declare zero or more `[[send_as]]` rows. Real Gmail uses the
     /// `sendAsEmail` as the primary key; v0 enforces uniqueness per
@@ -732,6 +739,40 @@ impl Fixture {
             .iter()
             .find(|a| a.mailbox_id == mailbox_id && a.identifier == viewer)
             .map(|a| a.rights.clone())
+    }
+
+    /// A public folder by id.
+    pub fn public_folder(&self, id: &str) -> Option<&PublicFolder> {
+        self.public_folders.iter().find(|f| f.id == id)
+    }
+
+    /// Public folders whose parent is `parent` (`None` = the top-level
+    /// folders that hang off `publicfoldersroot`). Drives the EWS
+    /// `FindFolder` hierarchy walk.
+    pub fn public_folders_under<'a>(
+        &'a self,
+        parent: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a PublicFolder> + 'a {
+        self.public_folders
+            .iter()
+            .filter(move |f| f.parent_id.as_deref() == parent)
+    }
+
+    /// Items in a public folder, in declared order. Drives EWS
+    /// `FindItem`.
+    pub fn public_items_in<'a>(
+        &'a self,
+        folder_id: &'a str,
+    ) -> impl Iterator<Item = &'a PublicItem> + 'a {
+        self.public_items
+            .iter()
+            .filter(move |i| i.folder_id == folder_id)
+    }
+
+    /// A public-folder item by id, across every folder. Drives EWS
+    /// `GetItem`.
+    pub fn public_item(&self, id: &str) -> Option<&PublicItem> {
+        self.public_items.iter().find(|i| i.id == id)
     }
 
     /// Emails scoped to one account.
@@ -2319,6 +2360,33 @@ pub struct AclGrant {
     pub rights: String,
 }
 
+/// A public-folder node in the org-wide EWS public-folder tree. Unlike
+/// [`Mailbox`], public folders are not account-scoped: they hang off a
+/// synthetic `publicfoldersroot` and are visible to every EWS caller.
+/// `parent_id` is `None` for a top-level folder (child of the root).
+/// Served by the EWS `FindFolder` / `FindItem` surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicFolder {
+    pub id: String,
+    pub display_name: String,
+    pub parent_id: Option<String>,
+}
+
+/// One item (message) inside a [`PublicFolder`]. A deliberately small
+/// projection of the message shape EWS `FindItem` / `GetItem` need:
+/// subject, sender, recipients, body, and received time. Its EWS
+/// `ChangeKey` derives deterministically from the fixture state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicItem {
+    pub id: String,
+    pub folder_id: String,
+    pub subject: String,
+    pub from: Address,
+    pub to: Vec<Address>,
+    pub body_text: String,
+    pub received_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Inbox,
@@ -2656,6 +2724,10 @@ pub(crate) struct RawFixture {
     pub(crate) groups: Vec<RawGroup>,
     #[serde(default, rename = "acl")]
     pub(crate) acls: Vec<RawAcl>,
+    #[serde(default, rename = "public_folder")]
+    pub(crate) public_folders: Vec<RawPublicFolder>,
+    #[serde(default, rename = "public_item")]
+    pub(crate) public_items: Vec<RawPublicItem>,
     #[serde(default, rename = "send_as")]
     pub(crate) send_as: Vec<RawSendAs>,
     #[serde(default, rename = "change")]
@@ -2926,6 +2998,29 @@ pub(crate) struct RawAcl {
     pub(crate) identifier: String,
     #[serde(default)]
     pub(crate) rights: Option<String>,
+}
+
+/// TOML projection of one `[[public_folder]]` node.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawPublicFolder {
+    pub(crate) id: String,
+    pub(crate) display_name: String,
+    #[serde(default)]
+    pub(crate) parent_id: Option<String>,
+}
+
+/// TOML projection of one `[[public_item]]` message.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawPublicItem {
+    pub(crate) id: String,
+    pub(crate) folder_id: String,
+    pub(crate) subject: String,
+    pub(crate) from: RawAddress,
+    #[serde(default)]
+    pub(crate) to: Vec<RawAddress>,
+    #[serde(default)]
+    pub(crate) body_text: String,
+    pub(crate) received_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3814,6 +3909,62 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    // EWS public folders. Org-wide (no account scope). Own id
+    // namespace; `parent_id` (when present) must reference another
+    // declared public folder, and a folder cannot parent itself.
+    let mut public_folder_ids: HashMap<String, ()> = HashMap::new();
+    let mut public_folders = Vec::with_capacity(raw.public_folders.len());
+    for pf in raw.public_folders {
+        if public_folder_ids.insert(pf.id.clone(), ()).is_some() {
+            return Err(format!("duplicate public_folder id {:?}", pf.id));
+        }
+        public_folders.push(PublicFolder {
+            id: pf.id,
+            display_name: pf.display_name,
+            parent_id: pf.parent_id,
+        });
+    }
+    for pf in &public_folders {
+        if let Some(parent) = &pf.parent_id {
+            if parent == &pf.id {
+                return Err(format!("public_folder {:?} is its own parent", pf.id));
+            }
+            if !public_folder_ids.contains_key(parent) {
+                return Err(format!(
+                    "public_folder {:?}: parent_id {parent:?} does not match any declared public_folder",
+                    pf.id
+                ));
+            }
+        }
+    }
+
+    // Public-folder items. `folder_id` must reference a declared
+    // public folder; own id namespace.
+    let mut public_item_ids: HashMap<String, ()> = HashMap::new();
+    let mut public_items = Vec::with_capacity(raw.public_items.len());
+    for it in raw.public_items {
+        if public_item_ids.insert(it.id.clone(), ()).is_some() {
+            return Err(format!("duplicate public_item id {:?}", it.id));
+        }
+        if !public_folder_ids.contains_key(&it.folder_id) {
+            return Err(format!(
+                "public_item {:?}: folder_id {:?} does not match any declared public_folder",
+                it.id, it.folder_id
+            ));
+        }
+        let received_at = parse_ts(&it.received_at)
+            .map_err(|e| format!("public_item {:?} received_at: {e}", it.id))?;
+        public_items.push(PublicItem {
+            id: it.id,
+            folder_id: it.folder_id,
+            subject: it.subject,
+            from: it.from.into(),
+            to: it.to.into_iter().map(Address::from).collect(),
+            body_text: it.body_text,
+            received_at,
+        });
+    }
+
     // SendAs identities. Flat per-account; primary key per account
     // is the `send_as_email` address. Real Gmail accepts the same
     // address under multiple accounts (e.g. an alias shared across
@@ -3930,6 +4081,8 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         categories,
         groups,
         acls,
+        public_folders,
+        public_items,
         send_as: send_as_entries,
         account_logs: BTreeMap::new(),
         change_script,

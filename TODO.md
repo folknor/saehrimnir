@@ -20,11 +20,22 @@ From the ratatoskr A5 / B8-groups gap report:
 - **[done] IMAP NAMESPACE + MYRIGHTS/GETACL + `#user/` shared
   folders.** Fixture `[[acl]]` grants + other-users namespace read
   path. See CLAUDE.md "IMAP" + `notes/ratatoskr-imap-surface.md`.
-- **[next] EWS SOAP + Autodiscover (A5b).** Entirely missing; the
-  largest remaining A5 gap. GetUserSettings Autodiscover,
-  find_folder / find_items, GetStreamingEvents for public-folder +
-  EWS-streaming push. New SOAP/XML module (`src/ews.rs`). Tracked
-  under "Microsoft Graph (other future work)" below.
+- **[done] EWS SOAP + Autodiscover (A5b).** New listener
+  (`src/ews/`, `--ews-port`): Autodiscover GetUserSettings,
+  FindFolder / FindItem / GetItem over `[[public_folder]]` /
+  `[[public_item]]`, and Subscribe / GetStreamingEvents /
+  Unsubscribe streaming push wired through `PushHub`. See
+  CLAUDE.md "EWS" + `notes/ratatoskr-ews-surface.md`. Follow-ups
+  below.
+
+The A5 / B8 report is now cleared. EWS follow-ups (only when
+forced): EWS write ops (CreateItem / UpdateItem / DeleteItem),
+SyncFolderHierarchy / SyncFolderItems delta, a held-open long-poll
+`GetStreamingEvents`, POX Autodiscover, and Lua builders for the
+public-folder tables (TOML-only today). Tighten
+`notes/ratatoskr-ews-surface.md` against the real ratatoskr EWS
+client when that integration lands (the doc was authored from the
+EWS schemas + gap report, not a client citation).
 
 ## From the 2026-05-10 multi-agent review (today's slice)
 
@@ -233,10 +244,11 @@ future Graph work:
 
 - OneDrive resumable upload sessions (`onedrive.rs`) - needed once
   the SMTP / Graph submit paths grow attachments.
-- Public-folder sync via EWS (`ews/`, `public_folder_sync.rs`).
-  Different protocol (SOAP), separate `src/ews.rs` module.
 - Webhooks / change notifications (`webhooks.rs`).
-- Autodiscover (`autodiscover.rs`).
+
+EWS SOAP + Autodiscover (public folders + EWS-streaming push) is
+landed as its own listener (`src/ews/`); see the Priority section
+for the remaining EWS follow-ups.
 
 ## Gmail (future work)
 

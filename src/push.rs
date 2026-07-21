@@ -113,6 +113,15 @@ pub struct GmailWatch {
     pub label_ids: Vec<String>,
 }
 
+/// An EWS `Subscribe` (StreamingSubscription) registration. Bound to
+/// the mailbox account it watches; a `GetStreamingEvents` poll for the
+/// id drains the account's queued notifications.
+#[derive(Debug, Clone)]
+pub struct EwsSubscription {
+    pub id: String,
+    pub account_id: String,
+}
+
 /// A Graph `POST /subscriptions` registration.
 #[derive(Debug, Clone)]
 pub struct GraphSubscription {
@@ -140,6 +149,13 @@ struct Inner {
     pubsub: Mutex<Vec<Value>>,
     graph_subs: Mutex<HashMap<String, GraphSubscription>>,
     graph_log: Mutex<Vec<Value>>,
+    /// EWS streaming subscriptions by id.
+    ews_subs: Mutex<HashMap<String, EwsSubscription>>,
+    /// Queued EWS notification events by subscription id. A state
+    /// advance enqueues one event per matching subscription;
+    /// `GetStreamingEvents` drains the queue for its id. Each event is
+    /// `{ "watermark": <string>, "timestamp": <rfc3339 string> }`.
+    ews_events: Mutex<HashMap<String, Vec<Value>>>,
 }
 
 /// Cheap-to-clone handle to the shared push registry. See module docs.
@@ -167,6 +183,8 @@ impl PushHub {
                 pubsub: Mutex::new(Vec::new()),
                 graph_subs: Mutex::new(HashMap::new()),
                 graph_log: Mutex::new(Vec::new()),
+                ews_subs: Mutex::new(HashMap::new()),
+                ews_events: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -341,6 +359,54 @@ impl PushHub {
             .clone()
     }
 
+    // ── EWS streaming-subscription registry ─────────────────────────
+
+    pub fn ews_create_subscription(&self, sub: EwsSubscription) {
+        self.inner
+            .ews_subs
+            .lock()
+            .expect("ews_subs lock poisoned")
+            .insert(sub.id.clone(), sub);
+    }
+
+    pub fn ews_get_subscription(&self, id: &str) -> Option<EwsSubscription> {
+        self.inner
+            .ews_subs
+            .lock()
+            .expect("ews_subs lock poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    /// Delete a streaming subscription and discard any queued events.
+    /// Returns whether one was present.
+    pub fn ews_delete_subscription(&self, id: &str) -> bool {
+        self.inner
+            .ews_events
+            .lock()
+            .expect("ews_events lock poisoned")
+            .remove(id);
+        self.inner
+            .ews_subs
+            .lock()
+            .expect("ews_subs lock poisoned")
+            .remove(id)
+            .is_some()
+    }
+
+    /// Drain (and clear) the queued notification events for a
+    /// subscription. `GetStreamingEvents` returns these to the client.
+    /// An unknown / empty subscription yields an empty batch.
+    pub fn ews_drain_events(&self, id: &str) -> Vec<Value> {
+        self.inner
+            .ews_events
+            .lock()
+            .expect("ews_events lock poisoned")
+            .get_mut(id)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
     // ── Reset ───────────────────────────────────────────────────────
 
     /// Clear volatile push state (logs, sinks, watches, subscriptions,
@@ -379,6 +445,16 @@ impl PushHub {
             .lock()
             .expect("graph_log lock poisoned")
             .clear();
+        self.inner
+            .ews_subs
+            .lock()
+            .expect("ews_subs lock poisoned")
+            .clear();
+        self.inner
+            .ews_events
+            .lock()
+            .expect("ews_events lock poisoned")
+            .clear();
     }
 
     // ── Emission ────────────────────────────────────────────────────
@@ -394,6 +470,38 @@ impl PushHub {
             self.emit_imap(p);
             self.emit_gmail(p);
             self.emit_graph(p);
+            self.emit_ews(p);
+        }
+    }
+
+    /// Enqueue one EWS streaming notification per subscription bound to
+    /// the account whose state advanced. `GetStreamingEvents` drains
+    /// the queue. The watermark is a monotonic id; the timestamp mirrors
+    /// the push snapshot's history id (a stand-in wall clock).
+    fn emit_ews(&self, p: &AccountPush) {
+        let sub_ids: Vec<String> = self
+            .inner
+            .ews_subs
+            .lock()
+            .expect("ews_subs lock poisoned")
+            .values()
+            .filter(|s| s.account_id == p.account_id)
+            .map(|s| s.id.clone())
+            .collect();
+        if sub_ids.is_empty() {
+            return;
+        }
+        let watermark = format!("W{}", self.next_seq());
+        let mut events = self
+            .inner
+            .ews_events
+            .lock()
+            .expect("ews_events lock poisoned");
+        for id in sub_ids {
+            events.entry(id).or_default().push(serde_json::json!({
+                "watermark": watermark,
+                "timestamp": p.history_id.to_string(),
+            }));
         }
     }
 

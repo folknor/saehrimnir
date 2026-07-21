@@ -577,6 +577,46 @@ Drives IMAP `NAMESPACE` / `LIST "" "#user/*"` / `MYRIGHTS` /
 read-only in v0. No Lua `acl({...})` builder yet - TOML-only. See
 `notes/ratatoskr-imap-surface.md` "Shared folders".
 
+## EWS public folders (optional)
+
+Org-wide public-folder tree for the EWS `FindFolder` / `FindItem` /
+`GetItem` surface. Not account-scoped: folders hang off a synthetic
+`publicfoldersroot`. `[[public_folder]]` declares the tree,
+`[[public_item]]` the messages inside it.
+
+```toml
+[[public_folder]]
+id = "pf-root-eng"
+display_name = "Engineering"
+# parent_id omitted -> top-level (child of publicfoldersroot)
+
+[[public_folder]]
+id = "pf-eng-releases"
+display_name = "Releases"
+parent_id = "pf-root-eng"
+
+[[public_item]]
+id = "pi-eng-001"
+folder_id = "pf-root-eng"
+subject = "Team sync notes"
+from = "lead@example.com"       # bare string or { name, email }
+to = ["team@example.com"]       # optional
+body_text = "Notes from the weekly sync."   # optional
+received_at = "2026-02-01T09:00:00Z"
+```
+
+Validation:
+
+- `public_folder.id` / `public_item.id` are each unique within their
+  table.
+- `public_folder.parent_id` (when present) must reference another
+  declared public folder, and a folder cannot parent itself.
+- `public_item.folder_id` must reference a declared public folder.
+- `public_item.received_at` is RFC 3339.
+
+Read-only in v0. No Lua builders yet - TOML-only. See
+`notes/ratatoskr-ews-surface.md`.
+
 ## OAuth (optional)
 
 ```toml

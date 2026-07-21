@@ -97,6 +97,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gcal_addr = gcal_listener.local_addr()?;
     eprintln!("saehrimnir: gcal listening on {gcal_addr}");
 
+    // Exchange Web Services (EWS) SOAP + Autodiscover listener. Own
+    // port; the Autodiscover response advertises this socket's
+    // ExternalEwsUrl so a client that autodiscovers binds back here.
+    let ews_listener =
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.ews_port)).await?;
+    let ews_addr = ews_listener.local_addr()?;
+    eprintln!("saehrimnir: ews listening on {ews_addr}");
+
     sentinel::write_ready(
         &args.readiness_file,
         &[
@@ -135,6 +143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProtocolPort {
                 name: "GCAL",
                 port: gcal_addr.port(),
+            },
+            ProtocolPort {
+                name: "EWS",
+                port: ews_addr.port(),
             },
         ],
     )
@@ -333,10 +345,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Google Calendar server.
-    let gcal_state = saehrimnir::gcal::AppState { shared };
+    let gcal_state = saehrimnir::gcal::AppState {
+        shared: shared.clone(),
+    };
     let gcal_shutdown_rx = shutdown_rx.clone();
     let gcal_task = tokio::spawn(async move {
         saehrimnir::gcal::serve(gcal_listener, gcal_state, gcal_shutdown_rx).await
+    });
+
+    // Exchange Web Services (EWS) server. The Autodiscover response
+    // advertises this listener's own base URL as the ExternalEwsUrl.
+    let ews_state = saehrimnir::ews::AppState {
+        shared,
+        base_url: format!("http://{ews_addr}"),
+    };
+    let ews_shutdown_rx = shutdown_rx.clone();
+    let ews_task = tokio::spawn(async move {
+        saehrimnir::ews::serve(ews_listener, ews_state, ews_shutdown_rx).await
     });
 
     // Race the OS signal handler against any mock_done()/mock_fail()
@@ -381,6 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = carddav_task.await;
         let _ = people_task.await;
         let _ = gcal_task.await;
+        let _ = ews_task.await;
     };
     match tokio::time::timeout(SHUTDOWN_BUDGET, drain).await {
         Ok(()) => eprintln!("saehrimnir: clean shutdown"),

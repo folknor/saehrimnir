@@ -37,7 +37,8 @@ brokkr sync-smoke <script.lua>
     │     on BackstopExpired: SIGKILL mock, preserve dir, fail
     │
     ├─ read sentinel content → parse per-protocol ports
-    │     (one line per protocol: JMAP/IMAP/SMTP/GRAPH/GMAIL/CALDAV/PEOPLE/GCAL <port>)
+    │     (one line per protocol:
+    │      JMAP/IMAP/SMTP/GRAPH/GMAIL/CALDAV/CARDDAV/PEOPLE/GCAL/EWS <port>)
     │
     ├─ spawn harness binary
     │     env: RATATOSKR_TEST_JMAP_ENDPOINT=http://127.0.0.1:<jmap-port>
@@ -80,7 +81,7 @@ Plan 3 wires whatever names are configured; we don't hardcode them.
   an empty file.
 - **Content:** one line per protocol, each `<NAME> <port>\n`, with
   `<NAME>` upper-case: `JMAP`, `IMAP`, `SMTP`, `GRAPH`, `GMAIL`,
-  `CALDAV`, `PEOPLE`, `GCAL`. Every line is always present (we bind every listener,
+  `CALDAV`, `CARDDAV`, `PEOPLE`, `GCAL`, `EWS`. Every line is always present (we bind every listener,
   even when the test only cares about one). Brokkr's
   `wait_for_sentinel` doesn't parse the content (it's
   presence-only); plan-3-side code reads the file and picks the

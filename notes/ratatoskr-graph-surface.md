@@ -519,10 +519,12 @@ Remaining:
 | Module                       | What it syncs                              |
 |------------------------------|--------------------------------------------|
 | `onedrive.rs`                | Resumable upload sessions for attachments  |
-| `public_folder_sync.rs`      | Pinned public folders via EWS              |
 | `webhooks.rs`                | Change subscriptions                       |
-| `autodiscover.rs`            | Shared-mailbox discovery via SOAP          |
-| `ews/`                       | Exchange Web Services SOAP                 |
+
+EWS + Autodiscover (public folders, EWS-streaming push) landed as its
+own listener (`src/ews/`, `--ews-port`), not under `src/graph/` -
+it's a separate SOAP wire paradigm. See
+`notes/ratatoskr-ews-surface.md`.
 
 The v0 module structure (`src/graph/`) keeps mail handlers in
 `mail.rs`, OData plumbing in `odata.rs`, and reserves room for

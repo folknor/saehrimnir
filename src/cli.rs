@@ -69,6 +69,16 @@ pub struct Args {
     #[arg(long = "carddav-port", default_value_t = 0)]
     pub carddav_port: u16,
 
+    /// Exchange Web Services (EWS) mock port. `0` (default) picks an
+    /// ephemeral port; the chosen port lands in the readiness file
+    /// under `EWS <port>`. Mounts the SOAP Autodiscover endpoint
+    /// (`/autodiscover/autodiscover.svc`) and the EWS operation
+    /// endpoint (`/EWS/Exchange.asmx`: FindFolder / FindItem / GetItem
+    /// over public folders + Subscribe / GetStreamingEvents /
+    /// Unsubscribe streaming notifications).
+    #[arg(long = "ews-port", default_value_t = 0)]
+    pub ews_port: u16,
+
     /// Path to write the readiness sentinel once every listener is
     /// bound. One line per protocol, e.g.:
     /// `JMAP 12345\nIMAP 23456\nSMTP 34567\nGRAPH 45678\nGMAIL 56789\n`.

@@ -1,0 +1,45 @@
+name = "ews-public"
+
+# One account (the loader requires at least one) plus an org-wide EWS
+# public-folder tree:
+#
+#   publicfoldersroot
+#     Engineering            (pf-root-eng)      -> pi-eng-001
+#       Releases             (pf-eng-releases)
+#     Announcements          (pf-root-announce) -> pi-announce-001
+
+[[account]]
+id = "account-primary"
+name = "user@example.com"
+is_personal = true
+primary = true
+
+[[public_folder]]
+id = "pf-root-eng"
+display_name = "Engineering"
+
+[[public_folder]]
+id = "pf-eng-releases"
+display_name = "Releases"
+parent_id = "pf-root-eng"
+
+[[public_folder]]
+id = "pf-root-announce"
+display_name = "Announcements"
+
+[[public_item]]
+id = "pi-eng-001"
+folder_id = "pf-root-eng"
+subject = "Team sync notes"
+from = "lead@example.com"
+to = ["team@example.com"]
+body_text = "Notes from the weekly sync."
+received_at = "2026-02-01T09:00:00Z"
+
+[[public_item]]
+id = "pi-announce-001"
+folder_id = "pf-root-announce"
+subject = "Office closed Friday"
+from = "hr@example.com"
+body_text = "The office is closed this Friday."
+received_at = "2026-02-02T08:00:00Z"

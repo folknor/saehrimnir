@@ -33,6 +33,11 @@ resource modules), and `notes/` for the per-protocol surface docs.
   Calendar v3 (`/calendar/v3/users/me/calendarList` +
   `/calendar/v3/calendars/{id}/events[/...]`). Sibling listener
   to Gmail.
+- `notes/ratatoskr-ews-surface.md` - same shape, for Exchange
+  Web Services SOAP + Autodiscover (`/autodiscover/autodiscover.svc`
+  GetUserSettings, `/EWS/Exchange.asmx` FindFolder / FindItem /
+  GetItem over public folders + Subscribe / GetStreamingEvents /
+  Unsubscribe streaming push). Own listener (`--ews-port`).
 - `notes/ratatoskr-oauth-surface.md` - mock OAuth 2.0 provider
   mounted on the JMAP listener (`/oauth/token`,
   `/oauth/userinfo`, `/test/oauth/invalidate`) plus the
@@ -349,6 +354,16 @@ checking whether the fact is already in `notes/`.
   attachments stub, MIME payload builder, hand-rolled base64url).
   Sibling files for People-API contacts / Drive uploads land here
   later.
+- `src/ews/` - Exchange Web Services SOAP + Autodiscover mock
+  (own listener, `--ews-port`). `mod.rs` (router, AppState with
+  its own `base_url` for the Autodiscover ExternalEwsUrl, SOAP
+  envelope wrap, operation dispatch by first `soap:Body` element,
+  and the handlers: Autodiscover GetUserSettings; FindFolder /
+  FindItem / GetItem over the `[[public_folder]]` /
+  `[[public_item]]` tree; Subscribe / GetStreamingEvents /
+  Unsubscribe streaming push wired through `PushHub`), `xml.rs`
+  (hand-rolled XML - escape, has_element, element_attr /
+  all_element_attr, element_text - caldav-style, no XML crate).
 - `tests/api.rs` - JMAP integration tests via
   `tower::ServiceExt::oneshot`.
 - `tests/imap.rs` - IMAP integration tests over a duplex stream.
@@ -379,6 +394,14 @@ checking whether the fact is already in `notes/`.
   patch / delete round-trip, and a cross-protocol assertion
   that a Google-Calendar create surfaces in a Graph
   `calendarView/delta`.
+- `tests/ews.rs` - EWS SOAP + Autodiscover integration tests via
+  `tower::ServiceExt::oneshot`. Covers Autodiscover
+  GetUserSettings (ExternalEwsUrl), FindFolder shallow/deep
+  traversal + child/item counts, FindItem default + IdOnly shapes
+  + unknown-folder error, GetItem body hydration + per-item
+  not-found, and the streaming lifecycle (Subscribe ->
+  GetStreamingEvents empty heartbeat -> state advance ->
+  NewMailEvent drain -> one-shot -> Unsubscribe -> Closed).
 - `tests/discovery.rs` - account-discovery integration tests
   via `tower::ServiceExt::oneshot`. Covers WebFinger JRD shape +
   rel filter + emit-time href prefixing, OIDC discovery
@@ -870,6 +893,12 @@ Per protocol:
   so coalesced wakes still produce one correct diff. No observability
   log of its own (it is live wire transport only); assert via a live
   IMAP connection in tests.
+- EWS streaming: `Subscribe` (StreamingSubscription) registers a
+  subscription on the hub scoped to the bearer-resolved account. On
+  state advance, one `NewMailEvent` (Watermark + TimeStamp) is enqueued
+  per subscription bound to the touched account; the next
+  `GetStreamingEvents` drains the queue (one-shot). Poll-drain model,
+  not a held-open long-poll. See the EWS status section.
 Observability: every emitted JMAP frame and Graph notification is
 logged and every Pub/Sub message kept in a sink, exposed over
 `GET /test/push/jmap`, `GET /test/push/graph`,
@@ -937,6 +966,37 @@ a `calendar_created` transition; Graph `/v1.0/me/calendars`
 405 on an existing calendar id and 404 under an unknown
 principal. v0 explicitly does not implement PROPPATCH / ACLs /
 scheduling.
+
+EWS (Exchange Web Services SOAP + Autodiscover): complete for v0's
+public-folder read path + streaming push (drives ratatoskr A5b).
+Own listener (`--ews-port`; sentinel `EWS <port>`; brokkr would
+plumb `RATATOSKR_TEST_EWS_ENDPOINT` when ratatoskr grows the
+override). Two POST endpoints, SOAP over plain HTTP, every response
+`text/xml` wrapped in a `<s:Envelope>`. Autodiscover
+(`/autodiscover/autodiscover.svc`): `GetUserSettings` returns
+`ExternalEwsUrl` built from the EWS listener's own base URL, so a
+client that autodiscovers binds back to this process. EWS
+operations (`/EWS/Exchange.asmx`, dispatched by the first
+`soap:Body` element's local name): `FindFolder` (Deep = whole tree,
+Shallow = children of `publicfoldersroot` or a named `FolderId`;
+emits FolderId + ChangeKey + DisplayName + TotalCount +
+ChildFolderCount), `FindItem` (items in a folder; `IdOnly` vs
+default Subject/DateTimeReceived/From shape; unknown folder ->
+`ErrorFolderNotFound`), `GetItem` (per-id body hydration; unknown
+id degrades that message to `ErrorItemNotFound`, not the batch).
+Backed by the org-wide `[[public_folder]]` / `[[public_item]]`
+fixture tables (not account-scoped). Streaming lifecycle wired to
+`PushHub`: `Subscribe` mints a `SubscriptionId` bound to the
+bearer-resolved account; a fixture state advance enqueues a
+`NewMailEvent` per matching subscription; `GetStreamingEvents`
+drains it (one-shot poll-drain, not a held-open long-poll; unknown
+sub -> `ConnectionStatus Closed`); `Unsubscribe` drops it.
+`ChangeKey` derives from the fixture primary state (opaque). XML is
+hand-rolled (`src/ews/xml.rs`), caldav-style. Read-only in v0 (no
+CreateItem/UpdateItem/DeleteItem, no sync-delta, no POX
+Autodiscover, no auth enforcement). `fixtures/ews-public.toml` +
+`tests/ews.rs` cover the surface. See
+`notes/ratatoskr-ews-surface.md`.
 
 Discovery (WebFinger / OIDC / autoconfig): complete for v0.
 Mounted on the JMAP HTTP listener, unauthenticated (real
