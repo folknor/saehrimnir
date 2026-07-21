@@ -13,12 +13,21 @@
 //! - `/v1.0/groups` - list.
 //! - `/v1.0/groups/{id}` - single.
 //! - `/v1.0/groups/{id}/members` - users belonging to the group.
-//! - `/v1.0/me/memberOf` - groups containing the bearer-token's
-//!   account (bearer-resolved via the same `account_from_bearer`
-//!   helper Gmail / gcal / People use).
-//! - `/v1.0/users/{userId}/memberOf` - groups containing the
-//!   named account (`me` aliases the bearer-resolved primary;
-//!   unknown id returns 404).
+//! - `/v1.0/groups/{id}/transitiveMembers[/microsoft.graph.user]` -
+//!   the transitive-closure twin bifrost's groups surface drives.
+//!   v0 has no nested groups, so the transitive closure equals the
+//!   direct `members` set, and every member is user-typed - the
+//!   `microsoft.graph.user` OData type-cast is therefore an all-pass
+//!   filter here. Both alias `list_group_members`; if the fixture
+//!   ever grows group-typed members the cast will need a real filter.
+//! - `/v1.0/me/memberOf[/microsoft.graph.group]` - groups containing
+//!   the bearer-token's account (bearer-resolved via the same
+//!   `account_from_bearer` helper Gmail / gcal / People use). The
+//!   `microsoft.graph.group` type-cast is all-pass in v0 since
+//!   `memberOf` only ever yields group-typed directoryObjects.
+//! - `/v1.0/users/{userId}/memberOf[/microsoft.graph.group]` - groups
+//!   containing the named account (`me` aliases the bearer-resolved
+//!   primary; unknown id returns 404).
 
 use axum::{
     Router,
@@ -37,8 +46,26 @@ pub fn router() -> Router<AppState> {
         .route("/v1.0/groups", get(list_groups))
         .route("/v1.0/groups/{group}", get(get_group))
         .route("/v1.0/groups/{group}/members", get(list_group_members))
+        // Transitive-closure twins. No nested groups in v0, so these
+        // resolve to the same member set as `/members`; the
+        // `microsoft.graph.user` cast is all-pass. See module doc.
+        .route(
+            "/v1.0/groups/{group}/transitiveMembers",
+            get(list_group_members),
+        )
+        .route(
+            "/v1.0/groups/{group}/transitiveMembers/microsoft.graph.user",
+            get(list_group_members),
+        )
         .route("/v1.0/me/memberOf", get(member_of_me))
+        // OData type-cast twin; all-pass in v0 (memberOf yields only
+        // group-typed directoryObjects). See module doc.
+        .route("/v1.0/me/memberOf/microsoft.graph.group", get(member_of_me))
         .route("/v1.0/users/{user}/memberOf", get(member_of_user))
+        .route(
+            "/v1.0/users/{user}/memberOf/microsoft.graph.group",
+            get(member_of_user),
+        )
 }
 
 // ── Read handlers ───────────────────────────────────────────────────

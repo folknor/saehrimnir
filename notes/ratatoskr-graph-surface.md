@@ -138,8 +138,9 @@ ratatoskr's group-enumeration code path consumes:
 | `GET /v1.0/groups` | List all groups. No paging in v0 - the group set is small. Members are NOT inlined; clients call `/groups/{id}/members` to expand (matches real Graph). |
 | `GET /v1.0/groups/{id}` | Single group; 404 on unknown id. |
 | `GET /v1.0/groups/{id}/members` | Project each member-account as a `#microsoft.graph.user` with `id`, `displayName`, `mail`, `userPrincipalName` populated from `account.name`. Real Graph emits each entry typed (user / group / device); v0 only models user-typed members. |
-| `GET /v1.0/me/memberOf` | Groups containing the bearer-resolved account (`oauth::account_from_bearer`, same fallback-to-primary semantics as Gmail / gcal / People). |
-| `GET /v1.0/users/{userId}/memberOf` | Path-resolved: `me` aliases the bearer-resolved primary, otherwise the `userId` must match a declared account. Unknown id returns 404 `ResourceNotFound`. |
+| `GET /v1.0/groups/{id}/transitiveMembers[/microsoft.graph.user]` | Transitive-closure twin of `/members`. v0 has no nested groups, so the closure equals the direct member set, and the `microsoft.graph.user` OData type-cast is an all-pass filter (every member is user-typed). Both alias the `/members` handler. |
+| `GET /v1.0/me/memberOf[/microsoft.graph.group]` | Groups containing the bearer-resolved account (`oauth::account_from_bearer`, same fallback-to-primary semantics as Gmail / gcal / People). The `microsoft.graph.group` type-cast is all-pass in v0 (`memberOf` yields only group-typed directoryObjects). |
+| `GET /v1.0/users/{userId}/memberOf[/microsoft.graph.group]` | Path-resolved: `me` aliases the bearer-resolved primary, otherwise the `userId` must match a declared account. Unknown id returns 404 `ResourceNotFound`. Same all-pass `microsoft.graph.group` type-cast twin. |
 
 Read-only in v0 - the Graph group surface has no mutating verbs.
 

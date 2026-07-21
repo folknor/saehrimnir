@@ -2520,6 +2520,74 @@ async fn graph_users_memberof_scopes_by_account() {
     assert_eq!(groups.len(), 2);
 }
 
+#[tokio::test]
+async fn graph_group_transitive_members_mirrors_direct_members() {
+    // No nested groups in v0, so transitiveMembers == members.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/groups/grp-eng/transitiveMembers",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let members = v["value"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    let ids: Vec<&str> = members.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"account-primary"));
+    assert!(ids.contains(&"account-secondary"));
+
+    // The microsoft.graph.user type-cast is all-pass in v0 (every
+    // member is user-typed); same result set.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/groups/grp-eng/transitiveMembers/microsoft.graph.user",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let members = v["value"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0]["@odata.type"], "#microsoft.graph.user");
+
+    // Unknown group still 404s through the transitive twin.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/groups/grp-bogus/transitiveMembers",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn graph_memberof_group_type_cast_mirrors_plain_memberof() {
+    // /me/memberOf/microsoft.graph.group == /me/memberOf in v0.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/me/memberOf/microsoft.graph.group",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = v["value"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+
+    // Path-resolved twin scopes by account and honours the cast.
+    let (_, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/memberOf/microsoft.graph.group",
+    )
+    .await;
+    let groups = v["value"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["id"], "grp-eng");
+
+    // Unknown user 404s through the type-cast twin.
+    let (status, _) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-bogus/memberOf/microsoft.graph.group",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // ── Calendar recurrence writes ──────────────────────────────────────
 
 #[tokio::test]

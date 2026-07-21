@@ -295,8 +295,10 @@ checking whether the fact is already in `notes/`.
   `/v1.0/me/outlook/masterCategories`, mutations via
   `Fixture::mutate`), `group_sync.rs` (cross-account groups -
   `/v1.0/groups`, `/v1.0/groups/{id}`,
-  `/v1.0/groups/{id}/members`, `/v1.0/me/memberOf`,
-  `/v1.0/users/{id}/memberOf`), `profile.rs` (user profile -
+  `/v1.0/groups/{id}/members` + `/transitiveMembers`
+  [+ `/microsoft.graph.user`], `/v1.0/me/memberOf`,
+  `/v1.0/users/{id}/memberOf` [both + `/microsoft.graph.group`]),
+  `profile.rs` (user profile -
   `/v1.0/me` + `/v1.0/users/{id}`, the first call
   `GraphAccountFactory::open` makes - plus GAL directory search on
   `/v1.0/users` + `/v1.0/me/users`), `settings.rs` (accept-and-ignore
@@ -696,7 +698,14 @@ projecting each member-account as a `#microsoft.graph.user` (id,
 displayName, mail, userPrincipalName populated from
 `account.name`), plus `/v1.0/me/memberOf` (bearer-resolved) and
 `/v1.0/users/{id}/memberOf` (path-resolved; `me` aliases the
-bearer's primary). Groups are cross-account by nature - each
+bearer's primary). The OData type-cast twins bifrost's groups
+surface drives are wired too: `/v1.0/groups/{id}/transitiveMembers`
+(+ `/microsoft.graph.user`) and `/me`- / `/users/{id}`-`/memberOf/
+microsoft.graph.group`. v0 has no nested groups, so
+`transitiveMembers` equals the direct member set and both casts
+are all-pass filters (members are always user-typed, memberOf
+yields only group-typed objects); all four alias the plain
+handlers. Groups are cross-account by nature - each
 fixture `[[group]]` carries a `members = [...]` list of declared
 account ids. Read-only in v0 (no mutating verbs on the Graph
 group surface).
