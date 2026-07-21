@@ -218,6 +218,10 @@ impl Builder {
             directory_people: self.directory_people,
             categories: self.categories,
             groups: self.groups,
+            // No Lua `acl(...)` builder yet - shared-folder fixtures
+            // are TOML-only in v0. Add a builder here when a Lua
+            // scenario needs `[[acl]]` coverage.
+            acls: vec![],
             send_as: self.send_as,
             // Lua change_script lives in `Builder::change_script`
             // (fully-typed `Vec<ChangeStep>`) and is grafted onto

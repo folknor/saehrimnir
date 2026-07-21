@@ -62,8 +62,14 @@ The mock advertises:
   `ENABLE QRESYNC` after LOGIN and expects `* ENABLED QRESYNC` in the
   response. Without that line the client falls back to CONDSTORE-only.
   `connection.rs:438-502`.
-- Optional but recognized: `NAMESPACE`, `MYRIGHTS`, `MOVE`. Used if
-  present, graceful fallback otherwise.
+- `NAMESPACE` (RFC 2342) - advertised and implemented. Returns the
+  personal namespace (`("" "/")`), the other-users namespace
+  (`("#user/" "/")`) that surfaces shared folders, and a NIL shared
+  namespace. Drives ratatoskr's shared-folder (A5c) discovery.
+- `ACL` (RFC 4314) - advertised; `MYRIGHTS` and `GETACL` implemented
+  (read-only ACL surface, no SETACL/DELETEACL in v0).
+- Optional but recognized: `MOVE`. Used if present, graceful
+  fallback otherwise.
 
 Advertised in v0:
 
@@ -85,8 +91,11 @@ NOT advertised in v0:
 
 - Command: `LIST "" "*"` (list all). `client/mod.rs:43`.
 - Shared folders use `LIST "" "{prefix}*"` per namespace
-  (`client/mod.rs:134`); v0 does not need to satisfy this since we do
-  not advertise NAMESPACE.
+  (`client/mod.rs:134`). We advertise NAMESPACE and serve the
+  other-users prefix `#user/`: a `LIST "" "#user/*"` enumerates
+  mailboxes other accounts have shared with the authenticated one
+  (fixture `[[acl]]` grants), projected as `#user/<owner>/<path>`. A
+  bare `LIST "" "*"` stays personal-only. See "Shared folders" below.
 - Untagged response: `* LIST (attributes) "delimiter" "name"`. Parser:
   `parse.rs:14-40`.
   - Attributes: `\Noselect` skips the folder. RFC 6154 special-use
@@ -300,10 +309,41 @@ delta on the same fixture.
   ratatoskr's writeback flow.
 - NOTIFY, COMPRESS - bandwidth / push-refinement optimisations
   (`IDLE` itself is implemented; see above).
-- ACL / MYRIGHTS - attempted but failures are soft
-  (`connection.rs:712-755`).
-- NAMESPACE / shared folders - personal-mailbox-only is enough.
+- SETACL / DELETEACL / LISTRIGHTS - the ACL surface is read-only in
+  v0 (`GETACL` / `MYRIGHTS` only). Shared folders are read-only.
 - XLIST - client falls back to LIST + attributes.
+
+## Shared folders (NAMESPACE / ACL, RFC 2342 + 4314)
+
+Drives ratatoskr's shared-folder sync (A5c). A fixture `[[acl]]`
+grant shares an owned mailbox with another declared account:
+
+```toml
+[[acl]]
+mailbox_id = "mbx-bob-inbox"   # owned by some account
+identifier = "account-alice"   # the account it is shared with
+rights = "lr"                  # RFC 4314 rights; default "lr"
+```
+
+- `NAMESPACE` -> `* NAMESPACE (("" "/")) (("#user/" "/")) NIL`.
+- `LIST "" "#user/*"` -> the grantee sees each shared mailbox as
+  `#user/<owner-name>/<owner-path>` (e.g. `#user/bob@example.com/
+  INBOX`) with the owner's role attributes. A bare `LIST "" "*"`
+  stays personal-only.
+- `MYRIGHTS <mailbox>` -> the authenticated account's rights: full
+  `lrswipkxtea` on a personal mailbox it owns, the granted rights on
+  a shared one. `NO` when the name doesn't resolve or the account
+  holds no grant.
+- `GETACL <mailbox>` -> `* ACL <mailbox> <owner> lrswipkxtea
+  <grantee> <rights> ...` (owner first, always full rights, then each
+  grant in declared order).
+- `SELECT #user/<owner>/<path>` + `UID FETCH` / `UID SEARCH` /
+  `IDLE` read the owner's messages while the connection stays
+  authenticated as the borrowing account (per-selection account
+  override). A shared folder the account holds no grant on returns
+  `NO SELECT unknown mailbox`.
+- Shared folders are read-only in v0: `UID STORE` / `COPY` / `MOVE`
+  / `EXPUNGE` on a shared selection return `NO [NOPERM]`.
 
 ## Things that WILL break sync if wrong
 

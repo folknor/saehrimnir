@@ -70,6 +70,13 @@ pub struct Fixture {
     /// surface plus the `/v1.0/me/memberOf` /
     /// `/v1.0/users/{userId}/memberOf` walkers. Empty by default.
     pub groups: Vec<Group>,
+    /// RFC 4314 access-control grants for IMAP shared folders. Each
+    /// entry shares an owned mailbox with another declared account,
+    /// exposing it under that account's `#user/<owner>/...` other-
+    /// users namespace. Empty by default; fixtures that don't need
+    /// shared-folder coverage omit the `[[acl]]` table. See
+    /// `AclGrant` and `notes/ratatoskr-imap-surface.md`.
+    pub acls: Vec<AclGrant>,
     /// Gmail SendAs identities. Flat per-account: an account may
     /// declare zero or more `[[send_as]]` rows. Real Gmail uses the
     /// `sendAsEmail` as the primary key; v0 enforces uniqueness per
@@ -684,6 +691,47 @@ impl Fixture {
         self.mailboxes
             .iter()
             .filter(move |m| m.account_id == account_id)
+    }
+
+    /// Borrow a mailbox by id across all accounts. Used by the IMAP
+    /// shared-folder resolver, which starts from an [`AclGrant`]'s
+    /// `mailbox_id` and needs the owning account before it can scope
+    /// the listing.
+    pub fn mailbox_by_id(&self, id: &str) -> Option<&Mailbox> {
+        self.mailboxes.iter().find(|m| m.id == id)
+    }
+
+    /// ACL grants that make a mailbox visible to `viewer` (i.e. grants
+    /// whose `identifier` is `viewer`). Drives the `#user/...` shared-
+    /// folder listing and SELECT access check.
+    pub fn acls_for_viewer<'a>(
+        &'a self,
+        viewer: &'a str,
+    ) -> impl Iterator<Item = &'a AclGrant> + 'a {
+        self.acls.iter().filter(move |a| a.identifier == viewer)
+    }
+
+    /// Every ACL grant on `mailbox_id`, in declared order. Drives the
+    /// IMAP `GETACL` listing (the owner is added by the caller).
+    pub fn acls_for_mailbox<'a>(
+        &'a self,
+        mailbox_id: &'a str,
+    ) -> impl Iterator<Item = &'a AclGrant> + 'a {
+        self.acls.iter().filter(move |a| a.mailbox_id == mailbox_id)
+    }
+
+    /// The RFC 4314 rights `viewer` holds on `mailbox_id`, or `None`
+    /// if the viewer neither owns the mailbox nor holds a grant on it.
+    /// The owning account always holds [`OWNER_RIGHTS`].
+    pub fn rights_for(&self, mailbox_id: &str, viewer: &str) -> Option<String> {
+        let mailbox = self.mailbox_by_id(mailbox_id)?;
+        if mailbox.account_id == viewer {
+            return Some(OWNER_RIGHTS.to_string());
+        }
+        self.acls
+            .iter()
+            .find(|a| a.mailbox_id == mailbox_id && a.identifier == viewer)
+            .map(|a| a.rights.clone())
     }
 
     /// Emails scoped to one account.
@@ -2246,6 +2294,31 @@ pub struct Mailbox {
     pub is_subscribed: bool,
 }
 
+/// RFC 4314 rights an account holds on a mailbox it owns. The full
+/// standard set: lookup, read, seen, write, insert, post, keep,
+/// delete-mailbox, delete-message, expunge, administer.
+pub const OWNER_RIGHTS: &str = "lrswipkxtea";
+
+/// Default rights a shared-folder grant confers when a fixture
+/// `[[acl]]` entry omits `rights`: lookup + read only (a read-only
+/// shared folder). Enough for the v0 shared-folder sync read path.
+pub const DEFAULT_SHARED_RIGHTS: &str = "lr";
+
+/// One RFC 4314 access-control grant on a mailbox. Decoupled from
+/// [`Mailbox`] (a top-level `[[acl]]` table) so adding shared-folder
+/// coverage to a fixture doesn't churn every `Mailbox` construction
+/// site. `mailbox_id` names the owned mailbox being shared;
+/// `identifier` is the declared account id granted access; `rights`
+/// is the RFC 4314 rights string that account holds on it. The
+/// mailbox's owning account always holds [`OWNER_RIGHTS`] implicitly
+/// and needs no grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclGrant {
+    pub mailbox_id: String,
+    pub identifier: String,
+    pub rights: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Inbox,
@@ -2581,6 +2654,8 @@ pub(crate) struct RawFixture {
     pub(crate) categories: Vec<RawCategory>,
     #[serde(default, rename = "group")]
     pub(crate) groups: Vec<RawGroup>,
+    #[serde(default, rename = "acl")]
+    pub(crate) acls: Vec<RawAcl>,
     #[serde(default, rename = "send_as")]
     pub(crate) send_as: Vec<RawSendAs>,
     #[serde(default, rename = "change")]
@@ -2841,6 +2916,16 @@ pub(crate) struct RawGroup {
     pub(crate) security_enabled: Option<bool>,
     #[serde(default)]
     pub(crate) members: Vec<String>,
+}
+
+/// TOML / Lua projection of one `[[acl]]` grant. `rights` is optional;
+/// when omitted the grant confers [`DEFAULT_SHARED_RIGHTS`].
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawAcl {
+    pub(crate) mailbox_id: String,
+    pub(crate) identifier: String,
+    #[serde(default)]
+    pub(crate) rights: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3682,6 +3767,53 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         });
     }
 
+    // IMAP shared-folder ACL grants. Each references an owned mailbox
+    // (`mailbox_id`) and a declared account it is shared with
+    // (`identifier`). A grant to the mailbox's own account is rejected
+    // (the owner holds OWNER_RIGHTS implicitly, so a self-grant is a
+    // fixture-authoring mistake); duplicate (mailbox, identifier)
+    // pairs are rejected so the GETACL listing stays a set.
+    let mailbox_ids: HashMap<&str, &str> = mailboxes
+        .iter()
+        .map(|m| (m.id.as_str(), m.account_id.as_str()))
+        .collect();
+    let mut acl_keys: HashMap<(String, String), ()> = HashMap::new();
+    let mut acls = Vec::with_capacity(raw.acls.len());
+    for a in raw.acls {
+        let Some(&owner) = mailbox_ids.get(a.mailbox_id.as_str()) else {
+            return Err(format!(
+                "acl: mailbox_id {:?} does not match any declared mailbox",
+                a.mailbox_id
+            ));
+        };
+        if !account_ids.contains_key(&a.identifier) {
+            return Err(format!(
+                "acl on {:?}: identifier {:?} does not match any declared account",
+                a.mailbox_id, a.identifier
+            ));
+        }
+        if owner == a.identifier {
+            return Err(format!(
+                "acl on {:?}: identifier {:?} owns the mailbox (owner rights are implicit)",
+                a.mailbox_id, a.identifier
+            ));
+        }
+        if acl_keys
+            .insert((a.mailbox_id.clone(), a.identifier.clone()), ())
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate acl grant on {:?} for {:?}",
+                a.mailbox_id, a.identifier
+            ));
+        }
+        acls.push(AclGrant {
+            mailbox_id: a.mailbox_id,
+            identifier: a.identifier,
+            rights: a.rights.unwrap_or_else(|| DEFAULT_SHARED_RIGHTS.to_string()),
+        });
+    }
+
     // SendAs identities. Flat per-account; primary key per account
     // is the `send_as_email` address. Real Gmail accepts the same
     // address under multiple accounts (e.g. an alias shared across
@@ -3797,6 +3929,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         directory_people,
         categories,
         groups,
+        acls,
         send_as: send_as_entries,
         account_logs: BTreeMap::new(),
         change_script,

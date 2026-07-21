@@ -11,9 +11,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 async fn run_with_fixture(script: &[u8]) -> String {
-    let fix = saehrimnir::shared::handle(
-        fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap(),
-    );
+    run_with_fixture_path("fixtures/jmap-small.toml", script).await
+}
+
+async fn run_with_fixture_path(path: &str, script: &[u8]) -> String {
+    let fix = saehrimnir::shared::handle(fixture::load(std::path::Path::new(path)).unwrap());
     let (server, mut client) = tokio::io::duplex(32 * 1024);
     let (_tx, rx) = watch::channel(false);
     let task = tokio::spawn(async move {
@@ -91,10 +93,12 @@ async fn full_initial_sync_transcript() {
     assert!(out.starts_with("* OK saehrimnir IMAP4rev1 ready\r\n"));
 
     // Capability + auth.
-    assert!(out.contains("* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS\r\n"));
+    assert!(out.contains(
+        "* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS NAMESPACE ACL\r\n"
+    ));
     assert!(out.contains("a1 OK CAPABILITY completed\r\n"));
     assert!(out.contains(
-        "a2 OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS] LOGIN completed\r\n"
+        "a2 OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS NAMESPACE ACL] LOGIN completed\r\n"
     ));
     assert!(out.contains("* ENABLED QRESYNC\r\n"));
     assert!(out.contains("a3 OK ENABLE completed\r\n"));
@@ -1399,5 +1403,149 @@ async fn authenticate_plain_with_ordinary_password_succeeds() {
     assert!(
         out.contains("a2 OK [READ-WRITE] SELECT completed"),
         "SELECT after ordinary PLAIN auth should work: {out}"
+    );
+}
+
+// ── Shared folders (NAMESPACE / ACL / #user namespace) ──────────────
+//
+// The imap-shared fixture makes bob's inbox visible to alice (primary)
+// via an `[[acl]]` grant. A default connection binds to alice.
+
+/// NAMESPACE advertises the personal + other-users prefixes bifrost
+/// walks to discover shared folders.
+#[tokio::test]
+async fn namespace_advertises_personal_and_other_users() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"pw\"\r\n\
+        a2 NAMESPACE\r\n\
+        a3 LOGOUT\r\n";
+    let out = run_with_fixture_path("fixtures/imap-shared.toml", script).await;
+    assert!(
+        out.contains("* NAMESPACE ((\"\" \"/\")) ((\"#user/\" \"/\")) NIL\r\n"),
+        "got: {out}"
+    );
+    assert!(out.contains("a2 OK NAMESPACE completed\r\n"), "got: {out}");
+}
+
+/// `LIST "" "#user/*"` enumerates the shared folder, while a bare
+/// `LIST "" "*"` stays personal-only (the other-users namespace is
+/// only walked when named).
+#[tokio::test]
+async fn list_shared_namespace_scopes_to_user_prefix() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"pw\"\r\n\
+        a2 LIST \"\" \"*\"\r\n\
+        a3 LIST \"\" \"#user/*\"\r\n\
+        a4 LOGOUT\r\n";
+    let out = run_with_fixture_path("fixtures/imap-shared.toml", script).await;
+
+    // Alice's personal INBOX is listed on the bare `*`, bob's shared
+    // folder is not.
+    let after_a2 = out.split("a2 OK LIST completed").next().unwrap();
+    assert!(after_a2.contains("\"INBOX\""), "own inbox missing: {out}");
+    assert!(
+        !after_a2.contains("#user/"),
+        "bare LIST leaked shared folder: {out}"
+    );
+
+    // The `#user/*` pattern surfaces bob's shared inbox with its role
+    // attribute, and does NOT re-list alice's own INBOX.
+    let a3 = out
+        .split("a2 OK LIST completed")
+        .nth(1)
+        .unwrap()
+        .split("a3 OK LIST completed")
+        .next()
+        .unwrap();
+    assert!(
+        a3.contains("* LIST (\\Inbox) \"/\" \"#user/bob@example.com/INBOX\"\r\n"),
+        "shared inbox missing: {out}"
+    );
+    assert!(
+        !a3.contains("\"INBOX\"\r\n"),
+        "own inbox leaked into #user listing: {out}"
+    );
+}
+
+/// MYRIGHTS reports full owner rights on a personal mailbox and the
+/// granted rights on a shared folder; GETACL lists owner + grants.
+#[tokio::test]
+async fn myrights_and_getacl_report_shared_grants() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"pw\"\r\n\
+        a2 MYRIGHTS \"INBOX\"\r\n\
+        a3 MYRIGHTS \"#user/bob@example.com/INBOX\"\r\n\
+        a4 GETACL \"#user/bob@example.com/INBOX\"\r\n\
+        a5 LOGOUT\r\n";
+    let out = run_with_fixture_path("fixtures/imap-shared.toml", script).await;
+
+    assert!(
+        out.contains("* MYRIGHTS \"INBOX\" lrswipkxtea\r\n"),
+        "own rights: {out}"
+    );
+    assert!(
+        out.contains("* MYRIGHTS \"#user/bob@example.com/INBOX\" lr\r\n"),
+        "shared rights: {out}"
+    );
+    assert!(
+        out.contains(
+            "* ACL \"#user/bob@example.com/INBOX\" bob@example.com lrswipkxtea alice@example.com lr\r\n"
+        ),
+        "acl listing: {out}"
+    );
+}
+
+/// SELECT + FETCH on a shared folder read the owner's messages while
+/// the connection stays authenticated as the borrowing account.
+#[tokio::test]
+async fn select_and_fetch_shared_folder_reads_owner_messages() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"pw\"\r\n\
+        a2 SELECT \"#user/bob@example.com/INBOX\"\r\n\
+        a3 UID FETCH 1:* (UID FLAGS BODY.PEEK[])\r\n\
+        a4 LOGOUT\r\n";
+    let out = run_with_fixture_path("fixtures/imap-shared.toml", script).await;
+
+    assert!(
+        out.contains("* 1 EXISTS\r\n"),
+        "shared inbox should show bob's one message: {out}"
+    );
+    assert!(
+        out.contains("a2 OK [READ-WRITE] SELECT completed\r\n"),
+        "select shared: {out}"
+    );
+    assert!(out.contains("a3 OK UID FETCH completed\r\n"), "fetch: {out}");
+    // Bob's message body, not alice's.
+    assert!(out.contains("Subject: Bob shared"), "bob body: {out}");
+    assert!(!out.contains("Alice private"), "leaked alice's mail: {out}");
+}
+
+/// A shared folder the viewer holds no grant on does not resolve, and
+/// a write on a (read-only) shared selection is refused.
+#[tokio::test]
+async fn shared_folder_access_and_write_are_gated() {
+    // Unknown shared path (bob has not shared a "Sent" folder) 404s.
+    let script = b"\
+        a1 LOGIN \"alice\" \"pw\"\r\n\
+        a2 SELECT \"#user/bob@example.com/Sent\"\r\n\
+        a3 MYRIGHTS \"#user/bob@example.com/Sent\"\r\n\
+        a4 LOGOUT\r\n";
+    let out = run_with_fixture_path("fixtures/imap-shared.toml", script).await;
+    assert!(out.contains("a2 NO SELECT unknown mailbox\r\n"), "got: {out}");
+    assert!(
+        out.contains("a3 NO MYRIGHTS unknown or inaccessible mailbox\r\n"),
+        "got: {out}"
+    );
+
+    // A write against a read-only shared selection is refused NOPERM.
+    let script = b"\
+        a1 LOGIN \"alice\" \"pw\"\r\n\
+        a2 SELECT \"#user/bob@example.com/INBOX\"\r\n\
+        a3 UID STORE 1 +FLAGS (\\Seen)\r\n\
+        a4 LOGOUT\r\n";
+    let out = run_with_fixture_path("fixtures/imap-shared.toml", script).await;
+    assert!(
+        out.contains("a3 NO [NOPERM]"),
+        "shared write should be NOPERM: {out}"
     );
 }

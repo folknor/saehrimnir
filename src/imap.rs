@@ -25,7 +25,7 @@ use tokio::sync::watch;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
-use crate::fixture::{Address, Body, Email, Fixture, Mailbox, Role};
+use crate::fixture::{Address, Body, Email, Fixture, Mailbox, OWNER_RIGHTS, Role};
 
 /// Greeting line emitted as soon as the connection is accepted, before
 /// the client says anything. Per RFC 3501 sec 7.1, an `* OK` greeting
@@ -36,7 +36,14 @@ pub const GREETING: &str = "* OK saehrimnir IMAP4rev1 ready\r\n";
 /// `OK [CAPABILITY ...]` resp-text. Authenticated set; the
 /// pre-auth set adds `LOGINDISABLED`-equivalents only if we ever grow
 /// real auth, which v0 does not.
-pub const CAPABILITIES: &str = "IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS";
+pub const CAPABILITIES: &str = "IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS NAMESPACE ACL";
+
+/// Other-users namespace prefix (RFC 2342). Mailboxes another account
+/// has shared with the authenticated one (via a fixture `[[acl]]`
+/// grant) surface under `#user/<owner>/<path>`. Advertised by
+/// `NAMESPACE`; recognised on `LIST` / `SELECT` / `MYRIGHTS` /
+/// `GETACL`.
+pub const SHARED_NAMESPACE_PREFIX: &str = "#user/";
 
 /// Reserved sentinel password. v0 auth is opt-in accept-everything, so
 /// a harness script cannot otherwise provoke an authentication
@@ -146,6 +153,7 @@ where
         request_log,
         latency,
         selected: None,
+        selected_account: None,
         account_id: primary_account_id,
         connection_id: crate::connection_id::next(),
         push,
@@ -194,6 +202,15 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     /// SELECT/EXAMINE, cleared on CLOSE/UNSELECT (which we don't yet
     /// handle).
     selected: Option<String>,
+    /// Owning account of the currently selected mailbox when it is a
+    /// shared folder reached through the `#user/<owner>/...` other-
+    /// users namespace; `None` for a personal selection (the common
+    /// case), which scopes to `account_id`. Every selected-mailbox
+    /// read (FETCH / SEARCH / IDLE) scopes through
+    /// [`Self::effective_account`], so a shared SELECT reads the
+    /// owner's messages while the connection stays authenticated as
+    /// the borrowing account. Cleared alongside `selected`.
+    selected_account: Option<String>,
     /// Account this connection is scoped to. Default = primary;
     /// LOGIN and AUTHENTICATE parse the supplied credential and
     /// rebind to a matching declared account if the username (or
@@ -390,6 +407,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             "LOGIN" => self.cmd_login(parsed.tag, parsed.args).await,
             "AUTHENTICATE" => self.cmd_authenticate(parsed.tag, parsed.args).await,
             "ENABLE" => self.cmd_enable(parsed.tag, parsed.args).await,
+            "NAMESPACE" => self.cmd_namespace(parsed.tag).await,
+            "MYRIGHTS" => self.cmd_myrights(parsed.tag, parsed.args).await,
+            "GETACL" => self.cmd_getacl(parsed.tag, parsed.args).await,
             "LIST" => self.cmd_list(parsed.tag, parsed.args).await,
             "CREATE" => self.cmd_create(parsed.tag, parsed.args).await,
             "RENAME" => self.cmd_rename(parsed.tag, parsed.args).await,
@@ -615,7 +635,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // falls back to substring matching, which is enough for
         // ratatoskr (it only ever sends `*`).
         let _ = reference; // hierarchy reference is unused in v0.
-        let entries = list_mailboxes(&self.fix_read(), &self.account_id);
+        let mut entries = list_mailboxes(&self.fix_read(), &self.account_id);
+        // Other-users namespace: a `LIST "" "#user/*"` (or any pattern
+        // naming the `#user/` prefix) enumerates mailboxes other
+        // accounts have shared with this one. A bare `LIST "" "*"`
+        // stays personal-only - matching real servers, where the
+        // other-users namespace is not walked unless explicitly named
+        // - so shared entries are appended only when the pattern
+        // references the prefix.
+        if pattern.contains(SHARED_NAMESPACE_PREFIX) {
+            entries.extend(
+                list_shared_mailboxes(&self.fix_read(), &self.account_id)
+                    .into_iter()
+                    .map(|s| ListEntry {
+                        fixture_id: s.fixture_id,
+                        path: s.path,
+                        attributes: s.attributes,
+                    }),
+            );
+        }
         for e in &entries {
             if !pattern_matches(&pattern, &e.path) {
                 continue;
@@ -629,6 +667,158 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 .await?;
         }
         self.write_line(&format!("{tag} OK LIST completed")).await
+    }
+
+    /// `NAMESPACE` (RFC 2342). Advertises the personal namespace
+    /// (empty prefix, `/` delimiter), the other-users namespace
+    /// (`#user/` prefix) that surfaces shared folders, and a NIL
+    /// shared namespace. bifrost walks the raw response line to learn
+    /// the other-users prefix before `LIST`ing shared folders.
+    async fn cmd_namespace(&mut self, tag: &str) -> std::io::Result<()> {
+        if !self.is_authenticated() {
+            return self
+                .write_line(&format!("{tag} BAD NAMESPACE requires authentication"))
+                .await;
+        }
+        self.write_line(&format!(
+            "* NAMESPACE ((\"\" \"/\")) ((\"{SHARED_NAMESPACE_PREFIX}\" \"/\")) NIL"
+        ))
+        .await?;
+        self.write_line(&format!("{tag} OK NAMESPACE completed"))
+            .await
+    }
+
+    /// `MYRIGHTS <mailbox>` (RFC 4314). Reports the rights the
+    /// authenticated account holds on the named mailbox - full
+    /// [`OWNER_RIGHTS`] for a personal mailbox it owns, or the granted
+    /// rights for a `#user/<owner>/...` shared folder. `NO` when the
+    /// mailbox doesn't resolve or the account holds no rights on it.
+    async fn cmd_myrights(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !self.is_authenticated() {
+            return self
+                .write_line(&format!("{tag} BAD MYRIGHTS requires authentication"))
+                .await;
+        }
+        let Some(name) = parse_one_astring(args) else {
+            return self
+                .write_line(&format!("{tag} BAD MYRIGHTS expects \"mailbox\""))
+                .await;
+        };
+        let Some(resolved) = self.resolve_mailbox(&name) else {
+            return self
+                .write_line(&format!("{tag} NO MYRIGHTS unknown or inaccessible mailbox"))
+                .await;
+        };
+        self.write_line(&format!("* MYRIGHTS \"{}\" {}", resolved.path, resolved.rights))
+            .await?;
+        self.write_line(&format!("{tag} OK MYRIGHTS completed"))
+            .await
+    }
+
+    /// `GETACL <mailbox>` (RFC 4314). Lists every identifier and its
+    /// rights on the mailbox: the owning account (always
+    /// [`OWNER_RIGHTS`]) plus each declared `[[acl]]` grant. The
+    /// authenticated account must itself hold rights on the mailbox to
+    /// read the ACL (v0 treats any held right as sufficient - real
+    /// servers gate on the `a` administer right).
+    async fn cmd_getacl(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if !self.is_authenticated() {
+            return self
+                .write_line(&format!("{tag} BAD GETACL requires authentication"))
+                .await;
+        }
+        let Some(name) = parse_one_astring(args) else {
+            return self
+                .write_line(&format!("{tag} BAD GETACL expects \"mailbox\""))
+                .await;
+        };
+        let Some(resolved) = self.resolve_mailbox(&name) else {
+            return self
+                .write_line(&format!("{tag} NO GETACL unknown or inaccessible mailbox"))
+                .await;
+        };
+        // Owner identifier first (full rights), then each grant in
+        // declared order. Read from owned data so the guard drops
+        // before the write.
+        let pairs: Vec<(String, String)> = {
+            let fix = self.fix_read();
+            let owner_name = fix
+                .account(&resolved.account_id)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| resolved.account_id.clone());
+            let mut pairs = vec![(owner_name, OWNER_RIGHTS.to_string())];
+            for g in fix.acls_for_mailbox(&resolved.fixture_id) {
+                let ident = fix
+                    .account(&g.identifier)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| g.identifier.clone());
+                pairs.push((ident, g.rights.clone()));
+            }
+            pairs
+        };
+        let rendered: String = pairs
+            .iter()
+            .map(|(id, rights)| format!("{id} {rights}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.write_line(&format!("* ACL \"{}\" {rendered}", resolved.path))
+            .await?;
+        self.write_line(&format!("{tag} OK GETACL completed"))
+            .await
+    }
+
+    /// The account whose messages the currently selected mailbox
+    /// belongs to: the shared folder's owner when one is selected,
+    /// otherwise the connection's own account. Every selected-mailbox
+    /// read scopes through this.
+    fn effective_account(&self) -> &str {
+        self.selected_account.as_deref().unwrap_or(&self.account_id)
+    }
+
+    /// Reject a mutating command when the currently selected mailbox is
+    /// a shared folder reached through the other-users namespace. v0
+    /// shared folders are read-only (grants default to `lr`), so a
+    /// write on one returns `NO [NOPERM]`. Returns `Ok(true)` when it
+    /// wrote the rejection (caller returns immediately), `Ok(false)`
+    /// for a normal personal selection.
+    async fn reject_shared_write(&mut self, tag: &str, cmd: &str) -> std::io::Result<bool> {
+        if self.selected_account.is_some() {
+            self.write_line(&format!(
+                "{tag} NO [NOPERM] {cmd} not permitted on a read-only shared folder"
+            ))
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Resolve a mailbox name - personal (`INBOX`, `Work/Reports`) or
+    /// shared (`#user/<owner>/<path>`) - to the owning account, the
+    /// fixture mailbox id, the canonical wire path, and the rights the
+    /// authenticated account holds on it. `None` when the name doesn't
+    /// resolve or the account has no access (no ACL grant on a shared
+    /// folder).
+    fn resolve_mailbox(&self, name: &str) -> Option<ResolvedMailbox> {
+        let fix = self.fix_read();
+        if name.starts_with(SHARED_NAMESPACE_PREFIX) {
+            let shared = list_shared_mailboxes(&fix, &self.account_id);
+            let entry = shared.into_iter().find(|s| s.path.eq_ignore_ascii_case(name))?;
+            Some(ResolvedMailbox {
+                account_id: entry.owner_account_id,
+                fixture_id: entry.fixture_id,
+                path: entry.path,
+                rights: entry.rights,
+            })
+        } else {
+            let entries = list_mailboxes(&fix, &self.account_id);
+            let entry = entries.into_iter().find(|e| e.path.eq_ignore_ascii_case(name))?;
+            Some(ResolvedMailbox {
+                account_id: self.account_id.clone(),
+                fixture_id: entry.fixture_id,
+                path: entry.path,
+                rights: OWNER_RIGHTS.to_string(),
+            })
+        }
     }
 
     async fn cmd_status(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
@@ -705,30 +895,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
         };
         let name = select.name.clone();
-        let entries = list_mailboxes(&self.fix_read(), &self.account_id);
-        let entry = entries.iter().find(|e| e.path.eq_ignore_ascii_case(&name));
-        let Some(entry) = entry else {
+        // Resolve personal or `#user/...` shared name to its owning
+        // account + fixture id. A shared name the viewer holds no
+        // grant on resolves to None -> NO, so cross-principal access
+        // without an ACL is refused.
+        let Some(resolved) = self.resolve_mailbox(&name) else {
             // Per RFC, on NO SELECT the connection drops back to
             // Authenticated state.
             self.state = State::Authenticated;
             self.selected = None;
+            self.selected_account = None;
             return self
                 .write_line(&format!("{tag} NO SELECT unknown mailbox"))
                 .await;
         };
+        // Scope every projection below to the mailbox's owning account
+        // (the shared folder's owner, or this connection's own account
+        // for a personal mailbox).
+        let owner = resolved.account_id.clone();
+        let entry_id = resolved.fixture_id.clone();
 
         // Counts and the first-unseen index are both pure projections
         // into owned data; each helper borrows the fixture only for
         // its own call and the result owns no `&Fixture` references,
         // so the guard drops between calls.
-        let counts = mailbox_counts(&self.fix_read(), &self.account_id, &entry.fixture_id);
+        let counts = mailbox_counts(&self.fix_read(), &owner, &entry_id);
         let first_unseen_idx = {
             let fix = self.fix_read();
-            mailbox_messages(&fix, &self.account_id, &entry.fixture_id)
+            mailbox_messages(&fix, &owner, &entry_id)
                 .iter()
                 .position(|(_, e)| !e.keywords.iter().any(|k| k == "$seen"))
         };
-        let entry_id = entry.fixture_id.clone();
 
         // Untagged responses, RFC 3501 sec 6.3.1. Order does not
         // matter, but we emit a stable order for byte-determinism.
@@ -752,7 +949,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             counts.uidnext
         ))
         .await?;
-        let highestmodseq = self.fix_read().imap_highestmodseq(&self.account_id);
+        let highestmodseq = self.fix_read().imap_highestmodseq(&owner);
         self.write_line(&format!("* OK [HIGHESTMODSEQ {highestmodseq}] modseq"))
             .await?;
 
@@ -783,6 +980,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         let verb = if read_write { "SELECT" } else { "EXAMINE" };
         self.state = State::Selected;
         self.selected = Some(entry_id);
+        // Remember the owning account only for a shared selection; a
+        // personal selection leaves it None so `effective_account`
+        // falls back to `account_id`.
+        self.selected_account = if owner == self.account_id {
+            None
+        } else {
+            Some(owner)
+        };
         self.write_line(&format!("{tag} OK [{access}] {verb} completed"))
             .await
     }
@@ -794,6 +999,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 .await;
         }
         self.selected = None;
+        self.selected_account = None;
         self.state = State::Authenticated;
         self.write_line(&format!("{tag} OK CLOSE completed")).await
     }
@@ -1035,10 +1241,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // the first wake diffs against the pre-IDLE state. The receiver
         // drops when this method returns (DONE / shutdown / peer close);
         // the hub prunes the stale registration on its next emit.
-        let mut idle_rx = self.push.register_imap_idle(self.account_id.clone());
+        // Wake on the *owning* account's state advance (the shared
+        // folder's owner for a shared selection, else our own).
+        let mut idle_rx = self
+            .push
+            .register_imap_idle(self.effective_account().to_string());
         let mut last_uids: Vec<u32> = {
             let fix = self.fix_read();
-            live_uids(&fix, &self.account_id, &selected_id)
+            live_uids(&fix, self.effective_account(), &selected_id)
         };
         self.write_line("+ idling").await?;
         loop {
@@ -1087,7 +1297,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     ) -> std::io::Result<()> {
         let new_uids: Vec<u32> = {
             let fix = self.fix_read();
-            live_uids(&fix, &self.account_id, selected_id)
+            live_uids(&fix, self.effective_account(), selected_id)
         };
         // Expunged: UIDs present before but gone now. The IMAP sequence
         // number is the 1-based position in the *old* live view; emit
@@ -1234,7 +1444,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // never do.
         let snapshot: Vec<(u32, u32, u64, Email)> = {
             let fix = self.fix_read();
-            mailbox_messages(&fix, &self.account_id, &selected_id)
+            let acct = self.effective_account();
+            mailbox_messages(&fix, acct, &selected_id)
                 .into_iter()
                 .enumerate()
                 .filter(|(_, (uid, _))| set.matches(*uid))
@@ -1248,7 +1459,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     // 1+`; a message last touched at counter N (modseq
                     // N+1) survives any `CHANGEDSINCE < N+1`, so a
                     // mutation surfaces in the next delta FETCH.
-                    let modseq = fix.email_modseq(&self.account_id, &email.id);
+                    let modseq = fix.email_modseq(acct, &email.id);
                     if let Some(since) = changedsince
                         && modseq <= since
                     {
@@ -1299,6 +1510,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// Emits a `* <seq> FETCH (UID x FLAGS (...))` per matched
     /// message unless `.SILENT` was requested, then a tagged OK.
     async fn cmd_uid_store(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if self.reject_shared_write(tag, "UID STORE").await? {
+            return Ok(());
+        }
         let (uid_set_str, after) = match split_after_set(args) {
             Some(p) => p,
             None => {
@@ -1383,6 +1597,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// COPYUID is omitted in v0 - ratatoskr's copy code accepts a
     /// bare OK.
     async fn cmd_uid_copy(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if self.reject_shared_write(tag, "UID COPY").await? {
+            return Ok(());
+        }
         if !matches!(self.state, State::Selected) {
             return self
                 .write_line(&format!("{tag} BAD UID COPY requires SELECT first"))
@@ -1496,6 +1713,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// MOVE nor UIDPLUS before this, so an IMAP move could not land at
     /// all. Returns `NO [TRYCREATE]` when the target does not resolve.
     async fn cmd_uid_move(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if self.reject_shared_write(tag, "UID MOVE").await? {
+            return Ok(());
+        }
         if !matches!(self.state, State::Selected) {
             return self
                 .write_line(&format!("{tag} BAD UID MOVE requires SELECT first"))
@@ -1658,6 +1878,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// after the operation, it is destroyed entirely; otherwise
     /// it survives in its other mailboxes.
     async fn cmd_uid_expunge(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
+        if self.reject_shared_write(tag, "UID EXPUNGE").await? {
+            return Ok(());
+        }
         if !matches!(self.state, State::Selected) {
             return self
                 .write_line(&format!("{tag} BAD UID EXPUNGE requires SELECT first"))
@@ -1763,7 +1986,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         };
         let mut hits: Vec<u32> = {
             let fix = self.fix_read();
-            mailbox_messages(&fix, &self.account_id, &selected_id)
+            mailbox_messages(&fix, self.effective_account(), &selected_id)
                 .iter()
                 .filter(|(uid, e)| matches.matches(*uid, e))
                 .map(|(uid, _)| *uid)
@@ -1801,6 +2024,67 @@ struct ListEntry {
     /// IMAP attributes (e.g. `\Inbox`, `\Sent`). Each entry already
     /// includes the leading backslash.
     attributes: Vec<String>,
+}
+
+/// A mailbox name resolved for SELECT / MYRIGHTS / GETACL. Covers both
+/// personal mailboxes (owned by the authenticated account) and shared
+/// folders reached through the `#user/...` namespace.
+struct ResolvedMailbox {
+    /// Owning account - the one whose messages the mailbox holds.
+    account_id: String,
+    fixture_id: String,
+    /// Canonical wire path (`INBOX`, or `#user/<owner>/<path>`).
+    path: String,
+    /// Rights the authenticated account holds on it.
+    rights: String,
+}
+
+/// One shared folder visible to a viewer account through the
+/// other-users namespace. Parallel to [`ListEntry`] but carries the
+/// owning account and the viewer's rights.
+struct SharedListEntry {
+    fixture_id: String,
+    owner_account_id: String,
+    /// `#user/<owner-name>/<owner-path>` wire path.
+    path: String,
+    attributes: Vec<String>,
+    rights: String,
+}
+
+/// Enumerate the mailboxes other accounts have shared with `viewer`,
+/// projected into the `#user/<owner>/<path>` other-users namespace.
+/// Driven by the fixture `[[acl]]` grants whose `identifier` is the
+/// viewer; the owner segment is the owning account's `name`, and the
+/// mailbox path is its own personal path (so a shared INBOX surfaces
+/// as `#user/<owner>/INBOX`).
+fn list_shared_mailboxes(fixture: &Fixture, viewer: &str) -> Vec<SharedListEntry> {
+    let mut out = Vec::new();
+    for grant in fixture.acls_for_viewer(viewer) {
+        let Some(mailbox) = fixture.mailbox_by_id(&grant.mailbox_id) else {
+            continue;
+        };
+        let owner_account_id = mailbox.account_id.clone();
+        let owner_name = fixture
+            .account(&owner_account_id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| owner_account_id.clone());
+        // The owner's personal path for this mailbox (INBOX, Work/X, ...).
+        let owner_entries = list_mailboxes(fixture, &owner_account_id);
+        let Some(owner_entry) = owner_entries
+            .into_iter()
+            .find(|e| e.fixture_id == grant.mailbox_id)
+        else {
+            continue;
+        };
+        out.push(SharedListEntry {
+            fixture_id: grant.mailbox_id.clone(),
+            owner_account_id,
+            path: format!("{SHARED_NAMESPACE_PREFIX}{owner_name}/{}", owner_entry.path),
+            attributes: owner_entry.attributes,
+            rights: grant.rights.clone(),
+        });
+    }
+    out
 }
 
 fn list_mailboxes(fixture: &Fixture, account_id: &str) -> Vec<ListEntry> {
@@ -3443,6 +3727,7 @@ mod tests {
             directory_people: vec![],
             categories: vec![],
             groups: vec![],
+            acls: vec![],
             send_as: vec![],
             mailbox_uid_history: HashMap::new(),
             synthetic_event_seq: 0,
@@ -3545,6 +3830,7 @@ mod tests {
             directory_people: vec![],
             categories: vec![],
             groups: vec![],
+            acls: vec![],
             send_as: vec![],
             mailbox_uid_history: HashMap::new(),
             synthetic_event_seq: 0,
@@ -3627,11 +3913,13 @@ mod tests {
         let out = run_script(b"a1 CAPABILITY\r\n").await;
         assert!(out.contains(GREETING));
         assert!(
-            out.contains("* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS\r\n"),
+            out.contains(
+                "* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS NAMESPACE ACL\r\n"
+            ),
             "got: {out:?}"
         );
         assert!(out.contains("a1 OK CAPABILITY completed\r\n"));
-        for k in ["STARTTLS", "COMPRESS", "NOTIFY", "APPEND", "NAMESPACE"] {
+        for k in ["STARTTLS", "COMPRESS", "NOTIFY", "APPEND"] {
             assert!(
                 !out.contains(k),
                 "advertised banned capability {k}: {out:?}"
@@ -3679,7 +3967,7 @@ mod tests {
         let out = run_script(b"a LOGIN \"alice\" \"hunter2\"\r\n").await;
         assert!(
             out.contains(
-                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS] LOGIN completed"
+                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS NAMESPACE ACL] LOGIN completed"
             ),
             "got: {out:?}"
         );
@@ -3699,7 +3987,7 @@ mod tests {
         let out = run_script(b"a AUTHENTICATE PLAIN AGFsaWNlAGh1bnRlcg==\r\n").await;
         assert!(
             out.contains(
-                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS] PLAIN authentication accepted"
+                "a OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS NAMESPACE ACL] PLAIN authentication accepted"
             ),
             "got: {out:?}"
         );

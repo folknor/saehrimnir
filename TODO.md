@@ -8,6 +8,24 @@ tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
 Concrete next-up items lifted above the per-protocol backlogs.
 
+From the ratatoskr A5 / B8-groups gap report:
+
+- **[done] B8-groups OData type-cast twins.** `/groups/{id}/
+  transitiveMembers[/microsoft.graph.user]` and
+  `/me`- / `/users/{id}`-`/memberOf/microsoft.graph.group`. All-pass
+  in v0 (no nested groups; single member type). See CLAUDE.md.
+- **[done] Graph shared-mailbox `/users/{id}` per-message twins.**
+  Already implemented; pinned with tests (single-message GET,
+  `$value`, `$batch` sub-requests, calendarView).
+- **[done] IMAP NAMESPACE + MYRIGHTS/GETACL + `#user/` shared
+  folders.** Fixture `[[acl]]` grants + other-users namespace read
+  path. See CLAUDE.md "IMAP" + `notes/ratatoskr-imap-surface.md`.
+- **[next] EWS SOAP + Autodiscover (A5b).** Entirely missing; the
+  largest remaining A5 gap. GetUserSettings Autodiscover,
+  find_folder / find_items, GetStreamingEvents for public-folder +
+  EWS-streaming push. New SOAP/XML module (`src/ews.rs`). Tracked
+  under "Microsoft Graph (other future work)" below.
+
 ## From the 2026-05-10 multi-agent review (today's slice)
 
 Findings from a four-agent (bugs / security / perf / arch) sweep of

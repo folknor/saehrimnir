@@ -549,6 +549,34 @@ Groups project over the Graph
 `/v1.0/users/{id}/memberOf` surfaces. The Lua loader exposes the
 same shape via `group({...})`.
 
+## Shared-folder ACLs (optional)
+
+RFC 4314 access-control grants for the IMAP other-users namespace.
+Each `[[acl]]` shares an owned mailbox with another declared
+account, exposing it under that account's `#user/<owner>/...`
+namespace. Decoupled from `[[mailbox]]` (a top-level table) so
+adding shared-folder coverage doesn't touch mailbox rows.
+
+```toml
+[[acl]]
+mailbox_id = "mbx-bob-inbox"   # an owned mailbox
+identifier = "account-alice"   # the account it is shared with
+rights = "lr"                  # optional; RFC 4314 rights, default "lr"
+```
+
+Validation:
+
+- `mailbox_id` must match a declared `[[mailbox]]`.
+- `identifier` must match a declared `[[account]]`.
+- `identifier` must not be the mailbox's own account (the owner
+  holds full `lrswipkxtea` rights implicitly).
+- `(mailbox_id, identifier)` pairs are unique.
+
+Drives IMAP `NAMESPACE` / `LIST "" "#user/*"` / `MYRIGHTS` /
+`GETACL` and shared-folder `SELECT` + read. Shared folders are
+read-only in v0. No Lua `acl({...})` builder yet - TOML-only. See
+`notes/ratatoskr-imap-surface.md` "Shared folders".
+
 ## OAuth (optional)
 
 ```toml

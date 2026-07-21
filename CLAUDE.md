@@ -505,7 +505,8 @@ update / destroy round trip, and the cross-protocol
 visibility assertion.
 
 IMAP: complete for v0's read path (greeting, `CAPABILITY`, `LOGIN`/
-`AUTHENTICATE`, `ENABLE QRESYNC`, `LIST`, `STATUS`, `SELECT`/`EXAMINE`/
+`AUTHENTICATE`, `ENABLE QRESYNC`, `NAMESPACE`, `LIST`, `STATUS`,
+`MYRIGHTS`, `GETACL`, `SELECT`/`EXAMINE`/
 `CLOSE`, `UID SEARCH`, `UID FETCH` with full RFC 822 body emission
 including `multipart/mixed` for fixtures with attachments,
 `ENVELOPE` (RFC 3501 7.4.2 structured envelope), `BODYSTRUCTURE`,
@@ -552,6 +553,28 @@ last mailbox membership goes away. Integration tests in
 `tests/imap.rs` drive both the full initial-sync transcript and
 the persistent writeback / copy / expunge round-trips, plus
 RFC 3501 §2.3.1.1 UID-stability regressions.
+
+Shared folders (NAMESPACE / ACL, RFC 2342 + 4314) drive
+ratatoskr's A5c shared-folder sync. `CAPABILITY` advertises
+`NAMESPACE ACL`. A fixture `[[acl]]` grant (`mailbox_id` /
+`identifier` / `rights`, decoupled from `Mailbox` as a top-level
+table) shares an owned mailbox with another declared account.
+`NAMESPACE` returns the personal (`("" "/")`) + other-users
+(`("#user/" "/")`) namespaces; `LIST "" "#user/*"` enumerates the
+grantee's shared mailboxes as `#user/<owner>/<path>` (a bare
+`LIST "" "*"` stays personal-only); `MYRIGHTS` / `GETACL` report
+rights (owner holds `lrswipkxtea` implicitly, grants default
+`lr`). `SELECT #user/<owner>/<path>` records the owner on the
+connection's `selected_account`, and every selected-mailbox read
+(`UID FETCH` / `UID SEARCH` / `IDLE`) scopes through
+`effective_account()` so a shared SELECT reads the owner's
+messages while the connection stays authenticated as the
+borrowing account. A shared folder the account holds no grant on
+`NO`s on SELECT/MYRIGHTS/GETACL; shared folders are read-only, so
+`UID STORE`/`COPY`/`MOVE`/`EXPUNGE` on a shared selection return
+`NO [NOPERM]`. `fixtures/imap-shared.toml` +
+`tests/imap.rs` cover the discovery walk, listing scope, rights
+reporting, cross-account FETCH isolation, and the write gate.
 
 UIDs are assigned by `Fixture::mailbox_uid_history`: an
 insertion-ordered list of email ids per mailbox. Each addition
