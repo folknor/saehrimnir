@@ -2429,6 +2429,147 @@ async fn graph_users_unknown_for_each_resource_family_returns_404() {
     }
 }
 
+// ── Shared-mailbox per-message twins on /users/{id} ─────────────────
+//
+// The collection reads above cover folder / calendar / contact
+// scoping. These pin the per-message treatments the A5 shared-mailbox
+// mail-sync harness leans on - single-message GET, `$value`, `$batch`
+// sub-requests, and calendarView - on the `/users/{id}` prefix, and
+// assert cross-account isolation through each.
+
+#[tokio::test]
+async fn graph_users_single_message_scopes_by_account() {
+    // /users/{secondary}/messages/{id} hydrates the secondary's mail.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/messages/email-secondary-001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], "email-secondary-001");
+    assert_eq!(v["subject"], "Hello secondary");
+    assert_eq!(v["from"]["emailAddress"]["address"], "elsewhere@example.com");
+
+    // Primary's /me can't reach the secondary's message id.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/me/messages/email-secondary-001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ErrorItemNotFound");
+
+    // Unknown user 404s ResourceNotFound (not ErrorItemNotFound).
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-bogus/messages/email-secondary-001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn graph_users_message_value_twin_returns_rfc822() {
+    let (status, bytes, _) = get_raw(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/messages/email-secondary-001/$value",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).unwrap();
+    assert!(body.contains("Subject: Hello secondary"), "got: {body}");
+    assert!(body.contains("elsewhere@example.com"), "from missing: {body}");
+    assert!(body.contains("Secondary account inbox email."));
+
+    // Cross-account: /me can't assemble the secondary's bytes.
+    let (status, _, _) = get_raw(
+        multi_account_graph_router(),
+        "/v1.0/me/messages/email-secondary-001/$value",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_users_batch_subrequests_scope_by_account() {
+    // A single $batch mixing a /users/{secondary} sub-request (hits)
+    // with a cross-account /me sub-request for the same id (misses).
+    let body = json!({
+        "requests": [
+            { "id": "1", "method": "GET",
+              "url": "/users/account-secondary/messages/email-secondary-001" },
+            { "id": "2", "method": "GET",
+              "url": "/me/messages/email-secondary-001" },
+        ]
+    });
+    let resp = multi_account_graph_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1.0/$batch")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let responses = v["responses"].as_array().unwrap();
+    let by_id = |id: &str| responses.iter().find(|r| r["id"] == id).unwrap();
+
+    // Secondary-prefixed sub-request hydrates the message.
+    let r1 = by_id("1");
+    assert_eq!(r1["status"], 200);
+    assert_eq!(r1["body"]["id"], "email-secondary-001");
+    assert_eq!(r1["body"]["subject"], "Hello secondary");
+
+    // /me sub-request for the same id misses per-item (primary scope).
+    let r2 = by_id("2");
+    assert_eq!(r2["status"], 404);
+    assert_eq!(r2["body"]["error"]["code"], "ErrorItemNotFound");
+}
+
+#[tokio::test]
+async fn graph_users_calendar_view_twin_scopes_by_account() {
+    // Range read of the secondary's calendar via the /users/{id} twin.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/calendars/cal-secondary/calendarView\
+         ?startDateTime=2026-02-01T00:00:00Z&endDateTime=2026-02-28T00:00:00Z",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let evs = v["value"].as_array().unwrap();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0]["id"], "ev-secondary-001");
+    assert_eq!(evs[0]["subject"], "Secondary review");
+
+    // The calendarView/delta twin walks the same account-scoped set.
+    let (status, v) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/users/account-secondary/calendars/cal-secondary/calendarView/delta",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let evs = v["value"].as_array().unwrap();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0]["id"], "ev-secondary-001");
+
+    // Cross-account: primary's /me can't resolve the secondary calendar.
+    let (status, _) = get_json_with(
+        multi_account_graph_router(),
+        "/v1.0/me/calendars/cal-secondary/calendarView\
+         ?startDateTime=2026-02-01T00:00:00Z&endDateTime=2026-02-28T00:00:00Z",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // ── Graph groups ────────────────────────────────────────────────────
 
 #[tokio::test]
