@@ -936,6 +936,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             self.selected = None;
             self.selected_account = None;
             self.selected_rights = None;
+            // A path in the other-users namespace can name a real mailbox
+            // whose ACL was withdrawn after the client discovered it. Keep
+            // that distinct from an invented mailbox: bifrost maps NOPERM
+            // on a previously shared scope to ScopeRevoked, which disables
+            // only that scope. Reporting it as an unqualified NO loses the
+            // permission class and incorrectly turns the account terminal.
+            if shared_mailbox_path_exists(&self.fix_read(), &self.account_id, &name) {
+                return self
+                    .write_line(&format!("{tag} NO [NOPERM] SELECT access revoked"))
+                    .await;
+            }
             return self
                 .write_line(&format!("{tag} NO SELECT unknown mailbox"))
                 .await;
@@ -2133,6 +2144,27 @@ fn list_shared_mailboxes(fixture: &Fixture, viewer: &str) -> Vec<SharedListEntry
         });
     }
     out
+}
+
+/// Whether `path` names an existing other-user mailbox, irrespective of the
+/// viewer's current ACL. SELECT uses this after normal shared resolution
+/// failed so a revoked grant returns the permission-shaped NOPERM response
+/// instead of pretending the known mailbox never existed.
+fn shared_mailbox_path_exists(fixture: &Fixture, viewer: &str, path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(SHARED_NAMESPACE_PREFIX) else {
+        return false;
+    };
+    fixture.accounts.iter().any(|account| {
+        if account.id == viewer {
+            return false;
+        }
+        let Some(owner_path) = rest.strip_prefix(&format!("{}/", account.name)) else {
+            return false;
+        };
+        list_mailboxes(fixture, &account.id)
+            .into_iter()
+            .any(|entry| entry.path.eq_ignore_ascii_case(owner_path))
+    })
 }
 
 fn list_mailboxes(fixture: &Fixture, account_id: &str) -> Vec<ListEntry> {

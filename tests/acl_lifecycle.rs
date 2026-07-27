@@ -153,9 +153,16 @@ async fn acl_grant_and_revoke_are_observable_on_a_live_imap_connection() {
         "a3 ",
     )
     .await;
+    // NOPERM, not unknown-mailbox: the mailbox exists and Alice simply holds
+    // no grant on it, which is what RFC 4314 reserves NOPERM for. The
+    // distinction is load-bearing downstream - a client maps NOPERM on a
+    // known shared path to a revoked scope and disables just that scope,
+    // where an unqualified NO loses the permission class and takes the whole
+    // account terminal. An genuinely nonexistent path still answers
+    // unknown mailbox.
     assert!(
-        out.contains("a3 NO SELECT unknown mailbox"),
-        "ungranted SELECT should be refused: {out}"
+        out.contains("a3 NO [NOPERM]"),
+        "ungranted SELECT should be refused with NOPERM: {out}"
     );
 
     // Post-attach ACL addition.
@@ -233,9 +240,14 @@ async fn acl_grant_and_revoke_are_observable_on_a_live_imap_connection() {
         "a7 ",
     )
     .await;
+    // Revoked, so NOPERM rather than unknown-mailbox: the mailbox plainly
+    // still exists, only the grant is gone. This is the case the whole
+    // distinction exists for - a client that reads an unqualified NO here
+    // cannot tell a withdrawn share from a vanished one, and takes the
+    // account terminal instead of quarantining the one dead scope.
     assert!(
-        out.contains("a7 NO SELECT unknown mailbox"),
-        "revoked mailbox must stop being selectable: {out}"
+        out.contains("a7 NO [NOPERM]"),
+        "revoked mailbox must stop being selectable with NOPERM: {out}"
     );
 
     // Alice's own namespace is untouched by either mutation.
