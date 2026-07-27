@@ -2448,7 +2448,10 @@ async fn graph_users_single_message_scopes_by_account() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["id"], "email-secondary-001");
     assert_eq!(v["subject"], "Hello secondary");
-    assert_eq!(v["from"]["emailAddress"]["address"], "elsewhere@example.com");
+    assert_eq!(
+        v["from"]["emailAddress"]["address"],
+        "elsewhere@example.com"
+    );
 
     // Primary's /me can't reach the secondary's message id.
     let (status, v) = get_json_with(
@@ -2479,7 +2482,10 @@ async fn graph_users_message_value_twin_returns_rfc822() {
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).unwrap();
     assert!(body.contains("Subject: Hello secondary"), "got: {body}");
-    assert!(body.contains("elsewhere@example.com"), "from missing: {body}");
+    assert!(
+        body.contains("elsewhere@example.com"),
+        "from missing: {body}"
+    );
     assert!(body.contains("Secondary account inbox email."));
 
     // Cross-account: /me can't assemble the secondary's bytes.

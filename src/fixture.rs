@@ -748,6 +748,30 @@ impl Fixture {
         self.acls.iter().filter(move |a| a.identifier == viewer)
     }
 
+    /// Whether this fixture models a server that shares mailboxes across
+    /// accounts at all: any static `[[acl]]` grant, any change-script
+    /// `acl_grant` op (a grant that will exist mid-run counts BEFORE its
+    /// step fires - the other-users namespace must be advertised from the
+    /// first NAMESPACE so a post-attach grant can surface without a
+    /// reconnect), or any declared non-personal account. Gates the IMAP
+    /// `NAMESPACE` other-users advertisement: a personal-only fixture
+    /// models the common personal-server shape (Gmail IMAP, plain
+    /// single-user Dovecot) where no `#user/` root exists and a client
+    /// never needs to re-poll for shares.
+    pub fn imap_advertises_other_namespace(&self) -> bool {
+        if !self.acls.is_empty() {
+            return true;
+        }
+        if self.accounts.iter().any(|account| !account.is_personal) {
+            return true;
+        }
+        self.change_script.iter().any(|step| {
+            step.ops
+                .iter()
+                .any(|op| matches!(op, ChangeOp::AclGrant { .. }))
+        })
+    }
+
     /// Every ACL grant on `mailbox_id`, in declared order. Drives the
     /// IMAP `GETACL` listing (the owner is added by the caller).
     pub fn acls_for_mailbox<'a>(
@@ -4115,7 +4139,9 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         acls.push(AclGrant {
             mailbox_id: a.mailbox_id,
             identifier: a.identifier,
-            rights: a.rights.unwrap_or_else(|| DEFAULT_SHARED_RIGHTS.to_string()),
+            rights: a
+                .rights
+                .unwrap_or_else(|| DEFAULT_SHARED_RIGHTS.to_string()),
         });
     }
 
@@ -4142,7 +4168,10 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             display_name: pf.display_name,
             parent_id: pf.parent_id,
             folder_class,
-            effective_rights: pf.effective_rights.map(EffectiveRights::from).unwrap_or_default(),
+            effective_rights: pf
+                .effective_rights
+                .map(EffectiveRights::from)
+                .unwrap_or_default(),
         });
     }
     for pf in &public_folders {
@@ -5113,7 +5142,8 @@ fn normalize_change_step(
     for a in raw.acl_revoke {
         let pair = format!("{}/{}", a.mailbox_id, a.identifier);
         ops.push(
-            acl_revoke_op(a).map_err(|e| format!("change step {id:?}: acl_revoke {pair:?}: {e}"))?,
+            acl_revoke_op(a)
+                .map_err(|e| format!("change step {id:?}: acl_revoke {pair:?}: {e}"))?,
         );
     }
 
@@ -5276,11 +5306,8 @@ pub(crate) fn normalize_email(
         Body::Text(s) => i64::try_from(s.len()).unwrap_or(i64::MAX),
     });
 
-    let attachments = normalize_attachments(
-        em.attachments,
-        fixture_dir,
-        &format!("email {:?}", em.id),
-    )?;
+    let attachments =
+        normalize_attachments(em.attachments, fixture_dir, &format!("email {:?}", em.id))?;
 
     let has_attachment = match em.has_attachment {
         Some(false) if !attachments.is_empty() => {
@@ -5453,9 +5480,7 @@ mod tests {
     /// existing fixture's meaning.
     #[test]
     fn public_folder_defaults_to_a_read_only_mail_folder() {
-        let s = format!(
-            "{MINIMAL}\n[[public_folder]]\nid = \"pf1\"\ndisplay_name = \"Notices\"\n"
-        );
+        let s = format!("{MINIMAL}\n[[public_folder]]\nid = \"pf1\"\ndisplay_name = \"Notices\"\n");
         let fix = parse(&s).unwrap();
         let pf = &fix.public_folders[0];
         assert_eq!(pf.folder_class, DEFAULT_FOLDER_CLASS);

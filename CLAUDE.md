@@ -621,7 +621,10 @@ ratatoskr's A5c shared-folder sync. `CAPABILITY` advertises
 `identifier` / `rights`, decoupled from `Mailbox` as a top-level
 table) shares an owned mailbox with another declared account.
 `NAMESPACE` returns the personal (`("" "/")`) + other-users
-(`("#user/" "/")`) namespaces; `LIST "" "#user/*"` enumerates the
+(`("#user/" "/")`) namespaces when the fixture can ever share a
+mailbox (`Fixture::imap_advertises_other_namespace`: any static
+`[[acl]]`, any scripted `acl_grant`, or a non-personal account) and
+`(("" "/")) NIL NIL` otherwise; `LIST "" "#user/*"` enumerates the
 grantee's shared mailboxes as `#user/<owner>/<path>` (a bare
 `LIST "" "*"` stays personal-only); `MYRIGHTS` / `GETACL` report
 rights (owner holds `lrswipkxtea` implicitly, grants default

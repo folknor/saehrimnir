@@ -242,9 +242,7 @@ const POX_OUTLOOK_NS: &str =
 /// binding a delegate mailbox; the value is opaque, so we derive it
 /// from the fixture account id to keep it deterministic.
 fn legacy_dn(account_id: &str) -> String {
-    format!(
-        "/o=saehrimnir/ou=Exchange Administrative Group/cn=Recipients/cn={account_id}"
-    )
+    format!("/o=saehrimnir/ou=Exchange Administrative Group/cn=Recipients/cn={account_id}")
 }
 
 /// `host:port` of this mount's base URL, used for the POX `<Server>`
@@ -342,11 +340,7 @@ async fn autodiscover_pox(State(state): State<AppState>, body: String) -> Respon
 
 // ── EWS operation dispatch ──────────────────────────────────────────
 
-async fn ews_endpoint(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
+async fn ews_endpoint(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
     // Priority order matters: check `Unsubscribe` and
     // `GetStreamingEvents` before `Subscribe` so the substring
     // `Subscribe` inside `Unsubscribe` doesn't misroute (the xml helper
@@ -399,7 +393,9 @@ fn find_folder(state: &AppState, body: &str) -> Response {
     let folders: Vec<&crate::fixture::PublicFolder> = if deep {
         fixture.public_folders.iter().collect()
     } else {
-        fixture.public_folders_under(parent_fid.as_deref()).collect()
+        fixture
+            .public_folders_under(parent_fid.as_deref())
+            .collect()
     };
 
     let mut items = String::new();
@@ -483,11 +479,7 @@ fn find_item(state: &AppState, body: &str) -> Response {
         );
     };
     if fixture.public_folder(&folder_id).is_none() {
-        return response_message_error(
-            "FindItem",
-            "ErrorFolderNotFound",
-            "no such public folder",
-        );
+        return response_message_error("FindItem", "ErrorFolderNotFound", "no such public folder");
     }
 
     let mut rows = String::new();
@@ -531,10 +523,7 @@ fn find_item(state: &AppState, body: &str) -> Response {
 /// an HTML body inside the SOAP document.
 fn body_xml(item: &crate::fixture::PublicItem) -> String {
     match &item.body_html {
-        Some(html) => format!(
-            "<t:Body BodyType=\"HTML\">{}</t:Body>",
-            xml::escape(html)
-        ),
+        Some(html) => format!("<t:Body BodyType=\"HTML\">{}</t:Body>", xml::escape(html)),
         None => format!(
             "<t:Body BodyType=\"Text\">{}</t:Body>",
             xml::escape(&item.body_text)
@@ -703,11 +692,8 @@ fn get_attachment(state: &AppState, body: &str) -> Response {
 /// PushHub scoped to the bearer-resolved account and returns a minted
 /// `SubscriptionId`.
 fn subscribe(state: &AppState, headers: &HeaderMap, _body: &str) -> Response {
-    let account_id = crate::oauth::account_from_bearer(
-        &state.fixture(),
-        &state.shared.token_store,
-        headers,
-    );
+    let account_id =
+        crate::oauth::account_from_bearer(&state.fixture(), &state.shared.token_store, headers);
     let id = format!("ews-sub-{}", state.shared.push.next_seq());
     state.shared.push.ews_create_subscription(EwsSubscription {
         id: id.clone(),

@@ -65,7 +65,13 @@ The mock advertises:
 - `NAMESPACE` (RFC 2342) - advertised and implemented. Returns the
   personal namespace (`("" "/")`), the other-users namespace
   (`("#user/" "/")`) that surfaces shared folders, and a NIL shared
-  namespace. Drives ratatoskr's shared-folder (A5c) discovery.
+  namespace. Drives ratatoskr's shared-folder (A5c) discovery. The
+  other-users namespace is advertised only when the fixture can ever
+  share a mailbox (`Fixture::imap_advertises_other_namespace`: any
+  static `[[acl]]`, any change-script `acl_grant`, or a non-personal
+  account); a personal-only fixture answers
+  `* NAMESPACE (("" "/")) NIL NIL`, modelling the common
+  personal-server shape where no `#user/` root exists.
 - `ACL` (RFC 4314) - advertised; `MYRIGHTS` and `GETACL` implemented
   (read-only ACL surface, no SETACL/DELETEACL in v0).
 - Optional but recognized: `MOVE`. Used if present, graceful
@@ -328,7 +334,10 @@ identifier = "account-alice"   # the account it is shared with
 rights = "lr"                  # RFC 4314 rights; default "lr"
 ```
 
-- `NAMESPACE` -> `* NAMESPACE (("" "/")) (("#user/" "/")) NIL`.
+- `NAMESPACE` -> `* NAMESPACE (("" "/")) (("#user/" "/")) NIL` on a
+  fixture with any shared surface (static `[[acl]]`, scripted
+  `acl_grant`, or a non-personal account);
+  `* NAMESPACE (("" "/")) NIL NIL` otherwise.
 - `LIST "" "#user/*"` -> the grantee sees each shared mailbox as
   `#user/<owner-name>/<owner-path>` (e.g. `#user/bob@example.com/
   INBOX`) with the owner's role attributes. A bare `LIST "" "*"`

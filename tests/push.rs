@@ -403,7 +403,11 @@ async fn expect_no_frame(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) 
     );
 }
 
-async fn create_subscription(graph_app: &axum::Router, resource: &str, client_state: &str) -> String {
+async fn create_subscription(
+    graph_app: &axum::Router,
+    resource: &str,
+    client_state: &str,
+) -> String {
     let resp = post(
         graph_app,
         "/v1.0/subscriptions",
@@ -491,17 +495,20 @@ async fn personal_shared_and_public_push_per_account() {
     // Gmail: exactly one Pub/Sub message, for the personal address.
     let msgs = get(&jmap, "/test/gmail/pubsub/messages").await;
     assert_eq!(msgs.as_array().unwrap().len(), 1);
-    let decoded: Value = serde_json::from_slice(&base64_decode(
-        msgs[0]["message"]["data"].as_str().unwrap(),
-    ))
-    .unwrap();
+    let decoded: Value =
+        serde_json::from_slice(&base64_decode(msgs[0]["message"]["data"].as_str().unwrap()))
+            .unwrap();
     assert_eq!(decoded["emailAddress"], "user@example.com");
 
     // Graph: the personal subscription fired; the public one did not,
     // and its exclusion is recorded rather than silent.
     let log = get(&jmap, "/test/push/graph").await;
     let log = log.as_array().unwrap();
-    assert_eq!(log.len(), 1, "only the personal subscription fires: {log:?}");
+    assert_eq!(
+        log.len(),
+        1,
+        "only the personal subscription fires: {log:?}"
+    );
     assert_eq!(log[0]["namespace"], "personal");
     assert_eq!(log[0]["body"]["value"][0]["clientState"], "cs-personal");
     assert_eq!(
@@ -561,7 +568,12 @@ async fn public_folder_subscription_does_not_poison_the_personal_set() {
         "cs-public",
     )
     .await;
-    create_subscription(&graph_app, "me/mailFolders('inbox')/messages", "cs-personal").await;
+    create_subscription(
+        &graph_app,
+        "me/mailFolders('inbox')/messages",
+        "cs-personal",
+    )
+    .await;
 
     step(&jmap, "personal-arrival").await;
 

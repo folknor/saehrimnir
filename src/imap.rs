@@ -683,16 +683,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// (`#user/` prefix) that surfaces shared folders, and a NIL
     /// shared namespace. bifrost walks the raw response line to learn
     /// the other-users prefix before `LIST`ing shared folders.
+    ///
+    /// The other-users namespace is advertised only when the fixture
+    /// can ever share a mailbox (`imap_advertises_other_namespace`:
+    /// static ACLs, scripted `acl_grant`s, or a non-personal account).
+    /// A personal-only fixture answers personal-namespace-only, so
+    /// clients see the common personal-server shape and never learn a
+    /// `#user/` root that could not possibly grow folders.
     async fn cmd_namespace(&mut self, tag: &str) -> std::io::Result<()> {
         if !self.is_authenticated() {
             return self
                 .write_line(&format!("{tag} BAD NAMESPACE requires authentication"))
                 .await;
         }
-        self.write_line(&format!(
-            "* NAMESPACE ((\"\" \"/\")) ((\"{SHARED_NAMESPACE_PREFIX}\" \"/\")) NIL"
-        ))
-        .await?;
+        let advertises_other = self
+            .fixture
+            .read()
+            .expect("fixture lock poisoned")
+            .imap_advertises_other_namespace();
+        let line = if advertises_other {
+            format!("* NAMESPACE ((\"\" \"/\")) ((\"{SHARED_NAMESPACE_PREFIX}\" \"/\")) NIL")
+        } else {
+            "* NAMESPACE ((\"\" \"/\")) NIL NIL".to_string()
+        };
+        self.write_line(&line).await?;
         self.write_line(&format!("{tag} OK NAMESPACE completed"))
             .await
     }
@@ -715,11 +729,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         };
         let Some(resolved) = self.resolve_mailbox(&name) else {
             return self
-                .write_line(&format!("{tag} NO MYRIGHTS unknown or inaccessible mailbox"))
+                .write_line(&format!(
+                    "{tag} NO MYRIGHTS unknown or inaccessible mailbox"
+                ))
                 .await;
         };
-        self.write_line(&format!("* MYRIGHTS \"{}\" {}", resolved.path, resolved.rights))
-            .await?;
+        self.write_line(&format!(
+            "* MYRIGHTS \"{}\" {}",
+            resolved.path, resolved.rights
+        ))
+        .await?;
         self.write_line(&format!("{tag} OK MYRIGHTS completed"))
             .await
     }
@@ -772,8 +791,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .join(" ");
         self.write_line(&format!("* ACL \"{}\" {rendered}", resolved.path))
             .await?;
-        self.write_line(&format!("{tag} OK GETACL completed"))
-            .await
+        self.write_line(&format!("{tag} OK GETACL completed")).await
     }
 
     /// The account whose messages the currently selected mailbox
@@ -832,7 +850,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         let fix = self.fix_read();
         if name.starts_with(SHARED_NAMESPACE_PREFIX) {
             let shared = list_shared_mailboxes(&fix, &self.account_id);
-            let entry = shared.into_iter().find(|s| s.path.eq_ignore_ascii_case(name))?;
+            let entry = shared
+                .into_iter()
+                .find(|s| s.path.eq_ignore_ascii_case(name))?;
             Some(ResolvedMailbox {
                 account_id: entry.owner_account_id,
                 fixture_id: entry.fixture_id,
@@ -841,7 +861,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             })
         } else {
             let entries = list_mailboxes(&fix, &self.account_id);
-            let entry = entries.into_iter().find(|e| e.path.eq_ignore_ascii_case(name))?;
+            let entry = entries
+                .into_iter()
+                .find(|e| e.path.eq_ignore_ascii_case(name))?;
             Some(ResolvedMailbox {
                 account_id: self.account_id.clone(),
                 fixture_id: entry.fixture_id,

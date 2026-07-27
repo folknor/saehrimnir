@@ -93,9 +93,11 @@ async fn full_initial_sync_transcript() {
     assert!(out.starts_with("* OK saehrimnir IMAP4rev1 ready\r\n"));
 
     // Capability + auth.
-    assert!(out.contains(
-        "* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS NAMESPACE ACL\r\n"
-    ));
+    assert!(
+        out.contains(
+            "* CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS NAMESPACE ACL\r\n"
+        )
+    );
     assert!(out.contains("a1 OK CAPABILITY completed\r\n"));
     assert!(out.contains(
         "a2 OK [CAPABILITY IMAP4REV1 IDLE CONDSTORE QRESYNC MOVE UIDPLUS NAMESPACE ACL] LOGIN completed\r\n"
@@ -1427,6 +1429,24 @@ async fn namespace_advertises_personal_and_other_users() {
     assert!(out.contains("a2 OK NAMESPACE completed\r\n"), "got: {out}");
 }
 
+/// A personal-only fixture (no `[[acl]]`, no scripted `acl_grant`, no
+/// non-personal account) advertises NO other-users namespace: clients
+/// see the common personal-server NAMESPACE shape and never learn a
+/// `#user/` root that could not possibly grow folders.
+#[tokio::test]
+async fn namespace_stays_personal_only_without_shared_surface() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"hunter2\"\r\n\
+        a2 NAMESPACE\r\n\
+        a3 LOGOUT\r\n";
+    let out = run_with_fixture(script).await;
+    assert!(
+        out.contains("* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n"),
+        "got: {out}"
+    );
+    assert!(out.contains("a2 OK NAMESPACE completed\r\n"), "got: {out}");
+}
+
 /// `LIST "" "#user/*"` enumerates the shared folder, while a bare
 /// `LIST "" "*"` stays personal-only (the other-users namespace is
 /// only walked when named).
@@ -1518,7 +1538,10 @@ async fn select_and_fetch_shared_folder_reads_owner_messages() {
         out.contains("a2 OK [READ-ONLY] SELECT completed\r\n"),
         "select shared: {out}"
     );
-    assert!(out.contains("a3 OK UID FETCH completed\r\n"), "fetch: {out}");
+    assert!(
+        out.contains("a3 OK UID FETCH completed\r\n"),
+        "fetch: {out}"
+    );
     // Bob's message body, not alice's.
     assert!(out.contains("Subject: Bob shared"), "bob body: {out}");
     assert!(!out.contains("Alice private"), "leaked alice's mail: {out}");
@@ -1535,7 +1558,10 @@ async fn shared_folder_access_and_write_are_gated() {
         a3 MYRIGHTS \"#user/bob@example.com/Sent\"\r\n\
         a4 LOGOUT\r\n";
     let out = run_with_fixture_path("fixtures/imap-shared.toml", script).await;
-    assert!(out.contains("a2 NO SELECT unknown mailbox\r\n"), "got: {out}");
+    assert!(
+        out.contains("a2 NO SELECT unknown mailbox\r\n"),
+        "got: {out}"
+    );
     assert!(
         out.contains("a3 NO MYRIGHTS unknown or inaccessible mailbox\r\n"),
         "got: {out}"

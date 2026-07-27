@@ -30,9 +30,9 @@ fn handle_for(path: &str) -> saehrimnir::shared::FixtureHandle {
 /// same thing, because the harness driving this mock has no EWS
 /// endpoint variable and can only reach the surface through Graph.
 fn graph_mounted_router(fixture: saehrimnir::shared::FixtureHandle) -> axum::Router {
-    saehrimnir::graph::router(saehrimnir::graph::AppState::for_test(std::sync::Arc::clone(
-        &fixture,
-    )))
+    saehrimnir::graph::router(saehrimnir::graph::AppState::for_test(
+        std::sync::Arc::clone(&fixture),
+    ))
     .merge(ews::router(ews::AppState::for_test(fixture)))
 }
 
@@ -75,7 +75,10 @@ async fn autodiscover_returns_external_ews_url() {
     );
     let (status, out) = post(app, "/autodiscover/autodiscover.svc", &body).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(out.contains("<a:Name>ExternalEwsUrl</a:Name>"), "got: {out}");
+    assert!(
+        out.contains("<a:Name>ExternalEwsUrl</a:Name>"),
+        "got: {out}"
+    );
     assert!(
         out.contains("/EWS/Exchange.asmx</a:Value>"),
         "EWS url missing: {out}"
@@ -230,7 +233,8 @@ async fn find_folder_reports_the_fixture_folder_class() {
         "{out}"
     );
     assert_eq!(
-        out.matches("<t:FolderClass>IPF.Note</t:FolderClass>").count(),
+        out.matches("<t:FolderClass>IPF.Note</t:FolderClass>")
+            .count(),
         3,
         "{out}"
     );
@@ -300,11 +304,23 @@ async fn find_folder_shallow_lists_top_level_and_deep_lists_all() {
 <t:DistinguishedFolderId Id=\"publicfoldersroot\"/></m:ParentFolderIds></m:FindFolder>",
     );
     let (_, out) = post(app.clone(), "/EWS/Exchange.asmx", &body).await;
-    assert!(out.contains("<t:DisplayName>Engineering</t:DisplayName>"), "{out}");
-    assert!(out.contains("<t:DisplayName>Announcements</t:DisplayName>"), "{out}");
-    assert!(!out.contains("<t:DisplayName>Releases</t:DisplayName>"), "{out}");
+    assert!(
+        out.contains("<t:DisplayName>Engineering</t:DisplayName>"),
+        "{out}"
+    );
+    assert!(
+        out.contains("<t:DisplayName>Announcements</t:DisplayName>"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("<t:DisplayName>Releases</t:DisplayName>"),
+        "{out}"
+    );
     // Engineering reports one child (Releases) and one item.
-    assert!(out.contains("<t:ChildFolderCount>1</t:ChildFolderCount>"), "{out}");
+    assert!(
+        out.contains("<t:ChildFolderCount>1</t:ChildFolderCount>"),
+        "{out}"
+    );
 
     // Deep -> the whole tree including Releases.
     let body = envelope(
@@ -313,7 +329,10 @@ async fn find_folder_shallow_lists_top_level_and_deep_lists_all() {
 <t:DistinguishedFolderId Id=\"publicfoldersroot\"/></m:ParentFolderIds></m:FindFolder>",
     );
     let (_, out) = post(app.clone(), "/EWS/Exchange.asmx", &body).await;
-    assert!(out.contains("<t:DisplayName>Releases</t:DisplayName>"), "deep: {out}");
+    assert!(
+        out.contains("<t:DisplayName>Releases</t:DisplayName>"),
+        "deep: {out}"
+    );
 
     // Shallow under Engineering -> just Releases.
     let body = envelope(
@@ -322,8 +341,14 @@ async fn find_folder_shallow_lists_top_level_and_deep_lists_all() {
 <t:FolderId Id=\"pf-root-eng\"/></m:ParentFolderIds></m:FindFolder>",
     );
     let (_, out) = post(app, "/EWS/Exchange.asmx", &body).await;
-    assert!(out.contains("<t:DisplayName>Releases</t:DisplayName>"), "{out}");
-    assert!(!out.contains("<t:DisplayName>Engineering</t:DisplayName>"), "{out}");
+    assert!(
+        out.contains("<t:DisplayName>Releases</t:DisplayName>"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("<t:DisplayName>Engineering</t:DisplayName>"),
+        "{out}"
+    );
 }
 
 #[tokio::test]
@@ -336,8 +361,14 @@ async fn find_item_lists_folder_items() {
     let (status, out) = post(app.clone(), "/EWS/Exchange.asmx", &body).await;
     assert_eq!(status, StatusCode::OK);
     assert!(out.contains("<t:ItemId Id=\"pi-eng-001\""), "{out}");
-    assert!(out.contains("<t:Subject>Team sync notes</t:Subject>"), "{out}");
-    assert!(out.contains("<t:EmailAddress>lead@example.com</t:EmailAddress>"), "{out}");
+    assert!(
+        out.contains("<t:Subject>Team sync notes</t:Subject>"),
+        "{out}"
+    );
+    assert!(
+        out.contains("<t:EmailAddress>lead@example.com</t:EmailAddress>"),
+        "{out}"
+    );
     // Announcements item does not leak into Engineering's listing.
     assert!(!out.contains("Office closed Friday"), "{out}");
 
@@ -368,7 +399,10 @@ async fn get_item_returns_body_and_per_item_error() {
     );
     let (status, out) = post(app, "/EWS/Exchange.asmx", &body).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(out.contains("<t:Subject>Office closed Friday</t:Subject>"), "{out}");
+    assert!(
+        out.contains("<t:Subject>Office closed Friday</t:Subject>"),
+        "{out}"
+    );
     assert!(
         out.contains("<t:Body BodyType=\"Text\">The office is closed this Friday.</t:Body>"),
         "{out}"
@@ -408,7 +442,10 @@ async fn get_item_returns_html_body_and_attachment_metadata() {
         out.contains("<t:HasAttachments>true</t:HasAttachments>"),
         "{out}"
     );
-    assert!(out.contains("<t:AttachmentId Id=\"pf-blob-001\"/>"), "{out}");
+    assert!(
+        out.contains("<t:AttachmentId Id=\"pf-blob-001\"/>"),
+        "{out}"
+    );
     assert!(
         out.contains("<t:Name>sync-notes.txt</t:Name>"),
         "attachment name: {out}"
@@ -462,9 +499,7 @@ async fn get_attachment_returns_the_bytes_and_a_per_item_error() {
     let (status, out) = post(app, "/EWS/Exchange.asmx", &body).await;
     assert_eq!(status, StatusCode::OK);
 
-    let expected = ews::xml::base64_standard(
-        &std::fs::read("fixtures/blobs/sample.txt").unwrap(),
-    );
+    let expected = ews::xml::base64_standard(&std::fs::read("fixtures/blobs/sample.txt").unwrap());
     assert!(
         out.contains(&format!("<t:Content>{expected}</t:Content>")),
         "attachment bytes missing: {out}"
@@ -511,7 +546,10 @@ async fn streaming_subscription_delivers_events_on_state_advance() {
 <m:ConnectionTimeout>1</m:ConnectionTimeout></m:GetStreamingEvents>"
     ));
     let (_, out) = post(app.clone(), "/EWS/Exchange.asmx", &poll).await;
-    assert!(out.contains("<m:ConnectionStatus>OK</m:ConnectionStatus>"), "{out}");
+    assert!(
+        out.contains("<m:ConnectionStatus>OK</m:ConnectionStatus>"),
+        "{out}"
+    );
     assert!(!out.contains("<t:NewMailEvent>"), "unexpected event: {out}");
 
     // Drive a state advance on the subscription's account.
@@ -533,7 +571,10 @@ async fn streaming_subscription_delivers_events_on_state_advance() {
 
     // Draining is one-shot: the next poll is empty again.
     let (_, out) = post(app.clone(), "/EWS/Exchange.asmx", &poll).await;
-    assert!(!out.contains("<t:NewMailEvent>"), "event re-delivered: {out}");
+    assert!(
+        !out.contains("<t:NewMailEvent>"),
+        "event re-delivered: {out}"
+    );
 
     // Unsubscribe, then the subscription is gone (Closed).
     let unsub = envelope(&format!(
@@ -542,5 +583,8 @@ async fn streaming_subscription_delivers_events_on_state_advance() {
     let (_, out) = post(app.clone(), "/EWS/Exchange.asmx", &unsub).await;
     assert!(out.contains("ResponseClass=\"Success\""), "{out}");
     let (_, out) = post(app, "/EWS/Exchange.asmx", &poll).await;
-    assert!(out.contains("<m:ConnectionStatus>Closed</m:ConnectionStatus>"), "{out}");
+    assert!(
+        out.contains("<m:ConnectionStatus>Closed</m:ConnectionStatus>"),
+        "{out}"
+    );
 }

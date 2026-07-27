@@ -1880,7 +1880,9 @@ fn read_acl_grant(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> delli
         };
         state.pop(1)?;
         let op = crate::fixture::acl_grant_op(raw).map_err(|e| {
-            state.error(ErrorKind::InternalError(format!("acl_grant entry {i}: {e}")))
+            state.error(ErrorKind::InternalError(format!(
+                "acl_grant entry {i}: {e}"
+            )))
         })?;
         ops.push(op);
     }

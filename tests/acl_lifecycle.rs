@@ -140,7 +140,10 @@ async fn acl_grant_and_revoke_are_observable_on_a_live_imap_connection() {
         "a2 OK LIST completed",
     )
     .await;
-    assert!(out.contains(BOB_INBOX), "shared inbox should be listed: {out}");
+    assert!(
+        out.contains(BOB_INBOX),
+        "shared inbox should be listed: {out}"
+    );
     assert!(
         !out.contains(BOB_PROJECTS),
         "ungranted mailbox must not be listed: {out}"
@@ -168,8 +171,14 @@ async fn acl_grant_and_revoke_are_observable_on_a_live_imap_connection() {
     // Post-attach ACL addition.
     let (status, body) = step(&router, "grant-projects").await;
     assert_eq!(status, StatusCode::OK, "grant step: {body}");
-    assert_eq!(body["changes"]["acls"]["granted"][0]["mailbox_id"], "mbx-bob-projects");
-    assert_eq!(body["changes"]["acls"]["granted"][0]["identifier"], "account-alice");
+    assert_eq!(
+        body["changes"]["acls"]["granted"][0]["mailbox_id"],
+        "mbx-bob-projects"
+    );
+    assert_eq!(
+        body["changes"]["acls"]["granted"][0]["identifier"],
+        "account-alice"
+    );
     assert_eq!(
         body["changes"]["acls"]["granted"][0]["owner_account_id"],
         "account-bob"
@@ -213,7 +222,10 @@ async fn acl_grant_and_revoke_are_observable_on_a_live_imap_connection() {
             .is_empty(),
         "revoke must not report a grant: {body}"
     );
-    assert_eq!(body["changes"]["acls"]["revoked"][0]["mailbox_id"], "mbx-bob-inbox");
+    assert_eq!(
+        body["changes"]["acls"]["revoked"][0]["mailbox_id"],
+        "mbx-bob-inbox"
+    );
     assert_eq!(
         body["changes"]["acls"]["revoked"][0]["owner_account_id"],
         "account-bob"
@@ -251,12 +263,7 @@ async fn acl_grant_and_revoke_are_observable_on_a_live_imap_connection() {
     );
 
     // Alice's own namespace is untouched by either mutation.
-    let out = exchange(
-        &mut client,
-        "a8 LIST \"\" \"*\"\r\na9 LOGOUT\r\n",
-        "a9 OK",
-    )
-    .await;
+    let out = exchange(&mut client, "a8 LIST \"\" \"*\"\r\na9 LOGOUT\r\n", "a9 OK").await;
     assert!(
         out.contains("\"INBOX\""),
         "personal namespace should be intact: {out}"
