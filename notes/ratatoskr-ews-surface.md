@@ -13,7 +13,10 @@ integration lands.
 
 ## Listener
 
-Own listener on `--ews-port`; sentinel line `EWS <port>`. POST
+Own listener on `--ews-port`, with no sentinel line (brokkr's
+sentinel reader rejects protocol names it does not know, so
+announcing EWS fails the harness run before it starts; harness runs
+use the Graph co-mount instead). POST
 endpoints:
 
 - `/autodiscover/autodiscover.svc` - SOAP Autodiscover

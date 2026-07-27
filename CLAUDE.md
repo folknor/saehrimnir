@@ -1002,9 +1002,12 @@ scheduling.
 
 EWS (Exchange Web Services SOAP + Autodiscover): complete for v0's
 public-folder read path + streaming push (drives ratatoskr A5b).
-Own listener (`--ews-port`; sentinel `EWS <port>`; brokkr would
-plumb `RATATOSKR_TEST_EWS_ENDPOINT` when ratatoskr grows the
-override) AND merged into the Graph listener's router, because the
+Own listener (`--ews-port`; deliberately NO sentinel line, since
+brokkr's sentinel reader rejects a protocol name it does not know
+and an `EWS` line therefore fails the whole harness run before the
+test process starts; brokkr would plumb
+`RATATOSKR_TEST_EWS_ENDPOINT` and learn the name together) AND
+merged into the Graph listener's router, because the
 harness injects a fixed set of endpoint env vars with no EWS slot -
 without the co-mount a harness run cannot reach the surface at all.
 Each mount carries its own `base_url`, so the Autodiscover URLs

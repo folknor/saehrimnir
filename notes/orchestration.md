@@ -81,11 +81,19 @@ Plan 3 wires whatever names are configured; we don't hardcode them.
   an empty file.
 - **Content:** one line per protocol, each `<NAME> <port>\n`, with
   `<NAME>` upper-case: `JMAP`, `IMAP`, `SMTP`, `GRAPH`, `GMAIL`,
-  `CALDAV`, `CARDDAV`, `PEOPLE`, `GCAL`, `EWS`. Every line is always present (we bind every listener,
+  `CALDAV`, `CARDDAV`, `PEOPLE`, `GCAL`. Every line is always present (we bind every listener,
   even when the test only cares about one). Brokkr's
   `wait_for_sentinel` doesn't parse the content (it's
   presence-only); plan-3-side code reads the file and picks the
   port for the protocol it cares about.
+
+  EWS is the one bound listener with NO sentinel line. The
+  harness-side reader maps each line onto a protocol it knows and
+  rejects a name it does not, so announcing `EWS` fails the whole
+  run before the test process starts. Harness runs reach the EWS
+  surface through its co-mount on the Graph listener instead; the
+  dedicated `--ews-port` listener is for direct/manual use. Restore
+  the line only in lockstep with brokkr learning the name.
 - **Brokkr's watcher:** polls the path until it appears or a backstop
   fires. Returns `Appeared` or `BackstopExpired` as first-class
   outcomes. No inotify; polling is fine.

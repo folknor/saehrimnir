@@ -144,10 +144,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name: "GCAL",
                 port: gcal_addr.port(),
             },
-            ProtocolPort {
-                name: "EWS",
-                port: ews_addr.port(),
-            },
+            // Deliberately no EWS line. Brokkr's harness-side sentinel
+            // reader maps each line onto a protocol it knows, and EWS is
+            // not one of them, so announcing it fails the run before the
+            // test process starts. The listener above still binds and
+            // serves; a harness run reaches the EWS surface through the
+            // co-mount on the Graph listener, which is the whole reason
+            // that co-mount exists. Add the line back only together with
+            // brokkr learning the name.
         ],
     )
     .await?;
