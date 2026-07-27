@@ -584,8 +584,12 @@ COPY` needs `i`, `UID MOVE` needs `i` + `t`, `UID EXPUNGE` needs `e`,
 and a `SELECT` with no write-shaped right completes `OK [READ-ONLY]`.
 So `rights = "lr"` is a read-only shared folder and
 `rights = "lrswipkxte"` is a writable one; `fixtures/shared-rights.toml`
-stages both in one fixture. No Lua `acl({...})` builder yet -
-TOML-only. See `notes/ratatoskr-imap-surface.md` "Shared folders".
+stages both in one fixture. The Lua loader exposes the same shape via
+`acl({...})`. Grants are also mutable mid-run through the change
+script's `acl_grant` / `acl_revoke` ops (see "Incremental change
+scripts"); `fixtures/imap-acl-lifecycle.toml` stages a mid-session
+grant and revoke. See `notes/ratatoskr-imap-surface.md` "Shared
+folders".
 
 ## EWS public folders (optional)
 
@@ -860,6 +864,31 @@ Op contracts:
   move a contact to a folder created by an earlier op in the same
   step).
 - **`contact_destroy`**: array of contact-id strings.
+- **`acl_grant`**: array of `{ mailbox_id, identifier, rights? }` -
+  the same fields a static `[[acl]]` row carries, `rights`
+  defaulting to `"lr"`. Shares an owned mailbox with another
+  declared account mid-run (the post-attach ACL addition: a shared
+  mailbox granted after the account is already connected). Apply
+  time validates the mailbox exists, the identifier is a declared
+  account, and the identifier does not own the mailbox; re-granting
+  the same rights to the same pair is rejected as a duplicate, while
+  re-granting *different* rights re-rights the existing grant (a
+  read-only share becoming writable is a real transition).
+- **`acl_revoke`**: array of `{ mailbox_id, identifier }`. Withdraws
+  the grant (the ACL revocation case). Apply rejects a pair with no
+  grant.
+
+  ACL ops run last within a step, so a step may create a mailbox and
+  share it in one transition. Both ops advance *two* accounts' state
+  tokens - the owner's and the grantee's - because a grant changes
+  what the grantee's other-users namespace contains, and a consumer
+  polling as the grantee has to see its own state move. The step
+  response reports them under `changes.acls.granted` /
+  `changes.acls.revoked`, and the live grant set is readable from
+  `GET /test/snapshot-state`'s `acls` key. On the IMAP surface the
+  effect is immediate and needs no reconnect: `LIST "" "#user/*"`,
+  `SELECT`, `MYRIGHTS` and `GETACL` all re-resolve grants from the
+  live fixture on every command.
 
 ### TOML projection
 
@@ -900,6 +929,21 @@ id = "move"
 [[change.email_move]]
 id = "email-002"
 mailbox_ids = ["mb-archive"]
+
+[[change]]
+id = "share"
+
+[[change.acl_grant]]
+mailbox_id = "mbx-bob-projects"
+identifier = "account-alice"
+rights = "lr"
+
+[[change]]
+id = "unshare"
+
+[[change.acl_revoke]]
+mailbox_id = "mbx-bob-inbox"
+identifier = "account-alice"
 ```
 
 Same op contracts apply (attachments rejected in `email_create`,

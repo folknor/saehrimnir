@@ -1,0 +1,117 @@
+name = "push-namespaces"
+state = "push-0"
+
+# Personal + shared + public in one fixture, for asserting push
+# behaviour when all three namespaces are present at once.
+#
+#   account-personal  primary, personal mailbox            (personal)
+#   account-shared    a shared mailbox granted to the
+#                     personal account via [[acl]]         (shared)
+#   pf-root-announce  org-wide public folder tree          (public)
+#
+# The point of the arrangement: shared and public resources must not
+# disturb personal push. A mutation in the personal mailbox pushes
+# account-personal only; a mutation in the shared mailbox pushes
+# account-shared only; and a Graph subscription on the public-folder
+# tree is excluded from the fan-out (it has no owning account and no
+# per-account state token) instead of poisoning the personal
+# subscription set it sits beside.
+
+[[account]]
+id = "account-personal"
+name = "user@example.com"
+is_personal = true
+primary = true
+
+[[account]]
+id = "account-shared"
+name = "shared-team@example.com"
+is_personal = false
+
+# ── Personal namespace ──────────────────────────────────────────────
+
+[[mailbox]]
+id = "mbx-personal-inbox"
+account_id = "account-personal"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+[[email]]
+id = "email-personal-001"
+mailbox_ids = ["mbx-personal-inbox"]
+received_at = "2026-03-01T09:00:00Z"
+from = "alice@example.com"
+to = ["user@example.com"]
+subject = "Personal baseline"
+body_text = "Baseline message in the personal inbox."
+
+# ── Shared namespace ────────────────────────────────────────────────
+
+[[mailbox]]
+id = "mbx-shared-inbox"
+account_id = "account-shared"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+[[email]]
+id = "email-shared-001"
+mailbox_ids = ["mbx-shared-inbox"]
+received_at = "2026-03-01T09:30:00Z"
+from = "customer@example.com"
+to = ["shared-team@example.com"]
+subject = "Shared baseline"
+body_text = "Baseline message in the shared mailbox."
+
+# The personal account can see the shared mailbox (read-only), which
+# is what makes it a shared mailbox rather than just a second account.
+
+[[acl]]
+mailbox_id = "mbx-shared-inbox"
+identifier = "account-personal"
+rights = "lr"
+
+# ── Public namespace ────────────────────────────────────────────────
+
+[[public_folder]]
+id = "pf-root-announce"
+display_name = "Announcements"
+
+[[public_item]]
+id = "pi-announce-001"
+folder_id = "pf-root-announce"
+subject = "Office closed Friday"
+from = "hr@example.com"
+body_text = "The office is closed this Friday."
+received_at = "2026-03-01T08:00:00Z"
+
+# ── Change script ───────────────────────────────────────────────────
+
+# Step 1: personal-namespace arrival. Pushes account-personal only.
+
+[[change]]
+id = "personal-arrival"
+
+[[change.email_create]]
+id = "email-personal-002"
+mailbox_ids = ["mbx-personal-inbox"]
+received_at = "2026-03-02T10:00:00Z"
+from = "bob@example.com"
+to = ["user@example.com"]
+subject = "Personal arrival"
+body_text = "New mail in the personal inbox."
+
+# Step 2: shared-namespace arrival. Pushes account-shared only.
+
+[[change]]
+id = "shared-arrival"
+
+[[change.email_create]]
+id = "email-shared-002"
+mailbox_ids = ["mbx-shared-inbox"]
+received_at = "2026-03-02T11:00:00Z"
+from = "customer@example.com"
+to = ["shared-team@example.com"]
+subject = "Shared arrival"
+body_text = "New mail in the shared mailbox."

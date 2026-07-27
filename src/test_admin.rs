@@ -16,6 +16,8 @@
 //! - `POST /test/fixture/step` -> `step_fixture` (drives
 //!   `apply_change_step` against the fixture's `change_script`)
 //! - `GET /test/snapshot-state` -> `snapshot_state`
+//! - `GET /test/push/jmap`, `GET /test/push/graph`,
+//!   `GET /test/push/graph/excluded`, `GET /test/push/subscriptions`
 //! - `GET /test/latency`, `POST /test/latency` -> `get_latency` /
 //!   `set_latency`
 
@@ -51,6 +53,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/test/push/jmap", get(list_jmap_push))
         .route("/test/push/graph", get(list_graph_push))
+        .route("/test/push/graph/excluded", get(list_graph_excluded))
+        .route("/test/push/subscriptions", get(list_push_subscriptions))
         .route(
             "/test/gmail/pubsub/messages",
             get(list_pubsub).delete(clear_pubsub),
@@ -77,6 +81,25 @@ async fn list_jmap_push(State(state): State<AppState>) -> Json<Value> {
 /// `{ "notification_url": <url>, "body": <Graph notification> }`.
 async fn list_graph_push(State(state): State<AppState>) -> Json<Value> {
     Json(json!(state.shared.push.graph_log()))
+}
+
+/// `GET /test/push/graph/excluded` -> JSON array of every subscription
+/// a state advance deliberately skipped. Each entry is
+/// `{ "subscription_id", "account_id", "resource", "namespace",
+/// "reason" }`. Complements `/test/push/graph`: that route shows what
+/// fired, this one shows what was held back and why, so a consumer can
+/// prove a public-folder subscription was excluded from the fan-out
+/// rather than merely absent.
+async fn list_graph_excluded(State(state): State<AppState>) -> Json<Value> {
+    Json(json!(state.shared.push.graph_excluded()))
+}
+
+/// `GET /test/push/subscriptions` -> JSON array of every registered
+/// Graph subscription with its resolved namespace
+/// (`personal` / `shared` / `public`) and whether a state advance fans
+/// out to it. Ordered by subscription id.
+async fn list_push_subscriptions(State(state): State<AppState>) -> Json<Value> {
+    Json(json!(state.shared.push.graph_subscriptions()))
 }
 
 /// `GET /test/gmail/pubsub/messages` -> JSON array of every Pub/Sub
@@ -693,6 +716,35 @@ async fn snapshot_state(State(state): State<AppState>) -> Json<Value> {
             })
         })
         .collect();
+    // Shared-folder grants. Mutable since the change-script gained
+    // acl_grant / acl_revoke, so a harness can read the current
+    // sharing state without going through IMAP GETACL.
+    let acls: Vec<Value> = fix
+        .acls
+        .iter()
+        .map(|a| {
+            json!({
+                "mailbox_id": a.mailbox_id,
+                "identifier": a.identifier,
+                "rights": a.rights,
+            })
+        })
+        .collect();
+    // Public folders are org-wide (no account scope) and immutable in
+    // v0; projected here so a fixture staging personal + shared +
+    // public resources is fully readable from one admin call.
+    let public_folders: Vec<Value> = fix
+        .public_folders
+        .iter()
+        .map(|f| {
+            json!({
+                "id": f.id,
+                "display_name": f.display_name,
+                "parent_id": f.parent_id,
+                "folder_class": f.folder_class,
+            })
+        })
+        .collect();
     Json(json!({
         "name": fix.name,
         "state": fix.primary_state(),
@@ -701,6 +753,8 @@ async fn snapshot_state(State(state): State<AppState>) -> Json<Value> {
         "events": events,
         "contact_folders": contact_folders,
         "contacts": contacts,
+        "acls": acls,
+        "public_folders": public_folders,
     }))
 }
 
@@ -797,6 +851,7 @@ async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) 
     let saved_contacts = touched.contacts.then(|| fix.contacts.clone());
     let saved_contact_folders = touched.contact_folders.then(|| fix.contact_folders.clone());
     let saved_mailbox_uid_history = touched.emails.then(|| fix.mailbox_uid_history.clone());
+    let saved_acls = touched.acls.then(|| fix.acls.clone());
 
     let mut diff = crate::fixture::MutationDiff::default();
     let mut moved: Vec<String> = Vec::new();
@@ -822,6 +877,9 @@ async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) 
         }
         if let Some(v) = saved_mailbox_uid_history {
             fix.mailbox_uid_history = v;
+        }
+        if let Some(v) = saved_acls {
+            fix.acls = v;
         }
         return (code, Json(payload)).into_response();
     }
@@ -928,10 +986,31 @@ async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) 
                 "updated": trans.contact_updated,
                 "destroyed": trans.contact_destroyed,
             },
+            "acls": {
+                "granted": acl_refs(&trans.acl_granted),
+                "revoked": acl_refs(&trans.acl_revoked),
+            },
         },
         "state": new_state,
     }))
     .into_response()
+}
+
+/// Render the ACL side of a step's transition for the step response:
+/// `[{ "mailbox_id": ..., "identifier": ..., "owner_account_id": ... }]`.
+/// The owner is included because a consumer driving the other-users
+/// namespace needs to know whose namespace segment moved without
+/// re-reading the mailbox table.
+fn acl_refs(refs: &[crate::fixture::AclRef]) -> Vec<Value> {
+    refs.iter()
+        .map(|a| {
+            json!({
+                "mailbox_id": a.mailbox_id,
+                "identifier": a.identifier,
+                "owner_account_id": a.owner_account_id,
+            })
+        })
+        .collect()
 }
 
 /// Which fixture sections a step's ops will touch. Lets
@@ -944,6 +1023,7 @@ struct StepTouches {
     events: bool,
     contacts: bool,
     contact_folders: bool,
+    acls: bool,
 }
 
 impl StepTouches {
@@ -968,6 +1048,7 @@ impl StepTouches {
                 ChangeOp::ContactFolderCreate(_)
                 | ChangeOp::ContactFolderUpdate { .. }
                 | ChangeOp::ContactFolderDestroy { .. } => t.contact_folders = true,
+                ChangeOp::AclGrant { .. } | ChangeOp::AclRevoke { .. } => t.acls = true,
             }
         }
         t
@@ -1531,6 +1612,108 @@ fn apply_change_step(
                 diff.contact_destroyed.push(id.clone());
                 diff.contact_destroyed_parents
                     .push(parent.expect("contact existed before retain"));
+            }
+            ChangeOp::AclGrant {
+                mailbox_id,
+                identifier,
+                rights,
+            } => {
+                // Same cross-reference rules the static `[[acl]]`
+                // loader enforces, re-checked here because an earlier
+                // op in this step may have created the mailbox.
+                let Some(mailbox) = fix.mailboxes.iter().find(|m| &m.id == mailbox_id) else {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "unknownMailbox",
+                        &format!("acl_grant {mailbox_id:?}: mailbox not in fixture"),
+                    ));
+                };
+                let owner_account_id = mailbox.account_id.clone();
+                if fix.account(identifier).is_none() {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "unknownAccount",
+                        &format!(
+                            "acl_grant on {mailbox_id:?}: identifier {identifier:?} does not match any declared account"
+                        ),
+                    ));
+                }
+                if &owner_account_id == identifier {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "ownerGrant",
+                        &format!(
+                            "acl_grant on {mailbox_id:?}: identifier {identifier:?} owns the mailbox (owner rights are implicit)"
+                        ),
+                    ));
+                }
+                // Resolve to an index rather than holding an
+                // `iter_mut` borrow across the arms: the `None` arm
+                // needs to push, which borrowck won't allow while the
+                // scrutinee's mutable borrow is live.
+                let existing = fix
+                    .acls
+                    .iter()
+                    .position(|a| &a.mailbox_id == mailbox_id && &a.identifier == identifier);
+                match existing {
+                    Some(idx) if fix.acls[idx].rights == *rights => {
+                        return Err(step_apply_error(
+                            &step.id,
+                            i,
+                            "duplicate",
+                            &format!(
+                                "acl_grant on {mailbox_id:?}: {identifier:?} already holds {rights:?}"
+                            ),
+                        ));
+                    }
+                    // Re-grant with different rights: a rights change
+                    // is a real transition (a read-only share becoming
+                    // writable), recorded as a grant.
+                    Some(idx) => fix.acls[idx].rights.clone_from(rights),
+                    None => fix.acls.push(crate::fixture::AclGrant {
+                        mailbox_id: mailbox_id.clone(),
+                        identifier: identifier.clone(),
+                        rights: rights.clone(),
+                    }),
+                }
+                diff.acl_granted.push(crate::fixture::AclRef {
+                    mailbox_id: mailbox_id.clone(),
+                    identifier: identifier.clone(),
+                    owner_account_id,
+                });
+            }
+            ChangeOp::AclRevoke {
+                mailbox_id,
+                identifier,
+            } => {
+                let Some(idx) = fix
+                    .acls
+                    .iter()
+                    .position(|a| &a.mailbox_id == mailbox_id && &a.identifier == identifier)
+                else {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "notFound",
+                        &format!("acl_revoke on {mailbox_id:?}: no grant for {identifier:?}"),
+                    ));
+                };
+                // Resolve the owner BEFORE the removal; a revoke
+                // leaves nothing behind to route the owner's log from
+                // (same reason the destroy paths capture parents).
+                let owner_account_id = fix
+                    .mailbox_by_id(mailbox_id)
+                    .map(|m| m.account_id.clone())
+                    .unwrap_or_else(|| fix.primary_account().id.clone());
+                fix.acls.remove(idx);
+                diff.acl_revoked.push(crate::fixture::AclRef {
+                    mailbox_id: mailbox_id.clone(),
+                    identifier: identifier.clone(),
+                    owner_account_id,
+                });
             }
         }
     }

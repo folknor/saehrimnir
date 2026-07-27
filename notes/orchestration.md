@@ -245,10 +245,35 @@ feature gate guards these. All routes are scoped under `/test/`.
     "contact_folders":  [{ "id", "display_name",
                            "parent_folder_id", "is_default" }],
     "contacts":         [{ "id", "folder_id", "display_name",
-                           "emails": [{ "address", "name" }] }] }
+                           "emails": [{ "address", "name" }] }],
+    "acls":             [{ "mailbox_id", "identifier", "rights" }],
+    "public_folders":   [{ "id", "display_name", "parent_id",
+                           "folder_class" }] }
   ```
+  `acls` is the live shared-folder grant set - mutable, since the
+  change script can grant / revoke mid-run. `public_folders` is the
+  org-wide tree (immutable in v0), included so a fixture staging
+  personal + shared + public resources is readable in one call.
   Body bytes and attachment data are deliberately excluded; tests
   that need the wire body fetch from the protocol's GET surface.
+- `GET /test/push/jmap` / `GET /test/push/graph` -> what the push
+  hub emitted: JMAP `StateChange` frames, and Graph change
+  notifications as `{ "notification_url", "namespace", "body" }`.
+- `GET /test/push/subscriptions` -> every registered Graph
+  subscription as `{ "id", "account_id", "resource", "change_type",
+  "notification_url", "namespace", "emits" }`, ordered by id.
+  `namespace` is `personal` (`me/...`), `shared` (`users/{id}/...`,
+  which also binds the subscription to *that* principal's account
+  rather than the bearer's), or `public` (the org-wide public-folder
+  tree). Only `personal` and `shared` emit.
+- `GET /test/push/graph/excluded` -> every subscription a state
+  advance deliberately skipped, as `{ "subscription_id",
+  "account_id", "resource", "namespace", "reason" }`. Public-folder
+  resources have no owning account and no per-account state token,
+  so they are dropped individually - the personal / shared
+  subscriptions sharing that account still fire. Absence from
+  `/test/push/graph` alone would not prove the exclusion (the
+  subscription could simply be missing); this route does.
 - `GET /test/latency` -> JSON object keyed by protocol tag (or
   `"global"`); values are milliseconds. Empty `{}` when no knob
   is set (the default).
@@ -355,10 +380,18 @@ feature gate guards these. All routes are scoped under `/test/`.
         "contact_folders":  { "created": [], "updated": [],
                               "destroyed": [] },
         "contacts":         { "created": [], "updated": [],
-                              "destroyed": [] }
+                              "destroyed": [] },
+        "acls":             { "granted": [], "revoked": [] }
       },
       "state": "<post-step JMAP state token>" }
     ```
+    `changes.acls.granted` / `.revoked` entries are
+    `{ "mailbox_id", "identifier", "owner_account_id" }` - the
+    shared-folder grant the `acl_grant` / `acl_revoke` ops added or
+    withdrew, with the owning account resolved for the harness (a
+    revoke leaves nothing behind to resolve it from). An ACL touch
+    advances both the owner's and the grantee's state token.
+
     `changes.emails.moved` overlaps with `changes.emails.updated`
     (a move is wire-equivalent to a `mailboxIds` update for
     delta-walking purposes). The split is presentation-only so

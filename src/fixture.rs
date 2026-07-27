@@ -311,6 +311,29 @@ pub struct Transition {
     /// with no parent resource, so the producer captures the account
     /// at destroy time.
     pub category_destroyed_accounts: Vec<String>,
+    /// Shared-folder ACL grants added by this mutation. An ACL touch
+    /// is the one resource that is inherently two-sided: it advances
+    /// both the owner's log (its mailbox's sharing changed) and the
+    /// grantee's log (a mailbox entered / left its other-users
+    /// namespace), so `split_diff_by_account` routes each entry to
+    /// both accounts. See [`AclRef`].
+    pub acl_granted: Vec<AclRef>,
+    /// Shared-folder ACL grants withdrawn by this mutation.
+    pub acl_revoked: Vec<AclRef>,
+}
+
+/// One shared-folder ACL touch, as recorded in a [`MutationDiff`] /
+/// [`Transition`]. `mailbox_id` + `identifier` name the grant (the
+/// same pair the fixture `[[acl]]` table keys on); `owner_account_id`
+/// is the mailbox's owning account, captured at mutation time so a
+/// revoke - which leaves nothing behind to resolve ownership from -
+/// can still be routed to the owner's change log. Same role the
+/// `*_destroyed_accounts` sidecars play for the other resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclRef {
+    pub mailbox_id: String,
+    pub identifier: String,
+    pub owner_account_id: String,
 }
 
 /// One updated email's Gmail label-set delta. `id` is the email id;
@@ -377,6 +400,11 @@ pub struct MutationDiff {
     pub category_destroyed: Vec<String>,
     /// Parallel to `category_destroyed`.
     pub category_destroyed_accounts: Vec<String>,
+    /// Shared-folder ACL grants added by this mutation. Routed to
+    /// *both* the owning and the granted account (see [`AclRef`]).
+    pub acl_granted: Vec<AclRef>,
+    /// Shared-folder ACL grants withdrawn by this mutation.
+    pub acl_revoked: Vec<AclRef>,
 }
 
 impl MutationDiff {
@@ -402,6 +430,8 @@ impl MutationDiff {
             && self.category_created.is_empty()
             && self.category_updated.is_empty()
             && self.category_destroyed.is_empty()
+            && self.acl_granted.is_empty()
+            && self.acl_revoked.is_empty()
     }
 }
 
@@ -1350,6 +1380,23 @@ impl Fixture {
             sub.category_destroyed.push(id);
             sub.category_destroyed_accounts.push(acct);
         }
+        // ACL touches are two-sided: the owner's sharing changed and
+        // the grantee's other-users namespace changed. Both logs
+        // advance, so both accounts' next delta walk (and both
+        // accounts' push subscribers) observe the transition. The
+        // grantee side is the one the consumer actually gates on - a
+        // revoked shared mailbox has to become visible as a change on
+        // the *viewer's* connection, not only the owner's.
+        for a in diff.acl_granted {
+            for acct in [a.owner_account_id.clone(), a.identifier.clone()] {
+                out.entry(acct).or_default().acl_granted.push(a.clone());
+            }
+        }
+        for a in diff.acl_revoked {
+            for acct in [a.owner_account_id.clone(), a.identifier.clone()] {
+                out.entry(acct).or_default().acl_revoked.push(a.clone());
+            }
+        }
 
         out
     }
@@ -1741,6 +1788,8 @@ fn transition_from_diff(from_state: String, to_state: String, diff: MutationDiff
         category_updated: diff.category_updated,
         category_destroyed: diff.category_destroyed,
         category_destroyed_accounts: diff.category_destroyed_accounts,
+        acl_granted: diff.acl_granted,
+        acl_revoked: diff.acl_revoked,
     };
     debug_assert_eq!(
         trans.event_destroyed.len(),
@@ -1912,6 +1961,24 @@ pub enum ChangeOp {
     },
     ContactDestroy {
         id: String,
+    },
+    /// Grant `identifier` (a declared account id) access to
+    /// `mailbox_id` (an owned mailbox), i.e. add the `[[acl]]` row a
+    /// static fixture would have declared. `rights` defaults to
+    /// [`DEFAULT_SHARED_RIGHTS`]. Re-granting an existing pair with
+    /// different rights re-rights it; re-granting with identical
+    /// rights is rejected (a script that grants twice is a script
+    /// bug, same as a duplicate create).
+    AclGrant {
+        mailbox_id: String,
+        identifier: String,
+        rights: String,
+    },
+    /// Withdraw the `(mailbox_id, identifier)` grant. Rejected when
+    /// no such grant exists.
+    AclRevoke {
+        mailbox_id: String,
+        identifier: String,
     },
 }
 
@@ -2857,6 +2924,21 @@ pub(crate) struct RawChangeStep {
     pub(crate) contact_update: Vec<RawContactUpdate>,
     #[serde(default)]
     pub(crate) contact_destroy: Vec<String>,
+    /// `[[change.acl_grant]]` - same fields as a static `[[acl]]`
+    /// row (`mailbox_id`, `identifier`, optional `rights`).
+    #[serde(default)]
+    pub(crate) acl_grant: Vec<RawAcl>,
+    /// `[[change.acl_revoke]]` - `{ mailbox_id, identifier }`.
+    #[serde(default)]
+    pub(crate) acl_revoke: Vec<RawAclRevoke>,
+}
+
+/// TOML / Lua projection of one `acl_revoke` change-script entry. No
+/// `rights`: a revoke drops the whole grant.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawAclRevoke {
+    pub(crate) mailbox_id: String,
+    pub(crate) identifier: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4497,6 +4579,46 @@ pub(crate) fn event_update_op(
     })
 }
 
+/// Build an `AclGrant` op. `rights` defaults to
+/// [`DEFAULT_SHARED_RIGHTS`], matching the static `[[acl]]` loader.
+/// Cross-reference validation (mailbox exists, identifier is a
+/// declared account, identifier is not the owner) happens at apply
+/// time, not load time, so a step can share a mailbox an earlier op
+/// in the same step created.
+pub(crate) fn acl_grant_op(raw: RawAcl) -> Result<ChangeOp, &'static str> {
+    if raw.mailbox_id.is_empty() {
+        return Err("mailbox_id must be non-empty");
+    }
+    if raw.identifier.is_empty() {
+        return Err("identifier must be non-empty");
+    }
+    let rights = raw
+        .rights
+        .unwrap_or_else(|| DEFAULT_SHARED_RIGHTS.to_string());
+    if rights.is_empty() {
+        return Err("rights, when given, must be non-empty");
+    }
+    Ok(ChangeOp::AclGrant {
+        mailbox_id: raw.mailbox_id,
+        identifier: raw.identifier,
+        rights,
+    })
+}
+
+/// Build an `AclRevoke` op.
+pub(crate) fn acl_revoke_op(raw: RawAclRevoke) -> Result<ChangeOp, &'static str> {
+    if raw.mailbox_id.is_empty() {
+        return Err("mailbox_id must be non-empty");
+    }
+    if raw.identifier.is_empty() {
+        return Err("identifier must be non-empty");
+    }
+    Ok(ChangeOp::AclRevoke {
+        mailbox_id: raw.mailbox_id,
+        identifier: raw.identifier,
+    })
+}
+
 /// Build a `ContactFolderCreate` op.
 pub(crate) fn contact_folder_create_op(raw: RawContactFolder) -> ChangeOp {
     ChangeOp::ContactFolderCreate(Box::new(ContactFolder {
@@ -4978,6 +5100,21 @@ fn normalize_change_step(
     }
     for d in raw.contact_destroy {
         ops.push(ChangeOp::ContactDestroy { id: d });
+    }
+
+    // ACL ops run last within a step, so a step may create a mailbox
+    // and share it in the same transition.
+    for a in raw.acl_grant {
+        let pair = format!("{}/{}", a.mailbox_id, a.identifier);
+        ops.push(
+            acl_grant_op(a).map_err(|e| format!("change step {id:?}: acl_grant {pair:?}: {e}"))?,
+        );
+    }
+    for a in raw.acl_revoke {
+        let pair = format!("{}/{}", a.mailbox_id, a.identifier);
+        ops.push(
+            acl_revoke_op(a).map_err(|e| format!("change step {id:?}: acl_revoke {pair:?}: {e}"))?,
+        );
     }
 
     Ok(ChangeStep { id, ops })

@@ -170,13 +170,25 @@ async fn create_subscription(
             .into_response();
     }
     let body = body.map_or(Value::Null, |Json(v)| v);
-    let account_id =
-        crate::oauth::account_from_bearer(&state.fixture(), &state.shared.token_store, &headers);
     let resource = body
         .get("resource")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // A `users/{id}/...` resource subscribes to *another* principal's
+    // mailbox (the shared-mailbox shape), so the subscription belongs
+    // to that account, not the bearer's - otherwise a mutation in the
+    // shared mailbox would never reach it and a mutation in the
+    // bearer's own mailbox would spuriously fire it. Everything else
+    // (personal `me/...`, the public-folder tree) stays on the bearer's
+    // account; the public-folder case is then dropped at fan-out time
+    // by its namespace, not by its account.
+    let account_id = {
+        let fix = state.fixture();
+        account_for_subscription_resource(&fix, &resource).unwrap_or_else(|| {
+            crate::oauth::account_from_bearer(&fix, &state.shared.token_store, &headers)
+        })
+    };
     let change_type = body
         .get("changeType")
         .and_then(|v| v.as_str())
@@ -222,6 +234,29 @@ async fn create_subscription(
         })),
     )
         .into_response()
+}
+
+/// Resolve the account a `users/{id}/...` subscription resource names.
+/// `{id}` may be the declared account id or its address (real clients
+/// use either the objectId or the UPN); an id that matches neither, or
+/// a resource that isn't in the `users/` shape, yields `None` and the
+/// caller falls back to the bearer's account.
+fn account_for_subscription_resource(
+    fixture: &crate::fixture::Fixture,
+    resource: &str,
+) -> Option<String> {
+    if crate::push::namespace_for_resource(resource) != crate::push::PushNamespace::Shared {
+        return None;
+    }
+    // The namespace check above already established the (case-
+    // insensitive) `users/` prefix, so slicing past it is safe.
+    let rest = resource.trim_start_matches('/').get("users/".len()..)?;
+    let segment = rest.split('/').next()?.trim_matches('\'');
+    fixture
+        .accounts
+        .iter()
+        .find(|a| a.id == segment || a.name == segment)
+        .map(|a| a.id.clone())
 }
 
 /// Renew (PATCH): update the stored expiration and echo it back. An

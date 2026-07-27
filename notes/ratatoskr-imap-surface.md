@@ -363,6 +363,28 @@ rights = "lr"                  # RFC 4314 rights; default "lr"
   what a consumer needs in order to prove it distinguishes them
   rather than assuming one.
 
+### Mid-session grant / revoke
+
+Grants are not load-time-only. The change script's `acl_grant` /
+`acl_revoke` ops (see `notes/fixture-format.md` "Incremental change
+scripts") mutate the grant set through the same
+`POST /test/fixture/step` path every other op uses, and every
+shared-folder read path re-resolves grants from the live fixture on
+each command. So on one connection, with no reconnect:
+
+- an `acl_grant` makes a previously invisible mailbox appear in
+  `LIST "" "#user/*"`, become selectable, and start reporting rights
+  through `MYRIGHTS` / `GETACL`;
+- an `acl_revoke` makes a previously visible one disappear from the
+  listing and go back to `NO SELECT unknown mailbox`.
+
+Both advance the grantee's state token as well as the owner's, so a
+consumer polling as the grantee sees the change on its next sync the
+same way an email or mailbox change would surface.
+`fixtures/imap-acl-lifecycle.toml` stages both cases (grant first,
+then revoke) against a live connection; `tests/acl_lifecycle.rs`
+drives it.
+
 ## Things that WILL break sync if wrong
 
 - Missing server greeting on initial connect.

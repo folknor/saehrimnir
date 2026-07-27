@@ -191,6 +191,8 @@ struct Builder {
     groups: Vec<crate::fixture::RawGroup>,
     /// Gmail SendAs identities accumulated via `send_as({...})`.
     send_as: Vec<crate::fixture::RawSendAs>,
+    /// Shared-folder ACL grants accumulated via `acl({...})`.
+    acls: Vec<crate::fixture::RawAcl>,
 }
 
 impl Builder {
@@ -218,10 +220,7 @@ impl Builder {
             directory_people: self.directory_people,
             categories: self.categories,
             groups: self.groups,
-            // No Lua `acl(...)` builder yet - shared-folder fixtures
-            // are TOML-only in v0. Add a builder here when a Lua
-            // scenario needs `[[acl]]` coverage.
-            acls: vec![],
+            acls: self.acls,
             // No Lua builders for the EWS public-folder tables yet;
             // TOML-only in v0.
             public_folders: vec![],
@@ -276,6 +275,8 @@ fn install_builders(state: &mut State) -> dellingr::Result<()> {
     state.set_global("group");
     state.push_rust_fn(builder_send_as)?;
     state.set_global("send_as");
+    state.push_rust_fn(builder_acl)?;
+    state.set_global("acl");
     state.push_rust_fn(builder_discovery)?;
     state.set_global("discovery");
     state.push_rust_fn(builder_wait)?;
@@ -426,6 +427,24 @@ fn builder_account(state: &mut State) -> dellingr::Result<u8> {
         is_personal,
         primary,
     });
+    Ok(0)
+}
+
+/// `acl { mailbox_id, identifier, rights? }` - one static shared-folder
+/// grant, the Lua mirror of the TOML `[[acl]]` table. Cross-reference
+/// validation (mailbox / account existence, owner-self-grant, duplicate
+/// pairs) happens in `normalize`, so this builder only collects.
+/// Needed for parity with the change-script `acl_revoke` op: a Lua
+/// scenario that revokes mid-run has to be able to declare the grant it
+/// revokes.
+fn builder_acl(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "acl")?;
+    let raw = crate::fixture::RawAcl {
+        mailbox_id: read_string(state, 1, "mailbox_id")?,
+        identifier: read_string(state, 1, "identifier")?,
+        rights: read_string_opt(state, 1, "rights")?,
+    };
+    builder_mut(state)?.acls.push(raw);
     Ok(0)
 }
 
@@ -1363,6 +1382,13 @@ fn read_attachment_array_at_top(
 ///   body_text? }`. Patch is a JSON object the Graph-side `event_set`
 ///   path applies field-by-field at apply time.
 /// - `event_destroy`: array of event-id strings.
+/// - `acl_grant`: array of `{ mailbox_id, identifier, rights? }` -
+///   shares an owned mailbox with another declared account mid-run.
+///   `rights` defaults to `DEFAULT_SHARED_RIGHTS`.
+/// - `acl_revoke`: array of `{ mailbox_id, identifier }` - withdraws
+///   the grant. Both run last within a step (so a step can create a
+///   mailbox and share it), and both advance the owning *and* the
+///   granted account's state token.
 fn builder_change(state: &mut State) -> dellingr::Result<u8> {
     require_one_table_arg(state, "change")?;
     let id = read_string(state, 1, "id")?;
@@ -1417,6 +1443,11 @@ fn builder_change(state: &mut State) -> dellingr::Result<u8> {
     read_id_destroy(state, 1, "contact_destroy", &mut ops, |id| {
         ChangeOp::ContactDestroy { id }
     })?;
+
+    // ACL ops run last so a step can create a mailbox and share it in
+    // the same transition. Matches the TOML projection's op order.
+    read_acl_grant(state, 1, &mut ops)?;
+    read_acl_revoke(state, 1, &mut ops)?;
 
     builder_mut(state)?
         .change_script
@@ -1809,6 +1840,87 @@ fn read_email_move(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dell
         let op = crate::fixture::email_move_op(id, mailbox_ids).map_err(|e| {
             state.error(ErrorKind::InternalError(format!(
                 "email_move entry {i}: {e}"
+            )))
+        })?;
+        ops.push(op);
+    }
+    state.pop(1)?;
+    Ok(())
+}
+
+/// `acl_grant = { { mailbox_id = ..., identifier = ..., rights? }, ... }`
+#[allow(clippy::cast_possible_wrap)]
+fn read_acl_grant(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "acl_grant")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1)?;
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1)?;
+            return fail(state, "field \"acl_grant\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64)?;
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2)?;
+            return fail(state, format!("acl_grant entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let raw = crate::fixture::RawAcl {
+            mailbox_id: read_string(state, entry_idx, "mailbox_id")?,
+            identifier: read_string(state, entry_idx, "identifier")?,
+            rights: read_string_opt(state, entry_idx, "rights")?,
+        };
+        state.pop(1)?;
+        let op = crate::fixture::acl_grant_op(raw).map_err(|e| {
+            state.error(ErrorKind::InternalError(format!("acl_grant entry {i}: {e}")))
+        })?;
+        ops.push(op);
+    }
+    state.pop(1)?;
+    Ok(())
+}
+
+/// `acl_revoke = { { mailbox_id = ..., identifier = ... }, ... }`
+#[allow(clippy::cast_possible_wrap)]
+fn read_acl_revoke(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "acl_revoke")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1)?;
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1)?;
+            return fail(state, "field \"acl_revoke\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64)?;
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2)?;
+            return fail(state, format!("acl_revoke entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let raw = crate::fixture::RawAclRevoke {
+            mailbox_id: read_string(state, entry_idx, "mailbox_id")?,
+            identifier: read_string(state, entry_idx, "identifier")?,
+        };
+        state.pop(1)?;
+        let op = crate::fixture::acl_revoke_op(raw).map_err(|e| {
+            state.error(ErrorKind::InternalError(format!(
+                "acl_revoke entry {i}: {e}"
             )))
         })?;
         ops.push(op);

@@ -34,6 +34,17 @@ fn routers() -> (axum::Router, axum::Router, axum::Router, SharedHandles) {
     let source = std::fs::read_to_string(path).unwrap();
     let chunk = format!("@{}", path.display());
     let fix = lua::load_source_with_dir(&source, &chunk, path.parent().unwrap()).unwrap();
+    routers_for(fix)
+}
+
+/// Same three-router bag over a TOML fixture.
+fn routers_toml(path: &str) -> (axum::Router, axum::Router, axum::Router, SharedHandles) {
+    routers_for(saehrimnir::fixture::load(std::path::Path::new(path)).unwrap())
+}
+
+fn routers_for(
+    fix: saehrimnir::fixture::Fixture,
+) -> (axum::Router, axum::Router, axum::Router, SharedHandles) {
     let handle = shared::handle(fix);
     let shared = SharedHandles::for_test(Arc::clone(&handle));
     let jmap = routes::router(routes::AppState {
@@ -373,6 +384,216 @@ async fn read_until(client: &mut tokio::io::DuplexStream, needle: &str) -> Strin
         acc.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
     acc
+}
+
+// ── Personal + shared + public namespaces ───────────────────────────
+//
+// `fixtures/push-namespaces.toml` stages all three at once: a personal
+// mailbox, a shared mailbox (owned by a second account and granted to
+// the personal one via `[[acl]]`), and an org-wide public folder. The
+// contract under test is that the shared and public resources do not
+// disturb personal push.
+
+/// Await a frame that must NOT arrive.
+async fn expect_no_frame(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+    let r = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        r.is_err(),
+        "a mutation in another account must not push this one: {r:?}"
+    );
+}
+
+async fn create_subscription(graph_app: &axum::Router, resource: &str, client_state: &str) -> String {
+    let resp = post(
+        graph_app,
+        "/v1.0/subscriptions",
+        json!({
+            "resource": resource,
+            "changeType": "created,updated,deleted",
+            "notificationUrl": "http://127.0.0.1:9/none",
+            "clientState": client_state,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "subscribe {resource}");
+    body_json(resp).await["id"].as_str().unwrap().to_string()
+}
+
+/// With personal, shared and public resources staged together, a state
+/// advance pushes exactly the account it touched, over every transport,
+/// and the public-folder subscription is excluded from the fan-out
+/// rather than firing alongside the personal one.
+#[tokio::test]
+async fn personal_shared_and_public_push_per_account() {
+    let (jmap, gmail_app, graph_app, shared) = routers_toml("fixtures/push-namespaces.toml");
+
+    let mut personal_ws = shared.push.register_jmap_ws("account-personal".to_string());
+    let mut shared_ws = shared.push.register_jmap_ws("account-shared".to_string());
+
+    // Gmail watch binds to the bearer's account (the primary, i.e. the
+    // personal one) - the shared mailbox has no watch.
+    let resp = post(
+        &gmail_app,
+        "/gmail/v1/users/me/watch",
+        json!({ "topicName": "projects/p/topics/mail" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // One Graph subscription per namespace.
+    let personal_sub = create_subscription(&graph_app, "me/messages", "cs-personal").await;
+    let shared_sub = create_subscription(
+        &graph_app,
+        "users/account-shared/mailFolders('inbox')/messages",
+        "cs-shared",
+    )
+    .await;
+    let public_sub = create_subscription(
+        &graph_app,
+        "publicfolders/pf-root-announce/messages",
+        "cs-public",
+    )
+    .await;
+
+    // The subscription set classifies each resource, and says up front
+    // which ones a state advance fans out to.
+    let subs = get(&jmap, "/test/push/subscriptions").await;
+    let subs = subs.as_array().unwrap();
+    assert_eq!(subs.len(), 3);
+    let by_id = |id: &str| -> Value {
+        subs.iter()
+            .find(|s| s["id"] == id)
+            .unwrap_or_else(|| panic!("subscription {id} missing"))
+            .clone()
+    };
+    assert_eq!(by_id(&personal_sub)["namespace"], "personal");
+    assert_eq!(by_id(&personal_sub)["account_id"], "account-personal");
+    assert_eq!(by_id(&personal_sub)["emits"], true);
+    // A `users/{id}/...` resource binds to the named principal, not the
+    // bearer, so a shared-mailbox mutation reaches it.
+    assert_eq!(by_id(&shared_sub)["namespace"], "shared");
+    assert_eq!(by_id(&shared_sub)["account_id"], "account-shared");
+    assert_eq!(by_id(&shared_sub)["emits"], true);
+    assert_eq!(by_id(&public_sub)["namespace"], "public");
+    assert_eq!(by_id(&public_sub)["emits"], false);
+
+    // ── Personal arrival ────────────────────────────────────────────
+    step(&jmap, "personal-arrival").await;
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), personal_ws.recv())
+        .await
+        .expect("personal push should arrive")
+        .expect("channel open");
+    let frame: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(frame["changed"]["account-personal"]["Email"], "push-0.1");
+    expect_no_frame(&mut shared_ws).await;
+
+    // Gmail: exactly one Pub/Sub message, for the personal address.
+    let msgs = get(&jmap, "/test/gmail/pubsub/messages").await;
+    assert_eq!(msgs.as_array().unwrap().len(), 1);
+    let decoded: Value = serde_json::from_slice(&base64_decode(
+        msgs[0]["message"]["data"].as_str().unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(decoded["emailAddress"], "user@example.com");
+
+    // Graph: the personal subscription fired; the public one did not,
+    // and its exclusion is recorded rather than silent.
+    let log = get(&jmap, "/test/push/graph").await;
+    let log = log.as_array().unwrap();
+    assert_eq!(log.len(), 1, "only the personal subscription fires: {log:?}");
+    assert_eq!(log[0]["namespace"], "personal");
+    assert_eq!(log[0]["body"]["value"][0]["clientState"], "cs-personal");
+    assert_eq!(
+        log[0]["body"]["value"][0]["resourceData"]["id"],
+        "email-personal-002"
+    );
+
+    let excluded = get(&jmap, "/test/push/graph/excluded").await;
+    let excluded = excluded.as_array().unwrap();
+    assert_eq!(excluded.len(), 1, "the public sub is excluded once");
+    assert_eq!(excluded[0]["subscription_id"], public_sub);
+    assert_eq!(excluded[0]["namespace"], "public");
+
+    // ── Shared arrival ──────────────────────────────────────────────
+    step(&jmap, "shared-arrival").await;
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), shared_ws.recv())
+        .await
+        .expect("shared push should arrive")
+        .expect("channel open");
+    let frame: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(frame["changed"]["account-shared"]["Email"], "push-0.1");
+    expect_no_frame(&mut personal_ws).await;
+
+    // No Gmail watch on the shared account: the sink is unchanged.
+    let msgs = get(&jmap, "/test/gmail/pubsub/messages").await;
+    assert_eq!(msgs.as_array().unwrap().len(), 1);
+
+    // Graph: the shared subscription fired this time, the personal one
+    // did not, and the public one stayed excluded exactly once (it is
+    // bound to the personal account, so a shared advance never reaches
+    // it at all).
+    let log = get(&jmap, "/test/push/graph").await;
+    let log = log.as_array().unwrap();
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[1]["namespace"], "shared");
+    assert_eq!(log[1]["body"]["value"][0]["clientState"], "cs-shared");
+    assert_eq!(
+        log[1]["body"]["value"][0]["resourceData"]["id"],
+        "email-shared-002"
+    );
+    let excluded = get(&jmap, "/test/push/graph/excluded").await;
+    assert_eq!(excluded.as_array().unwrap().len(), 1);
+}
+
+/// A public-folder subscription registered *first* still doesn't
+/// poison the personal one that follows it: the personal notification
+/// fires with its own clientState, and no notification ever carries the
+/// public subscription's.
+#[tokio::test]
+async fn public_folder_subscription_does_not_poison_the_personal_set() {
+    let (jmap, _gmail, graph_app, _shared) = routers_toml("fixtures/push-namespaces.toml");
+
+    let public_sub = create_subscription(
+        &graph_app,
+        "publicfolders/pf-root-announce/messages",
+        "cs-public",
+    )
+    .await;
+    create_subscription(&graph_app, "me/mailFolders('inbox')/messages", "cs-personal").await;
+
+    step(&jmap, "personal-arrival").await;
+
+    let log = get(&jmap, "/test/push/graph").await;
+    let log = log.as_array().unwrap();
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(log[0]["body"]["value"][0]["clientState"], "cs-personal");
+    let rendered = serde_json::to_string(&log).unwrap();
+    assert!(
+        !rendered.contains("cs-public"),
+        "public subscription leaked into the fan-out: {rendered}"
+    );
+
+    let excluded = get(&jmap, "/test/push/graph/excluded").await;
+    assert_eq!(excluded[0]["subscription_id"], public_sub);
+}
+
+/// The fixture is readable as one arrangement: personal + shared
+/// mailboxes with the ACL that links them, plus the public tree.
+#[tokio::test]
+async fn namespaces_fixture_projects_all_three_resource_kinds() {
+    let (jmap, _gmail, _graph, _shared) = routers_toml("fixtures/push-namespaces.toml");
+    let snap = get(&jmap, "/test/snapshot-state").await;
+    let mailboxes = snap["mailboxes"].as_array().unwrap();
+    assert_eq!(mailboxes.len(), 2);
+    let acls = snap["acls"].as_array().unwrap();
+    assert_eq!(acls.len(), 1);
+    assert_eq!(acls[0]["mailbox_id"], "mbx-shared-inbox");
+    assert_eq!(acls[0]["identifier"], "account-personal");
+    let public = snap["public_folders"].as_array().unwrap();
+    assert_eq!(public.len(), 1);
+    assert_eq!(public[0]["id"], "pf-root-announce");
 }
 
 /// IMAP `IDLE` observes a state mutation driven through the *same*

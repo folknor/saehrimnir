@@ -453,6 +453,21 @@ checking whether the fact is already in `notes/`.
   `isPersonal` projection. Drives the rights tests in
   `tests/imap.rs` / `tests/ews.rs` and the non-personal session
   test in `tests/api.rs`.
+- `fixtures/imap-acl-lifecycle.toml` - shared-folder ACL lifecycle:
+  two accounts, one grant at load, and a change script that grants a
+  second mailbox mid-run (post-attach ACL addition) then revokes the
+  first (ACL revocation), plus a third step that revokes a
+  now-missing grant to pin the rewind path. Drives
+  `tests/acl_lifecycle.rs`, which holds one IMAP connection open
+  across both mutations.
+- `fixtures/push-namespaces.toml` - personal + shared + public
+  resources in one fixture: a personal mailbox, a shared mailbox
+  owned by a second account and granted to the personal one via
+  `[[acl]]`, and an org-wide public folder, plus a 2-step change
+  script (one arrival per mailbox). Drives the namespace tests in
+  `tests/push.rs`: push fires per account, and a public-folder Graph
+  subscription is excluded from the fan-out instead of poisoning the
+  personal subscription set.
 - `fixtures/jmap-incremental.lua` and
   `fixtures/jmap-incremental.toml` - equivalent 2-mailbox /
   2-email baseline plus a 4-step change script (new + change +
@@ -631,6 +646,16 @@ folder and `rights = "lrswipkxte"` a writable one.
 reporting, cross-account FETCH isolation, and the write gate;
 `fixtures/shared-rights.toml` stages a read-only and a writable
 shared folder in one fixture so the two can be told apart.
+
+Grants are mutable mid-run: the change script's `acl_grant` /
+`acl_revoke` ops add / withdraw a grant through the same
+`POST /test/fixture/step` path as every other op, and each ACL touch
+advances *both* the owner's and the grantee's state token (a grant
+changes what the grantee's other-users namespace contains). Because
+LIST / SELECT / MYRIGHTS / GETACL all re-resolve grants from the live
+fixture per command, a grant or revoke is visible on an already-open
+connection with no reconnect. `fixtures/imap-acl-lifecycle.toml` +
+`tests/acl_lifecycle.rs` cover both directions.
 
 UIDs are assigned by `Fixture::mailbox_uid_history`: an
 insertion-ordered list of email ids per mailbox. Each addition
@@ -914,7 +939,14 @@ Per protocol:
   resource, resourceData, the stored clientState) POSTed to its
   loopback notificationUrl. Subscriptions are process-volatile (cleared
   by `POST /test/fixture/reset`), not fixture-backed, so they record no
-  change-log transition.
+  change-log transition. Each subscription's `resource` classifies into
+  a `PushNamespace`: `personal` (`me/...`), `shared` (`users/{id}/...`,
+  which also binds the subscription to that principal's account rather
+  than the bearer's) or `public` (the org-wide public-folder tree).
+  Public resources have no owning account and no per-account state
+  token, so they are individually skipped at fan-out time - the
+  personal / shared subscriptions on the same account still fire - and
+  the skip is recorded on `GET /test/push/graph/excluded`.
 - IMAP IDLE: `IDLE` is advertised in CAPABILITY and implemented
   (`src/imap.rs::cmd_idle`). A connection in the Selected state parks
   on `IDLE` and registers a waiter on the shared `PushHub`. On state
@@ -935,7 +967,10 @@ Per protocol:
 Observability: every emitted JMAP frame and Graph notification is
 logged and every Pub/Sub message kept in a sink, exposed over
 `GET /test/push/jmap`, `GET /test/push/graph`,
-`GET /test/gmail/pubsub/messages` (+ `DELETE`),
+`GET /test/push/graph/excluded` (subscriptions a state advance
+skipped, with the reason), `GET /test/push/subscriptions` (every
+registered Graph subscription with its resolved namespace and whether
+it emits), `GET /test/gmail/pubsub/messages` (+ `DELETE`),
 `POST /test/gmail/pubsub/publish` (manual `{emailAddress, historyId}`
 publish), and `POST /test/gmail/pubsub/push-endpoint`. Live transport
 (WebSocket send, hand-rolled loopback HTTP POST) happens alongside the

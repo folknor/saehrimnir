@@ -39,6 +39,21 @@ From the ratatoskr A5 / B8-groups gap report:
   `fixtures/shared-rights.toml` stages read-only and writable
   shared folders side by side.
 
+- **[done] ACL mutation + push across namespaces.** Change-script
+  `acl_grant` / `acl_revoke` ops (both loaders, plus a Lua
+  `acl({...})` static builder so a Lua scenario can revoke what it
+  declared) routed through the same `Fixture::mutate` path as every
+  other op, advancing the owner's *and* the grantee's state token;
+  `fixtures/imap-acl-lifecycle.toml` stages the mid-session grant
+  and revoke a consumer needs to gate shared-mailbox lifecycle.
+  Graph subscriptions classify their `resource` into a
+  `PushNamespace` (personal / shared / public): a `users/{id}/...`
+  resource binds to that principal's account, and a public-folder
+  resource is excluded from the fan-out (recorded on
+  `GET /test/push/graph/excluded`) instead of firing alongside the
+  personal ones. `fixtures/push-namespaces.toml` stages personal +
+  shared + public together.
+
 The A5 / B8 report is now cleared. EWS follow-ups (only when
 forced): EWS write ops (CreateItem / UpdateItem / DeleteItem),
 SyncFolderHierarchy / SyncFolderItems delta, a held-open long-poll

@@ -122,6 +122,71 @@ pub struct EwsSubscription {
     pub account_id: String,
 }
 
+/// Which namespace a subscribed resource lives in.
+///
+/// A consumer syncing an Exchange-shaped account holds three kinds of
+/// resource at once: its own mailbox, mailboxes other principals have
+/// shared with it, and the org-wide public-folder tree. The first two
+/// are per-account and push-bearing; the third is not owned by any
+/// account and real Graph refuses to subscribe to it. The mock keeps
+/// that distinction explicit rather than implicit so a consumer can
+/// assert that a public-folder resource is *excluded* from the
+/// subscription set it fans a state advance out to, instead of
+/// silently poisoning the personal subscriptions alongside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushNamespace {
+    /// The authenticated account's own mailbox (`me/...`).
+    Personal,
+    /// Another principal's mailbox (`users/{id}/...`).
+    Shared,
+    /// The org-wide public-folder tree. Not push-bearing.
+    Public,
+}
+
+impl PushNamespace {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Shared => "shared",
+            Self::Public => "public",
+        }
+    }
+
+    /// Whether a state advance fans out to a subscription in this
+    /// namespace. Public folders are org-wide, carry no per-account
+    /// state token, and have no owning account whose log could
+    /// advance - so they never emit.
+    pub fn emits(self) -> bool {
+        !matches!(self, Self::Public)
+    }
+}
+
+/// Classify a Graph subscription `resource` string into a namespace.
+/// Matches the resource shapes ratatoskr's Graph sync actually
+/// subscribes to:
+///
+/// - `me/messages`, `me/mailFolders('inbox')/messages` -> personal
+/// - `users/{id}/messages`, `users/{id}/mailFolders(...)` -> shared
+/// - anything naming the public-folder tree -> public
+///
+/// An unrecognised / empty resource classifies as personal, which
+/// keeps the pre-existing single-account fixtures behaving exactly as
+/// they did (`""` resources still emit).
+pub fn namespace_for_resource(resource: &str) -> PushNamespace {
+    let lower = resource.trim_start_matches('/').to_ascii_lowercase();
+    if lower.starts_with("publicfolders")
+        || lower.starts_with("publicfolderroot")
+        || lower.starts_with("publicfoldersroot")
+        || lower.contains("/publicfolders")
+    {
+        return PushNamespace::Public;
+    }
+    if lower.starts_with("users/") {
+        return PushNamespace::Shared;
+    }
+    PushNamespace::Personal
+}
+
 /// A Graph `POST /subscriptions` registration.
 #[derive(Debug, Clone)]
 pub struct GraphSubscription {
@@ -132,6 +197,15 @@ pub struct GraphSubscription {
     pub client_state: Option<String>,
     pub notification_url: String,
     pub expiration: String,
+}
+
+impl GraphSubscription {
+    /// The namespace this subscription's resource lives in. Derived
+    /// (not stored) so a resource string is classified by exactly one
+    /// rule, in one place.
+    pub fn namespace(&self) -> PushNamespace {
+        namespace_for_resource(&self.resource)
+    }
 }
 
 struct Inner {
@@ -149,6 +223,12 @@ struct Inner {
     pubsub: Mutex<Vec<Value>>,
     graph_subs: Mutex<HashMap<String, GraphSubscription>>,
     graph_log: Mutex<Vec<Value>>,
+    /// Subscriptions a state advance deliberately skipped, appended
+    /// one entry per (advance, skipped subscription). Absence of a
+    /// notification in `graph_log` proves nothing on its own (a
+    /// subscription could be missing, or bound to another account);
+    /// this log makes the exclusion positively observable.
+    graph_excluded: Mutex<Vec<Value>>,
     /// EWS streaming subscriptions by id.
     ews_subs: Mutex<HashMap<String, EwsSubscription>>,
     /// Queued EWS notification events by subscription id. A state
@@ -183,6 +263,7 @@ impl PushHub {
                 pubsub: Mutex::new(Vec::new()),
                 graph_subs: Mutex::new(HashMap::new()),
                 graph_log: Mutex::new(Vec::new()),
+                graph_excluded: Mutex::new(Vec::new()),
                 ews_subs: Mutex::new(HashMap::new()),
                 ews_events: Mutex::new(HashMap::new()),
             }),
@@ -350,13 +431,53 @@ impl PushHub {
     }
 
     /// Snapshot of every Graph notification emitted so far. Each entry
-    /// is `{ "notification_url": <url>, "body": <notification> }`.
+    /// is `{ "notification_url": <url>, "namespace": <tag>,
+    /// "body": <notification> }`.
     pub fn graph_log(&self) -> Vec<Value> {
         self.inner
             .graph_log
             .lock()
             .expect("graph_log lock poisoned")
             .clone()
+    }
+
+    /// Snapshot of every subscription a state advance skipped. Each
+    /// entry is `{ "subscription_id", "account_id", "resource",
+    /// "namespace", "reason" }`.
+    pub fn graph_excluded(&self) -> Vec<Value> {
+        self.inner
+            .graph_excluded
+            .lock()
+            .expect("graph_excluded lock poisoned")
+            .clone()
+    }
+
+    /// Every registered Graph subscription with its resolved
+    /// namespace and whether a state advance fans out to it. Sorted by
+    /// id so the rendered JSON is stable across runs (the registry is
+    /// a HashMap).
+    pub fn graph_subscriptions(&self) -> Vec<Value> {
+        let subs: std::collections::BTreeMap<String, GraphSubscription> = self
+            .inner
+            .graph_subs
+            .lock()
+            .expect("graph_subs lock poisoned")
+            .values()
+            .map(|s| (s.id.clone(), s.clone()))
+            .collect();
+        subs.values()
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "account_id": s.account_id,
+                    "resource": s.resource,
+                    "change_type": s.change_type,
+                    "notification_url": s.notification_url,
+                    "namespace": s.namespace().as_str(),
+                    "emits": s.namespace().emits(),
+                })
+            })
+            .collect()
     }
 
     // ── EWS streaming-subscription registry ─────────────────────────
@@ -444,6 +565,11 @@ impl PushHub {
             .graph_log
             .lock()
             .expect("graph_log lock poisoned")
+            .clear();
+        self.inner
+            .graph_excluded
+            .lock()
+            .expect("graph_excluded lock poisoned")
             .clear();
         self.inner
             .ews_subs
@@ -556,16 +682,40 @@ impl PushHub {
     }
 
     fn emit_graph(&self, p: &AccountPush) {
-        let subs: Vec<GraphSubscription> = self
+        // Keyed by id: deterministic fan-out order (the registry is a
+        // HashMap) so a fixture staging several namespaces on one
+        // account renders the same log every run.
+        let subs: std::collections::BTreeMap<String, GraphSubscription> = self
             .inner
             .graph_subs
             .lock()
             .expect("graph_subs lock poisoned")
             .values()
             .filter(|s| s.account_id == p.account_id)
-            .cloned()
+            .map(|s| (s.id.clone(), s.clone()))
             .collect();
-        for sub in subs {
+        for sub in subs.into_values() {
+            let ns = sub.namespace();
+            if !ns.emits() {
+                // Public-folder resources are org-wide: no owning
+                // account, no per-account state token, nothing to
+                // notify about. Skipping one must not disturb the
+                // personal / shared subscriptions sharing this
+                // account, so it is dropped individually here rather
+                // than failing the whole fan-out.
+                self.inner
+                    .graph_excluded
+                    .lock()
+                    .expect("graph_excluded lock poisoned")
+                    .push(json!({
+                        "subscription_id": sub.id,
+                        "account_id": sub.account_id,
+                        "resource": sub.resource,
+                        "namespace": ns.as_str(),
+                        "reason": "public-folder resources are not push-bearing",
+                    }));
+                continue;
+            }
             let note = graph_notification(&sub, p);
             self.inner
                 .graph_log
@@ -573,6 +723,7 @@ impl PushHub {
                 .expect("graph_log lock poisoned")
                 .push(json!({
                     "notification_url": sub.notification_url,
+                    "namespace": ns.as_str(),
                     "body": note.clone(),
                 }));
             let url = sub.notification_url.clone();
@@ -764,6 +915,35 @@ mod tests {
         assert_eq!(base64_standard(b"foob"), "Zm9vYg==");
         assert_eq!(base64_standard(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_standard(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn resource_namespaces_classify_the_three_shapes() {
+        use PushNamespace::{Personal, Public, Shared};
+        // Personal, including the shapes ratatoskr's Graph sync uses
+        // and the empty resource older fixtures leave unset.
+        for r in ["me/messages", "me/mailFolders('inbox')/messages", ""] {
+            assert_eq!(namespace_for_resource(r), Personal, "{r}");
+        }
+        // Shared: another principal's mailbox.
+        for r in [
+            "users/account-shared/messages",
+            "/users/shared@example.com/mailFolders('inbox')/messages",
+            "Users/account-shared/messages",
+        ] {
+            assert_eq!(namespace_for_resource(r), Shared, "{r}");
+        }
+        // Public: the org-wide tree, which never emits.
+        for r in [
+            "publicfolders/pf-root/messages",
+            "publicFolders/pf-root",
+            "/publicfoldersroot/pf-root",
+        ] {
+            assert_eq!(namespace_for_resource(r), Public, "{r}");
+            assert!(!namespace_for_resource(r).emits(), "{r}");
+        }
+        assert!(Personal.emits());
+        assert!(Shared.emits());
     }
 
     #[test]
