@@ -97,7 +97,7 @@ pub fn load_source_with_dispatcher_and_dir(
 ) -> Result<(Fixture, Dispatcher), String> {
     let mut state = State::new();
     state.set_user_data(LuaExtras::default());
-    install_builders(&mut state);
+    install_builders(&mut state).map_err(|e| format!("install builders for {chunk_name}: {e}"))?;
 
     state
         .load_string_named(source, Some(chunk_name.to_string()))
@@ -239,51 +239,52 @@ impl Builder {
 
 // ── Builder registration ────────────────────────────────────────────
 
-fn install_builders(state: &mut State) {
-    state.push_rust_fn(builder_fixture);
+fn install_builders(state: &mut State) -> dellingr::Result<()> {
+    state.push_rust_fn(builder_fixture)?;
     state.set_global("fixture");
-    state.push_rust_fn(builder_account);
+    state.push_rust_fn(builder_account)?;
     state.set_global("account");
-    state.push_rust_fn(builder_oauth);
+    state.push_rust_fn(builder_oauth)?;
     state.set_global("oauth");
-    state.push_rust_fn(builder_mailbox);
+    state.push_rust_fn(builder_mailbox)?;
     state.set_global("mailbox");
-    state.push_rust_fn(builder_email);
+    state.push_rust_fn(builder_email)?;
     state.set_global("email");
-    state.push_rust_fn(builder_bulk_emails);
+    state.push_rust_fn(builder_bulk_emails)?;
     state.set_global("bulk_emails");
-    state.push_rust_fn(builder_bulk_threads);
+    state.push_rust_fn(builder_bulk_threads)?;
     state.set_global("bulk_threads");
-    state.push_rust_fn(builder_bulk_mailboxes);
+    state.push_rust_fn(builder_bulk_mailboxes)?;
     state.set_global("bulk_mailboxes");
-    state.push_rust_fn(builder_on);
+    state.push_rust_fn(builder_on)?;
     state.set_global("on");
-    state.push_rust_fn(builder_change);
+    state.push_rust_fn(builder_change)?;
     state.set_global("change");
-    state.push_rust_fn(builder_contact_folder);
+    state.push_rust_fn(builder_contact_folder)?;
     state.set_global("contact_folder");
-    state.push_rust_fn(builder_contact);
+    state.push_rust_fn(builder_contact)?;
     state.set_global("contact");
-    state.push_rust_fn(builder_contact_group);
+    state.push_rust_fn(builder_contact_group)?;
     state.set_global("contact_group");
-    state.push_rust_fn(builder_other_contact);
+    state.push_rust_fn(builder_other_contact)?;
     state.set_global("other_contact");
-    state.push_rust_fn(builder_directory_person);
+    state.push_rust_fn(builder_directory_person)?;
     state.set_global("directory_person");
-    state.push_rust_fn(builder_category);
+    state.push_rust_fn(builder_category)?;
     state.set_global("category");
-    state.push_rust_fn(builder_group);
+    state.push_rust_fn(builder_group)?;
     state.set_global("group");
-    state.push_rust_fn(builder_send_as);
+    state.push_rust_fn(builder_send_as)?;
     state.set_global("send_as");
-    state.push_rust_fn(builder_discovery);
+    state.push_rust_fn(builder_discovery)?;
     state.set_global("discovery");
-    state.push_rust_fn(builder_wait);
+    state.push_rust_fn(builder_wait)?;
     state.set_global("wait");
-    state.push_rust_fn(builder_mock_done);
+    state.push_rust_fn(builder_mock_done)?;
     state.set_global("mock_done");
-    state.push_rust_fn(builder_mock_fail);
+    state.push_rust_fn(builder_mock_fail)?;
     state.set_global("mock_fail");
+    Ok(())
 }
 
 /// `wait(ms)` blocks the calling thread for `ms` milliseconds. Used
@@ -665,16 +666,16 @@ fn read_table_opt<T>(
     let typ = lookup(state, t, key)?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             Ok(None)
         }
         LuaType::Table => {
             let r = f(state)?;
-            state.pop(1);
+            state.pop(1)?;
             Ok(Some(r))
         }
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             fail(state, format!("field {key:?} must be a table"))
         }
     }
@@ -693,10 +694,10 @@ fn read_webfinger_links(
             let len = state.table_len(arr);
             let mut out = Vec::with_capacity(len);
             for i in 1..=len {
-                state.push_number(i as f64);
+                state.push_number(i as f64)?;
                 state.get_table_raw(arr)?;
                 if state.typ(-1) != LuaType::Table {
-                    state.pop(1);
+                    state.pop(1)?;
                     return fail(
                         state,
                         format!("field \"links\" entry {i} must be a {{rel, href}} table"),
@@ -705,14 +706,14 @@ fn read_webfinger_links(
                 let entry_idx = state.get_top() as isize;
                 let rel = read_string(state, entry_idx, "rel")?;
                 let href = read_string(state, entry_idx, "href")?;
-                state.pop(1);
+                state.pop(1)?;
                 out.push(crate::fixture::RawWebFingerLink { rel, href });
             }
             Ok(out)
         }
         _ => fail(state, "field \"links\" must be an array".to_string()),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -751,7 +752,7 @@ fn read_contact_email_array_opt_present(
     let typ = lookup(state, t, key)?;
     let result: dellingr::Result<Option<Vec<crate::fixture::RawContactEmail>>> = match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(None);
         }
         LuaType::Table => {
@@ -760,23 +761,23 @@ fn read_contact_email_array_opt_present(
             let len = state.table_len(arr);
             let mut out = Vec::with_capacity(len);
             for i in 1..=len {
-                state.push_number(i as f64);
+                state.push_number(i as f64)?;
                 state.get_table_raw(arr)?;
                 let entry_typ = state.typ(-1);
                 match entry_typ {
                     LuaType::String => {
                         out.push(crate::fixture::RawContactEmail::Bare(state.to_string(-1)?));
-                        state.pop(1);
+                        state.pop(1)?;
                     }
                     LuaType::Table => {
                         let entry_idx = state.get_top() as isize;
                         let address = read_string(state, entry_idx, "address")?;
                         let name = read_string_opt(state, entry_idx, "name")?;
-                        state.pop(1);
+                        state.pop(1)?;
                         out.push(crate::fixture::RawContactEmail::Full { address, name });
                     }
                     _ => {
-                        state.pop(1);
+                        state.pop(1)?;
                         return fail(
                             state,
                             format!(
@@ -790,7 +791,7 @@ fn read_contact_email_array_opt_present(
         }
         _ => fail(state, format!("field {key:?} must be an array")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -810,23 +811,23 @@ fn read_contact_phone_array_opt(
             let len = state.table_len(arr);
             let mut out = Vec::with_capacity(len);
             for i in 1..=len {
-                state.push_number(i as f64);
+                state.push_number(i as f64)?;
                 state.get_table_raw(arr)?;
                 let entry_typ = state.typ(-1);
                 match entry_typ {
                     LuaType::String => {
                         out.push(crate::fixture::RawContactPhone::Bare(state.to_string(-1)?));
-                        state.pop(1);
+                        state.pop(1)?;
                     }
                     LuaType::Table => {
                         let entry_idx = state.get_top() as isize;
                         let number = read_string(state, entry_idx, "number")?;
                         let kind = read_string_opt(state, entry_idx, "kind")?;
-                        state.pop(1);
+                        state.pop(1)?;
                         out.push(crate::fixture::RawContactPhone::Full { number, kind });
                     }
                     _ => {
-                        state.pop(1);
+                        state.pop(1)?;
                         return fail(
                             state,
                             format!(
@@ -840,7 +841,7 @@ fn read_contact_phone_array_opt(
         }
         _ => fail(state, format!("field {key:?} must be an array")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -855,10 +856,10 @@ fn read_contact_phone_array_opt_present(
 ) -> dellingr::Result<Option<Vec<crate::fixture::RawContactPhone>>> {
     let typ = lookup(state, t, key)?;
     if typ == LuaType::Nil {
-        state.pop(1);
+        state.pop(1)?;
         return Ok(None);
     }
-    state.pop(1);
+    state.pop(1)?;
     read_contact_phone_array_opt(state, t, key).map(Some)
 }
 
@@ -876,23 +877,23 @@ fn read_contact_email_array_opt(
             let len = state.table_len(arr);
             let mut out = Vec::with_capacity(len);
             for i in 1..=len {
-                state.push_number(i as f64);
+                state.push_number(i as f64)?;
                 state.get_table_raw(arr)?;
                 let entry_typ = state.typ(-1);
                 match entry_typ {
                     LuaType::String => {
                         out.push(crate::fixture::RawContactEmail::Bare(state.to_string(-1)?));
-                        state.pop(1);
+                        state.pop(1)?;
                     }
                     LuaType::Table => {
                         let entry_idx = state.get_top() as isize;
                         let address = read_string(state, entry_idx, "address")?;
                         let name = read_string_opt(state, entry_idx, "name")?;
-                        state.pop(1);
+                        state.pop(1)?;
                         out.push(crate::fixture::RawContactEmail::Full { address, name });
                     }
                     _ => {
-                        state.pop(1);
+                        state.pop(1)?;
                         return fail(
                             state,
                             format!(
@@ -906,7 +907,7 @@ fn read_contact_email_array_opt(
         }
         _ => fail(state, format!("field {key:?} must be an array")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -1289,7 +1290,7 @@ fn read_attachment_array_opt(
         LuaType::Table => read_attachment_array_at_top(state, key),
         _ => fail(state, format!("field {key:?} must be an array")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -1303,10 +1304,10 @@ fn read_attachment_array_at_top(
     let len = state.table_len(arr);
     let mut out = Vec::with_capacity(len);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, format!("field {key:?} entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
@@ -1319,7 +1320,7 @@ fn read_attachment_array_at_top(
             cid: read_string_opt(state, entry_idx, "cid")?,
             data_path: read_string(state, entry_idx, "data_path")?,
         };
-        state.pop(1);
+        state.pop(1)?;
         out.push(raw);
     }
     Ok(out)
@@ -1432,22 +1433,22 @@ fn read_contact_folder_create(
     let typ = lookup(state, t, "contact_folder_create")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"contact_folder_create\" must be an array");
         }
     }
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(
                 state,
                 format!("contact_folder_create entry {i} must be a table"),
@@ -1461,10 +1462,10 @@ fn read_contact_folder_create(
             is_default: read_bool_opt(state, entry_idx, "is_default")?.unwrap_or(false),
             account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
-        state.pop(1);
+        state.pop(1)?;
         ops.push(crate::fixture::contact_folder_create_op(raw));
     }
-    state.pop(1);
+    state.pop(1)?;
     Ok(())
 }
 
@@ -1477,22 +1478,22 @@ fn read_contact_folder_update(
     let typ = lookup(state, t, "contact_folder_update")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"contact_folder_update\" must be an array");
         }
     }
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(
                 state,
                 format!("contact_folder_update entry {i} must be a table"),
@@ -1502,7 +1503,7 @@ fn read_contact_folder_update(
         let id = read_string(state, entry_idx, "id")?;
         let display_name = read_string_opt(state, entry_idx, "display_name")?;
         let parent_folder_id = read_string_opt(state, entry_idx, "parent_folder_id")?;
-        state.pop(1);
+        state.pop(1)?;
         let op = crate::fixture::contact_folder_update_op(id, display_name, parent_folder_id)
             .map_err(|e| {
                 state.error(ErrorKind::InternalError(format!(
@@ -1511,7 +1512,7 @@ fn read_contact_folder_update(
             })?;
         ops.push(op);
     }
-    state.pop(1);
+    state.pop(1)?;
     Ok(())
 }
 
@@ -1524,22 +1525,22 @@ fn read_contact_create(
     let typ = lookup(state, t, "contact_create")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"contact_create\" must be an array");
         }
     }
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(state, format!("contact_create entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
@@ -1557,10 +1558,10 @@ fn read_contact_create(
             malformed_vcard: read_bool_opt(state, entry_idx, "malformed_vcard")?.unwrap_or(false),
             account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
-        state.pop(1);
+        state.pop(1)?;
         ops.push(crate::fixture::contact_create_op(raw));
     }
-    state.pop(1);
+    state.pop(1)?;
     Ok(())
 }
 
@@ -1573,22 +1574,22 @@ fn read_contact_update(
     let typ = lookup(state, t, "contact_update")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"contact_update\" must be an array");
         }
     }
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(state, format!("contact_update entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
@@ -1607,7 +1608,7 @@ fn read_contact_update(
         let job_title = read_string_opt(state, entry_idx, "job_title")?;
         let department = read_string_opt(state, entry_idx, "department")?;
         let notes = read_string_opt(state, entry_idx, "notes")?;
-        state.pop(1);
+        state.pop(1)?;
         let fields = crate::fixture::ContactUpdateFields {
             display_name,
             folder_id,
@@ -1625,7 +1626,7 @@ fn read_contact_update(
         })?;
         ops.push(op);
     }
-    state.pop(1);
+    state.pop(1)?;
     Ok(())
 }
 
@@ -1636,12 +1637,12 @@ fn read_email_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
     let typ = lookup(state, t, "email_create")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"email_create\" must be an array");
         }
     }
@@ -1649,16 +1650,16 @@ fn read_email_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
     let len = state.table_len(arr);
     let mut entries: Vec<RawEmail> = Vec::with_capacity(len);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(state, format!("email_create entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
         let raw = read_raw_email_at(state, entry_idx)?;
         if !raw.attachments.is_empty() {
-            state.pop(2);
+            state.pop(2)?;
             return fail(
                 state,
                 format!(
@@ -1666,10 +1667,10 @@ fn read_email_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
                 ),
             );
         }
-        state.pop(1);
+        state.pop(1)?;
         entries.push(raw);
     }
-    state.pop(1);
+    state.pop(1)?;
     // Normalise each entry against the mailbox set declared *so far*
     // in script order. This is an early-error convenience for the
     // common case where every `mailbox(...)` declaration comes before
@@ -1744,29 +1745,29 @@ fn read_email_update(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
     let typ = lookup(state, t, "email_update")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"email_update\" must be an array");
         }
     }
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(state, format!("email_update entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
         let id = read_string(state, entry_idx, "id")?;
         let keywords = read_string_array_opt_present(state, entry_idx, "keywords")?;
         let mailbox_ids = read_string_array_opt_present(state, entry_idx, "mailbox_ids")?;
-        state.pop(1);
+        state.pop(1)?;
         let op = crate::fixture::email_update_op(id, keywords, mailbox_ids).map_err(|e| {
             state.error(ErrorKind::InternalError(format!(
                 "email_update entry {i}: {e}"
@@ -1774,7 +1775,7 @@ fn read_email_update(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
         })?;
         ops.push(op);
     }
-    state.pop(1);
+    state.pop(1)?;
     Ok(())
 }
 
@@ -1783,28 +1784,28 @@ fn read_email_move(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dell
     let typ = lookup(state, t, "email_move")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"email_move\" must be an array");
         }
     }
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(state, format!("email_move entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
         let id = read_string(state, entry_idx, "id")?;
         let mailbox_ids = read_string_array(state, entry_idx, "mailbox_ids")?;
-        state.pop(1);
+        state.pop(1)?;
         let op = crate::fixture::email_move_op(id, mailbox_ids).map_err(|e| {
             state.error(ErrorKind::InternalError(format!(
                 "email_move entry {i}: {e}"
@@ -1812,7 +1813,7 @@ fn read_email_move(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dell
         })?;
         ops.push(op);
     }
-    state.pop(1);
+    state.pop(1)?;
     Ok(())
 }
 
@@ -1830,17 +1831,17 @@ where
     let typ = lookup(state, t, key)?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, format!("field {key:?} must be an array"));
         }
     }
     let ids = read_string_array_at_top(state, key)?;
-    state.pop(1);
+    state.pop(1)?;
     for id in ids {
         ops.push(mk(id));
     }
@@ -1856,12 +1857,12 @@ fn read_mailbox_create(
     let typ = lookup(state, t, "mailbox_create")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"mailbox_create\" must be an array");
         }
     }
@@ -1869,10 +1870,10 @@ fn read_mailbox_create(
     let len = state.table_len(arr);
     let mut raws: Vec<RawMailbox> = Vec::with_capacity(len);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(state, format!("mailbox_create entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
@@ -1885,10 +1886,10 @@ fn read_mailbox_create(
             is_subscribed: read_bool_opt(state, entry_idx, "is_subscribed")?,
             account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
-        state.pop(1);
+        state.pop(1)?;
         raws.push(mb);
     }
-    state.pop(1);
+    state.pop(1)?;
     for raw in raws {
         let mb_id = raw.id.clone();
         let op = crate::fixture::mailbox_create_op(raw).map_err(|e| {
@@ -1910,22 +1911,22 @@ fn read_mailbox_update(
     let typ = lookup(state, t, "mailbox_update")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"mailbox_update\" must be an array");
         }
     }
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(state, format!("mailbox_update entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
@@ -1935,7 +1936,7 @@ fn read_mailbox_update(
         let sort_order = read_int_opt(state, entry_idx, "sort_order")?;
         let role = read_string_opt(state, entry_idx, "role")?;
         let is_subscribed = read_bool_opt(state, entry_idx, "is_subscribed")?;
-        state.pop(1);
+        state.pop(1)?;
         let op =
             crate::fixture::mailbox_update_op(id, name, parent_id, sort_order, role, is_subscribed)
                 .map_err(|e| {
@@ -1945,7 +1946,7 @@ fn read_mailbox_update(
                 })?;
         ops.push(op);
     }
-    state.pop(1);
+    state.pop(1)?;
     Ok(())
 }
 
@@ -1954,22 +1955,22 @@ fn read_event_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
     let typ = lookup(state, t, "event_create")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"event_create\" must be an array");
         }
     }
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(state, format!("event_create entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
@@ -1995,7 +1996,7 @@ fn read_event_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
             raw_ical: read_string_opt(state, entry_idx, "raw_ical")?,
             account_id: read_string_opt(state, entry_idx, "account_id")?,
         };
-        state.pop(1);
+        state.pop(1)?;
         let op = crate::fixture::event_create_op(raw).map_err(|e| {
             state.error(ErrorKind::InternalError(format!(
                 "event_create entry {i} {e}"
@@ -2003,7 +2004,7 @@ fn read_event_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
         })?;
         ops.push(op);
     }
-    state.pop(1);
+    state.pop(1)?;
     Ok(())
 }
 
@@ -2012,22 +2013,22 @@ fn read_event_update(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
     let typ = lookup(state, t, "event_update")?;
     match typ {
         LuaType::Nil => {
-            state.pop(1);
+            state.pop(1)?;
             return Ok(());
         }
         LuaType::Table => {}
         _ => {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, "field \"event_update\" must be an array");
         }
     }
     let arr = state.get_top() as isize;
     let len = state.table_len(arr);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::Table {
-            state.pop(2);
+            state.pop(2)?;
             return fail(state, format!("event_update entry {i} must be a table"));
         }
         let entry_idx = state.get_top() as isize;
@@ -2037,7 +2038,7 @@ fn read_event_update(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
         let end = read_string_opt(state, entry_idx, "end")?;
         let location = read_string_opt(state, entry_idx, "location")?;
         let body_text = read_string_opt(state, entry_idx, "body_text")?;
-        state.pop(1);
+        state.pop(1)?;
         let op = crate::fixture::event_update_op(id, subject, start, end, location, body_text)
             .map_err(|e| {
                 state.error(ErrorKind::InternalError(format!(
@@ -2046,7 +2047,7 @@ fn read_event_update(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
             })?;
         ops.push(op);
     }
-    state.pop(1);
+    state.pop(1)?;
     Ok(())
 }
 
@@ -2109,7 +2110,7 @@ fn fail<T>(state: &State, msg: impl Into<String>) -> dellingr::Result<T> {
 /// On entry the input table is at index `t`. On exit the value is at
 /// `-1` and the caller is responsible for popping it.
 fn lookup(state: &mut State, t: isize, key: &str) -> dellingr::Result<LuaType> {
-    state.push_string(key);
+    state.push_string(key)?;
     state.get_table_raw(t)?;
     Ok(state.typ(-1))
 }
@@ -2117,15 +2118,15 @@ fn lookup(state: &mut State, t: isize, key: &str) -> dellingr::Result<LuaType> {
 fn read_string(state: &mut State, t: isize, key: &str) -> dellingr::Result<String> {
     let typ = lookup(state, t, key)?;
     if typ == LuaType::Nil {
-        state.pop(1);
+        state.pop(1)?;
         return fail(state, format!("missing required field {key:?}"));
     }
     if typ != LuaType::String {
-        state.pop(1);
+        state.pop(1)?;
         return fail(state, format!("field {key:?} must be a string"));
     }
     let s = state.to_string(-1)?;
-    state.pop(1);
+    state.pop(1)?;
     Ok(s)
 }
 
@@ -2136,7 +2137,7 @@ fn read_string_opt(state: &mut State, t: isize, key: &str) -> dellingr::Result<O
         LuaType::String => Ok(Some(state.to_string(-1)?)),
         _ => fail(state, format!("field {key:?} must be a string")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -2147,7 +2148,7 @@ fn read_bool_opt(state: &mut State, t: isize, key: &str) -> dellingr::Result<Opt
         LuaType::Boolean => Ok(Some(state.to_boolean(-1))),
         _ => fail(state, format!("field {key:?} must be a boolean")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -2166,14 +2167,14 @@ fn read_int_opt(state: &mut State, t: isize, key: &str) -> dellingr::Result<Opti
             let n = state.to_number(-1)?;
             if n.fract() != 0.0 {
                 let msg = format!("field {key:?} must be an integer");
-                state.pop(1);
+                state.pop(1)?;
                 return fail(state, msg);
             }
             // f64 -> i64 cast bounded by the i64 range check above.
             #[allow(clippy::cast_possible_truncation)]
             if !(I64_MIN_F64..=I64_MAX_F64).contains(&n) {
                 let msg = format!("field {key:?} integer is out of i64 range");
-                state.pop(1);
+                state.pop(1)?;
                 return fail(state, msg);
             }
             #[allow(clippy::cast_possible_truncation)]
@@ -2181,22 +2182,22 @@ fn read_int_opt(state: &mut State, t: isize, key: &str) -> dellingr::Result<Opti
         }
         _ => fail(state, format!("field {key:?} must be a number")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
 fn read_string_array(state: &mut State, t: isize, key: &str) -> dellingr::Result<Vec<String>> {
     let typ = lookup(state, t, key)?;
     if typ == LuaType::Nil {
-        state.pop(1);
+        state.pop(1)?;
         return fail(state, format!("missing required field {key:?}"));
     }
     if typ != LuaType::Table {
-        state.pop(1);
+        state.pop(1)?;
         return fail(state, format!("field {key:?} must be an array"));
     }
     let result = read_string_array_at_top(state, key);
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -2207,7 +2208,7 @@ fn read_string_array_opt(state: &mut State, t: isize, key: &str) -> dellingr::Re
         LuaType::Table => read_string_array_at_top(state, key),
         _ => fail(state, format!("field {key:?} must be an array")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -2229,7 +2230,7 @@ fn read_string_array_opt_present(
         LuaType::Table => read_string_array_at_top(state, key).map(Some),
         _ => fail(state, format!("field {key:?} must be an array")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -2245,14 +2246,14 @@ fn read_string_array_at_top(state: &mut State, key: &str) -> dellingr::Result<Ve
     let len = state.table_len(arr);
     let mut out = Vec::with_capacity(len);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         if state.typ(-1) != LuaType::String {
-            state.pop(1);
+            state.pop(1)?;
             return fail(state, format!("field {key:?} entry {i} must be a string"));
         }
         out.push(state.to_string(-1)?);
-        state.pop(1);
+        state.pop(1)?;
     }
     Ok(out)
 }
@@ -2269,7 +2270,7 @@ fn read_address_opt(
         LuaType::Table => Ok(Some(read_address_table_at_top(state, key)?)),
         _ => fail(state, format!("field {key:?} must be a string or table")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -2284,7 +2285,7 @@ fn read_address_array_opt(
         LuaType::Table => read_address_array_at_top(state, key),
         _ => fail(state, format!("field {key:?} must be an array")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -2295,18 +2296,18 @@ fn read_address_array_at_top(state: &mut State, key: &str) -> dellingr::Result<V
     let len = state.table_len(arr);
     let mut out = Vec::with_capacity(len);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         let typ = state.typ(-1);
         let entry = match typ {
             LuaType::String => RawAddress::Bare(state.to_string(-1)?),
             LuaType::Table => read_address_table_at_top(state, key)?,
             _ => {
-                state.pop(1);
+                state.pop(1)?;
                 return fail(state, format!("field {key:?} entry {i} bad shape"));
             }
         };
-        state.pop(1);
+        state.pop(1)?;
         out.push(entry);
     }
     Ok(out)
@@ -2322,14 +2323,14 @@ fn read_address_table_at_top(state: &mut State, key: &str) -> dellingr::Result<R
     let name = read_string_opt(state, t, "name")?;
     let typ = lookup(state, t, "email")?;
     if typ != LuaType::String {
-        state.pop(1);
+        state.pop(1)?;
         return fail(
             state,
             format!("field {key:?} address table needs a string `email`"),
         );
     }
     let email = state.to_string(-1)?;
-    state.pop(1);
+    state.pop(1)?;
     Ok(RawAddress::Full { name, email })
 }
 
@@ -2348,7 +2349,7 @@ fn read_event_attendee_array_opt(
         LuaType::Table => read_event_attendee_array_at_top(state, key),
         _ => fail(state, format!("field {key:?} must be an array")),
     };
-    state.pop(1);
+    state.pop(1)?;
     result
 }
 
@@ -2362,18 +2363,18 @@ fn read_event_attendee_array_at_top(
     let len = state.table_len(arr);
     let mut out = Vec::with_capacity(len);
     for i in 1..=len {
-        state.push_number(i as f64);
+        state.push_number(i as f64)?;
         state.get_table_raw(arr)?;
         let typ = state.typ(-1);
         let entry = match typ {
             LuaType::String => RawEventAttendee::Bare(state.to_string(-1)?),
             LuaType::Table => read_event_attendee_table_at_top(state, key)?,
             _ => {
-                state.pop(1);
+                state.pop(1)?;
                 return fail(state, format!("field {key:?} entry {i} bad shape"));
             }
         };
-        state.pop(1);
+        state.pop(1)?;
         out.push(entry);
     }
     Ok(out)
@@ -2393,14 +2394,14 @@ fn read_event_attendee_table_at_top(
     let status = read_string_opt(state, t, "status")?;
     let typ = lookup(state, t, "email")?;
     if typ != LuaType::String {
-        state.pop(1);
+        state.pop(1)?;
         return fail(
             state,
             format!("field {key:?} attendee table needs a string `email`"),
         );
     }
     let email = state.to_string(-1)?;
-    state.pop(1);
+    state.pop(1)?;
     Ok(RawEventAttendee::Full {
         name,
         email,
@@ -2553,32 +2554,34 @@ fn run_dispatch<F>(state: &mut State, anchor: Anchor, call_index: u64, build_req
 where
     F: FnOnce(&mut State) -> dellingr::Result<()>,
 {
-    state.new_table();
-    // Built-in field call_index. dellingr's set_table_raw uses the
-    // standard Lua C API order: push KEY first, then VALUE on top,
-    // then call - matching `lua_settable`.
-    state.push_string("call_index");
-    state.push_number(call_index as f64);
-    if state.set_table_raw(-3).is_err() {
-        state.set_top(0);
-        return Override::None;
-    }
-    if build_req(state).is_err() {
-        state.set_top(0);
-        return Override::None;
-    }
-    // Stack: [req_table]. call_anchor inserts the function below the
-    // 1 arg, then runs the call - so net effect is f(req).
-    if state
-        .call_anchor(anchor, ArgCount::Fixed(1), RetCount::Fixed(1))
-        .is_err()
-    {
-        state.set_top(0);
+    // Build the `req` table, hand it to the script's callback, and
+    // run the call. Every step is fallible at the VM level (stack
+    // overflow, bad index, a Lua error inside the callback); any of
+    // them failing means "no override" - the mock falls back to its
+    // default response rather than propagating the fault onto the
+    // wire.
+    let called = (|| -> dellingr::Result<()> {
+        state.new_table()?;
+        // Built-in field call_index. dellingr's set_table_raw uses the
+        // standard Lua C API order: push KEY first, then VALUE on top,
+        // then call - matching `lua_settable`.
+        state.push_string("call_index")?;
+        state.push_number(call_index as f64)?;
+        state.set_table_raw(-3)?;
+        build_req(state)?;
+        // Stack: [req_table]. call_anchor inserts the function below
+        // the 1 arg, then runs the call - so net effect is f(req).
+        state.call_anchor(anchor, ArgCount::Fixed(1), RetCount::Fixed(1))
+    })();
+    if called.is_err() {
+        // Best-effort unwind; a failing set_top leaves the next
+        // dispatch to clean up, and there is nothing better to do here.
+        let _ = state.set_top(0);
         return Override::None;
     }
     // Stack: [result]
     let out = decode_override(state);
-    state.pop(1);
+    let _ = state.pop(1);
     out
 }
 
@@ -2611,7 +2614,7 @@ fn decode_override(state: &mut State) -> Override {
 /// negative relative index that points at the table is unsafe
 /// because pushing the key shifts the relative position.
 fn field_string(state: &mut State, t: isize, key: &str) -> Option<String> {
-    state.push_string(key);
+    state.push_string(key).ok()?;
     if state.get_table_raw(t).is_err() {
         return None;
     }
@@ -2620,7 +2623,7 @@ fn field_string(state: &mut State, t: isize, key: &str) -> Option<String> {
     } else {
         None
     };
-    state.pop(1);
+    state.pop(1).ok()?;
     result
 }
 
@@ -2635,16 +2638,16 @@ fn field_string(state: &mut State, t: isize, key: &str) -> Option<String> {
 /// Lua C API order: push KEY first, then VALUE on top, then call
 /// `set_table_raw` - matching `lua_settable`.
 pub fn req_set_str(state: &mut State, key: &str, value: &str) -> dellingr::Result<()> {
-    state.push_string(key);
-    state.push_string(value);
+    state.push_string(key)?;
+    state.push_string(value)?;
     state.set_table_raw(-3)
 }
 
 /// Set `req[key] = value` (number) where the table is at the top of
 /// the stack.
 pub fn req_set_int(state: &mut State, key: &str, value: i64) -> dellingr::Result<()> {
-    state.push_string(key);
-    state.push_number(value as f64);
+    state.push_string(key)?;
+    state.push_number(value as f64)?;
     state.set_table_raw(-3)
 }
 
@@ -2663,12 +2666,12 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    state.push_string(key);
-    state.new_table();
+    state.push_string(key)?;
+    state.new_table()?;
     let arr = state.get_top() as isize;
     for (i, v) in values.into_iter().enumerate() {
-        state.push_number((i + 1) as f64);
-        state.push_string(v.as_ref());
+        state.push_number((i + 1) as f64)?;
+        state.push_string(v.as_ref())?;
         state.set_table_raw(arr)?;
     }
     state.set_table_raw(-3)

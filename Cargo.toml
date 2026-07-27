@@ -2,6 +2,7 @@
 # cargo from walking up the directory tree and adopting an unrelated parent
 # manifest as its workspace.
 [workspace]
+dependencies = {}
 
 [package]
 name = "saehrimnir"
@@ -23,7 +24,7 @@ serde_json = "1"
 toml = "1.1.2"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-dellingr = "0.3.0"
+dellingr = "0.4.0"
 rand = "0.10"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
