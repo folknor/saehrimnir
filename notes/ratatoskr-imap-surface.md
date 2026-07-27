@@ -310,7 +310,10 @@ delta on the same fixture.
 - NOTIFY, COMPRESS - bandwidth / push-refinement optimisations
   (`IDLE` itself is implemented; see above).
 - SETACL / DELETEACL / LISTRIGHTS - the ACL surface is read-only in
-  v0 (`GETACL` / `MYRIGHTS` only). Shared folders are read-only.
+  v0 (`GETACL` / `MYRIGHTS` only; the *grants themselves* are
+  fixture-authored and cannot be changed over the wire). Whether a
+  shared folder accepts writes is a different question, and is driven
+  by the granted rights - see "Shared folders" below.
 - XLIST - client falls back to LIST + attributes.
 
 ## Shared folders (NAMESPACE / ACL, RFC 2342 + 4314)
@@ -342,8 +345,23 @@ rights = "lr"                  # RFC 4314 rights; default "lr"
   authenticated as the borrowing account (per-selection account
   override). A shared folder the account holds no grant on returns
   `NO SELECT unknown mailbox`.
-- Shared folders are read-only in v0: `UID STORE` / `COPY` / `MOVE`
-  / `EXPUNGE` on a shared selection return `NO [NOPERM]`.
+- Writes on a shared selection are gated on the granted rights, not
+  blanket-refused. Each mutating command names the RFC 4314 right it
+  needs - `UID STORE` -> `w`, `UID COPY` -> `i`, `UID MOVE` -> `i`+`t`,
+  `UID EXPUNGE` -> `e` - and a selection whose grant lacks it gets
+  `NO [NOPERM] <cmd> not permitted on this shared folder (requires
+  "w", holds "lr")`. A grant of `lrswipkxte` therefore accepts the
+  same writes a personal mailbox does. Personal selections are never
+  gated (the owner holds `lrswipkxtea` implicitly).
+- `SELECT` on a shared folder with no write-shaped right (none of
+  `i` / `w` / `s` / `e` / `t`) completes `OK [READ-ONLY]`, so a client
+  learns the folder is read-only without a separate `MYRIGHTS` round
+  trip. The tagged verb still names the command that was issued
+  (`SELECT`, not `EXAMINE`).
+- `fixtures/shared-rights.toml` stages a read-only (`lr`) and a
+  writable (`lrswipkxte`) shared folder in the same fixture, which is
+  what a consumer needs in order to prove it distinguishes them
+  rather than assuming one.
 
 ## Things that WILL break sync if wrong
 

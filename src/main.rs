@@ -272,10 +272,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
     });
-    // Microsoft Graph server.
+    // Microsoft Graph server. The EWS / Autodiscover routes are
+    // co-mounted here in addition to their own listener below: the
+    // harness that drives this mock injects a fixed set of endpoint
+    // environment variables into the process under test and has no
+    // EWS slot, so without this a harness run cannot reach the EWS
+    // surface at all. The two mounts are independent routers over the
+    // same `SharedHandles`, each with its own `base_url`, so the
+    // Autodiscover URLs a request gets back point at the listener it
+    // arrived on. The merge is safe because the EWS router declares no
+    // fallback of its own (axum panics when merging two routers that
+    // both set one) and its three paths do not collide with any Graph
+    // route.
     let graph_app = graph::router(graph::AppState {
         shared: shared.clone(),
-    });
+    })
+    .merge(saehrimnir::ews::router(saehrimnir::ews::AppState {
+        shared: shared.clone(),
+        base_url: format!("http://{graph_addr}"),
+    }));
     let graph_shutdown_rx = shutdown_rx.clone();
     let graph_task = tokio::spawn(
         axum::serve(

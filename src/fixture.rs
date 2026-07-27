@@ -775,6 +775,22 @@ impl Fixture {
         self.public_items.iter().find(|i| i.id == id)
     }
 
+    /// A public-folder attachment by its EWS `AttachmentId` (the
+    /// fixture `blob_id`), across every item. Drives EWS
+    /// `GetAttachment`, which addresses an attachment by id alone with
+    /// no item context - the loader enforces org-wide uniqueness of
+    /// public attachment blob ids so this lookup is unambiguous.
+    /// Returns the owning item alongside the attachment so the
+    /// response can name it.
+    pub fn public_attachment(&self, attachment_id: &str) -> Option<(&PublicItem, &Attachment)> {
+        self.public_items.iter().find_map(|it| {
+            it.attachments
+                .iter()
+                .find(|a| a.blob_id == attachment_id)
+                .map(|a| (it, a))
+        })
+    }
+
     /// Emails scoped to one account.
     pub fn emails_for<'a>(&'a self, account_id: &'a str) -> impl Iterator<Item = &'a Email> + 'a {
         self.emails
@@ -2313,6 +2329,14 @@ pub struct Group {
 pub struct Account {
     pub id: String,
     pub name: String,
+    /// Whether this is the authenticating user's own account
+    /// (`true`, the common case) or a foreign / shared mailbox the
+    /// user merely has access to (`false`). Projected onto the JMAP
+    /// session's per-account `isPersonal` flag, which is how a
+    /// client tells its own store apart from a shared one. A fixture
+    /// staging a shared-mailbox scenario declares the shared account
+    /// with `is_personal = false`.
+    pub is_personal: bool,
     /// The v0 account every protocol surface scopes to today.
     /// Exactly one declared account is the primary. Single-account
     /// fixtures (the v0 majority) get their lone account flagged
@@ -2360,6 +2384,43 @@ pub struct AclGrant {
     pub rights: String,
 }
 
+/// Default Exchange folder class for a public folder: a mail folder.
+/// A fixture staging a non-mail public folder (calendar, contacts,
+/// tasks) sets `folder_class` explicitly (`IPF.Appointment`,
+/// `IPF.Contact`, `IPF.Task`, ...) so a consumer can prove it keeps
+/// non-mail folders out of its mail path.
+pub const DEFAULT_FOLDER_CLASS: &str = "IPF.Note";
+
+/// EWS `EffectiveRights` on a public folder - the per-folder rights
+/// projection a client reads to decide whether it may write. Defaults
+/// to read-only (`read` alone), which is what an org-wide public
+/// folder grants an ordinary user; a fixture stages a writable folder
+/// by turning on the create / modify / delete bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveRights {
+    pub create_associated: bool,
+    pub create_contents: bool,
+    pub create_hierarchy: bool,
+    pub delete: bool,
+    pub modify: bool,
+    pub read: bool,
+    pub view_private_items: bool,
+}
+
+impl Default for EffectiveRights {
+    fn default() -> Self {
+        Self {
+            create_associated: false,
+            create_contents: false,
+            create_hierarchy: false,
+            delete: false,
+            modify: false,
+            read: true,
+            view_private_items: false,
+        }
+    }
+}
+
 /// A public-folder node in the org-wide EWS public-folder tree. Unlike
 /// [`Mailbox`], public folders are not account-scoped: they hang off a
 /// synthetic `publicfoldersroot` and are visible to every EWS caller.
@@ -2370,12 +2431,20 @@ pub struct PublicFolder {
     pub id: String,
     pub display_name: String,
     pub parent_id: Option<String>,
+    /// Exchange folder class (`IPF.Note` for mail, `IPF.Appointment`
+    /// for a calendar, ...). Defaults to [`DEFAULT_FOLDER_CLASS`].
+    pub folder_class: String,
+    /// Rights the calling client holds on this folder. Fixture-driven
+    /// so one fixture can stage a read-only and a writable public
+    /// folder side by side.
+    pub effective_rights: EffectiveRights,
 }
 
 /// One item (message) inside a [`PublicFolder`]. A deliberately small
 /// projection of the message shape EWS `FindItem` / `GetItem` need:
-/// subject, sender, recipients, body, and received time. Its EWS
-/// `ChangeKey` derives deterministically from the fixture state.
+/// subject, sender, recipients, body, attachments, and received time.
+/// Its EWS `ChangeKey` derives deterministically from the fixture
+/// state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicItem {
     pub id: String,
@@ -2384,6 +2453,14 @@ pub struct PublicItem {
     pub from: Address,
     pub to: Vec<Address>,
     pub body_text: String,
+    /// HTML body. When present, `GetItem` serves it as
+    /// `BodyType="HTML"` in preference to `body_text` (real Exchange
+    /// stores one best body per item and the client asks for the
+    /// richest one it can render).
+    pub body_html: Option<String>,
+    /// Attachments on the item. Metadata rides the `GetItem`
+    /// projection; the bytes come back from `GetAttachment`.
+    pub attachments: Vec<Attachment>,
     pub received_at: DateTime<Utc>,
 }
 
@@ -2685,9 +2762,9 @@ pub(crate) struct RawFixture {
     /// `[[account]]` repeated. At least one entry; exactly one
     /// flagged `primary = true` (or, when none is flagged, the
     /// first entry is taken as primary so single-account fixtures
-    /// don't have to bother). All entries must have
-    /// `is_personal = true` for the duration of Stage 1; relaxes
-    /// once Graph shared mailbox sync lands.
+    /// don't have to bother). `is_personal = false` is accepted and
+    /// surfaces as the JMAP session's per-account `isPersonal` flag,
+    /// so a fixture can stage a foreign / shared mailbox.
     #[serde(default, rename = "account")]
     pub(crate) accounts: Vec<RawAccount>,
     #[serde(default, rename = "mailbox")]
@@ -3007,9 +3084,52 @@ pub(crate) struct RawPublicFolder {
     pub(crate) display_name: String,
     #[serde(default)]
     pub(crate) parent_id: Option<String>,
+    /// Exchange folder class; defaults to [`DEFAULT_FOLDER_CLASS`].
+    #[serde(default)]
+    pub(crate) folder_class: Option<String>,
+    #[serde(default)]
+    pub(crate) effective_rights: Option<RawEffectiveRights>,
 }
 
-/// TOML projection of one `[[public_item]]` message.
+/// TOML projection of a public folder's `effective_rights` table.
+/// Every field is optional; omitted bits take the
+/// [`EffectiveRights::default`] value (read-only).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawEffectiveRights {
+    #[serde(default)]
+    pub(crate) create_associated: Option<bool>,
+    #[serde(default)]
+    pub(crate) create_contents: Option<bool>,
+    #[serde(default)]
+    pub(crate) create_hierarchy: Option<bool>,
+    #[serde(default)]
+    pub(crate) delete: Option<bool>,
+    #[serde(default)]
+    pub(crate) modify: Option<bool>,
+    #[serde(default)]
+    pub(crate) read: Option<bool>,
+    #[serde(default)]
+    pub(crate) view_private_items: Option<bool>,
+}
+
+impl From<RawEffectiveRights> for EffectiveRights {
+    fn from(raw: RawEffectiveRights) -> Self {
+        let d = EffectiveRights::default();
+        Self {
+            create_associated: raw.create_associated.unwrap_or(d.create_associated),
+            create_contents: raw.create_contents.unwrap_or(d.create_contents),
+            create_hierarchy: raw.create_hierarchy.unwrap_or(d.create_hierarchy),
+            delete: raw.delete.unwrap_or(d.delete),
+            modify: raw.modify.unwrap_or(d.modify),
+            read: raw.read.unwrap_or(d.read),
+            view_private_items: raw.view_private_items.unwrap_or(d.view_private_items),
+        }
+    }
+}
+
+/// TOML projection of one `[[public_item]]` message. `body_html` and
+/// `[[public_item.attachment]]` are optional; without them the item is
+/// the plain-text, attachment-free shape v0 shipped with.
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawPublicItem {
     pub(crate) id: String,
@@ -3020,6 +3140,10 @@ pub(crate) struct RawPublicItem {
     pub(crate) to: Vec<RawAddress>,
     #[serde(default)]
     pub(crate) body_text: String,
+    #[serde(default)]
+    pub(crate) body_html: Option<String>,
+    #[serde(default, rename = "attachment")]
+    pub(crate) attachments: Vec<RawAttachment>,
     pub(crate) received_at: String,
 }
 
@@ -3457,17 +3581,20 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             "fixture declares {primary_flags} primary accounts; exactly one may be primary"
         ));
     }
-    // Stage 1 invariants: every account must be personal and have
-    // an email-shaped name (OAuth userinfo serves `account.name`
-    // as the `email` / `name` claims).
+    // Every account must have an email-shaped name (OAuth userinfo
+    // serves `account.name` as the `email` / `name` claims).
+    //
+    // `is_personal = false` is accepted and carried through to the
+    // JMAP session's per-account `isPersonal` flag. It used to be a
+    // hard load-time rejection (a Stage 1 invariant of the multi-
+    // account refactor); relaxing it is what lets a fixture stage a
+    // foreign / shared mailbox at all, which is the whole point of a
+    // shared-mailbox scenario. Nothing else in the mock branches on
+    // the flag - a non-personal account is served exactly like a
+    // personal one - so the relaxation cannot regress an existing
+    // fixture, which by construction sets it true.
     let mut accounts: Vec<Account> = Vec::with_capacity(accounts_raw.len());
     for raw_acct in accounts_raw {
-        if !raw_acct.is_personal {
-            return Err(format!(
-                "account {:?}: is_personal must be true (Stage 1 of the multi-account refactor still requires every declared account to be personal)",
-                raw_acct.id
-            ));
-        }
         if !is_email_shaped(&raw_acct.name) {
             return Err(format!(
                 "account {:?}: name must be email-shaped (got {:?}); the OAuth userinfo endpoint exposes it as the `email` claim",
@@ -3477,6 +3604,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         accounts.push(Account {
             id: raw_acct.id,
             name: raw_acct.name,
+            is_personal: raw_acct.is_personal,
             primary: raw_acct.primary,
         });
     }
@@ -3918,10 +4046,21 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         if public_folder_ids.insert(pf.id.clone(), ()).is_some() {
             return Err(format!("duplicate public_folder id {:?}", pf.id));
         }
+        let folder_class = pf
+            .folder_class
+            .unwrap_or_else(|| DEFAULT_FOLDER_CLASS.to_string());
+        if folder_class.trim().is_empty() {
+            return Err(format!(
+                "public_folder {:?}: folder_class must be non-empty (omit the field for the {DEFAULT_FOLDER_CLASS} default)",
+                pf.id
+            ));
+        }
         public_folders.push(PublicFolder {
             id: pf.id,
             display_name: pf.display_name,
             parent_id: pf.parent_id,
+            folder_class,
+            effective_rights: pf.effective_rights.map(EffectiveRights::from).unwrap_or_default(),
         });
     }
     for pf in &public_folders {
@@ -3941,6 +4080,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
     // Public-folder items. `folder_id` must reference a declared
     // public folder; own id namespace.
     let mut public_item_ids: HashMap<String, ()> = HashMap::new();
+    let mut public_attachment_ids: HashMap<String, ()> = HashMap::new();
     let mut public_items = Vec::with_capacity(raw.public_items.len());
     for it in raw.public_items {
         if public_item_ids.insert(it.id.clone(), ()).is_some() {
@@ -3954,6 +4094,27 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         }
         let received_at = parse_ts(&it.received_at)
             .map_err(|e| format!("public_item {:?} received_at: {e}", it.id))?;
+        let attachments = normalize_attachments(
+            it.attachments,
+            fixture_dir,
+            &format!("public_item {:?}", it.id),
+        )?;
+        // Attachment blob ids are the EWS `AttachmentId`s, and
+        // `GetAttachment` resolves one by id across the whole public
+        // tree (a client hands back the id it read, with no folder or
+        // item context). So they have to be unique org-wide, not just
+        // within their item.
+        for att in &attachments {
+            if public_attachment_ids
+                .insert(att.blob_id.clone(), ())
+                .is_some()
+            {
+                return Err(format!(
+                    "public_item {:?}: attachment blob_id {:?} is already used by another public item (EWS AttachmentIds are resolved without item context, so they must be unique across the public tree)",
+                    it.id, att.blob_id
+                ));
+            }
+        }
         public_items.push(PublicItem {
             id: it.id,
             folder_id: it.folder_id,
@@ -3961,6 +4122,8 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             from: it.from.into(),
             to: it.to.into_iter().map(Address::from).collect(),
             body_text: it.body_text,
+            body_html: it.body_html,
+            attachments,
             received_at,
         });
     }
@@ -4826,6 +4989,57 @@ pub fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {
         .map_err(|e| format!("invalid RFC3339 timestamp {s:?}: {e}"))
 }
 
+/// Load one owner's `[[...attachment]]` rows: dedupe blob ids, parse
+/// the disposition, and read the bytes from `data_path` (resolved
+/// against the fixture file's directory). Shared by `[[email]]` and
+/// `[[public_item]]` so both attachment surfaces agree on validation
+/// and on the `size`-defaults-to-byte-length rule.
+///
+/// `owner` is a pre-rendered label (`email "e1"`, `public_item "p1"`)
+/// spliced into the error messages.
+fn normalize_attachments(
+    raws: Vec<RawAttachment>,
+    fixture_dir: &Path,
+    owner: &str,
+) -> Result<Vec<Attachment>, String> {
+    let mut attachments = Vec::with_capacity(raws.len());
+    let mut blob_ids: HashMap<String, ()> = HashMap::new();
+    for raw_att in raws {
+        if blob_ids.insert(raw_att.blob_id.clone(), ()).is_some() {
+            return Err(format!(
+                "{owner}: duplicate attachment blob_id {:?}",
+                raw_att.blob_id
+            ));
+        }
+        let disposition = match raw_att.disposition.as_deref() {
+            Some(s) => Disposition::parse(s)
+                .map_err(|e| format!("{owner} attachment {:?}: {e}", raw_att.blob_id))?,
+            None => Disposition::Attachment,
+        };
+        let blob_path = fixture_dir.join(&raw_att.data_path);
+        let data = std::fs::read(&blob_path).map_err(|e| {
+            format!(
+                "{owner} attachment {:?}: read {}: {e}",
+                raw_att.blob_id,
+                blob_path.display()
+            )
+        })?;
+        let size = raw_att
+            .size
+            .unwrap_or_else(|| i64::try_from(data.len()).unwrap_or(i64::MAX));
+        attachments.push(Attachment {
+            blob_id: raw_att.blob_id,
+            name: raw_att.name,
+            content_type: raw_att.content_type,
+            size,
+            disposition,
+            cid: raw_att.cid,
+            data,
+        });
+    }
+    Ok(attachments)
+}
+
 /// Normalise one [`RawEmail`] into a typed [`Email`]: timestamp parsing,
 /// body extraction, attachment loading, and cross-reference checks
 /// against `mb_ids` (the set of mailbox ids known to the surrounding
@@ -4925,42 +5139,11 @@ pub(crate) fn normalize_email(
         Body::Text(s) => i64::try_from(s.len()).unwrap_or(i64::MAX),
     });
 
-    let mut attachments = Vec::with_capacity(em.attachments.len());
-    let mut blob_ids: HashMap<String, ()> = HashMap::new();
-    for raw_att in em.attachments {
-        if blob_ids.insert(raw_att.blob_id.clone(), ()).is_some() {
-            return Err(format!(
-                "email {:?}: duplicate attachment blob_id {:?}",
-                em.id, raw_att.blob_id
-            ));
-        }
-        let disposition = match raw_att.disposition.as_deref() {
-            Some(s) => Disposition::parse(s)
-                .map_err(|e| format!("email {:?} attachment {:?}: {e}", em.id, raw_att.blob_id))?,
-            None => Disposition::Attachment,
-        };
-        let blob_path = fixture_dir.join(&raw_att.data_path);
-        let data = std::fs::read(&blob_path).map_err(|e| {
-            format!(
-                "email {:?} attachment {:?}: read {}: {e}",
-                em.id,
-                raw_att.blob_id,
-                blob_path.display()
-            )
-        })?;
-        let size = raw_att
-            .size
-            .unwrap_or_else(|| i64::try_from(data.len()).unwrap_or(i64::MAX));
-        attachments.push(Attachment {
-            blob_id: raw_att.blob_id,
-            name: raw_att.name,
-            content_type: raw_att.content_type,
-            size,
-            disposition,
-            cid: raw_att.cid,
-            data,
-        });
-    }
+    let attachments = normalize_attachments(
+        em.attachments,
+        fixture_dir,
+        &format!("email {:?}", em.id),
+    )?;
 
     let has_attachment = match em.has_attachment {
         Some(false) if !attachments.is_empty() => {
@@ -5113,11 +5296,65 @@ mod tests {
         assert_eq!(fix.primary_state(), "fixture-state");
     }
 
+    /// `is_personal = false` used to be a hard load-time rejection.
+    /// It now round-trips through the normalizer onto the canonical
+    /// `Account`, which is what lets a fixture stage a foreign /
+    /// shared mailbox (the JMAP session projects the flag onto the
+    /// per-account `isPersonal`).
     #[test]
-    fn rejects_non_personal_account() {
+    fn accepts_non_personal_account() {
         let s = MINIMAL.replace("is_personal = true", "is_personal = false");
+        let fix = parse(&s).unwrap();
+        assert!(!fix.accounts[0].is_personal);
+        // The default (personal) path still reads back as personal.
+        assert!(parse(MINIMAL).unwrap().accounts[0].is_personal);
+    }
+
+    /// A public folder that declares neither `folder_class` nor
+    /// `effective_rights` is a read-only mail folder - the shape v0
+    /// shipped with, so adding the two fields cannot change an
+    /// existing fixture's meaning.
+    #[test]
+    fn public_folder_defaults_to_a_read_only_mail_folder() {
+        let s = format!(
+            "{MINIMAL}\n[[public_folder]]\nid = \"pf1\"\ndisplay_name = \"Notices\"\n"
+        );
+        let fix = parse(&s).unwrap();
+        let pf = &fix.public_folders[0];
+        assert_eq!(pf.folder_class, DEFAULT_FOLDER_CLASS);
+        assert_eq!(pf.effective_rights, EffectiveRights::default());
+        assert!(pf.effective_rights.read);
+        assert!(!pf.effective_rights.create_contents);
+        assert!(!pf.effective_rights.modify);
+        assert!(!pf.effective_rights.delete);
+    }
+
+    /// ... and an explicit class / rights table overrides only the
+    /// bits it names.
+    #[test]
+    fn public_folder_honours_declared_class_and_partial_rights() {
+        let s = format!(
+            "{MINIMAL}\n[[public_folder]]\nid = \"pf1\"\n\
+display_name = \"Team Calendar\"\nfolder_class = \"IPF.Appointment\"\n\
+effective_rights = {{ create_contents = true }}\n"
+        );
+        let fix = parse(&s).unwrap();
+        let pf = &fix.public_folders[0];
+        assert_eq!(pf.folder_class, "IPF.Appointment");
+        assert!(pf.effective_rights.create_contents);
+        // Unnamed bits keep their defaults - `read` stays on.
+        assert!(pf.effective_rights.read);
+        assert!(!pf.effective_rights.modify);
+    }
+
+    #[test]
+    fn rejects_empty_public_folder_class() {
+        let s = format!(
+            "{MINIMAL}\n[[public_folder]]\nid = \"pf1\"\n\
+display_name = \"Notices\"\nfolder_class = \"\"\n"
+        );
         let err = parse(&s).unwrap_err();
-        assert!(err.contains("is_personal"), "got: {err}");
+        assert!(err.contains("folder_class"), "got: {err}");
     }
 
     #[test]

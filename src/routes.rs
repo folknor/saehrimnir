@@ -251,11 +251,19 @@ async fn session(
                 json!({ "mayCreateAddressBook": true }),
             );
         }
+        // `isPersonal` is fixture-driven (`[[account]] is_personal`).
+        // A foreign / shared mailbox staged with `is_personal = false`
+        // advertises as non-personal here, which is how a JMAP client
+        // tells the user's own store apart from one they merely have
+        // access to. `isReadOnly` stays false regardless: the fixture
+        // has no per-account write gate, and JMAP's account-level
+        // read-only flag is a different axis from personal-ness (a
+        // shared account can be writable).
         accounts.insert(
             acct.id.clone(),
             json!({
                 "name": acct.name,
-                "isPersonal": true,
+                "isPersonal": acct.is_personal,
                 "isReadOnly": false,
                 "accountCapabilities": Value::Object(caps),
             }),

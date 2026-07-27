@@ -2343,6 +2343,7 @@ mod tests {
             accounts: vec![Account {
                 id: "acct".into(),
                 name: "a@b".into(),
+                is_personal: true,
                 primary: true,
             }],
             mailboxes: vec![
@@ -2591,6 +2592,7 @@ mod tests {
             accounts: vec![Account {
                 id: "acct".into(),
                 name: "a@b".into(),
+                is_personal: true,
                 primary: true,
             }],
             mailboxes: vec![
@@ -2885,6 +2887,7 @@ mod tests {
             accounts: vec![Account {
                 id: "acct".into(),
                 name: "a@b".into(),
+                is_personal: true,
                 primary: true,
             }],
             mailboxes: vec![Mailbox {

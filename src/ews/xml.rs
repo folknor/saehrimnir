@@ -95,6 +95,41 @@ fn attr_in_span(span: &str, attr: &str) -> Option<String> {
     Some(span[start..end].to_string())
 }
 
+/// Standard (`+`/`/`) base64 with padding - the encoding EWS uses for
+/// a `FileAttachment`'s `<t:Content>`. Hand-rolled to avoid pulling in
+/// the `base64` crate for one call site, matching what the Graph and
+/// push modules already do.
+pub fn base64_standard(input: &[u8]) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let (chunks, rem) = input.as_chunks::<3>();
+    for &[c0, c1, c2] in chunks {
+        let n = (u32::from(c0) << 16) | (u32::from(c1) << 8) | u32::from(c2);
+        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+        out.push(ALPHA[(n & 0x3f) as usize] as char);
+    }
+    match rem.len() {
+        1 => {
+            let n = u32::from(rem[0]) << 16;
+            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
+            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
 /// The text content of the first element whose local name is `tag`.
 /// e.g. `element_text(body, "SubscriptionId")`.
 pub fn element_text(xml: &str, tag: &str) -> Option<String> {
@@ -107,4 +142,20 @@ pub fn element_text(xml: &str, tag: &str) -> Option<String> {
     let rest = &xml[gt + 1..];
     let close = rest.find("</")?;
     Some(rest[..close].trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_standard_matches_known_vectors() {
+        assert_eq!(base64_standard(b""), "");
+        assert_eq!(base64_standard(b"f"), "Zg==");
+        assert_eq!(base64_standard(b"fo"), "Zm8=");
+        assert_eq!(base64_standard(b"foo"), "Zm9v");
+        assert_eq!(base64_standard(b"foobar"), "Zm9vYmFy");
+        // Bytes outside ASCII exercise the `+` / `/` alphabet tail.
+        assert_eq!(base64_standard(&[0xff, 0xef, 0xfe]), "/+/+");
+    }
 }

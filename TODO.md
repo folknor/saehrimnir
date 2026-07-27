@@ -27,15 +27,51 @@ From the ratatoskr A5 / B8-groups gap report:
   Unsubscribe streaming push wired through `PushHub`. See
   CLAUDE.md "EWS" + `notes/ratatoskr-ews-surface.md`. Follow-ups
   below.
+- **[done] Shared mailboxes / public folders, uniform surface.**
+  POX Autodiscover (`AlternativeMailboxes` projection); the EWS
+  router co-mounted on the Graph listener (the harness has no EWS
+  endpoint variable); `is_personal = false` accepted by the loader
+  and projected onto the JMAP session's `isPersonal`;
+  `[[public_folder]] folder_class` + `effective_rights`;
+  `[[public_item]] body_html` + `[[public_item.attachment]]` served
+  by `GetItem` / `GetAttachment`; IMAP shared-folder writes gated on
+  the granted RFC 4314 rights rather than blanket-refused.
+  `fixtures/shared-rights.toml` stages read-only and writable
+  shared folders side by side.
 
 The A5 / B8 report is now cleared. EWS follow-ups (only when
 forced): EWS write ops (CreateItem / UpdateItem / DeleteItem),
 SyncFolderHierarchy / SyncFolderItems delta, a held-open long-poll
-`GetStreamingEvents`, POX Autodiscover, and Lua builders for the
+`GetStreamingEvents`, the POX discovery cascade (SRV / CNAME /
+redirect responses - only the direct POST is served), enforcement of
+`EffectiveRights` (reported, not enforced - there is no write
+surface), and Lua builders for the
 public-folder tables (TOML-only today). Tighten
 `notes/ratatoskr-ews-surface.md` against the real ratatoskr EWS
 client when that integration lands (the doc was authored from the
 EWS schemas + gap report, not a client citation).
+
+Two defects surfaced while landing that slice, neither in its scope:
+
+- **BUG: `cmd_uid_store` derives UIDs positionally.** It walks the
+  mailbox's emails and treats `slot + 1` as the UID instead of
+  resolving through `mailbox_uid_history` the way the FETCH path
+  does. Retired slots are never reclaimed, so once an expunge has
+  retired a slot every later `UID STORE` addresses the WRONG message.
+  A consumer's IMAP flag-writeback gate that runs after an expunge
+  therefore asserts against a silently mis-targeted store. The
+  COPY / EXPUNGE neighbourhood shares the shape and wants the same
+  look. Fix by routing every UID resolution through
+  `mailbox_uid_history`, and pin it with a regression test that
+  expunges first and then stores.
+- **The Graph co-mount bypasses bearer enforcement.** Merging the EWS
+  router into the Graph listener puts the EWS routes outside Graph's
+  bearer middleware. That is correct for EWS itself (accept-all by
+  design), but it means a fixture with `[oauth] enforce = true` has
+  an unauthenticated hole on the Graph port: a request to an EWS path
+  there skips the enforcement every other Graph route applies. Decide
+  whether the merged routes should carry their own enforcement layer,
+  or whether the co-mount should be gated off when enforcement is on.
 
 ## From the 2026-05-10 multi-agent review (today's slice)
 

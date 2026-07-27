@@ -1510,8 +1510,12 @@ async fn select_and_fetch_shared_folder_reads_owner_messages() {
         out.contains("* 1 EXISTS\r\n"),
         "shared inbox should show bob's one message: {out}"
     );
+    // Bob's grant to alice is `lr` - no write-shaped right - so the
+    // SELECT opens READ-ONLY even though the command was SELECT. That
+    // is the client's first signal that the folder is read-only,
+    // before it ever issues MYRIGHTS.
     assert!(
-        out.contains("a2 OK [READ-WRITE] SELECT completed\r\n"),
+        out.contains("a2 OK [READ-ONLY] SELECT completed\r\n"),
         "select shared: {out}"
     );
     assert!(out.contains("a3 OK UID FETCH completed\r\n"), "fetch: {out}");
@@ -1548,4 +1552,66 @@ async fn shared_folder_access_and_write_are_gated() {
         out.contains("a3 NO [NOPERM]"),
         "shared write should be NOPERM: {out}"
     );
+}
+
+/// One fixture stages a read-only shared folder (`lr`) and a writable
+/// one (`lrswipkxte`) side by side. The rights are fixture-driven, so
+/// the two must behave differently on every rights-observing surface:
+/// MYRIGHTS, GETACL, the SELECT access level, and the write gate.
+#[tokio::test]
+async fn shared_folder_rights_distinguish_readonly_from_writable() {
+    let script = b"\
+        a1 LOGIN \"alice\" \"pw\"\r\n\
+        a2 MYRIGHTS \"#user/bob@example.com/INBOX\"\r\n\
+        a3 MYRIGHTS \"#user/bob@example.com/Projects\"\r\n\
+        a4 GETACL \"#user/bob@example.com/Projects\"\r\n\
+        a5 LOGOUT\r\n";
+    let out = run_with_fixture_path("fixtures/shared-rights.toml", script).await;
+    assert!(
+        out.contains("* MYRIGHTS \"#user/bob@example.com/INBOX\" lr\r\n"),
+        "read-only rights: {out}"
+    );
+    assert!(
+        out.contains("* MYRIGHTS \"#user/bob@example.com/Projects\" lrswipkxte\r\n"),
+        "writable rights: {out}"
+    );
+    assert!(
+        out.contains(
+            "* ACL \"#user/bob@example.com/Projects\" bob@example.com lrswipkxtea alice@example.com lrswipkxte\r\n"
+        ),
+        "acl listing: {out}"
+    );
+
+    // The read-only folder opens READ-ONLY and refuses a flag write.
+    let script = b"\
+        a1 LOGIN \"alice\" \"pw\"\r\n\
+        a2 SELECT \"#user/bob@example.com/INBOX\"\r\n\
+        a3 UID STORE 1 +FLAGS (\\Seen)\r\n\
+        a4 LOGOUT\r\n";
+    let out = run_with_fixture_path("fixtures/shared-rights.toml", script).await;
+    assert!(
+        out.contains("a2 OK [READ-ONLY] SELECT completed\r\n"),
+        "read-only select: {out}"
+    );
+    assert!(out.contains("a3 NO [NOPERM]"), "read-only write: {out}");
+
+    // The writable folder opens READ-WRITE and accepts the same write,
+    // which lands on the owner's message.
+    let script = b"\
+        a1 LOGIN \"alice\" \"pw\"\r\n\
+        a2 SELECT \"#user/bob@example.com/Projects\"\r\n\
+        a3 UID STORE 1 +FLAGS (\\Seen)\r\n\
+        a4 UID FETCH 1 (UID FLAGS)\r\n\
+        a5 LOGOUT\r\n";
+    let out = run_with_fixture_path("fixtures/shared-rights.toml", script).await;
+    assert!(
+        out.contains("a2 OK [READ-WRITE] SELECT completed\r\n"),
+        "writable select: {out}"
+    );
+    assert!(
+        out.contains("a3 OK UID STORE completed\r\n"),
+        "writable store should succeed: {out}"
+    );
+    assert!(!out.contains("NO [NOPERM]"), "unexpected refusal: {out}");
+    assert!(out.contains("\\Seen"), "flag should have landed: {out}");
 }

@@ -154,6 +154,7 @@ where
         latency,
         selected: None,
         selected_account: None,
+        selected_rights: None,
         account_id: primary_account_id,
         connection_id: crate::connection_id::next(),
         push,
@@ -211,6 +212,14 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
     /// owner's messages while the connection stays authenticated as
     /// the borrowing account. Cleared alongside `selected`.
     selected_account: Option<String>,
+    /// RFC 4314 rights the authenticated account holds on the
+    /// currently selected mailbox, as reported by `MYRIGHTS`. Set by
+    /// SELECT/EXAMINE from the resolved mailbox, cleared alongside
+    /// `selected`. Personal mailboxes get [`OWNER_RIGHTS`]; a shared
+    /// folder gets whatever its `[[acl]]` grant confers, which is what
+    /// makes the write gate below fixture-driven rather than a blanket
+    /// "shared is read-only" rule.
+    selected_rights: Option<String>,
     /// Account this connection is scoped to. Default = primary;
     /// LOGIN and AUTHENTICATE parse the supplied credential and
     /// rebind to a matching declared account if the username (or
@@ -775,16 +784,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         self.selected_account.as_deref().unwrap_or(&self.account_id)
     }
 
-    /// Reject a mutating command when the currently selected mailbox is
-    /// a shared folder reached through the other-users namespace. v0
-    /// shared folders are read-only (grants default to `lr`), so a
-    /// write on one returns `NO [NOPERM]`. Returns `Ok(true)` when it
-    /// wrote the rejection (caller returns immediately), `Ok(false)`
-    /// for a normal personal selection.
-    async fn reject_shared_write(&mut self, tag: &str, cmd: &str) -> std::io::Result<bool> {
-        if self.selected_account.is_some() {
+    /// True when the authenticated account holds every RFC 4314 right
+    /// in `needed` on the current selection. A personal selection has
+    /// no recorded rights string and is always permitted (the owner
+    /// holds [`OWNER_RIGHTS`] implicitly).
+    fn holds_rights(&self, needed: &str) -> bool {
+        match &self.selected_rights {
+            Some(held) => needed.chars().all(|c| held.contains(c)),
+            None => true,
+        }
+    }
+
+    /// Reject a mutating command the current selection's rights do not
+    /// cover. `needed` is the RFC 4314 right(s) the command requires
+    /// (`w` write flags, `i` insert, `t` delete-message, `e` expunge);
+    /// the held set comes from the fixture `[[acl]]` grant, so one
+    /// fixture can stage a read-only shared folder (`lr`) next to a
+    /// writable one (`lrswipkxte`) and the two behave differently.
+    ///
+    /// Returns `Ok(true)` when it wrote the rejection (caller returns
+    /// immediately), `Ok(false)` when the command may proceed. A
+    /// personal selection always proceeds.
+    async fn reject_shared_write(
+        &mut self,
+        tag: &str,
+        cmd: &str,
+        needed: &str,
+    ) -> std::io::Result<bool> {
+        if self.selected_account.is_some() && !self.holds_rights(needed) {
             self.write_line(&format!(
-                "{tag} NO [NOPERM] {cmd} not permitted on a read-only shared folder"
+                "{tag} NO [NOPERM] {cmd} not permitted on this shared folder (requires {needed:?}, holds {:?})",
+                self.selected_rights.as_deref().unwrap_or("")
             ))
             .await?;
             return Ok(true);
@@ -905,6 +935,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             self.state = State::Authenticated;
             self.selected = None;
             self.selected_account = None;
+            self.selected_rights = None;
             return self
                 .write_line(&format!("{tag} NO SELECT unknown mailbox"))
                 .await;
@@ -914,6 +945,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // for a personal mailbox).
         let owner = resolved.account_id.clone();
         let entry_id = resolved.fixture_id.clone();
+        let rights = resolved.rights.clone();
 
         // Counts and the first-unseen index are both pure projections
         // into owned data; each helper borrows the fixture only for
@@ -972,14 +1004,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
         }
 
-        let access = if read_write {
+        // A SELECT the account holds no write-shaped right on opens
+        // READ-ONLY, which is how a client learns a shared folder is
+        // read-only without a separate MYRIGHTS round trip. Any of
+        // insert / write-flags / seen / expunge / delete-message
+        // counts as writable. Personal mailboxes carry OWNER_RIGHTS,
+        // so this only ever downgrades a shared selection.
+        let writable = "iwset".chars().any(|c| rights.contains(c));
+        let access = if read_write && writable {
             "READ-WRITE"
         } else {
             "READ-ONLY"
         };
+        // The verb names the command that was issued, not the access
+        // level granted: an EXAMINE always reports EXAMINE, and a
+        // SELECT downgraded to READ-ONLY still reports SELECT.
         let verb = if read_write { "SELECT" } else { "EXAMINE" };
         self.state = State::Selected;
         self.selected = Some(entry_id);
+        self.selected_rights = Some(rights);
         // Remember the owning account only for a shared selection; a
         // personal selection leaves it None so `effective_account`
         // falls back to `account_id`.
@@ -1000,6 +1043,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         }
         self.selected = None;
         self.selected_account = None;
+        self.selected_rights = None;
         self.state = State::Authenticated;
         self.write_line(&format!("{tag} OK CLOSE completed")).await
     }
@@ -1510,7 +1554,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// Emits a `* <seq> FETCH (UID x FLAGS (...))` per matched
     /// message unless `.SILENT` was requested, then a tagged OK.
     async fn cmd_uid_store(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
-        if self.reject_shared_write(tag, "UID STORE").await? {
+        // Flag writes need the `w` (write) right; `\Seen` alone would
+        // technically be `s`, but the mock does not split the two.
+        if self.reject_shared_write(tag, "UID STORE", "w").await? {
             return Ok(());
         }
         let (uid_set_str, after) = match split_after_set(args) {
@@ -1597,7 +1643,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// COPYUID is omitted in v0 - ratatoskr's copy code accepts a
     /// bare OK.
     async fn cmd_uid_copy(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
-        if self.reject_shared_write(tag, "UID COPY").await? {
+        // COPY inserts into the target mailbox: the `i` right.
+        if self.reject_shared_write(tag, "UID COPY", "i").await? {
             return Ok(());
         }
         if !matches!(self.state, State::Selected) {
@@ -1713,7 +1760,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// MOVE nor UIDPLUS before this, so an IMAP move could not land at
     /// all. Returns `NO [TRYCREATE]` when the target does not resolve.
     async fn cmd_uid_move(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
-        if self.reject_shared_write(tag, "UID MOVE").await? {
+        // MOVE is COPY + delete: insert plus delete-message.
+        if self.reject_shared_write(tag, "UID MOVE", "it").await? {
             return Ok(());
         }
         if !matches!(self.state, State::Selected) {
@@ -1878,7 +1926,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// after the operation, it is destroyed entirely; otherwise
     /// it survives in its other mailboxes.
     async fn cmd_uid_expunge(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
-        if self.reject_shared_write(tag, "UID EXPUNGE").await? {
+        if self.reject_shared_write(tag, "UID EXPUNGE", "e").await? {
             return Ok(());
         }
         if !matches!(self.state, State::Selected) {
@@ -3710,6 +3758,7 @@ mod tests {
             accounts: vec![Account {
                 id: "a".into(),
                 name: "a@b".into(),
+                is_personal: true,
                 primary: true,
             }],
             mailboxes: vec![],
@@ -3774,6 +3823,7 @@ mod tests {
             accounts: vec![Account {
                 id: "a".into(),
                 name: "a@b".into(),
+                is_personal: true,
                 primary: true,
             }],
             mailboxes: vec![

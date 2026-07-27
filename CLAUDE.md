@@ -75,7 +75,10 @@ checking whether the fact is already in `notes/`.
   the declared `[[account]]` set at load time.
   `Fixture::*_for(account_id)` helpers expose filtered
   iterators. JMAP advertises every declared account in its
-  session resource; `primaryAccounts.{core,mail,calendars}` and
+  session resource, each with its fixture-declared
+  `isPersonal` (`[[account]] is_personal = false` stages a
+  foreign / shared mailbox; the loader used to reject it);
+  `primaryAccounts.{core,mail,calendars}` and
   `username` resolve through `oauth::account_from_bearer` so a
   bearer minted for the secondary account sees the secondary as
   its default scope (no-bearer / unknown-token requests fall
@@ -355,15 +358,20 @@ checking whether the fact is already in `notes/`.
   Sibling files for People-API contacts / Drive uploads land here
   later.
 - `src/ews/` - Exchange Web Services SOAP + Autodiscover mock
-  (own listener, `--ews-port`). `mod.rs` (router, AppState with
+  (own listener, `--ews-port`, AND merged into the Graph
+  listener's router by `main.rs` - the harness has no EWS
+  endpoint variable, so co-mounting is what makes the surface
+  reachable from a harness run). `mod.rs` (router, AppState with
   its own `base_url` for the Autodiscover ExternalEwsUrl, SOAP
   envelope wrap, operation dispatch by first `soap:Body` element,
-  and the handlers: Autodiscover GetUserSettings; FindFolder /
-  FindItem / GetItem over the `[[public_folder]]` /
-  `[[public_item]]` tree; Subscribe / GetStreamingEvents /
-  Unsubscribe streaming push wired through `PushHub`), `xml.rs`
+  and the handlers: Autodiscover GetUserSettings and POX
+  Autodiscover; FindFolder / FindItem / GetItem / GetAttachment
+  over the `[[public_folder]]` / `[[public_item]]` tree;
+  Subscribe / GetStreamingEvents / Unsubscribe streaming push
+  wired through `PushHub`), `xml.rs`
   (hand-rolled XML - escape, has_element, element_attr /
-  all_element_attr, element_text - caldav-style, no XML crate).
+  all_element_attr, element_text, base64_standard - caldav-style,
+  no XML crate).
 - `tests/api.rs` - JMAP integration tests via
   `tower::ServiceExt::oneshot`.
 - `tests/imap.rs` - IMAP integration tests over a duplex stream.
@@ -396,12 +404,19 @@ checking whether the fact is already in `notes/`.
   `calendarView/delta`.
 - `tests/ews.rs` - EWS SOAP + Autodiscover integration tests via
   `tower::ServiceExt::oneshot`. Covers Autodiscover
-  GetUserSettings (ExternalEwsUrl), FindFolder shallow/deep
-  traversal + child/item counts, FindItem default + IdOnly shapes
-  + unknown-folder error, GetItem body hydration + per-item
-  not-found, and the streaming lifecycle (Subscribe ->
-  GetStreamingEvents empty heartbeat -> state advance ->
-  NewMailEvent drain -> one-shot -> Unsubscribe -> Closed).
+  GetUserSettings (ExternalEwsUrl), POX Autodiscover
+  (AlternativeMailboxes projection, unknown-mailbox fallback to
+  primary, non-Autodiscover body -> POX error doc), the
+  dedicated-listener-vs-Graph-mount response identity (plus that
+  the merge does not lose a Graph route), FindFolder shallow/deep
+  traversal + child/item counts + FolderClass + per-folder
+  EffectiveRights, FindItem default + IdOnly shapes
+  + unknown-folder error, GetItem body hydration (HTML preferred)
+  + attachment metadata + per-item not-found, GetAttachment bytes
+  + per-item invalid-id error, and the streaming lifecycle
+  (Subscribe -> GetStreamingEvents empty heartbeat -> state
+  advance -> NewMailEvent drain -> one-shot -> Unsubscribe ->
+  Closed).
 - `tests/discovery.rs` - account-discovery integration tests
   via `tower::ServiceExt::oneshot`. Covers WebFinger JRD shape +
   rel filter + emit-time href prefixing, OIDC discovery
@@ -430,6 +445,14 @@ checking whether the fact is already in `notes/`.
 - `fixtures/jmap-oauth.toml` - bearer-enforced
   (`[oauth] enforce = true`) variant of jmap-small. Drives the
   revoked-token-recovery flow asserted in `tests/api.rs`.
+- `fixtures/shared-rights.toml` - shared-access rights staged at
+  three levels in one fixture: an IMAP read-only (`lr`) and a
+  writable (`lrswipkxte`) shared folder, an EWS read-only and
+  writable public folder, and a non-personal
+  (`is_personal = false`) account for the JMAP session's
+  `isPersonal` projection. Drives the rights tests in
+  `tests/imap.rs` / `tests/ews.rs` and the non-personal session
+  test in `tests/api.rs`.
 - `fixtures/jmap-incremental.lua` and
   `fixtures/jmap-incremental.toml` - equivalent 2-mailbox /
   2-email baseline plus a 4-step change script (new + change +
@@ -593,11 +616,21 @@ connection's `selected_account`, and every selected-mailbox read
 `effective_account()` so a shared SELECT reads the owner's
 messages while the connection stays authenticated as the
 borrowing account. A shared folder the account holds no grant on
-`NO`s on SELECT/MYRIGHTS/GETACL; shared folders are read-only, so
-`UID STORE`/`COPY`/`MOVE`/`EXPUNGE` on a shared selection return
-`NO [NOPERM]`. `fixtures/imap-shared.toml` +
+`NO`s on SELECT/MYRIGHTS/GETACL. Writes on a shared selection are
+gated on the *granted rights*, not blanket-refused: the connection
+records the selection's rights (`selected_rights`) and each
+mutating command names the RFC 4314 right it needs (`UID STORE` ->
+`w`, `UID COPY` -> `i`, `UID MOVE` -> `i`+`t`, `UID EXPUNGE` ->
+`e`), returning `NO [NOPERM] ... (requires "w", holds "lr")` when
+it is missing. A `SELECT` with no write-shaped right
+(none of `iwset`) completes `OK [READ-ONLY]` while still naming the
+verb the client issued. So `rights = "lr"` is a read-only shared
+folder and `rights = "lrswipkxte"` a writable one.
+`fixtures/imap-shared.toml` +
 `tests/imap.rs` cover the discovery walk, listing scope, rights
-reporting, cross-account FETCH isolation, and the write gate.
+reporting, cross-account FETCH isolation, and the write gate;
+`fixtures/shared-rights.toml` stages a read-only and a writable
+shared folder in one fixture so the two can be told apart.
 
 UIDs are assigned by `Fixture::mailbox_uid_history`: an
 insertion-ordered list of email ids per mailbox. Each addition
@@ -971,19 +1004,38 @@ EWS (Exchange Web Services SOAP + Autodiscover): complete for v0's
 public-folder read path + streaming push (drives ratatoskr A5b).
 Own listener (`--ews-port`; sentinel `EWS <port>`; brokkr would
 plumb `RATATOSKR_TEST_EWS_ENDPOINT` when ratatoskr grows the
-override). Two POST endpoints, SOAP over plain HTTP, every response
-`text/xml` wrapped in a `<s:Envelope>`. Autodiscover
+override) AND merged into the Graph listener's router, because the
+harness injects a fixed set of endpoint env vars with no EWS slot -
+without the co-mount a harness run cannot reach the surface at all.
+Each mount carries its own `base_url`, so the Autodiscover URLs
+point back at whichever listener the request arrived on; the merged
+routes sit outside Graph's bearer / log middleware (EWS is
+accept-all). SOAP over plain HTTP, every EWS response `text/xml`
+wrapped in a `<s:Envelope>`. Autodiscover
 (`/autodiscover/autodiscover.svc`): `GetUserSettings` returns
-`ExternalEwsUrl` built from the EWS listener's own base URL, so a
-client that autodiscovers binds back to this process. EWS
+`ExternalEwsUrl` built from the mount's own base URL, so a
+client that autodiscovers binds back to this process. POX
+Autodiscover (`/autodiscover/autodiscover.xml`, plus the
+capitalised spellings): the delegate / shared-mailbox discovery
+channel - a bare (non-SOAP) `<Autodiscover>` document carrying the
+requesting user's EXCH protocol block plus an
+`<AlternativeMailboxes>` block projecting every declared account
+other than the requesting one. EWS
 operations (`/EWS/Exchange.asmx`, dispatched by the first
 `soap:Body` element's local name): `FindFolder` (Deep = whole tree,
 Shallow = children of `publicfoldersroot` or a named `FolderId`;
-emits FolderId + ChangeKey + DisplayName + TotalCount +
-ChildFolderCount), `FindItem` (items in a folder; `IdOnly` vs
-default Subject/DateTimeReceived/From shape; unknown folder ->
-`ErrorFolderNotFound`), `GetItem` (per-id body hydration; unknown
-id degrades that message to `ErrorItemNotFound`, not the batch).
+emits FolderId + ChangeKey + ParentFolderId + FolderClass +
+DisplayName + TotalCount + ChildFolderCount + EffectiveRights, the
+last two fixture-driven per folder), `FindItem` (items in a folder;
+`IdOnly` vs default Subject/DateTimeReceived/From shape; unknown
+folder -> `ErrorFolderNotFound`), `GetItem` (per-id hydration -
+HTML body when the fixture stages `body_html`, else text, plus
+attachment metadata and HasAttachments; unknown
+id degrades that message to `ErrorItemNotFound`, not the batch),
+`GetAttachment` (attachment bytes base64 in `<t:Content>`, resolved
+by AttachmentId alone - the loader enforces org-wide uniqueness of
+public attachment blob ids; unknown id ->
+`ErrorInvalidAttachmentId` per-item).
 Backed by the org-wide `[[public_folder]]` / `[[public_item]]`
 fixture tables (not account-scoped). Streaming lifecycle wired to
 `PushHub`: `Subscribe` mints a `SubscriptionId` bound to the
@@ -993,9 +1045,13 @@ drains it (one-shot poll-drain, not a held-open long-poll; unknown
 sub -> `ConnectionStatus Closed`); `Unsubscribe` drops it.
 `ChangeKey` derives from the fixture primary state (opaque). XML is
 hand-rolled (`src/ews/xml.rs`), caldav-style. Read-only in v0 (no
-CreateItem/UpdateItem/DeleteItem, no sync-delta, no POX
-Autodiscover, no auth enforcement). `fixtures/ews-public.toml` +
-`tests/ews.rs` cover the surface. See
+CreateItem/UpdateItem/DeleteItem, no sync-delta, no auth
+enforcement; `EffectiveRights` are reported, not enforced - there is
+no write surface to enforce them against).
+`fixtures/ews-public.toml` (POX alternatives, folder classes, an
+item with an HTML body + attachment) and
+`fixtures/shared-rights.toml` (a read-only and a writable public
+folder in one fixture) + `tests/ews.rs` cover the surface. See
 `notes/ratatoskr-ews-surface.md`.
 
 Discovery (WebFinger / OIDC / autoconfig): complete for v0.

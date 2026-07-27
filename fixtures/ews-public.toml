@@ -1,12 +1,19 @@
 name = "ews-public"
 
-# One account (the loader requires at least one) plus an org-wide EWS
+# Two accounts (the second makes the POX Autodiscover
+# `AlternativeMailboxes` projection non-empty - it lists every declared
+# account other than the requesting one) plus an org-wide EWS
 # public-folder tree:
 #
 #   publicfoldersroot
 #     Engineering            (pf-root-eng)      -> pi-eng-001
 #       Releases             (pf-eng-releases)
 #     Announcements          (pf-root-announce) -> pi-announce-001
+#     Team Calendar          (pf-root-calendar) IPF.Appointment, no items
+#
+# Engineering is writable, everything else is read-only, and the
+# calendar folder is the non-mail (`IPF.Appointment`) folder a consumer
+# has to keep out of its mail path.
 
 [[account]]
 id = "account-primary"
@@ -14,9 +21,16 @@ name = "user@example.com"
 is_personal = true
 primary = true
 
+[[account]]
+id = "account-shared"
+name = "shared-team@example.com"
+is_personal = false
+
 [[public_folder]]
 id = "pf-root-eng"
 display_name = "Engineering"
+folder_class = "IPF.Note"
+effective_rights = { read = true, create_contents = true, modify = true, delete = true }
 
 [[public_folder]]
 id = "pf-eng-releases"
@@ -27,6 +41,16 @@ parent_id = "pf-root-eng"
 id = "pf-root-announce"
 display_name = "Announcements"
 
+# A non-mail public folder. Same tree, different folder class - the
+# consumer must not walk this one as mail.
+[[public_folder]]
+id = "pf-root-calendar"
+display_name = "Team Calendar"
+folder_class = "IPF.Appointment"
+
+# Carries an HTML body plus an attachment, so `GetItem` has something
+# to hydrate a reading pane with and `GetAttachment` has bytes to
+# serve.
 [[public_item]]
 id = "pi-eng-001"
 folder_id = "pf-root-eng"
@@ -34,7 +58,15 @@ subject = "Team sync notes"
 from = "lead@example.com"
 to = ["team@example.com"]
 body_text = "Notes from the weekly sync."
+body_html = "<p>Notes from the <b>weekly sync</b>.</p>"
 received_at = "2026-02-01T09:00:00Z"
+
+[[public_item.attachment]]
+blob_id = "pf-blob-001"
+name = "sync-notes.txt"
+content_type = "text/plain"
+disposition = "attachment"
+data_path = "blobs/sample.txt"
 
 [[public_item]]
 id = "pi-announce-001"

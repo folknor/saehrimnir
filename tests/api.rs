@@ -52,6 +52,50 @@ fn send_router() -> axum::Router {
     routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))
 }
 
+/// `is_personal = false` used to be a hard load-time rejection, so a
+/// foreign / shared mailbox could not be staged at all. It now
+/// round-trips through the normalizer and surfaces on the session's
+/// per-account `isPersonal` flag, which is how a JMAP client tells the
+/// user's own store apart from one it merely has access to.
+#[tokio::test]
+async fn session_reports_a_non_personal_account_as_non_personal() {
+    let fix = fixture::load(std::path::Path::new("fixtures/shared-rights.toml")).unwrap();
+    let app = routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let accounts = v["accounts"].as_object().unwrap();
+
+    assert_eq!(
+        accounts["account-team"]["isPersonal"], false,
+        "shared mailbox should advertise as non-personal: {accounts:?}"
+    );
+    assert_eq!(
+        accounts["account-team"]["name"], "team@example.com",
+        "{accounts:?}"
+    );
+    // The user's own accounts are unaffected.
+    assert_eq!(accounts["account-alice"]["isPersonal"], true);
+    assert_eq!(accounts["account-bob"]["isPersonal"], true);
+    // Non-personal does not imply read-only - a shared mailbox can be
+    // writable, and the fixture has no per-account write gate.
+    assert_eq!(accounts["account-team"]["isReadOnly"], false);
+    // The account still carries the mail capability, so a client can
+    // actually open it.
+    assert!(
+        accounts["account-team"]["accountCapabilities"]["urn:ietf:params:jmap:mail"].is_object(),
+        "{accounts:?}"
+    );
+}
+
 #[tokio::test]
 async fn session_advertises_submission_capability_and_max_delayed_send() {
     let resp = send_router()

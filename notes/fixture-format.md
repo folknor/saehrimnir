@@ -22,7 +22,12 @@ id = "account-1"
 # falls back to it when principals lookup fails (out of scope for v0,
 # but cheap to satisfy).
 name = "test@example.com"
-is_personal = true   # Stage 1 requires this on every declared account
+# true = the authenticating user's own account (the common case).
+# false = a foreign / shared mailbox the user merely has access to;
+# the JMAP session reports it as `isPersonal: false`. Nothing else in
+# the mock branches on the flag - a non-personal account is served
+# exactly like a personal one.
+is_personal = true
 # primary = true     # optional for single-account fixtures (the lone
                      # entry is auto-promoted); required when more than
                      # one account is declared
@@ -573,9 +578,14 @@ Validation:
 - `(mailbox_id, identifier)` pairs are unique.
 
 Drives IMAP `NAMESPACE` / `LIST "" "#user/*"` / `MYRIGHTS` /
-`GETACL` and shared-folder `SELECT` + read. Shared folders are
-read-only in v0. No Lua `acl({...})` builder yet - TOML-only. See
-`notes/ratatoskr-imap-surface.md` "Shared folders".
+`GETACL` and shared-folder `SELECT` + read. The granted `rights` also
+gate writes on the shared selection: `UID STORE` needs `w`, `UID
+COPY` needs `i`, `UID MOVE` needs `i` + `t`, `UID EXPUNGE` needs `e`,
+and a `SELECT` with no write-shaped right completes `OK [READ-ONLY]`.
+So `rights = "lr"` is a read-only shared folder and
+`rights = "lrswipkxte"` is a writable one; `fixtures/shared-rights.toml`
+stages both in one fixture. No Lua `acl({...})` builder yet -
+TOML-only. See `notes/ratatoskr-imap-surface.md` "Shared folders".
 
 ## EWS public folders (optional)
 
@@ -589,11 +599,24 @@ Org-wide public-folder tree for the EWS `FindFolder` / `FindItem` /
 id = "pf-root-eng"
 display_name = "Engineering"
 # parent_id omitted -> top-level (child of publicfoldersroot)
+# folder_class omitted -> "IPF.Note" (a mail folder)
+# effective_rights omitted -> read-only (Read alone)
 
 [[public_folder]]
 id = "pf-eng-releases"
 display_name = "Releases"
 parent_id = "pf-root-eng"
+
+# A non-mail public folder plus a writable one.
+[[public_folder]]
+id = "pf-team-calendar"
+display_name = "Team Calendar"
+folder_class = "IPF.Appointment"
+
+[[public_folder]]
+id = "pf-drafts"
+display_name = "Team Drafts"
+effective_rights = { read = true, create_contents = true, modify = true, delete = true }
 
 [[public_item]]
 id = "pi-eng-001"
@@ -602,8 +625,22 @@ subject = "Team sync notes"
 from = "lead@example.com"       # bare string or { name, email }
 to = ["team@example.com"]       # optional
 body_text = "Notes from the weekly sync."   # optional
+body_html = "<p>Notes.</p>"     # optional; wins over body_text on GetItem
 received_at = "2026-02-01T09:00:00Z"
+
+# Optional; same shape as `[[email.attachment]]`.
+[[public_item.attachment]]
+blob_id = "pf-blob-001"
+name = "sync-notes.txt"
+content_type = "text/plain"
+disposition = "attachment"      # optional; "attachment" | "inline"
+data_path = "blobs/sample.txt"  # relative to the fixture file
 ```
+
+`effective_rights` accepts any subset of `create_associated`,
+`create_contents`, `create_hierarchy`, `delete`, `modify`, `read`,
+`view_private_items`; omitted bits default to the read-only shape
+(`read = true`, everything else false).
 
 Validation:
 
@@ -611,10 +648,16 @@ Validation:
   table.
 - `public_folder.parent_id` (when present) must reference another
   declared public folder, and a folder cannot parent itself.
+- `public_folder.folder_class`, when given, must be non-empty.
 - `public_item.folder_id` must reference a declared public folder.
 - `public_item.received_at` is RFC 3339.
+- Public attachment `blob_id`s are unique across the *whole* public
+  tree, not just within their item: EWS `GetAttachment` resolves an
+  attachment by id alone, with no item context.
+- A public attachment's `data_path` must exist and be readable.
 
-Read-only in v0. No Lua builders yet - TOML-only. See
+Read-only in v0 (the rights are reported, not enforced - there is no
+EWS write surface). No Lua builders yet - TOML-only. See
 `notes/ratatoskr-ews-surface.md`.
 
 ## OAuth (optional)
@@ -661,7 +704,6 @@ The mock refuses to start (non-zero exit, stderr message) if:
 - A mailbox's role is set but not one of the seven recognized values.
 - Two mailboxes share an `id`.
 - Two emails share an `id`.
-- Any declared `account.is_personal` is `false`.
 - No `[[account]]` block is declared.
 - Two declared accounts share an `id`.
 - More than one account is declared and either none or more than
@@ -682,6 +724,12 @@ that adversarial-shape fixtures can be authored:
   testing how ratatoskr's incremental sync handles the case where
   two distinct messages happen to share a Message-Id (a real-world
   edge case from broken senders).
+- `account.is_personal = false`. It used to be a hard rejection (a
+  Stage 1 invariant of the multi-account refactor). A shared-mailbox
+  scenario cannot be staged without it, and no protocol surface
+  branches on the flag beyond reporting it, so the rejection bought
+  nothing. A fixture may also declare the *primary* account
+  non-personal - unusual, but the mock has no reason to care.
 
 ## Determinism contract
 

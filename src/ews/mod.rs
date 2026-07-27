@@ -7,12 +7,27 @@
 //!   `GetUserSettings`. Returns the `ExternalEwsUrl` pointing back at
 //!   this process's EWS endpoint, so a client that autodiscovers then
 //!   binds to the mock.
+//! - `POST /autodiscover/autodiscover.xml` - POX (plain-old-XML)
+//!   Autodiscover. The delegate / shared-mailbox discovery channel:
+//!   the response's `AlternativeMailboxes` block projects every
+//!   declared account other than the requesting one, which is how a
+//!   client learns about the shared mailboxes it should also open.
 //! - `POST /EWS/Exchange.asmx` - the EWS operation endpoint. Dispatch
 //!   is by the local name of the first element inside `soap:Body`:
-//!   `FindFolder` / `FindItem` / `GetItem` over the org-wide public-
-//!   folder tree (`[[public_folder]]` / `[[public_item]]`), plus the
-//!   streaming-notification lifecycle `Subscribe` (StreamingSubscription)
-//!   / `GetStreamingEvents` / `Unsubscribe`.
+//!   `FindFolder` / `FindItem` / `GetItem` / `GetAttachment` over the
+//!   org-wide public-folder tree (`[[public_folder]]` /
+//!   `[[public_item]]`), plus the streaming-notification lifecycle
+//!   `Subscribe` (StreamingSubscription) / `GetStreamingEvents` /
+//!   `Unsubscribe`.
+//!
+//! The same router is mounted twice by `main.rs`: on the dedicated
+//! `--ews-port` listener, and (merged) on the Graph listener. The
+//! harness that drives this mock injects a fixed set of endpoint
+//! environment variables into the process under test and has no EWS
+//! slot, so co-mounting on Graph is what makes the surface reachable
+//! at all from a harness run. Each mount gets its own `base_url`, so
+//! the Autodiscover URLs each advertises point back at the listener
+//! the request arrived on.
 //!
 //! Streaming subscriptions register on the shared [`crate::push::
 //! PushHub`]; a fixture state advance (`POST /test/fixture/step`)
@@ -74,9 +89,23 @@ impl AppState {
     }
 }
 
+/// Build the EWS / Autodiscover router. Returned fully-stated
+/// (`Router<()>`) so it can either be served on its own listener or
+/// merged into another listener's router - the Graph one, which is
+/// what `main.rs` does to make the surface reachable through the
+/// harness's Graph endpoint variable.
+///
+/// Autodiscover is registered under both the lower-case path
+/// (`/autodiscover/autodiscover.{svc,xml}`) and the capitalised one
+/// real Outlook-family clients use (`/Autodiscover/Autodiscover.xml`);
+/// axum matches paths case-sensitively, so a client that picks the
+/// documented capitalisation would otherwise 404.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/autodiscover/autodiscover.svc", post(autodiscover))
+        .route("/Autodiscover/Autodiscover.svc", post(autodiscover))
+        .route("/autodiscover/autodiscover.xml", post(autodiscover_pox))
+        .route("/Autodiscover/Autodiscover.xml", post(autodiscover_pox))
         .route("/EWS/Exchange.asmx", post(ews_endpoint))
         .with_state(state)
 }
@@ -110,6 +139,19 @@ fn soap(body: &str) -> Response {
     );
     (
         StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
+        doc,
+    )
+        .into_response()
+}
+
+/// Emit a bare (non-SOAP) XML document as `text/xml`. POX Autodiscover
+/// is not SOAP - the response is a plain `<Autodiscover>` root - so it
+/// bypasses [`soap`].
+fn xml_doc(status: StatusCode, body: &str) -> Response {
+    let doc = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>{body}");
+    (
+        status,
         [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
         doc,
     )
@@ -184,6 +226,120 @@ xmlns:i=\"http://www.w3.org/2001/XMLSchema-instance\">\
     soap(&inner)
 }
 
+// ── POX Autodiscover ────────────────────────────────────────────────
+
+/// POX Autodiscover response namespaces. The outer `Autodiscover`
+/// element sits in the response schema; the inner `Response` switches
+/// the default namespace to the Outlook response schema, and every
+/// descendant inherits it (which is why none of the inner elements
+/// carry a prefix).
+const POX_NS: &str = "http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006";
+const POX_OUTLOOK_NS: &str =
+    "http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a";
+
+/// Synthetic Exchange legacy distinguished name for an account. Real
+/// Autodiscover carries one per mailbox and clients echo it back when
+/// binding a delegate mailbox; the value is opaque, so we derive it
+/// from the fixture account id to keep it deterministic.
+fn legacy_dn(account_id: &str) -> String {
+    format!(
+        "/o=saehrimnir/ou=Exchange Administrative Group/cn=Recipients/cn={account_id}"
+    )
+}
+
+/// `host:port` of this mount's base URL, used for the POX `<Server>`
+/// elements. Falls back to the whole base URL if it carries no scheme.
+fn server_host(base_url: &str) -> &str {
+    base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))
+        .unwrap_or(base_url)
+}
+
+/// `POST /autodiscover/autodiscover.xml` - POX Autodiscover.
+///
+/// This is the delegate / shared-mailbox discovery channel, distinct
+/// from the SOAP `GetUserSettings` endpoint above. The request names a
+/// mailbox (`<EMailAddress>`); the response describes that user's own
+/// EXCH protocol binding plus an `AlternativeMailboxes` block listing
+/// every *other* declared account, which is how a client performing
+/// delegate discovery finds the shared mailboxes it should also open.
+///
+/// Deviation from the published POX schema, deliberate: real POX emits
+/// repeated bare `<AlternativeMailbox>` children of `<Account>` with no
+/// container element. We wrap them in an `<AlternativeMailboxes>`
+/// container (the name the SOAP `AlternateMailboxes` setting uses) so
+/// a consumer can key off either the container or the individual
+/// entries; a parser that walks by local name finds the entries
+/// unchanged.
+async fn autodiscover_pox(State(state): State<AppState>, body: String) -> Response {
+    log(&state, "POST /autodiscover/autodiscover.xml");
+    if !xml::has_element(&body, "Autodiscover") {
+        // POX signals a bad request in-band, not with a SOAP fault.
+        let err = format!(
+            "<Autodiscover xmlns=\"{POX_NS}\"><Response>\
+<Error Time=\"00:00:00.0000000\" Id=\"0\">\
+<ErrorCode>600</ErrorCode><Message>Invalid Request</Message>\
+<DebugData/></Error></Response></Autodiscover>"
+        );
+        return xml_doc(StatusCode::BAD_REQUEST, &err);
+    }
+
+    let requested = xml::element_text(&body, "EMailAddress").unwrap_or_default();
+    let ews_url = format!("{}/EWS/Exchange.asmx", state.base_url);
+    let server = server_host(&state.base_url).to_string();
+    let fixture = state.fixture();
+
+    // The requesting mailbox: the declared account whose name matches
+    // `<EMailAddress>` (case-insensitively, as SMTP addresses are), or
+    // the primary when the request names nobody we know. Everyone else
+    // becomes an alternative mailbox.
+    let user = fixture
+        .accounts
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(requested.trim()))
+        .unwrap_or_else(|| fixture.primary_account());
+
+    let mut alternatives = String::new();
+    for acct in fixture.accounts.iter().filter(|a| a.id != user.id) {
+        // `Type` distinguishes a delegate mailbox from an archive.
+        // Every non-requesting account is staged as a delegate: the
+        // fixture has no archive concept.
+        alternatives.push_str(&format!(
+            "<AlternativeMailbox><Type>Delegate</Type>\
+<DisplayName>{name}</DisplayName>\
+<SmtpAddress>{name}</SmtpAddress>\
+<OwnerSmtpAddress>{name}</OwnerSmtpAddress>\
+<LegacyDN>{dn}</LegacyDN>\
+<Server>{server}</Server></AlternativeMailbox>",
+            name = xml::escape(&acct.name),
+            dn = xml::escape(&legacy_dn(&acct.id)),
+            server = xml::escape(&server),
+        ));
+    }
+
+    let doc = format!(
+        "<Autodiscover xmlns=\"{POX_NS}\">\
+<Response xmlns=\"{POX_OUTLOOK_NS}\">\
+<User><DisplayName>{name}</DisplayName>\
+<EMailAddress>{name}</EMailAddress>\
+<LegacyDN>{dn}</LegacyDN></User>\
+<Account><AccountType>email</AccountType><Action>settings</Action>\
+<Protocol><Type>EXCH</Type><Server>{server}</Server>\
+<ServerDN>{dn}</ServerDN>\
+<EwsUrl>{ews}</EwsUrl><EmwsUrl>{ews}</EmwsUrl>\
+<OABUrl>{base}/OAB/</OABUrl></Protocol>\
+<AlternativeMailboxes>{alternatives}</AlternativeMailboxes>\
+</Account></Response></Autodiscover>",
+        name = xml::escape(&user.name),
+        dn = xml::escape(&legacy_dn(&user.id)),
+        server = xml::escape(&server),
+        ews = xml::escape(&ews_url),
+        base = xml::escape(&state.base_url),
+    );
+    xml_doc(StatusCode::OK, &doc)
+}
+
 // ── EWS operation dispatch ──────────────────────────────────────────
 
 async fn ews_endpoint(
@@ -201,6 +357,9 @@ async fn ews_endpoint(
     } else if xml::has_element(&body, "FindItem") {
         log(&state, "POST /EWS FindItem");
         find_item(&state, &body)
+    } else if xml::has_element(&body, "GetAttachment") {
+        log(&state, "POST /EWS GetAttachment");
+        get_attachment(&state, &body)
     } else if xml::has_element(&body, "GetItem") {
         log(&state, "POST /EWS GetItem");
         get_item(&state, &body)
@@ -247,13 +406,27 @@ fn find_folder(state: &AppState, body: &str) -> Response {
     for f in &folders {
         let total = fixture.public_items_in(&f.id).count();
         let children = fixture.public_folders_under(Some(&f.id)).count();
+        // Element order follows the EWS `t:FolderType` sequence:
+        // FolderId, ParentFolderId, FolderClass, DisplayName,
+        // TotalCount, ChildFolderCount, ..., EffectiveRights.
+        let parent = match &f.parent_id {
+            Some(p) => format!(
+                "<t:ParentFolderId Id=\"{}\" ChangeKey=\"{ck}\"/>",
+                xml::escape(p)
+            ),
+            // A top-level public folder hangs off the synthetic root.
+            None => format!("<t:ParentFolderId Id=\"publicfoldersroot\" ChangeKey=\"{ck}\"/>"),
+        };
         items.push_str(&format!(
-            "<t:Folder><t:FolderId Id=\"{}\" ChangeKey=\"{ck}\"/>\
+            "<t:Folder><t:FolderId Id=\"{}\" ChangeKey=\"{ck}\"/>{parent}\
+<t:FolderClass>{}</t:FolderClass>\
 <t:DisplayName>{}</t:DisplayName>\
 <t:TotalCount>{total}</t:TotalCount>\
-<t:ChildFolderCount>{children}</t:ChildFolderCount></t:Folder>",
+<t:ChildFolderCount>{children}</t:ChildFolderCount>{}</t:Folder>",
             xml::escape(&f.id),
+            xml::escape(&f.folder_class),
             xml::escape(&f.display_name),
+            effective_rights_xml(&f.effective_rights),
         ));
     }
     let inner = format!(
@@ -266,6 +439,32 @@ fn find_folder(state: &AppState, body: &str) -> Response {
         folders.len(),
     );
     soap(&inner)
+}
+
+/// The `t:EffectiveRights` block for a public folder - the rights the
+/// calling client holds on it, staged per folder in the fixture
+/// (`[[public_folder]] effective_rights`). A read-only folder reports
+/// `Read` alone; a writable one turns on the create / modify / delete
+/// bits. Child order follows the EWS `EffectiveRightsType` sequence.
+fn effective_rights_xml(r: &crate::fixture::EffectiveRights) -> String {
+    format!(
+        "<t:EffectiveRights>\
+<t:CreateAssociated>{}</t:CreateAssociated>\
+<t:CreateContents>{}</t:CreateContents>\
+<t:CreateHierarchy>{}</t:CreateHierarchy>\
+<t:Delete>{}</t:Delete>\
+<t:Modify>{}</t:Modify>\
+<t:Read>{}</t:Read>\
+<t:ViewPrivateItems>{}</t:ViewPrivateItems>\
+</t:EffectiveRights>",
+        r.create_associated,
+        r.create_contents,
+        r.create_hierarchy,
+        r.delete,
+        r.modify,
+        r.read,
+        r.view_private_items,
+    )
 }
 
 /// `FindItem` in a public folder. Honours `BaseShape` (`IdOnly` emits
@@ -325,9 +524,64 @@ fn find_item(state: &AppState, body: &str) -> Response {
     soap(&inner)
 }
 
+/// The `t:Body` element for a public item. `body_html` wins when the
+/// fixture stages one (real Exchange serves the richest body it holds
+/// and the client asks for HTML); otherwise the plain-text body. The
+/// HTML is emitted escaped as element text, matching how EWS carries
+/// an HTML body inside the SOAP document.
+fn body_xml(item: &crate::fixture::PublicItem) -> String {
+    match &item.body_html {
+        Some(html) => format!(
+            "<t:Body BodyType=\"HTML\">{}</t:Body>",
+            xml::escape(html)
+        ),
+        None => format!(
+            "<t:Body BodyType=\"Text\">{}</t:Body>",
+            xml::escape(&item.body_text)
+        ),
+    }
+}
+
+/// The `t:Attachments` block for a public item: metadata only (name,
+/// content type, size, inline-ness). The bytes are deliberately
+/// absent, because a client fetches them with `GetAttachment`. That is
+/// the split real EWS makes, and the one the consumer's hydration path
+/// follows. Returns the empty string when the item carries no
+/// attachments, so the element is omitted entirely rather than emitted
+/// empty.
+fn attachments_xml(item: &crate::fixture::PublicItem) -> String {
+    if item.attachments.is_empty() {
+        return String::new();
+    }
+    let mut inner = String::new();
+    for att in &item.attachments {
+        let content_id = match &att.cid {
+            Some(cid) => format!("<t:ContentId>{}</t:ContentId>", xml::escape(cid)),
+            None => String::new(),
+        };
+        inner.push_str(&format!(
+            "<t:FileAttachment><t:AttachmentId Id=\"{}\"/>\
+<t:Name>{}</t:Name>\
+<t:ContentType>{}</t:ContentType>{content_id}\
+<t:Size>{}</t:Size>\
+<t:IsInline>{}</t:IsInline></t:FileAttachment>",
+            xml::escape(&att.blob_id),
+            xml::escape(&att.name),
+            xml::escape(&att.content_type),
+            att.size,
+            att.disposition == crate::fixture::Disposition::Inline,
+        ));
+    }
+    format!("<t:Attachments>{inner}</t:Attachments>")
+}
+
 /// `GetItem` - hydrate full item bodies by id. Each requested `ItemId`
 /// gets its own response message; an unknown id degrades that one
 /// message to `ErrorItemNotFound` rather than failing the batch.
+///
+/// The projection carries everything a reading pane needs: the staged
+/// body (HTML when the fixture declares one, else text) plus the
+/// attachment metadata. Attachment *bytes* come from `GetAttachment`.
 fn get_item(state: &AppState, body: &str) -> Response {
     let ids = xml::all_element_attr(body, "ItemId", "Id");
     let ck = change_key(state);
@@ -351,17 +605,22 @@ fn get_item(state: &AppState, body: &str) -> Response {
                     "<m:GetItemResponseMessage ResponseClass=\"Success\">\
 <m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message>\
 <t:ItemId Id=\"{}\" ChangeKey=\"{ck}\"/>\
+<t:ParentFolderId Id=\"{}\" ChangeKey=\"{ck}\"/>\
 <t:Subject>{}</t:Subject>\
 <t:DateTimeReceived>{}</t:DateTimeReceived>\
-<t:Body BodyType=\"Text\">{}</t:Body>\
+{body}{attachments}\
+<t:HasAttachments>{has_attachments}</t:HasAttachments>\
 <t:From><t:Mailbox><t:EmailAddress>{}</t:EmailAddress></t:Mailbox></t:From>\
 <t:ToRecipients>{recipients}</t:ToRecipients>\
 </t:Message></m:Items></m:GetItemResponseMessage>",
                     xml::escape(&it.id),
+                    xml::escape(&it.folder_id),
                     xml::escape(&it.subject),
                     it.received_at.format("%Y-%m-%dT%H:%M:%SZ"),
-                    xml::escape(&it.body_text),
                     xml::escape(&it.from.email),
+                    body = body_xml(it),
+                    attachments = attachments_xml(it),
+                    has_attachments = !it.attachments.is_empty(),
                 ));
             }
             None => {
@@ -377,6 +636,63 @@ fn get_item(state: &AppState, body: &str) -> Response {
     let inner = format!(
         "<m:GetItemResponse><m:ResponseMessages>{messages}</m:ResponseMessages>\
 </m:GetItemResponse>",
+    );
+    soap(&inner)
+}
+
+/// `GetAttachment` - serve attachment bytes by `AttachmentId`. This is
+/// the second half of the hydration split: `GetItem` hands the client
+/// attachment metadata, `GetAttachment` hands it the content, base64'd
+/// into `<t:Content>`.
+///
+/// EWS addresses an attachment by id alone (no item context), so the
+/// loader enforces org-wide uniqueness of public attachment blob ids.
+/// An unknown id degrades that one response message to
+/// `ErrorInvalidAttachmentId` rather than failing the batch, matching
+/// `GetItem`'s per-item error behaviour.
+fn get_attachment(state: &AppState, body: &str) -> Response {
+    let ids = xml::all_element_attr(body, "AttachmentId", "Id");
+    let fixture = state.fixture();
+
+    let mut messages = String::new();
+    for id in &ids {
+        match fixture.public_attachment(id) {
+            Some((_item, att)) => {
+                let content_id = match &att.cid {
+                    Some(cid) => format!("<t:ContentId>{}</t:ContentId>", xml::escape(cid)),
+                    None => String::new(),
+                };
+                messages.push_str(&format!(
+                    "<m:GetAttachmentResponseMessage ResponseClass=\"Success\">\
+<m:ResponseCode>NoError</m:ResponseCode><m:Attachments><t:FileAttachment>\
+<t:AttachmentId Id=\"{}\"/>\
+<t:Name>{}</t:Name>\
+<t:ContentType>{}</t:ContentType>{content_id}\
+<t:Size>{}</t:Size>\
+<t:IsInline>{}</t:IsInline>\
+<t:Content>{}</t:Content>\
+</t:FileAttachment></m:Attachments></m:GetAttachmentResponseMessage>",
+                    xml::escape(&att.blob_id),
+                    xml::escape(&att.name),
+                    xml::escape(&att.content_type),
+                    att.size,
+                    att.disposition == crate::fixture::Disposition::Inline,
+                    xml::base64_standard(&att.data),
+                ));
+            }
+            None => {
+                messages.push_str(
+                    "<m:GetAttachmentResponseMessage ResponseClass=\"Error\">\
+<m:ResponseCode>ErrorInvalidAttachmentId</m:ResponseCode>\
+<m:MessageText>attachment not found</m:MessageText>\
+<m:Attachments/></m:GetAttachmentResponseMessage>",
+                );
+            }
+        }
+    }
+    let inner = format!(
+        "<m:GetAttachmentResponse><m:ResponseMessages>{messages}</m:ResponseMessages>\
+</m:GetAttachmentResponse>",
     );
     soap(&inner)
 }
