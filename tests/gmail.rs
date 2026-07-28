@@ -1344,3 +1344,421 @@ async fn gmail_thread_delete_destroys_every_message_and_reports_tombstones() {
     deleted.sort();
     assert_eq!(deleted, vec!["msg-t1".to_string(), "msg-t2".to_string()]);
 }
+
+// ── Bulk mutation: combined add-and-remove, and archive ─────────────
+//
+// bifrost's Gmail bulk driver (`google account/mutation.rs`) has no
+// "move" verb to reach for: a move is `messages.batchModify` carrying
+// `addLabelIds` (the destination) and `removeLabelIds` (the container
+// being left) in ONE request. The source-carrying bulk-move work makes
+// `removeLabelIds` name the actual source instead of a blanket INBOX,
+// so the mock has to honour both halves of a single patch, in the
+// right order, including when the removed label is a mutually
+// exclusive system container (SPAM / TRASH).
+//
+// These paths were entirely untested before: `batchModify` and
+// `batchDelete` had no coverage at all, which is precisely the
+// wrong-shape trap - the mock could have served any shape and every
+// gate would still have passed.
+
+fn bulk_fixture() -> saehrimnir::shared::FixtureHandle {
+    let path = std::path::Path::new("fixtures/gmail-bulk-move.lua");
+    saehrimnir::shared::handle(fixture::load(path).unwrap())
+}
+
+fn bulk_router(handle: &saehrimnir::shared::FixtureHandle) -> axum::Router {
+    gmail::router(gmail::AppState::for_test(Arc::clone(handle)))
+}
+
+/// Gmail `labelIds` of one message, sorted, read straight off
+/// `messages.get`.
+async fn message_labels(router: axum::Router, id: &str) -> Vec<String> {
+    let (status, v) = get_json_with(router, &format!("/gmail/v1/users/me/messages/{id}")).await;
+    assert_eq!(status, StatusCode::OK, "messages.get {id}: {v}");
+    let mut labels: Vec<String> = v["labelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    labels.sort();
+    labels
+}
+
+/// The fixture-level mailbox membership of one message. The Gmail wire
+/// projection deliberately cannot show this for an archived message
+/// (All Mail has no label), so proving "the archive fallback landed it
+/// somewhere real" needs the canonical state.
+fn mailbox_ids(handle: &saehrimnir::shared::FixtureHandle, id: &str) -> Vec<String> {
+    let fix = handle.read().unwrap();
+    let mut ids = fix
+        .emails
+        .iter()
+        .find(|e| e.id == id)
+        .unwrap_or_else(|| panic!("no email {id}"))
+        .mailbox_ids
+        .clone();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn gmail_batch_modify_applies_add_and_remove_in_one_request() {
+    let handle = bulk_fixture();
+    let app = bulk_router(&handle);
+
+    // The shape a source-carrying bulk move drives: destination and
+    // source in one patch, over several ids.
+    let (status, body) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/batchModify",
+        serde_json::json!({
+            "ids": ["msg-1", "msg-2"],
+            "addLabelIds": ["Label_mb-work"],
+            "removeLabelIds": ["INBOX"],
+        }),
+    )
+    .await;
+    // bifrost reads no body from batchModify; real Gmail answers 204.
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(body, Value::Null);
+
+    for id in ["msg-1", "msg-2"] {
+        let labels = message_labels(app.clone(), id).await;
+        assert!(
+            labels.contains(&"Label_mb-work".to_string()),
+            "{id} missed the destination: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"INBOX".to_string()),
+            "{id} kept the source it was moved out of: {labels:?}"
+        );
+        // Both halves landed on the same message in the same request -
+        // an add-only mock would keep INBOX, a remove-only mock would
+        // drop the message into All Mail.
+        assert_eq!(mailbox_ids(&handle, id), vec!["mb-work".to_string()]);
+    }
+
+    // Untouched ids stay untouched: a bulk patch is not a broadcast.
+    assert_eq!(mailbox_ids(&handle, "msg-spam"), vec!["mb-spam".to_string()]);
+
+    // One history record PER MESSAGE, each carrying both sides of the
+    // patch. A consumer resyncing after a bulk move reads exactly this.
+    let (_, history) =
+        get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    let mut added = history_label_entries(&history, "labelsAdded");
+    added.sort();
+    assert_eq!(
+        added,
+        vec![
+            ("msg-1".to_string(), vec!["Label_mb-work".to_string()]),
+            ("msg-2".to_string(), vec!["Label_mb-work".to_string()]),
+        ],
+        "history: {history}"
+    );
+    let mut removed = history_label_entries(&history, "labelsRemoved");
+    removed.sort();
+    assert_eq!(
+        removed,
+        vec![
+            ("msg-1".to_string(), vec!["INBOX".to_string()]),
+            ("msg-2".to_string(), vec!["INBOX".to_string()]),
+        ],
+        "history: {history}"
+    );
+}
+
+/// The exclusive-container case. Gmail displays a message carrying
+/// SPAM or TRASH in that container whatever else it also carries, so a
+/// bulk move INTO the inbox is only correct if the same request strips
+/// them. Both must come off in one patch alongside the INBOX add.
+#[tokio::test]
+async fn gmail_batch_modify_move_to_inbox_strips_spam_and_trash() {
+    let handle = bulk_fixture();
+    let app = bulk_router(&handle);
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/batchModify",
+        serde_json::json!({
+            "ids": ["msg-spam", "msg-trash"],
+            "addLabelIds": ["INBOX"],
+            "removeLabelIds": ["SPAM", "TRASH"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    for id in ["msg-spam", "msg-trash"] {
+        let labels = message_labels(app.clone(), id).await;
+        assert!(labels.contains(&"INBOX".to_string()), "{id}: {labels:?}");
+        assert!(!labels.contains(&"SPAM".to_string()), "{id}: {labels:?}");
+        assert!(!labels.contains(&"TRASH".to_string()), "{id}: {labels:?}");
+        // Exactly the inbox, not the inbox alongside the container it
+        // was supposed to leave.
+        assert_eq!(mailbox_ids(&handle, id), vec!["mb-inbox".to_string()]);
+    }
+}
+
+/// The message-scoped modify is the same patch semantics as the bulk
+/// one, and returns the updated Message. bifrost's single-target path
+/// drives this; a divergence between the two would let a gate pass on
+/// one shape and ship the other.
+#[tokio::test]
+async fn gmail_message_modify_honours_combined_add_and_remove() {
+    let handle = bulk_fixture();
+    let app = bulk_router(&handle);
+
+    let (status, v) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/msg-spam/modify",
+        serde_json::json!({
+            "addLabelIds": ["INBOX"],
+            "removeLabelIds": ["SPAM", "TRASH"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let labels: Vec<&str> = v["labelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    // The RESPONSE already reflects the whole patch - a consumer that
+    // trusts the returned Message must not need a follow-up read.
+    assert!(labels.contains(&"INBOX"), "{labels:?}");
+    assert!(!labels.contains(&"SPAM"), "{labels:?}");
+    assert_eq!(mailbox_ids(&handle, "msg-spam"), vec!["mb-inbox".to_string()]);
+}
+
+/// Adds are applied before removes. Observable here because the add is
+/// a no-op (the message already carries the destination) while the
+/// remove is not: the message must end up detached from the inbox and
+/// still carrying the label, not stripped of both.
+#[tokio::test]
+async fn gmail_modify_add_then_remove_ordering_leaves_the_destination_on() {
+    let handle = bulk_fixture();
+    let app = bulk_router(&handle);
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/batchModify",
+        serde_json::json!({
+            "ids": ["msg-3"],
+            "addLabelIds": ["Label_mb-work"],
+            "removeLabelIds": ["INBOX"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(mailbox_ids(&handle, "msg-3"), vec!["mb-work".to_string()]);
+    let labels = message_labels(app, "msg-3").await;
+    assert!(labels.contains(&"Label_mb-work".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"INBOX".to_string()), "{labels:?}");
+}
+
+// ── Archive: a message with zero containers ─────────────────────────
+//
+// `removeLabelIds: ["INBOX"]` with nothing added is an ARCHIVE. Real
+// Gmail answers 200 and the message keeps existing with no container
+// label at all - it lives in All Mail. The fixture LOADER rejects an
+// email with empty `mailbox_ids`, and that rule stays: a mailbox-less
+// email is not a representable fixture state on any of the other
+// protocols this same fixture feeds. The mutation is the side that
+// adapts, landing the message in the `role = "archive"` mailbox, which
+// `Fixture::gmail_label_ids` already projects to no Gmail label. Both
+// sides then agree, and the wire shape matches real Gmail exactly.
+
+#[tokio::test]
+async fn gmail_archive_lands_the_message_in_all_mail() {
+    let handle = bulk_fixture();
+    let app = bulk_router(&handle);
+
+    let (status, v) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/msg-1/modify",
+        serde_json::json!({ "addLabelIds": [], "removeLabelIds": ["INBOX"] }),
+    )
+    .await;
+    // Not a 4xx: archiving is an ordinary Gmail operation.
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let labels: Vec<&str> = v["labelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(!labels.contains(&"INBOX"), "{labels:?}");
+    // No container label appears in its place. All Mail is not a
+    // label, and inventing one (say "ARCHIVE") would be a shape real
+    // Gmail never serves.
+    for container in ["SPAM", "TRASH", "SENT", "ARCHIVE", "ALL_MAIL"] {
+        assert!(!labels.contains(&container), "{container} in {labels:?}");
+    }
+
+    // The canonical state is the archive mailbox, never empty - which
+    // is what keeps the served fixture loadable by its own loader.
+    assert_eq!(mailbox_ids(&handle, "msg-1"), vec!["mb-archive".to_string()]);
+
+    // Still readable, still listed: archive is not a delete.
+    let (status, _) = get_json_with(app.clone(), "/gmail/v1/users/me/messages/msg-1").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn gmail_batch_modify_archive_lands_every_message_in_all_mail() {
+    let handle = bulk_fixture();
+    let app = bulk_router(&handle);
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/batchModify",
+        serde_json::json!({
+            "ids": ["msg-1", "msg-2"],
+            "addLabelIds": [],
+            "removeLabelIds": ["INBOX"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for id in ["msg-1", "msg-2"] {
+        assert_eq!(mailbox_ids(&handle, id), vec!["mb-archive".to_string()]);
+        assert!(!message_labels(app.clone(), id).await.contains(&"INBOX".to_string()));
+    }
+}
+
+/// A fixture with no `role = "archive"` mailbox cannot express All
+/// Mail, so an archive there is refused rather than silently producing
+/// a message the fixture loader would reject. Loud beats a 2xx that
+/// leaves the fixture in a state it could not have been authored in.
+#[tokio::test]
+async fn gmail_archive_without_an_archive_mailbox_is_refused_and_changes_nothing() {
+    let scenario = r#"
+        fixture({ name = "no-archive", state = "na-0" })
+        account({ id = "account-1", name = "test@example.com", primary = true })
+        mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox", sort_order = 0 })
+        email({
+            id = "only",
+            thread_id = "t",
+            mailbox_ids = { "mb-inbox" },
+            keywords = { "$seen" },
+            received_at = "2026-04-01T09:00:00Z",
+            from = "a@example.com",
+            to = { "test@example.com" },
+            subject = "Only",
+            body_text = "Body.",
+            message_id = { "<only@example.com>" },
+        })
+    "#;
+    let handle = saehrimnir::shared::handle(lua::load_source(scenario, "@no-archive").unwrap());
+    let app = bulk_router(&handle);
+
+    let (status, v) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/only/modify",
+        serde_json::json!({ "removeLabelIds": ["INBOX"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["errors"][0]["reason"], "invalidArgument");
+    // The message names the fixture-side fix rather than blaming the
+    // client, because the client did nothing wrong.
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains("archive"), "{message}");
+
+    // Rolled back whole: membership intact, and no state advance (an
+    // empty MutationDiff records no transition), so a consumer polling
+    // history does not see a phantom change.
+    assert_eq!(mailbox_ids(&handle, "only"), vec!["mb-inbox".to_string()]);
+    let (_, history) =
+        get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    assert!(
+        history["history"]
+            .as_array()
+            .is_none_or(std::vec::Vec::is_empty),
+        "refused patch left a history record: {history}"
+    );
+}
+
+/// The mirror-image gap: an `addLabelIds` naming a system container
+/// the fixture declares no mailbox for. Swallowing it silently would
+/// turn a consumer's move-to-trash into an archive - a 2xx, a passing
+/// gate, and the wrong state on the server.
+#[tokio::test]
+async fn gmail_add_of_an_undeclared_system_container_is_refused() {
+    let scenario = r#"
+        fixture({ name = "no-trash", state = "nt-0" })
+        account({ id = "account-1", name = "test@example.com", primary = true })
+        mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox", sort_order = 0 })
+        mailbox({ id = "mb-archive", name = "Archive", role = "archive", sort_order = 1 })
+        email({
+            id = "only",
+            thread_id = "t",
+            mailbox_ids = { "mb-inbox" },
+            keywords = { "$seen" },
+            received_at = "2026-04-01T09:00:00Z",
+            from = "a@example.com",
+            to = { "test@example.com" },
+            subject = "Only",
+            body_text = "Body.",
+            message_id = { "<only@example.com>" },
+        })
+    "#;
+    let handle = saehrimnir::shared::handle(lua::load_source(scenario, "@no-trash").unwrap());
+    let app = bulk_router(&handle);
+
+    let (status, v) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/batchModify",
+        serde_json::json!({
+            "ids": ["only"],
+            "addLabelIds": ["TRASH"],
+            "removeLabelIds": ["INBOX"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["errors"][0]["reason"], "invalidArgument");
+    assert!(v["error"]["message"].as_str().unwrap().contains("TRASH"));
+    // Refused before anything moved: no archive fallback, no detach.
+    assert_eq!(mailbox_ids(&handle, "only"), vec!["mb-inbox".to_string()]);
+}
+
+/// `batchDelete` had no coverage either. It is the other bulk verb
+/// bifrost drives, and its 204-with-no-body contract is the same one
+/// `batchModify` relies on.
+#[tokio::test]
+async fn gmail_batch_delete_destroys_the_listed_ids_only() {
+    let handle = bulk_fixture();
+    let app = bulk_router(&handle);
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/batchDelete",
+        serde_json::json!({ "ids": ["msg-1", "msg-trash"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(body, Value::Null);
+
+    for id in ["msg-1", "msg-trash"] {
+        let (status, _) = get_json_with(app.clone(), &format!("/gmail/v1/users/me/messages/{id}"))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id} survived batchDelete");
+    }
+    let (status, _) = get_json_with(app.clone(), "/gmail/v1/users/me/messages/msg-2").await;
+    assert_eq!(status, StatusCode::OK, "batchDelete swept up an unlisted id");
+
+    let (_, history) = get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    let mut deleted: Vec<String> = history["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.get("messagesDeleted").and_then(Value::as_array))
+        .flatten()
+        .map(|e| e["message"]["id"].as_str().unwrap().to_string())
+        .collect();
+    deleted.sort();
+    assert_eq!(deleted, vec!["msg-1".to_string(), "msg-trash".to_string()]);
+}

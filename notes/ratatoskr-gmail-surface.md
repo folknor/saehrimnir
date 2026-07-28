@@ -262,10 +262,75 @@ on the target: a `MutationTarget::Message` becomes the singular
 `messages/{id}/modify`, a `MutationTarget::Thread` becomes
 `threads/{id}/modify`, and `delete_thread` issues
 `DELETE /threads/{id}` only when the thread already sits in TRASH
-(every other destroy is a move-to-trash through `modify`). The two
-`batch*` forms are real Gmail endpoints the mock also serves, but
-bifrost does not currently drive them - do not treat their coverage
-as covering the mutation pipeline.
+(every other destroy is a move-to-trash through `modify`).
+
+The two `batch*` forms are driven too, by a different pipeline:
+bifrost's BULK driver (`google account/mutation.rs`) posts
+`messages/batchModify` for `bulk_set_flags` / `bulk_move` and
+`messages/batchDelete` for `bulk_destroy`, batching ids up to
+`GMAIL_BATCH_MODIFY_LIMIT`. (An earlier revision of this doc said
+bifrost did not drive them; that has not been true since the bulk
+driver landed.)
+
+#### Combined add-and-remove
+
+Gmail has no move verb, so a bulk move is ONE `batchModify` carrying
+both the destination in `addLabelIds` and the container being left in
+`removeLabelIds`. The mock honours both halves of a single patch on
+every mutating path (`messages/{id}/modify`, `threads/{id}/modify`,
+`messages/batchModify`), which matters as the bulk surface grows a
+SOURCE: the request shape stays one round trip rather than a move plus
+a per-message detach.
+
+Ordering is adds first, then removes. That is what makes
+`add INBOX` + `remove [SPAM, TRASH]` - Gmail's un-spam / un-trash,
+where the removed containers outrank the added one - resolve to plain
+inbox membership, and it keeps a move from passing through a
+transiently container-less state. A label named in BOTH lists nets out
+to removed; real Gmail's behaviour there is unspecified and no client
+drives it, so the mock simply pins a deterministic answer.
+
+`SPAM` and `TRASH` removals resolve through the account's `junk` /
+`trash` role mailboxes, so a fixture that stages those containers gets
+the real exclusive-container semantics rather than a no-op.
+
+#### Archive, and the two fixture-authoring gaps the mock refuses
+
+`removeLabelIds: ["INBOX"]` with nothing added is an ARCHIVE. Real
+Gmail answers 200 and the message keeps existing with no container
+label at all - it lives in All Mail, which is not a label. The fixture
+format spells that state as membership in a `role = "archive"`
+mailbox, which `Fixture::gmail_label_ids` deliberately projects to no
+Gmail label, so an archived message round-trips to exactly the shape
+real Gmail serves.
+
+The fixture LOADER rejects an email with empty `mailbox_ids`, and that
+rule stays: a mailbox-less email is not representable on the other
+protocols the same fixture feeds (JMAP requires a non-empty
+`mailboxIds`, IMAP and Graph both need a container, and the loader
+derives an email's account from its mailboxes). The MUTATION is the
+side that adapts - a patch that would empty the set lands the message
+in the archive mailbox instead.
+
+Two cases the mock cannot represent are refused with a Gmail-shaped
+`400 invalidArgument` naming the missing fixture declaration, after
+rolling the patch back whole (no partial application, no state
+advance, no history record):
+
+- the patch would empty the mailbox set and the account declares no
+  `role = "archive"` mailbox;
+- `addLabelIds` names a system container (`INBOX` / `TRASH` / `SPAM`)
+  the account declares no role mailbox for.
+
+Both are loud on purpose. Swallowing the second silently turns a
+consumer's move-to-trash into an archive: a 2xx, a passing gate, and
+the wrong state on the server. `SENT` and `IMPORTANT` are NOT in that
+set - neither is a destination a move can name, and `IMPORTANT` behaves
+like a flag rather than a container - so they stay silent no-ops.
+
+`fixtures/gmail-bulk-move.lua` stages every container the bulk paths
+can name, which is what a source-carrying bulk-move gate should point
+at.
 
 The thread form is deliberately the message form looped over the
 thread's messages, one `modify_one` per message, so `history.list`

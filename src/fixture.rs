@@ -11,9 +11,94 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+/// Identity of the fixture *source* this process was loaded from.
+///
+/// Published verbatim on `GET /test/fixture/identity` so a consumer
+/// holding its own copy of a fixture file can assert the mock it is
+/// actually driving is the copy it thinks it is driving. A consumer
+/// hashes its own bytes and compares; drift between the two copies
+/// then fails loudly at the top of the gate instead of silently
+/// changing what the gate proves.
+///
+/// Deliberately one-directional: sæhrimnir publishes, and never
+/// reaches across the repo boundary to look at a consumer's copy or to
+/// decide whether a mismatch matters. Whether to check is the
+/// consumer's call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FixtureIdentity {
+    /// Path the fixture was read from, absolutised against
+    /// [`std::env::current_dir`] when the caller passed a relative
+    /// path. `None` for source-string loads (unit tests, and the Lua
+    /// `load_source*` entry points), which have no file behind them.
+    ///
+    /// Absolutising deliberately goes through `current_dir()` and
+    /// never `env!("CARGO_MANIFEST_DIR")`: sæhrimnir is a nested
+    /// workspace, and a manifest-relative path resolves against the
+    /// wrong root the moment the binary is invoked from a parent
+    /// checkout (which is exactly how brokkr spawns it).
+    pub path: Option<String>,
+    /// Lowercase-hex SHA-256 of the fixture source bytes exactly as
+    /// read off disk - before parsing, before normalisation. Hashing
+    /// the source rather than the normalised [`Fixture`] is what makes
+    /// the digest reproducible by a consumer that has the file but not
+    /// this crate: `sha256sum <file>` matches.
+    ///
+    /// Empty only for a [`Fixture`] built by hand in a unit test that
+    /// never went through a loader.
+    pub sha256: String,
+}
+
+impl FixtureIdentity {
+    /// Digest `source` and record it with no backing path.
+    pub fn of_source(source: &[u8]) -> Self {
+        Self {
+            path: None,
+            sha256: sha256_hex(source),
+        }
+    }
+
+    /// Attach the file a previously-digested source was read from.
+    #[must_use]
+    pub fn with_path(mut self, path: &Path) -> Self {
+        self.path = Some(absolutise(path));
+        self
+    }
+}
+
+/// Lowercase-hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        // `write!` into a String is infallible; the lint budget here
+        // forbids `unwrap`, and dropping the Result is the documented
+        // idiom.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Render `path` as an absolute path string, joining relative paths
+/// onto the process's current working directory. Falls back to the
+/// path as given when the cwd is unreadable (deleted / permission),
+/// which is strictly better than failing a load over a cosmetic field.
+fn absolutise(path: &Path) -> String {
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path).display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fixture {
     pub name: String,
+    /// Source-identity digest of the file this fixture was loaded
+    /// from. Populated by the loaders; see [`FixtureIdentity`].
+    pub identity: FixtureIdentity,
     /// Shared state-token seed (e.g. `"fixture-state"`). Every
     /// account's state string is `{seed}` at load and `{seed}.{N}`
     /// after its Nth mutation; the seed is the same value for every
@@ -3854,7 +3939,8 @@ pub fn load(path: &Path) -> Result<Fixture, String> {
         let raw: RawFixture =
             toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
         let dir = path.parent().unwrap_or(Path::new("."));
-        let fixture = normalize_with_dir(raw, dir)?;
+        let mut fixture = normalize_with_dir(raw, dir)?;
+        fixture.identity = FixtureIdentity::of_source(text.as_bytes()).with_path(path);
         validate_announce_triggers(&fixture)?;
         Ok(fixture)
     }
@@ -4615,6 +4701,9 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             .max(contacts.len() as u64);
     Ok(Fixture {
         name: raw.name,
+        // Stamped by the loader that owns the source bytes; normalize
+        // only ever sees the parsed `RawFixture`.
+        identity: FixtureIdentity::default(),
         state_seed,
         accounts,
         mailboxes,

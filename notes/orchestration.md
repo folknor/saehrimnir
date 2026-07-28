@@ -327,6 +327,33 @@ feature gate guards these. All routes are scoped under `/test/`.
   exhaustion path; this knob does. Cleared by
   `DELETE /test/jmap/fail-open` (204) and by
   `POST /test/fixture/reset`.
+- `GET /test/fixture/identity` -> 200 +
+  `{ "name": <fixture name>, "path": <absolute path|null>,
+  "sha256": <lowercase hex> }` for the fixture source this process
+  was launched with.
+
+  The digest is over the SOURCE BYTES as read off disk - before
+  parsing, before normalisation - so a consumer reproduces it with
+  plain `sha256sum <file>`, no shared code and no dependency on this
+  crate. `path` is absolute, resolved against the SERVER process's
+  cwd (never a compile-time manifest dir: sæhrimnir is a nested
+  workspace and brokkr spawns the binary from a parent checkout), and
+  is diagnostic only. `sha256` is the empty string for a fixture that
+  never went through a loader, which a consumer should read as
+  "cannot verify".
+
+  The route exists for drift detection across a repo boundary. A
+  consumer keeping its own copy of a fixture file (bifrost currently
+  keeps a byte-identical `gmail-incremental.lua`) has nothing
+  enforcing that the two copies stay in step, so the gate can quietly
+  drift into proving something else. Hashing its own copy and
+  comparing at setup turns that into a loud failure.
+
+  Deliberately one-directional and fixture-agnostic: sæhrimnir
+  publishes, and never reaches across the boundary to look at a
+  consumer's copy or to decide that a mismatch matters. Whether to
+  check is the consumer's call. The value survives
+  `POST /test/fixture/reset`.
 - `POST /test/fixture/reset` -> 204; reset in-process mutable
   state to the post-load baseline. The route is the source of
   truth on what "reset" means; the handler in

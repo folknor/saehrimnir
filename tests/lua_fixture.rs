@@ -9,6 +9,19 @@ use std::path::Path;
 
 use saehrimnir::{fixture, lua};
 
+/// Blank the source-identity digest before a cross-format comparison.
+///
+/// `Fixture::identity` records the SHA-256 of the SOURCE BYTES and the
+/// path they came from, so the TOML and Lua spellings of one fixture
+/// differ there by construction - that is the whole point of the
+/// field. Everything the loaders are supposed to agree on is the
+/// normalised content, which is what these tests compare. The digest
+/// has its own coverage in `tests/api.rs`.
+fn content(mut f: fixture::Fixture) -> fixture::Fixture {
+    f.identity = fixture::FixtureIdentity::default();
+    f
+}
+
 #[test]
 fn lua_group_change_ops_preserve_sparse_and_empty_replacements() {
     let loaded = lua::load_source(
@@ -119,14 +132,14 @@ fn dispatcher_call_index_increments_per_protocol_command() {
 fn lua_fixture_matches_equivalent_toml() {
     let from_toml = fixture::load(Path::new("fixtures/jmap-small.toml")).unwrap();
     let from_lua = fixture::load(Path::new("fixtures/jmap-small.lua")).unwrap();
-    assert_eq!(from_toml, from_lua);
+    assert_eq!(content(from_toml.clone()), content(from_lua));
 }
 
 #[test]
 fn discovery_lua_fixture_matches_equivalent_toml() {
     let from_toml = fixture::load(Path::new("fixtures/discovery-small.toml")).unwrap();
     let from_lua = fixture::load(Path::new("fixtures/discovery-small.lua")).unwrap();
-    assert_eq!(from_toml, from_lua);
+    assert_eq!(content(from_toml.clone()), content(from_lua));
 }
 
 #[test]
@@ -239,7 +252,7 @@ fn duplicate_message_id_across_emails_is_accepted() {
 fn lua_incremental_fixture_matches_equivalent_toml() {
     let from_toml = fixture::load(Path::new("fixtures/jmap-incremental.toml")).unwrap();
     let from_lua = fixture::load(Path::new("fixtures/jmap-incremental.lua")).unwrap();
-    assert_eq!(from_toml, from_lua);
+    assert_eq!(content(from_toml.clone()), content(from_lua));
     // Spot-check that the change script actually populated rather
     // than passing trivially as two empty Vecs.
     assert_eq!(from_toml.change_script.len(), 4);
@@ -255,7 +268,7 @@ fn lua_incremental_fixture_matches_equivalent_toml() {
 fn lua_reactions_fixture_matches_equivalent_toml() {
     let from_toml = fixture::load(Path::new("fixtures/graph-reactions.toml")).unwrap();
     let from_lua = fixture::load(Path::new("fixtures/graph-reactions.lua")).unwrap();
-    assert_eq!(from_toml, from_lua);
+    assert_eq!(content(from_toml.clone()), content(from_lua));
 
     // Baseline covers all three authorable states.
     let by_id = |id: &str| {
@@ -348,7 +361,7 @@ fn lua_reaction_op_rejects_empty_entry() {
 fn lua_attach_fixture_matches_equivalent_toml() {
     let from_toml = fixture::load(Path::new("fixtures/jmap-attach.toml")).unwrap();
     let from_lua = fixture::load(Path::new("fixtures/jmap-attach.lua")).unwrap();
-    assert_eq!(from_toml, from_lua);
+    assert_eq!(content(from_toml.clone()), content(from_lua));
 
     let em = &from_toml.emails[0];
     assert!(em.has_attachment);

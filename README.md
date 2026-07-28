@@ -137,6 +137,11 @@ across cohort cycles without restarting it:
 - `GET /test/requests` / `DELETE /test/requests` - cross-protocol
   request log spanning every dispatch event across the five
   protocol layers (`(protocol, command, received_at, detail)`).
+- `GET /test/fixture/identity` - `{ name, path, sha256 }` for the
+  fixture source this process was launched with. The digest covers
+  the file's bytes as read, so a consumer holding its own copy can
+  `sha256sum` it and assert the mock it is driving is the copy it
+  thinks it is driving. Publishing is ours; checking is theirs.
 - `POST /test/fixture/reset` - clear the SMTP submission log, the
   request log, and the OAuth token store. The fixture itself is
   read-only in v0; this route grows when `[[change]]` scripts land.

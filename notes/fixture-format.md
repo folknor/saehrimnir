@@ -854,6 +854,15 @@ The mock refuses to start (non-zero exit, stderr message) if:
 - TOML parse fails.
 - Any `email.mailbox_ids` references a mailbox not declared in the
   fixture.
+- Any `email.mailbox_ids` is empty. An email has to live somewhere:
+  JMAP requires a non-empty `mailboxIds`, IMAP and Graph both need a
+  container, and the loader derives an email's account from its
+  mailboxes. "Archived" is not the absence of a mailbox - it is
+  membership in a `role = "archive"` mailbox, which the Gmail
+  projection deliberately renders as NO Gmail label (Gmail's All Mail
+  is not a label). Mutations that could otherwise empty the set are
+  responsible for honouring this; see the archive section of
+  `notes/ratatoskr-gmail-surface.md`.
 - Any `mailbox.parent_id` references a mailbox not declared in the
   fixture.
 - A mailbox's role is set but not one of the seven recognized values.

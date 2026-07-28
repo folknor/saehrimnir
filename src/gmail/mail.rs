@@ -1278,16 +1278,20 @@ async fn modify_message(
     let account_id = bearer_account(&state, &headers);
     let add = label_list(&body, "addLabelIds");
     let remove = label_list(&body, "removeLabelIds");
-    let found = {
+    let outcome = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
         modify_one(&mut fix, &account_id, &message_id, &add, &remove)
     };
-    if !found {
-        return error(
-            StatusCode::NOT_FOUND,
-            &format!("message {message_id:?} not found"),
-            "notFound",
-        );
+    match outcome {
+        ModifyOutcome::Applied => {}
+        ModifyOutcome::NotFound => {
+            return error(
+                StatusCode::NOT_FOUND,
+                &format!("message {message_id:?} not found"),
+                "notFound",
+            );
+        }
+        other => return modify_gap_error(&other),
     }
     let fixture = state.fixture();
     match fixture.emails_for(&account_id).find(|e| e.id == message_id) {
@@ -1345,11 +1349,12 @@ async fn modify_thread(
             "notFound",
         );
     }
-    {
+    let gap = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        for id in &ids {
-            modify_one(&mut fix, &account_id, id, &add, &remove);
-        }
+        apply_patch_to_ids(&mut fix, &account_id, &ids, &add, &remove)
+    };
+    if let Some(gap) = gap {
+        return modify_gap_error(&gap);
     }
     let fixture = state.fixture();
     let mut messages: Vec<&Email> = fixture
@@ -1406,13 +1411,62 @@ async fn batch_modify(
     let ids = label_list(&body, "ids");
     let add = label_list(&body, "addLabelIds");
     let remove = label_list(&body, "removeLabelIds");
-    {
+    let gap = {
         let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-        for id in &ids {
-            modify_one(&mut fix, &account_id, id, &add, &remove);
-        }
+        apply_patch_to_ids(&mut fix, &account_id, &ids, &add, &remove)
+    };
+    if let Some(gap) = gap {
+        return modify_gap_error(&gap);
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Apply one label patch to every id, returning the first
+/// fixture-authoring gap encountered (if any).
+///
+/// Unknown ids stay a silent skip: real Gmail's `batchModify` is a
+/// bulk verb over a client-supplied id list and does not itemise
+/// per-id failures, and bifrost reads no body from it. A gap in the
+/// FIXTURE is different in kind - it means the mock cannot express
+/// what was asked - so it surfaces as a request-level 400.
+///
+/// The `UnknownContainer` check is a pure function of
+/// `(account, addLabelIds)`, so it is hoisted ahead of the loop and
+/// the whole request is refused untouched. `NoArchiveMailbox` depends
+/// on the individual message's membership, so it can only be found
+/// mid-loop; the loop stops at the first one rather than pressing on.
+///
+/// Each id is a separate `Fixture::mutate`, so `history.list` gets one
+/// record per MESSAGE, which is what real Gmail emits and what makes a
+/// bulk patch distinguishable from a thread-level one in a delta.
+fn apply_patch_to_ids(
+    fix: &mut Fixture,
+    account_id: &str,
+    ids: &[String],
+    add: &[String],
+    remove: &[String],
+) -> Option<ModifyOutcome> {
+    if let Some(gap) = check_containers(fix, account_id, add) {
+        return Some(gap);
+    }
+    for id in ids {
+        match modify_one(fix, account_id, id, add, remove) {
+            ModifyOutcome::Applied | ModifyOutcome::NotFound => {}
+            other => return Some(other),
+        }
+    }
+    None
+}
+
+/// Refuse an `addLabelIds` naming a system container the account has
+/// no role-mailbox for. Pure read; mutates nothing.
+fn check_containers(fix: &Fixture, account_id: &str, add: &[String]) -> Option<ModifyOutcome> {
+    add.iter()
+        .find(|label| {
+            REQUIRED_CONTAINERS.contains(&label.as_str())
+                && container_mailbox(fix, account_id, label).is_none()
+        })
+        .map(|label| ModifyOutcome::UnknownContainer(label.clone()))
 }
 
 /// `POST /gmail/v1/users/me/messages/batchDelete`. Permanently
@@ -1446,22 +1500,143 @@ fn label_list(body: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Turn a fixture-authoring gap surfaced by [`modify_one`] into a
+/// Gmail-shaped 400 that names the missing fixture declaration.
+///
+/// Loud on purpose. Both arms describe a state the mock cannot
+/// represent, and the alternative - applying part of the patch, or
+/// none of it, behind a 2xx - is the failure mode this repo keeps
+/// hitting: the mock serves a shape the client did not drive and the
+/// gate passes anyway.
+fn modify_gap_error(outcome: &ModifyOutcome) -> Response {
+    let message = match outcome {
+        ModifyOutcome::NoArchiveMailbox => "label patch would leave the message in no mailbox, \
+             and the account declares no `role = \"archive\"` mailbox to model Gmail All Mail; \
+             add one to the fixture"
+            .to_string(),
+        ModifyOutcome::UnknownContainer(label) => format!(
+            "addLabelIds names the system container {label:?}, but the account declares no \
+             mailbox with the matching role; add one to the fixture"
+        ),
+        ModifyOutcome::Applied | ModifyOutcome::NotFound => {
+            "unexpected modify outcome".to_string()
+        }
+    };
+    error(StatusCode::BAD_REQUEST, &message, "invalidArgument")
+}
+
+/// Outcome of one [`modify_one`] label patch.
+///
+/// Richer than the old `bool` because two of the three arms are
+/// fixture-authoring gaps that used to be silent: a patch that lands
+/// nowhere is worse than a patch that is refused, because the client
+/// believes it succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModifyOutcome {
+    /// Patch applied; the transition is recorded.
+    Applied,
+    /// No such message id in this account.
+    NotFound,
+    /// The patch would have left the message in no mailbox at all and
+    /// the account declares no `role = "archive"` mailbox to hold it.
+    /// See the module comment on Gmail archive semantics. Nothing was
+    /// mutated.
+    NoArchiveMailbox,
+    /// An `addLabelIds` entry named a Gmail system container
+    /// (`INBOX` / `TRASH` / `SPAM`) the account declares no
+    /// role-mailbox for, so there is nowhere to put the message.
+    /// Nothing was mutated. Carries the offending label.
+    UnknownContainer(String),
+}
+
+/// Gmail's mutually exclusive system containers - the labels that
+/// decide *where a message lives*. An `addLabelIds` naming one of
+/// these against a fixture with no matching role-mailbox is a
+/// fixture gap worth refusing, not swallowing: silently ignoring
+/// `add TRASH` turns a consumer's move-to-trash into an archive and
+/// the gate still passes.
+///
+/// `SENT` and `IMPORTANT` are deliberately NOT in this set. Neither
+/// is a destination a move can name, and `IMPORTANT` behaves like a
+/// flag rather than a container in real Gmail, so a fixture without
+/// them is under-specified rather than wrong. They stay silent
+/// no-ops.
+const REQUIRED_CONTAINERS: [&str; 3] = ["INBOX", "TRASH", "SPAM"];
+
+/// Resolve the mailbox id backing a Gmail system container label for
+/// `account_id`, or `None` when the account declares no such role.
+fn container_mailbox(fix: &Fixture, account_id: &str, label: &str) -> Option<String> {
+    let role = match label {
+        "INBOX" => Role::Inbox,
+        "TRASH" => Role::Trash,
+        "SPAM" => Role::Junk,
+        _ => return None,
+    };
+    fix.mailboxes_for(account_id)
+        .find(|m| m.role == Some(role))
+        .map(|m| m.id.clone())
+}
+
 /// Apply a Gmail label patch to one fixture email, recording an
 /// `email_updated` transition plus the Gmail label-set delta sidecar
 /// so `history.list` projects the precise `labelsAdded` /
-/// `labelsRemoved`. Returns `false` when the id is not in the account.
+/// `labelsRemoved`.
+///
+/// Adds are applied before removes. That ordering is what makes a
+/// combined add-and-remove patch - the shape a bulk move drives, one
+/// `batchModify` carrying both the destination and the source it is
+/// leaving - land on the destination rather than passing through a
+/// transiently container-less state. It also makes `add INBOX` +
+/// `remove [SPAM, TRASH]` (Gmail's un-spam / un-trash, where the
+/// removed labels outrank the added one) resolve to plain inbox
+/// membership.
+///
+/// A patch naming the same label in both lists nets out to REMOVED
+/// under this ordering. Real Gmail's behaviour there is unspecified
+/// and no client drives it; the deterministic choice is documented
+/// rather than special-cased.
+///
+/// ## Archive: zero containers is a real Gmail state
+///
+/// `removeLabelIds: ["INBOX"]` on a message whose only container is
+/// the inbox is an ARCHIVE, and real Gmail answers 200: the message
+/// still exists, its `labelIds` simply carries no container, and it
+/// lives in All Mail. The fixture format already spells that state:
+/// membership in a `role = "archive"` mailbox, which
+/// `Fixture::gmail_label_ids` deliberately projects to NO Gmail label,
+/// so the archived message round-trips to exactly the wire shape real
+/// Gmail serves.
+///
+/// The loader's "mailbox_ids must not be empty" rule therefore stays:
+/// a mailbox-less email is not a representable fixture state (JMAP
+/// requires a non-empty `mailboxIds`, IMAP and Graph both need a
+/// container, and the loader derives an email's account from its
+/// mailboxes). The mutation is the side that was wrong - it emptied
+/// the set instead of landing the message in All Mail. Here it lands
+/// it in the archive mailbox.
 fn modify_one(
     fix: &mut Fixture,
     account_id: &str,
     message_id: &str,
     add: &[String],
     remove: &[String],
-) -> bool {
+) -> ModifyOutcome {
     let acct = account_id.to_string();
     let mid = message_id.to_string();
     if !fix.emails_for(account_id).any(|e| e.id == message_id) {
-        return false;
+        return ModifyOutcome::NotFound;
     }
+    // Pre-flight the container adds so an unrepresentable destination
+    // is refused before anything is mutated.
+    if let Some(gap) = check_containers(fix, account_id, add) {
+        return gap;
+    }
+    let archive_mailbox = fix
+        .mailboxes_for(account_id)
+        .find(|m| m.role == Some(Role::Archive))
+        .map(|m| m.id.clone());
+
+    let mut refused = false;
     let _ = fix.mutate(|f| {
         let Some(idx) = f
             .emails
@@ -1472,11 +1647,29 @@ fn modify_one(
         };
         let before = f.gmail_label_ids(&f.emails[idx]);
         let old_mailboxes = f.emails[idx].mailbox_ids.clone();
+        // `apply_gmail_label` touches exactly these two fields, so
+        // they are the whole rollback snapshot.
+        let old_keywords = f.emails[idx].keywords.clone();
         for label in add {
             apply_gmail_label(f, idx, &acct, label, true);
         }
         for label in remove {
             apply_gmail_label(f, idx, &acct, label, false);
+        }
+        if f.emails[idx].mailbox_ids.is_empty() {
+            match &archive_mailbox {
+                Some(mb) => f.emails[idx].mailbox_ids.push(mb.clone()),
+                None => {
+                    // Roll back wholesale and report. An empty
+                    // `MutationDiff` is a no-op inside `record_transition`
+                    // (no state bump, no transition), so the refusal
+                    // leaves no trace on the change log.
+                    f.emails[idx].mailbox_ids = old_mailboxes;
+                    f.emails[idx].keywords = old_keywords;
+                    refused = true;
+                    return MutationDiff::default();
+                }
+            }
         }
         let new_mailboxes = f.emails[idx].mailbox_ids.clone();
         f.sync_mailbox_uids(&mid, &old_mailboxes, &new_mailboxes);
@@ -1490,7 +1683,11 @@ fn modify_one(
         }
         diff
     });
-    true
+    if refused {
+        ModifyOutcome::NoArchiveMailbox
+    } else {
+        ModifyOutcome::Applied
+    }
 }
 
 /// Permanently destroy one fixture email: retire its UID slots in

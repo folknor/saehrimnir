@@ -12,6 +12,7 @@
 //!   - `list_smtp_submissions` / `clear_smtp_submissions`
 //! - `GET /test/requests`, `DELETE /test/requests`
 //!   - `list_requests` (with `?stable=true`) / `clear_requests`
+//! - `GET /test/fixture/identity` -> `fixture_identity`
 //! - `POST /test/fixture/reset` -> `reset_fixture`
 //! - `POST /test/fixture/step` -> `step_fixture` (drives
 //!   `apply_change_step` against the fixture's `change_script`)
@@ -43,6 +44,7 @@ pub fn router(state: AppState) -> Router {
             get(list_smtp_submissions).delete(clear_smtp_submissions),
         )
         .route("/test/requests", get(list_requests).delete(clear_requests))
+        .route("/test/fixture/identity", get(fixture_identity))
         .route("/test/fixture/reset", post(reset_fixture))
         .route("/test/fixture/step", post(step_fixture))
         .route("/test/snapshot-state", get(snapshot_state))
@@ -652,6 +654,33 @@ async fn clear_fail_open(State(state): State<AppState>) -> StatusCode {
 /// omitted (they bloat the response and aren't what assertions
 /// check). For per-protocol wire shape, hit the protocol's GET
 /// endpoints instead.
+/// `GET /test/fixture/identity` -> `{ name, path, sha256 }` for the
+/// fixture source this process was launched with.
+///
+/// The point of the route is drift detection across a repo boundary:
+/// a consumer that keeps its own copy of a fixture file can hash its
+/// bytes, compare against `sha256`, and fail its gate at setup time
+/// when the two copies have diverged - instead of running a gate that
+/// silently proves something else. `path` is absolute (resolved
+/// against the server process's cwd) and is diagnostic only; `name` is
+/// the fixture's declared name.
+///
+/// General for any fixture: nothing here knows which file a consumer
+/// cares about, and nothing here decides that a mismatch is an error.
+/// Publishing is ours; checking is theirs.
+///
+/// `sha256` is the empty string for a fixture that never went through
+/// a loader (hand-built in a unit test). A consumer treating "empty
+/// digest" as "cannot verify" is the intended reading.
+async fn fixture_identity(State(state): State<AppState>) -> Json<Value> {
+    let fix = state.shared.fixture.read().expect("fixture lock poisoned");
+    Json(json!({
+        "name": fix.name,
+        "path": fix.identity.path,
+        "sha256": fix.identity.sha256,
+    }))
+}
+
 async fn snapshot_state(State(state): State<AppState>) -> Json<Value> {
     let fix = state.shared.fixture.read().expect("fixture lock poisoned");
     let mailboxes: Vec<Value> = fix

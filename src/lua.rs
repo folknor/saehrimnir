@@ -22,8 +22,8 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use crate::fixture::{
-    self, ChangeOp, ChangeStep, ContactEmail, Fixture, RawAccount, RawAddress, RawAttachment,
-    RawEmail, RawEventAttendee, RawFixture, RawMailbox, RawOAuth,
+    self, ChangeOp, ChangeStep, ContactEmail, Fixture, FixtureIdentity, RawAccount, RawAddress,
+    RawAttachment, RawEmail, RawEventAttendee, RawFixture, RawMailbox, RawOAuth,
 };
 use crate::templates;
 
@@ -51,7 +51,11 @@ pub fn load(path: &Path) -> Result<Fixture, String> {
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let chunk_name = format!("@{}", path.display());
     let dir = path.parent().unwrap_or(Path::new("."));
-    load_source_with_dir(&source, &chunk_name, dir)
+    let mut fixture = load_source_with_dir(&source, &chunk_name, dir)?;
+    // `load_source_with_dir` already digested the source; only the
+    // backing path is knowable here.
+    fixture.identity = std::mem::take(&mut fixture.identity).with_path(path);
+    Ok(fixture)
 }
 
 /// Test-friendly entry point: parse and execute a Lua source string,
@@ -118,6 +122,10 @@ pub fn load_source_with_dispatcher_and_dir(
 
     let (raw, change_script, handlers) = builder.into_parts()?;
     let mut fixture = fixture::normalize_with_dir(raw, fixture_dir)?;
+    // Digest the script source, not the normalised fixture: a
+    // consumer with a byte-identical copy of the `.lua` reproduces
+    // this with `sha256sum`. `crate::lua::load` attaches the path.
+    fixture.identity = FixtureIdentity::of_source(source.as_bytes());
     fixture.change_script = change_script;
     // Announce triggers name change-script steps, and the script is
     // only attached here (normalize never sees it on the Lua path).

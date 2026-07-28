@@ -257,8 +257,13 @@ checking whether the fact is already in `notes/`.
   Also serves the test/admin control plane: `/test/smtp/submissions`,
   `/test/requests` (with `?stable=true` to strip wall-clock
   timestamps for byte-deterministic snapshots),
+  `/test/fixture/identity` (`{ name, path, sha256 }` over the fixture
+  SOURCE BYTES, so a consumer holding its own copy of a fixture file
+  can detect drift between the two copies; publish-only, the consumer
+  decides whether to check - see `notes/orchestration.md`),
   `/test/fixture/reset` (rewinds the fixture image to the post-load
-  baseline + clears volatile state + clears latency knob),
+  baseline + clears volatile state + clears latency knob; the
+  identity survives it),
   `/test/fixture/step` (cursor-driven application of the Lua-authored
   `change(...)` script; one Transition per step, atomic apply),
   `/test/snapshot-state` (thin JSON projection of fixture state),
@@ -553,6 +558,13 @@ checking whether the fact is already in `notes/`.
   own mutation (`messages/{id}/modify` vs `threads/{id}/modify`) and
   a change that arrives from the server. Drives the thread-mutation
   tests in `tests/gmail.rs`.
+- `fixtures/gmail-bulk-move.lua` - Gmail bulk mutation: every
+  container the bulk paths can name (inbox / junk / trash / archive
+  / a roleless `Label_mb-work`) plus messages sitting in SPAM and
+  TRASH. Stages the source-carrying bulk move - one `batchModify`
+  carrying destination AND source - the exclusive-container
+  un-spam / un-trash, and the archive-to-All-Mail path. Drives the
+  bulk-mutation tests in `tests/gmail.rs`.
 - `fixtures/calendar-no-scheduling.toml` - a plain RFC 4791 CalDAV
   store (`[caldav] scheduling = false`): the FALSE branch of a
   client's discovery-derived RSVP capability. Mirrors
@@ -1061,10 +1073,23 @@ bifrost's mutation pipeline splits on target: a
 `MutationTarget::Message` goes to `messages/{id}/modify` and a
 `MutationTarget::Thread` to `threads/{id}/modify` (`delete_thread`
 issues `DELETE /threads/{id}` only for an already-trashed thread).
-It does NOT currently drive either `batch*` form, so their coverage
-is not coverage of the mutation pipeline. The thread form loops the
-same per-message `modify_one` the message form uses, so
-`history.list` stays one-record-per-message as real Gmail does) +
+The `batch*` forms are driven by bifrost's separate BULK driver
+(`google account/mutation.rs`: `bulk_set_flags` / `bulk_move` ->
+`batchModify`, `bulk_destroy` -> `batchDelete`). The thread form
+loops the same per-message `modify_one` the message form uses, so
+`history.list` stays one-record-per-message as real Gmail does.
+Every mutating path honours a COMBINED add-and-remove in one
+request - the shape a bulk move drives, carrying destination and
+source together - applying adds before removes so `add INBOX` +
+`remove [SPAM, TRASH]` resolves to plain inbox membership. A patch
+that would leave a message in no mailbox is an ARCHIVE and lands it
+in the account's `role = "archive"` mailbox (Gmail All Mail, which
+`gmail_label_ids` projects to no label); with no archive mailbox
+declared, or with an `addLabelIds` naming an `INBOX`/`TRASH`/`SPAM`
+container the fixture declares no role mailbox for, the patch is
+rolled back whole and refused with `400 invalidArgument` rather
+than silently producing a state the fixture loader would reject.
+See the archive section of `notes/ratatoskr-gmail-surface.md`) +
 `/settings/sendAs`
 (list + per-address GET + PATCH). SendAs identities project from
 fixture `[[send_as]]` rows (TOML) or Lua `send_as({...})` builder,

@@ -2347,6 +2347,7 @@ mod tests {
         let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         Fixture {
             name: "t".into(),
+            identity: crate::fixture::FixtureIdentity::default(),
             state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "acct".into(),
@@ -2604,6 +2605,7 @@ mod tests {
         let mk = |y, m, d, hh| chrono::Utc.with_ymd_and_hms(y, m, d, hh, 0, 0).unwrap();
         Fixture {
             name: "q".into(),
+            identity: crate::fixture::FixtureIdentity::default(),
             state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "acct".into(),
@@ -2901,6 +2903,7 @@ mod tests {
             .unwrap();
         Fixture {
             name: "g".into(),
+            identity: crate::fixture::FixtureIdentity::default(),
             state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "acct".into(),

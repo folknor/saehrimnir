@@ -3772,3 +3772,170 @@ async fn mailbox_set_create_move_round_trips_through_mailbox_get() {
     assert!(list.iter().all(|m| m["name"] != json!("HarnessRenamed")));
     assert!(list.iter().all(|m| m["name"] != json!("HarnessParent")));
 }
+
+// ── Fixture identity digest ─────────────────────────────────────────
+//
+// `GET /test/fixture/identity` publishes `{ name, path, sha256 }` for
+// the fixture source this process was launched with. The consumer
+// problem it solves: a repository that keeps its own copy of a fixture
+// file has nothing enforcing that the two copies stay in step, so the
+// gate can drift into proving something else without anyone noticing.
+// The digest lets the consumer assert, at setup time, that the mock it
+// is driving is the copy it thinks it is driving.
+//
+// Two properties matter and are pinned below: the digest is over the
+// SOURCE BYTES (so `sha256sum <file>` reproduces it without this
+// crate), and it is a general affordance keyed on nothing but the
+// loaded file.
+
+/// Reference SHA-256 over `bytes`, computed independently of the
+/// production path's helper so the test would catch a hex-encoding or
+/// wrong-input regression rather than agreeing with itself.
+fn reference_sha256(bytes: &[u8]) -> String {
+    let d = ring::digest::digest(&ring::digest::SHA256, bytes);
+    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+async fn identity_of(fixture_path: &str) -> Value {
+    let fix = fixture::load(std::path::Path::new(fixture_path)).unwrap();
+    let app = routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/test/fixture/identity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn fixture_identity_publishes_source_digest_for_a_lua_fixture() {
+    let path = "fixtures/gmail-incremental.lua";
+    let v = identity_of(path).await;
+
+    assert_eq!(v["name"], "gmail-incremental");
+    // The digest is over the file as it sits on disk. A consumer with
+    // its own copy reproduces this with plain `sha256sum` - no shared
+    // code, which is what makes the check usable across a repo
+    // boundary.
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(v["sha256"], reference_sha256(&bytes));
+
+    // Path is absolute, resolved against the SERVER's cwd. Never
+    // against a compile-time manifest dir: saehrimnir is a nested
+    // workspace and the binary is routinely spawned from a parent
+    // checkout, where a manifest-relative path names the wrong file.
+    let reported = v["path"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(reported).is_absolute(),
+        "path must be absolute: {reported}"
+    );
+    assert!(reported.ends_with("fixtures/gmail-incremental.lua"), "{reported}");
+    assert_eq!(
+        std::fs::read(reported).unwrap(),
+        bytes,
+        "reported path must name the file that was actually hashed"
+    );
+}
+
+/// General affordance, not a special case for one file: the same
+/// route answers for a TOML fixture, and two different fixtures report
+/// two different digests. Equal digests here would mean the field was
+/// wired to something constant.
+#[tokio::test]
+async fn fixture_identity_is_general_and_discriminates_between_fixtures() {
+    let toml = identity_of("fixtures/jmap-small.toml").await;
+    assert_eq!(toml["name"], "jmap-small");
+    assert_eq!(
+        toml["sha256"],
+        reference_sha256(&std::fs::read("fixtures/jmap-small.toml").unwrap())
+    );
+
+    let lua_twin = identity_of("fixtures/jmap-small.lua").await;
+    // The two spellings normalise to the same fixture CONTENT (pinned
+    // in tests/lua_fixture.rs) but are different source files, so the
+    // digest must differ. This is exactly the drift a consumer is
+    // trying to detect.
+    assert_ne!(toml["sha256"], lua_twin["sha256"]);
+}
+
+/// A source-string load has no file behind it, so `path` is null while
+/// the digest still covers the source. A consumer reading a null path
+/// knows it is talking to a hand-built fixture, not a file it can
+/// compare against.
+#[tokio::test]
+async fn fixture_identity_from_a_source_string_has_no_path() {
+    let source = r#"
+        fixture({ name = "inline", state = "s0" })
+        account({ id = "a", name = "a@example.test", primary = true })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+    "#;
+    let fix = lua::load_source(source, "@inline").unwrap();
+    let app = routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/test/fixture/identity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["name"], "inline");
+    assert_eq!(v["path"], Value::Null);
+    assert_eq!(v["sha256"], reference_sha256(source.as_bytes()));
+}
+
+/// `POST /test/fixture/reset` rewinds the fixture to its post-load
+/// baseline. The identity must survive that: a consumer that checks
+/// the digest once at setup and resets between cases would otherwise
+/// see it vanish mid-run.
+#[tokio::test]
+async fn fixture_identity_survives_reset() {
+    let fix = fixture::load(std::path::Path::new("fixtures/jmap-small.toml")).unwrap();
+    let app = routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)));
+
+    let before = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/test/fixture/identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test/fixture/reset")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let after = body_json(
+        app.oneshot(
+            Request::builder()
+                .uri("/test/fixture/identity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(before, after);
+}

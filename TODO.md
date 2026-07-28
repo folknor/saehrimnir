@@ -66,7 +66,42 @@ public-folder tables (TOML-only today). Tighten
 client when that integration lands (the doc was authored from the
 EWS schemas + gap report, not a client citation).
 
-Two defects surfaced while landing that slice, neither in its scope:
+## From the Gmail bulk-mutation slice
+
+Landed: the fixture identity digest
+(`GET /test/fixture/identity`), the Gmail archive / zero-container
+reconciliation, and coverage of the previously-untested `batchModify`
+/ `batchDelete` paths. Lateral findings from that work:
+
+- **BUG: JMAP `Email/set` can still empty `mailbox_ids`.**
+  `src/jmap.rs:1594-1620`. Both the full replace (`mailboxIds: {}`)
+  and the patch form (`mailboxIds/<last-one>: null`) accept an update
+  that leaves the email in no mailbox - the same state the loader
+  rejects, now fixed on the Gmail side. JMAP is NOT the Gmail case:
+  RFC 8621 has no All Mail, an Email must belong to at least one
+  Mailbox, and the spec's answer is to reject with
+  `invalidProperties`. So the fix here is the opposite of the Gmail
+  one - refuse rather than fall back to the archive mailbox. IMAP
+  already gets this right (`EXPUNGE` destroys a message whose last
+  mailbox membership goes away); Graph's move always writes a single
+  non-empty parent.
+- **`apply_gmail_label` silently ignores unknown label ids.**
+  `src/gmail/mail.rs`. Anything without a `Label_` prefix that is not
+  a known system label is dropped on the floor; real Gmail 400s on an
+  invalid label id. The `INBOX` / `TRASH` / `SPAM` add case is now
+  refused (a fixture gap that would silently misplace a message), but
+  a typo'd `Labl_work` or a Gmail category label
+  (`CATEGORY_PERSONAL`, which the mock does not model) is still a
+  silent no-op. Tighten once a fixture cares, or once a consumer
+  starts driving category labels.
+- **`fixtures/gmail-threads.lua` declares no junk mailbox.** Any
+  future exclusive-container gate pointed at it would see `remove
+  SPAM` as a no-op that passes for the wrong reason.
+  `fixtures/gmail-bulk-move.lua` exists partly to avoid that; fold
+  the two if the thread fixture ever needs spam coverage.
+
+Two defects surfaced while landing an earlier slice, neither in its
+scope:
 
 - **BUG: `cmd_uid_store` derives UIDs positionally.** It walks the
   mailbox's emails and treats `slot + 1` as the UID instead of

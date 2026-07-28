@@ -3808,6 +3808,7 @@ mod tests {
     fn fixture() -> crate::shared::FixtureHandle {
         crate::shared::handle(Fixture {
             name: "t".into(),
+            identity: crate::fixture::FixtureIdentity::default(),
             state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "a".into(),
@@ -3877,6 +3878,7 @@ mod tests {
         };
         let mut fix = Fixture {
             name: "f".into(),
+            identity: crate::fixture::FixtureIdentity::default(),
             state_seed: "s1".into(),
             accounts: vec![Account {
                 id: "a".into(),
