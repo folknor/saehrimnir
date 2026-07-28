@@ -467,18 +467,29 @@ modelled:
 | `String {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name OwnerReactionType`  | `reaction_type`  |
 | `Integer {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name ReactionsCount`    | `reaction_count` |
 
-The consumer reads them by expanding the navigation property with a
-`$filter` on the ids, either on a plain message GET or (the shape it
-actually drives, chunked ~20 messages per batch) as `$batch`
-sub-requests:
+Two request shapes reach them, and both are served off one projection
+and one filter-selection rule:
 
 ```
+# 1. expand on the message
 GET /v1.0/me/messages/{id}
     ?$expand=singleValueExtendedProperties($filter=id eq '<owner id>'
                                             or id eq '<count id>')
+
+# 2. the nested property collection - THE shape the reaction refresh
+#    drives, one sub-request per message, chunked ~20 per $batch
+GET /v1.0/me/messages/{id}/singleValueExtendedProperties
+    ?$filter=id eq '<owner id>' or id eq '<count id>'
 ```
 
-Serving rules:
+Shape 1 returns the whole message projection with a
+`singleValueExtendedProperties` array on it; shape 2 returns only
+`{ "@odata.context": ..., "value": [ { id, value } ] }`. Do not
+conflate them: a consumer driving shape 2 reads `value`, and serving
+it the message projection (or a 501) is invisible to it except as a
+failure.
+
+Serving rules (both shapes):
 
 - The `$expand` clause is split paren-aware, so the inner `$select`
   of a sibling `attachments(...)` clause and the `or`-joined
@@ -502,6 +513,12 @@ Serving rules:
 - The same projection backs the folder message list and
   `messages/delta`, so an initial-sync page carries reactions without
   a per-message follow-up.
+- A message with no reaction staged is a clean 200 with an empty
+  collection, NOT an error. The consumer's three-lane batch accounting
+  treats a non-2xx item as `failed` and refuses to read it as a state,
+  so degrading "no reaction" to an error strands the cached reaction
+  instead of clearing it. A genuinely unknown message id is still a
+  per-item 404.
 
 Reactions are authorable in a fixture (`reaction_type` /
 `reaction_count` on `[[email]]`) and mutable mid-run through the

@@ -49,8 +49,10 @@ first. SMTP is essentially clean.
 **P0: none.** Open path (`research/bifrost/.../jmap/src/sync/factory.rs::open`)
 drives only `Email/get` (empty-ids state probe), `Mailbox/get`,
 `Thread/get`, and reads session capabilities - all implemented.
-`Principal/get` in `fetch_self_emails` is gated on the `principals`
-capability we deliberately never advertise, so it is never sent.
+`Principal/get` is gated on the `principals` capability, which is now
+advertised (with a per-account `principals:owner`) so a shared /
+foreign mailbox's owner email resolves; served by
+`src/jmap_principals.rs`.
 
 ### P1
 

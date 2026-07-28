@@ -83,6 +83,10 @@ pub fn router() -> Router<AppState> {
             get(get_message_value_me),
         )
         .route(
+            "/v1.0/me/messages/{message_id}/singleValueExtendedProperties",
+            get(get_message_extended_properties_me),
+        )
+        .route(
             "/v1.0/me/messages/{message_id}",
             get(get_message_me)
                 .patch(patch_message_me)
@@ -139,6 +143,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1.0/users/{user}/messages/{message_id}/$value",
             get(get_message_value_user),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{message_id}/singleValueExtendedProperties",
+            get(get_message_extended_properties_user),
         )
         .route(
             "/v1.0/users/{user}/messages/{message_id}",
@@ -237,6 +245,15 @@ async fn get_message_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_message_impl(state, &account_id, &message_id, raw).await
+}
+
+async fn get_message_extended_properties_me(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    get_message_extended_properties_impl(state, &account_id, &message_id, raw).await
 }
 
 async fn get_message_value_me(
@@ -407,6 +424,18 @@ async fn get_message_user(
         Err(r) => return r,
     };
     get_message_impl(state, &account_id, &message_id, raw).await
+}
+
+async fn get_message_extended_properties_user(
+    State(state): State<AppState>,
+    Path((user, message_id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    get_message_extended_properties_impl(state, &account_id, &message_id, raw).await
 }
 
 async fn get_message_value_user(
@@ -1550,6 +1579,29 @@ async fn get_message_impl(
     }
 }
 
+/// `GET /v1.0/me/messages/{id}/singleValueExtendedProperties` (and the
+/// `/users/{user}` twin) - the nested-collection form of the extended
+/// property read. bifrost drives this shape batched; the direct route
+/// exists so the surface is reachable unbatched too and the two share
+/// one projection.
+async fn get_message_extended_properties_impl(
+    state: AppState,
+    account_id: &str,
+    message_id: &str,
+    raw: Option<String>,
+) -> Response {
+    let fixture = state.fixture();
+    let q = odata::OdataQuery::parse(raw.as_deref());
+    match message_extended_properties_value(&fixture, account_id, message_id, q.filter.as_deref()) {
+        Some(v) => ok_json(v),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "ErrorItemNotFound",
+            &format!("message {message_id:?} not found"),
+        ),
+    }
+}
+
 /// `GET /v1.0/me/messages/{id}/$value` - the assembled RFC 822
 /// message bytes. bifrost's `open_raw_rfc822` (blob.rs) defers real
 /// body bytes to this endpoint after metadata hydration. Reuses the
@@ -2328,6 +2380,39 @@ fn message_get_value(
     Some(message_value_for(fixture, e, parent, expand))
 }
 
+/// `GET .../messages/{id}/singleValueExtendedProperties?$filter=...`
+/// as an OData collection read rather than an `$expand` on the message.
+///
+/// This is the shape bifrost's reaction refresh actually drives: it
+/// batches one nested-collection GET per message id, so the message
+/// projection never enters the picture and only the property entries
+/// come back. Returns `None` when the id is not in the account (the
+/// caller turns that into a per-item 404).
+///
+/// A message with no staged reaction is a clean 200 with an empty
+/// `value` array, NOT an error. The consumer reads an absent property
+/// as "no reaction", which is a real answer it acts on; degrading it to
+/// a non-2xx would push the item into the failed lane and strand the
+/// cached state instead.
+fn message_extended_properties_value(
+    fixture: &Fixture,
+    account_id: &str,
+    message_id: &str,
+    filter: Option<&str>,
+) -> Option<Value> {
+    let e = fixture
+        .emails_for(account_id)
+        .find(|e| e.id == message_id)?;
+    let props = reaction_properties(e, svep_selection(filter));
+    Some(json!({
+        "@odata.context": format!(
+            "https://graph.microsoft.com/v1.0/$metadata#users('{account_id}')\
+             /messages('{message_id}')/singleValueExtendedProperties"
+        ),
+        "value": props,
+    }))
+}
+
 /// `POST /v1.0/$batch` (Microsoft Graph JSON batching). bifrost
 /// hydrates message metadata by batching per-id `GET /me/messages/{id}`
 /// sub-requests through here (`client.rs::post_batch`,
@@ -2457,6 +2542,18 @@ fn dispatch_batch_request(
         ("GET", None) => {
             let expand = Expand::parse(odata::OdataQuery::parse(query).expand.as_deref());
             match message_get_value(fix, &account_id, message_id, expand) {
+                Some(v) => (200, v),
+                None => not_found(),
+            }
+        }
+        // The reaction refresh's per-message read. bifrost sends it as
+        // a nested-collection GET (not an `$expand` on the message), so
+        // without this arm every item fell through to the 501 default
+        // and the whole read landed in the consumer's failed lane.
+        ("GET", Some(SVEP)) => {
+            let filter = odata::OdataQuery::parse(query).filter;
+            match message_extended_properties_value(fix, &account_id, message_id, filter.as_deref())
+            {
                 Some(v) => (200, v),
                 None => not_found(),
             }
@@ -2787,23 +2884,38 @@ impl Expand {
             if clause.starts_with("attachments") {
                 out.attachments = true;
             } else if clause.starts_with(SVEP) {
-                // No inner filter = "give me every extended property
-                // on the item", so both reaction props are in scope.
-                let filter = clause_options(clause);
-                match filter {
-                    Some(f) => {
-                        let f = f.to_ascii_lowercase();
-                        out.owner_reaction_type |= f.contains(OWNER_REACTION_TYPE_NAME_LC);
-                        out.reactions_count |= f.contains(REACTIONS_COUNT_NAME_LC);
-                    }
-                    None => {
-                        out.owner_reaction_type = true;
-                        out.reactions_count = true;
-                    }
-                }
+                let selected = svep_selection(clause_options(clause));
+                out.owner_reaction_type |= selected.owner_reaction_type;
+                out.reactions_count |= selected.reactions_count;
             }
         }
         out
+    }
+}
+
+/// Which reaction properties a `singleValueExtendedProperties`
+/// `$filter` selects. Shared by the `$expand` inner-option parse and
+/// the nested-collection read
+/// (`/messages/{id}/singleValueExtendedProperties?$filter=...`), so the
+/// two paths can never disagree about what a filter means.
+///
+/// No filter at all = "give me every extended property on the item",
+/// which puts both reaction props in scope. Matching is substring on
+/// the lower-cased property NAME rather than the full id, so a
+/// consumer's GUID casing or spacing variant still resolves.
+fn svep_selection(filter: Option<&str>) -> Expand {
+    let Some(filter) = filter else {
+        return Expand {
+            attachments: false,
+            owner_reaction_type: true,
+            reactions_count: true,
+        };
+    };
+    let filter = filter.to_ascii_lowercase();
+    Expand {
+        attachments: false,
+        owner_reaction_type: filter.contains(OWNER_REACTION_TYPE_NAME_LC),
+        reactions_count: filter.contains(REACTIONS_COUNT_NAME_LC),
     }
 }
 

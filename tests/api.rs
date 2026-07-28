@@ -207,7 +207,7 @@ async fn jmap_raw_send_uploads_imports_and_submits_into_sent() {
 }
 
 #[tokio::test]
-async fn session_resource_advertises_core_and_mail_only() {
+async fn session_resource_advertises_core_mail_and_principals() {
     let resp = router()
         .oneshot(
             Request::builder()
@@ -222,9 +222,14 @@ async fn session_resource_advertises_core_and_mail_only() {
     let caps = v.get("capabilities").unwrap().as_object().unwrap();
     assert!(caps.contains_key("urn:ietf:params:jmap:core"));
     assert!(caps.contains_key("urn:ietf:params:jmap:mail"));
-    // Plan: must NOT advertise principals or the client takes
-    // shared-account / Principal/get paths the mock cannot satisfy.
-    assert!(!caps.contains_key("urn:ietf:params:jmap:principals"));
+    // RFC 9670 principals. A client gates shared-mailbox owner-email
+    // resolution on this key being present, so it is advertised
+    // unconditionally and the narrow `Principal/get` surface backs it.
+    let principals = caps
+        .get("urn:ietf:params:jmap:principals")
+        .expect("principals capability advertised");
+    assert_eq!(principals["accountIdForPrincipal"], "account-1");
+    assert_eq!(principals["currentUserPrincipalId"], "principal-account-1");
     // jmap-small carries no contact folders, so contacts must NOT be
     // advertised - otherwise bifrost enters the contacts sync flow.
     assert!(!caps.contains_key("urn:ietf:params:jmap:contacts"));
@@ -233,6 +238,171 @@ async fn session_resource_advertises_core_and_mail_only() {
     assert_eq!(accounts.len(), 1);
     let acct = accounts.get("account-1").unwrap();
     assert_eq!(acct.get("isPersonal").unwrap(), true);
+}
+
+// ── JMAP principals (RFC 9670) ──────────────────────────────────────
+
+fn shared_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/shared-rights.toml")).unwrap();
+    routes::router(routes::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+async fn post_jmap_to(app: axum::Router, envelope: Value) -> Value {
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jmap/api")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+/// Level TWO of the consumer's owner-email gate: the foreign account
+/// itself must carry `principals:owner` with a `principalId`. Without
+/// it the resolution degrades to a name heuristic (or nothing), so the
+/// principal id has to be on the SHARED account, not just the caller's.
+#[tokio::test]
+async fn session_advertises_an_owner_principal_on_every_account() {
+    let resp = shared_router()
+        .oneshot(
+            Request::builder()
+                .uri("/jmap/session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    let accounts = v["accounts"].as_object().unwrap();
+    let owner =
+        &accounts["account-team"]["accountCapabilities"]["urn:ietf:params:jmap:principals:owner"];
+    assert_eq!(
+        owner["principalId"], "principal-account-team",
+        "{accounts:?}"
+    );
+    // The principals account the follow-up `Principal/get` is issued
+    // against is the CALLER's, not the shared account's.
+    assert_eq!(owner["accountIdForPrincipal"], "account-alice");
+    // The personal account advertises its own owner too.
+    assert_eq!(
+        accounts["account-alice"]["accountCapabilities"]["urn:ietf:params:jmap:principals:owner"]["principalId"],
+        "principal-account-alice"
+    );
+}
+
+/// The whole point of the surface: a shared account's owner email,
+/// read out of `Principal/get` issued against the CALLER's account.
+/// Scoping the principal lookup to the requesting `accountId` would
+/// put the shared owner in `notFound`, and the consumer fails soft -
+/// it would silently resolve no owner rather than erroring.
+#[tokio::test]
+async fn principal_get_resolves_a_foreign_accounts_owner_email() {
+    let v = post_jmap_to(
+        shared_router(),
+        json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:principals"],
+            "methodCalls": [["Principal/get", {
+                "accountId": "account-alice",
+                "ids": ["principal-account-team"],
+                "properties": ["email", "name"],
+            }, "p0"]],
+        }),
+    )
+    .await;
+    let mr = &v["methodResponses"][0];
+    assert_eq!(mr[0], "Principal/get", "{v:?}");
+    let result = &mr[1];
+    assert_eq!(result["accountId"], "account-alice");
+    assert!(result["state"].is_string(), "{result:?}");
+    assert_eq!(result["notFound"], json!([]));
+    let principal = &result["list"][0];
+    assert_eq!(principal["id"], "principal-account-team");
+    assert_eq!(principal["email"], "team@example.com");
+    assert_eq!(principal["name"], "team@example.com");
+    assert_eq!(principal["type"], "individual");
+}
+
+#[tokio::test]
+async fn principal_get_reports_an_unknown_principal_as_not_found() {
+    let v = post_jmap_to(
+        shared_router(),
+        json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:principals"],
+            "methodCalls": [["Principal/get", {
+                "accountId": "account-alice",
+                "ids": ["principal-nope", "not-even-a-principal-id"],
+            }, "p0"]],
+        }),
+    )
+    .await;
+    let result = &v["methodResponses"][0][1];
+    assert_eq!(result["list"], json!([]));
+    assert_eq!(
+        result["notFound"],
+        json!(["principal-nope", "not-even-a-principal-id"])
+    );
+}
+
+#[tokio::test]
+async fn principal_get_with_null_ids_lists_every_account_principal() {
+    let v = post_jmap_to(
+        shared_router(),
+        json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:principals"],
+            "methodCalls": [["Principal/get", { "accountId": "account-alice" }, "p0"]],
+        }),
+    )
+    .await;
+    let list = v["methodResponses"][0][1]["list"].as_array().unwrap();
+    let ids: Vec<&str> = list.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        [
+            "principal-account-alice",
+            "principal-account-bob",
+            "principal-account-team"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn principal_get_rejects_an_unknown_account() {
+    let v = post_jmap_to(
+        shared_router(),
+        json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:principals"],
+            "methodCalls": [["Principal/get", { "accountId": "account-nope" }, "p0"]],
+        }),
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][0], "error");
+    assert_eq!(v["methodResponses"][0][1]["type"], "accountNotFound");
+}
+
+/// The principals capability unlocks exactly one method. The rest of
+/// RFC 9670 (and the `ShareNotification` family) stays out of scope, so
+/// a client probing it gets an honest `unknownMethod` rather than an
+/// empty-but-successful answer it would treat as authoritative.
+#[tokio::test]
+async fn principal_set_and_share_notification_stay_unknown_methods() {
+    for method in ["Principal/set", "Principal/query", "ShareNotification/get"] {
+        let v = post_jmap_to(
+            shared_router(),
+            json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:principals"],
+                "methodCalls": [[method, { "accountId": "account-alice" }, "p0"]],
+            }),
+        )
+        .await;
+        assert_eq!(v["methodResponses"][0][0], "error", "{method}: {v:?}");
+        assert_eq!(v["methodResponses"][0][1]["type"], "unknownMethod");
+    }
 }
 
 #[tokio::test]

@@ -159,9 +159,17 @@ checking whether the fact is already in `notes/`.
   `accountCapabilities`. Out-of-scope IMAP commands (NOTIFY,
   COMPRESS, etc.) return `BAD`. (`IDLE` is implemented - see the
   IMAP status section.)
-- The session must NOT advertise `urn:ietf:params:jmap:principals`.
-  It would pull the client into `Principal/get` and
-  `ShareNotification` paths the mock cannot satisfy.
+- The session advertises `urn:ietf:params:jmap:principals` (RFC 9670)
+  unconditionally, and every account advertises
+  `urn:ietf:params:jmap:principals:owner` with a `principalId`. That
+  pair is the two-level gate a client checks before resolving a
+  shared / foreign mailbox's OWNER EMAIL; without the session
+  capability no owner-email plan is made at all and the address comes
+  back as nothing. Backed by `Principal/get` only
+  (`src/jmap_principals.rs`) - `Principal/set` / `/changes` /
+  `/query` and the `ShareNotification` family stay `unknownMethod`.
+  See `notes/ratatoskr-jmap-surface.md` for the shapes and the two
+  silent-failure traps.
 - The session advertises `urn:ietf:params:jmap:calendars` iff the
   fixture carries any `[[calendar]]` entries; this gates the JMAP
   `Calendar/*` and `CalendarEvent/*` surface.
@@ -288,6 +296,13 @@ checking whether the fact is already in `notes/`.
   listener observe. `ContactCard/changes` unions
   `contact_delta_since` across the account's folders since JMAP
   carries no address-book filter on `/changes`.
+- `src/jmap_principals.rs` - JMAP principals surface (RFC 9670),
+  `Principal/get` only. Projects each fixture `Account` as its own
+  owner principal (`principal-<account_id>`, `email` = the account
+  `name`), which is what lets a client resolve a shared / foreign
+  mailbox's owner address. Lookup is account-UNSCOPED by design: the
+  request is issued against the CALLER's account and asks for a
+  FOREIGN account's principal, so scoping would 404 every share.
 - `src/imap.rs` - IMAP listener, connection state machine, command
   dispatcher, RFC 822 emit.
 - `src/smtp.rs` - SMTP submission listener + in-memory submission
@@ -515,6 +530,25 @@ per-account email delta onto threads (threads of created emails ->
 always empty since a gone email's `thread_id` is unrecoverable -
 bifrost re-fetches via `Thread/get` and reconciles). bifrost drives
 it on the first delta cycle after open.
+
+JMAP principals: `Principal/get` only (RFC 9670), in
+`src/jmap_principals.rs`. Serves exactly one consumer flow - the
+owner email of a foreign / shared account. The session advertises
+`urn:ietf:params:jmap:principals`
+(`currentUserPrincipalId` + `accountIdForPrincipal`) and every
+account advertises `urn:ietf:params:jmap:principals:owner`
+(`accountIdForPrincipal` = the caller's account, `principalId` =
+`principal-<that account's id>`); bifrost checks both levels before
+it will resolve an owner email at all. `Principal/get` returns the
+standard get envelope (`accountId` / `state` / `list` / `notFound`,
+all four required) with each principal as
+`{ id, type: "individual", name, email }`, `name` and `email` both
+the fixture `[[account]] name`. Lookup is deliberately NOT scoped by
+the request's `accountId`. The consumer fails soft on every error
+path, so a partial or misshapen response yields no owner email rather
+than an error - which is why the shape is pinned by tests rather than
+left to serialize incidentally. `Principal/set` / `/changes` /
+`/query` and `ShareNotification/*` stay `unknownMethod`.
 
 JMAP contacts: complete for v0 (RFC 9610 over RFC 9553 JSContact),
 in `src/jmap_contacts.rs`. Session advertises
@@ -814,9 +848,18 @@ read, selected by an `$expand=singleValueExtendedProperties($filter=
 id eq '...' or id eq '...')` clause naming the real Graph property
 ids `String {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name
 OwnerReactionType` and `Integer {41F28F13-83F4-4114-A584-EEDB5A6B0BFF}
-Name ReactionsCount`. Served on the single-message GET, the folder
-message list, `messages/delta`, and `$batch` GET sub-requests (the
-chunked shape the consumer actually drives). An unset slot omits the
+Name ReactionsCount`. TWO request shapes reach the same projection:
+the `$expand` above (single-message GET, folder message list,
+`messages/delta`), and the nested property collection
+`GET .../messages/{id}/singleValueExtendedProperties?$filter=...`,
+which returns only `{ "@odata.context", "value": [...] }` and is THE
+shape the consumer's reaction refresh drives - one sub-request per
+message, chunked ~20 per `$batch`. Both the direct route and the
+`$batch` sub-request path serve it. A message with no reaction staged
+is a clean 200 with an empty collection, never an error: the
+consumer's batch accounting routes any non-2xx into a failed lane and
+refuses to read it as state, so an error there strands the cached
+reaction instead of clearing it. An unset slot omits the
 property entirely rather than emitting an empty value - "absent" is
 how a removed reaction reads back, and it is a different state to
 "present but empty". `value` is a string on both properties (Graph

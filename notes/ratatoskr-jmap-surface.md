@@ -26,12 +26,14 @@ What ratatoskr reads off the session object:
 - `account.is_personal()` - must be `true` for the only account, or
   the shared-account branches fire.
   Source: `crates/jmap/src/sync/mod.rs:611-625`.
-- `account.name()` - used as a fallback email when principals lookup
-  fails. Should be the account's email address.
-- `session.has_capability("urn:ietf:params:jmap:principals")` - gates
-  `Principal/get` and `ShareNotification/changes` paths. **Do NOT
-  advertise this capability in v0.**
-  Source: `crates/jmap/src/sync/mod.rs:699`, `:842`.
+- `account.name()` - used as a fallback owner email when the account
+  advertises no owner principal. Should be the account's email address
+  (every mock surface follows that convention).
+- `session.has_capability("urn:ietf:params:jmap:principals")` - level
+  ONE of the shared-mailbox owner-email gate. The client makes NO
+  owner-email plan at all without it, not even the name fallback, so a
+  shared mailbox's owner address comes back as nothing. **Advertised.**
+  See "Principals" below.
 - The default account id (used when method calls don't specify an
   override) comes from `request.default_account_id()`, populated from
   the session's `primaryAccounts["urn:ietf:params:jmap:mail"]`.
@@ -45,13 +47,12 @@ Capabilities the session MUST advertise:
   calendar sync flow at `<ratatoskr>/crates/jmap/src/calendar_sync/
   mod.rs:sync_calendars`.
 
-Capabilities to NOT advertise (each pulls the client into work the
-mock can't satisfy in v0):
-
-- `urn:ietf:params:jmap:principals` - triggers `Principal/get` and
-  `ShareNotification/changes` polling.
-- `urn:ietf:params:jmap:submission` - only matters once we send.
-- `urn:ietf:params:jmap:websocket` - only matters once we push.
+- `urn:ietf:params:jmap:principals` - advertised unconditionally.
+  Principals are a property of the server, not of what the fixture
+  declares, and every fixture has at least one account with an owner.
+- `urn:ietf:params:jmap:submission` - advertised (the send surface
+  landed); `maxDelayedSend` is non-zero so scheduled send enables.
+- `urn:ietf:params:jmap:websocket` - advertised (push landed).
 
 The client tolerates missing capabilities; it just won't take those
 code paths.
@@ -83,8 +84,9 @@ right):
 
 6. `discover_shared_accounts` - iterates `session.accounts()`, skips
    `is_personal=true`. With one personal account, nothing happens.
-7. `resolve_shared_account_identities` - gated on principals
-   capability. Won't fire.
+7. Shared-account owner-email resolution - gated on the principals
+   capability, then on each account's `principals:owner`. Fires once
+   per foreign account; see "Principals" below.
 8. `jmap_contacts_initial_sync` - fails soft, just logs a warning.
    Plan 2 can ignore.
 9. Calendar sync flows through a separate `CalendarRuntime` (the
@@ -413,13 +415,75 @@ always orders by id).
 - Missing `state` on `Mailbox/get` or `Email/get` responses.
 - Missing `id` or `threadId` on an email - parser errors on either.
 - A non-personal account in `session.accounts()` - pulls the client
-  into shared-account sync.
-- Advertising `urn:ietf:params:jmap:principals` - pulls the client
-  into `Principal/get` and `ShareNotification/changes`.
+  into shared-account sync (which is the point of
+  `is_personal = false`, but a single-account fixture must not stage
+  one by accident).
+- A `principals:owner` capability naming a `principalId` that
+  `Principal/get` cannot resolve. The owner-email path deliberately
+  does NOT fall back to the account name once a principal id is
+  present, so an unresolvable id is worse than no id at all: it
+  silently yields no owner email.
 - An `Email/query` final page that returns exactly 50 ids - the loop
   re-queries with `position += 50` and the mock must terminate.
   Either return `< 50` on the last page, or return an empty page
   next.
+
+## Principals (RFC 9670)
+
+Scope: resolving the OWNER EMAIL of a foreign / shared account, and
+nothing else. `src/jmap_principals.rs`.
+
+The consumer's gate is two levels deep and both must pass:
+
+1. the SESSION advertises `urn:ietf:params:jmap:principals`. Without
+   it no owner-email plan is made for any account - not even the
+   account-name fallback - and every shared mailbox's owner resolves
+   to nothing.
+2. the individual ACCOUNT advertises
+   `urn:ietf:params:jmap:principals:owner` carrying a `principalId`.
+   That is what routes the account through `Principal/get`; an account
+   with the capability but no `principalId` falls back to its session
+   `name` when the name looks like an address.
+
+Shapes served:
+
+```jsonc
+// session capabilities
+"urn:ietf:params:jmap:principals": {
+  "currentUserPrincipalId": "principal-<caller account id>",
+  "accountIdForPrincipal": "<caller account id>"
+}
+// per-account accountCapabilities, on EVERY account
+"urn:ietf:params:jmap:principals:owner": {
+  "accountIdForPrincipal": "<caller account id>",
+  "principalId": "principal-<that account's id>"
+}
+```
+
+`Principal/get` returns the RFC 8620 get envelope - `accountId`,
+`state`, `list`, `notFound`, all four mandatory - with each principal
+projected as `{ id, type: "individual", name, email }`. `name` and
+`email` are both the fixture `[[account]] name`, which is the account's
+email address by mock-wide convention.
+
+Principal ids derive from account ids (`principal-<account_id>`), so
+the mapping is total and reversible with no fixture authoring.
+
+Two traps, both of which make the read silently return nothing rather
+than fail:
+
+- The lookup must NOT be scoped by the request's `accountId`. The
+  consumer asks its OWN account (`accountIdForPrincipal`) for the
+  principal of a DIFFERENT, foreign account; scoping would put every
+  shared owner in `notFound`.
+- The whole path fails soft on the consumer side. A missing `state`, a
+  missing `notFound`, or an `email` under a different key does not
+  error - it yields no owner email at all, which reads exactly like
+  "this share has no owner".
+
+Out of scope, and honestly `unknownMethod`: `Principal/set`,
+`Principal/changes`, `Principal/query`, and the `ShareNotification`
+family.
 
 ## Calendar surface
 

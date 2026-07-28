@@ -3173,6 +3173,129 @@ async fn graph_batch_reads_reactions_per_message() {
     assert_eq!(r3["singleValueExtendedProperties"], json!([]));
 }
 
+/// The `$filter` the consumer sends on the nested-collection read,
+/// un-encoded (it rides a `$batch` sub-request URL, which is a JSON
+/// string, not a request line).
+fn reactions_collection_query() -> String {
+    format!("$filter=id eq '{OWNER_REACTION_TYPE_ID}' or id eq '{REACTIONS_COUNT_ID}'")
+}
+
+/// Pull an entry out of a nested-collection extended-property read
+/// (`{ "value": [ { id, value } ] }`), as opposed to the `$expand`
+/// projection [`svep`] reads.
+fn collection_prop<'a>(body: &'a Value, id: &str) -> Option<&'a Value> {
+    body["value"].as_array()?.iter().find(|p| p["id"] == id)
+}
+
+/// The read the consumer's reaction refresh ACTUALLY issues: per-message
+/// `$batch` GETs on the nested `singleValueExtendedProperties`
+/// collection, not an `$expand` on the message. Every item must be 200,
+/// including the message with no reaction staged - the consumer routes
+/// any non-2xx into its failed lane, where a transient error is
+/// indistinguishable from a real answer and the cached reaction is
+/// stranded rather than updated.
+#[tokio::test]
+async fn graph_batch_reads_reactions_from_the_nested_property_collection() {
+    let q = reactions_collection_query();
+    let body = json!({
+        "requests": [
+            { "id": "0", "method": "GET",
+              "url": format!("/me/messages/email-001/singleValueExtendedProperties?{q}") },
+            { "id": "1", "method": "GET",
+              "url": format!("/me/messages/email-002/singleValueExtendedProperties?{q}") },
+            { "id": "2", "method": "GET",
+              "url": format!("/me/messages/email-003/singleValueExtendedProperties?{q}") },
+            { "id": "3", "method": "GET",
+              "url": format!("/me/messages/no-such-message/singleValueExtendedProperties?{q}") },
+        ]
+    });
+    let resp = reactions_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1.0/$batch")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let responses = v["responses"].as_array().unwrap();
+    let by_id = |id: &str| responses.iter().find(|r| r["id"] == id).unwrap();
+
+    // Owner reacted plus a count.
+    let r0 = by_id("0");
+    assert_eq!(r0["status"], 200, "{r0}");
+    assert_eq!(
+        collection_prop(&r0["body"], OWNER_REACTION_TYPE_ID).unwrap()["value"],
+        "like"
+    );
+    assert_eq!(
+        collection_prop(&r0["body"], REACTIONS_COUNT_ID).unwrap()["value"],
+        "3"
+    );
+
+    // Count only: the owner property is absent, not empty.
+    let r1 = by_id("1");
+    assert_eq!(r1["status"], 200, "{r1}");
+    assert!(collection_prop(&r1["body"], OWNER_REACTION_TYPE_ID).is_none());
+    assert_eq!(
+        collection_prop(&r1["body"], REACTIONS_COUNT_ID).unwrap()["value"],
+        "2"
+    );
+
+    // No reaction at all: a clean 200 with an empty collection. This is
+    // a real "no reaction" answer, not an error.
+    let r2 = by_id("2");
+    assert_eq!(r2["status"], 200, "{r2}");
+    assert_eq!(r2["body"]["value"], json!([]), "{r2}");
+
+    // An id that is not in the account is still a genuine per-item 404.
+    let r3 = by_id("3");
+    assert_eq!(r3["status"], 404, "{r3}");
+}
+
+/// The nested collection honours the `$filter` the same way the
+/// `$expand` inner option does - both go through one selection rule.
+#[tokio::test]
+async fn graph_extended_property_collection_honours_filter_and_404s() {
+    // Count only.
+    let (status, v) = get_json_with(
+        reactions_router(),
+        &format!(
+            "/v1.0/me/messages/email-001/singleValueExtendedProperties?{}",
+            pct_encode(&format!("$filter=id eq '{REACTIONS_COUNT_ID}'"))
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let props = v["value"].as_array().unwrap();
+    assert_eq!(props.len(), 1, "{v}");
+    assert_eq!(props[0]["id"], REACTIONS_COUNT_ID);
+
+    // No filter = every extended property on the item.
+    let (status, v) = get_json_with(
+        reactions_router(),
+        "/v1.0/me/messages/email-001/singleValueExtendedProperties",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["value"].as_array().unwrap().len(), 2, "{v}");
+
+    let (status, v) = get_json_with(
+        reactions_router(),
+        "/v1.0/me/messages/nope/singleValueExtendedProperties",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "ErrorItemNotFound");
+}
+
 #[tokio::test]
 async fn graph_reactions_surface_in_folder_listing_and_delta() {
     // The same projection backs the collection reads, so an initial

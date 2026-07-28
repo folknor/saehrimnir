@@ -24,6 +24,7 @@ pub mod imap;
 pub mod jmap;
 pub mod jmap_calendar;
 pub mod jmap_contacts;
+pub mod jmap_principals;
 pub mod latency;
 pub mod lua;
 pub mod oauth;

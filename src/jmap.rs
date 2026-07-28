@@ -177,6 +177,10 @@ fn dispatch(
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),
         },
+        "Principal/get" => match crate::jmap_principals::principal_get(&fix, args) {
+            Ok(v) => (name.to_string(), v),
+            Err(err) => ("error".to_string(), err),
+        },
         "Mailbox/changes" => match mailbox_changes(&fix, args) {
             Ok(v) => (name.to_string(), v),
             Err(err) => ("error".to_string(), err),

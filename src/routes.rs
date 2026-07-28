@@ -161,10 +161,12 @@ async fn root() -> &'static str {
 
 /// Session resource per RFC 8620 §2.
 ///
-/// Capabilities are deliberately limited to `core` + `mail` (see
-/// `notes/ratatoskr-jmap-surface.md` - advertising `principals`
-/// pulls the client into `Principal/get` and `ShareNotification`
-/// paths the mock can't satisfy in v0).
+/// Capabilities are `core` + `mail` + `submission` + `websocket` +
+/// `principals`, plus `calendars` / `contacts` gated on the fixture
+/// carrying those resources. See `notes/ratatoskr-jmap-surface.md`.
+/// `principals` is served narrowly (`Principal/get` only, for
+/// owner-email resolution); the `ShareNotification` family it nominally
+/// unlocks stays `unknownMethod`.
 // The Err variant is an axum `Response` (large); boxing it would break
 // the handler's `IntoResponse` impl, so allow rather than shrink. This
 // mirrors `enforce_bearer`, which boxes `Response` where it can.
@@ -251,6 +253,21 @@ async fn session(
                 json!({ "mayCreateAddressBook": true }),
             );
         }
+        // RFC 9670 account-level owner capability. This is what routes
+        // a foreign / shared account's owner-email resolution through
+        // `Principal/get` rather than a name heuristic: bifrost reads
+        // `principalId` here and `Principal/get`s it against
+        // `accountIdForPrincipal`. Advertised on every account (each
+        // account has exactly one owner - itself), not just the
+        // non-personal ones, because the capability describes the
+        // account's owner and is true for the personal account too.
+        caps.insert(
+            "urn:ietf:params:jmap:principals:owner".to_string(),
+            json!({
+                "accountIdForPrincipal": primary_id,
+                "principalId": crate::jmap_principals::principal_id_for(&acct.id),
+            }),
+        );
         // `isPersonal` is fixture-driven (`[[account]] is_personal`).
         // A foreign / shared mailbox staged with `is_personal = false`
         // advertises as non-personal here, which is how a JMAP client
@@ -353,6 +370,22 @@ async fn session(
         json!({
             "url": format!("{ws_base}/jmap/ws"),
             "supportsPush": true,
+        }),
+    );
+    // RFC 9670 principals. Level ONE of bifrost's owner-email gate: a
+    // session without this key makes no owner-email plan at all, so a
+    // shared mailbox's owner address resolves to nothing no matter what
+    // the per-account capability says. `accountIdForPrincipal` names
+    // the account `Principal/*` methods are issued against (the
+    // caller's own), and `currentUserPrincipalId` the caller's own
+    // principal. Unconditional: principals are a property of the
+    // server, not of what the fixture happens to declare, and every
+    // fixture has at least one account with an owner.
+    top_caps.insert(
+        "urn:ietf:params:jmap:principals".to_string(),
+        json!({
+            "currentUserPrincipalId": crate::jmap_principals::principal_id_for(&primary_id),
+            "accountIdForPrincipal": primary_id,
         }),
     );
     if advertise_calendars {
