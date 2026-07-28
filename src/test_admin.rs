@@ -1039,6 +1039,7 @@ impl StepTouches {
             match op {
                 ChangeOp::EmailCreate(_)
                 | ChangeOp::EmailUpdate { .. }
+                | ChangeOp::EmailReaction { .. }
                 | ChangeOp::EmailMove { .. }
                 | ChangeOp::EmailDestroy { .. } => t.emails = true,
                 ChangeOp::MailboxCreate(_)
@@ -1180,6 +1181,37 @@ fn apply_change_step(
                 if let Some(c) = crate::fixture::gmail_label_change(id, &old_labels, &new_labels) {
                     diff.email_label_changes.push(c);
                 }
+            }
+            ChangeOp::EmailReaction {
+                id,
+                reaction_type,
+                reaction_count,
+                clear,
+            } => {
+                let Some(idx) = fix.emails.iter().position(|e| &e.id == id) else {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "notFound",
+                        &format!("email_reaction {id:?}: no such email"),
+                    ));
+                };
+                if *clear {
+                    fix.emails[idx].reaction_type = None;
+                    fix.emails[idx].reaction_count = None;
+                } else {
+                    if let Some(t) = reaction_type {
+                        fix.emails[idx].reaction_type = Some(t.clone());
+                    }
+                    if let Some(c) = reaction_count {
+                        fix.emails[idx].reaction_count = Some(*c);
+                    }
+                }
+                // Mailbox membership and keywords are untouched, so no
+                // UID sync and no Gmail label change - just the update
+                // marker, which is what makes the next Graph delta /
+                // JMAP Email/changes cycle re-hydrate the message.
+                diff.email_updated.push(id.clone());
             }
             ChangeOp::EmailMove { id, mailbox_ids } => {
                 for mid in mailbox_ids {

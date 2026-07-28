@@ -247,6 +247,103 @@ fn lua_incremental_fixture_matches_equivalent_toml() {
     assert_eq!(from_toml.change_script[3].id, "move");
 }
 
+/// The reaction slots and the `email_reaction` change op have to land
+/// identically on both authoring paths - they share `RawFixture` and
+/// `normalize`, so a field wired into one loader and not the other is
+/// the failure mode this pins.
+#[test]
+fn lua_reactions_fixture_matches_equivalent_toml() {
+    let from_toml = fixture::load(Path::new("fixtures/graph-reactions.toml")).unwrap();
+    let from_lua = fixture::load(Path::new("fixtures/graph-reactions.lua")).unwrap();
+    assert_eq!(from_toml, from_lua);
+
+    // Baseline covers all three authorable states.
+    let by_id = |id: &str| {
+        from_toml
+            .emails
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap_or_else(|| panic!("no {id}"))
+    };
+    assert_eq!(by_id("email-001").reaction_type.as_deref(), Some("like"));
+    assert_eq!(by_id("email-001").reaction_count, Some(3));
+    // Count with no owner type: the slots are independent.
+    assert_eq!(by_id("email-002").reaction_type, None);
+    assert_eq!(by_id("email-002").reaction_count, Some(2));
+    // Neither.
+    assert_eq!(by_id("email-003").reaction_type, None);
+    assert_eq!(by_id("email-003").reaction_count, None);
+
+    // add -> change -> remove.
+    assert_eq!(from_toml.change_script.len(), 3);
+    assert_eq!(
+        from_toml.change_script[0].ops,
+        vec![fixture::ChangeOp::EmailReaction {
+            id: "email-003".into(),
+            reaction_type: Some("heart".into()),
+            reaction_count: Some(1),
+            clear: false,
+        }]
+    );
+    assert_eq!(
+        from_toml.change_script[2].ops,
+        vec![fixture::ChangeOp::EmailReaction {
+            id: "email-003".into(),
+            reaction_type: None,
+            reaction_count: None,
+            clear: true,
+        }]
+    );
+}
+
+#[test]
+fn lua_reaction_op_rejects_clear_with_values() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "x", state = "s" })
+        account({ id = "a1", name = "a@b.test" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "hi",
+        })
+        change({
+            id = "bad",
+            email_reaction = { { id = "e1", clear = true, reaction_type = "like" } },
+        })
+        "#,
+        "@bad-reaction",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("mutually exclusive"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn lua_reaction_op_rejects_empty_entry() {
+    let err = lua::load_source(
+        r#"
+        fixture({ name = "x", state = "s" })
+        account({ id = "a1", name = "a@b.test" })
+        mailbox({ id = "mb", name = "Inbox", role = "inbox" })
+        email({
+            id = "e1",
+            mailbox_ids = {"mb"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "hi",
+        })
+        change({ id = "bad", email_reaction = { { id = "e1" } } })
+        "#,
+        "@empty-reaction",
+    )
+    .unwrap_err();
+    assert!(err.contains("at least one of"), "unexpected error: {err}");
+}
+
 #[test]
 fn lua_attach_fixture_matches_equivalent_toml() {
     let from_toml = fixture::load(Path::new("fixtures/jmap-attach.toml")).unwrap();

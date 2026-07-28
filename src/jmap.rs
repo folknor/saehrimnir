@@ -1522,6 +1522,8 @@ fn build_email_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
         body: crate::fixture::Body::Text(body_text),
         attachments: vec![],
         raw_bytes: None,
+        reaction_type: None,
+        reaction_count: None,
     };
     Ok((server_id, email))
 }
@@ -1787,6 +1789,8 @@ fn build_email_from_import(fix: &mut Fixture, body: &Value) -> Result<(String, E
         body: crate::fixture::Body::Text(parsed.body_text.unwrap_or_default()),
         attachments: vec![],
         raw_bytes: Some(raw_string),
+        reaction_type: None,
+        reaction_count: None,
     };
     Ok((server_id, email))
 }
@@ -2390,6 +2394,8 @@ mod tests {
                     body: Body::Text("x".into()),
                     attachments: vec![],
                     raw_bytes: None,
+                    reaction_type: None,
+                    reaction_count: None,
                 },
                 Email {
                     id: "e2".into(),
@@ -2414,6 +2420,8 @@ mod tests {
                     body: Body::Text("y".into()),
                     attachments: vec![],
                     raw_bytes: None,
+                    reaction_type: None,
+                    reaction_count: None,
                 },
             ],
             oauth: crate::fixture::OAuthConfig::default(),
@@ -2581,6 +2589,8 @@ mod tests {
             body: Body::Text("x".into()),
             attachments: vec![],
             raw_bytes: None,
+            reaction_type: None,
+            reaction_count: None,
         }
     }
 
@@ -2928,6 +2938,8 @@ mod tests {
                 body: Body::Text("hello".into()),
                 attachments: vec![],
                 raw_bytes: None,
+                reaction_type: None,
+                reaction_count: None,
             }],
             oauth: crate::fixture::OAuthConfig::default(),
             discovery: crate::fixture::DiscoveryConfig::default(),

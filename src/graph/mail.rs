@@ -667,7 +667,7 @@ async fn list_messages_impl(
     };
     let q = odata::OdataQuery::parse(raw.as_deref());
     let host = host_or_default(&headers);
-    let expand = expand_attachments(q.expand.as_deref());
+    let expand = Expand::parse(q.expand.as_deref());
 
     let mut messages = sorted_messages_in(&fixture, account_id, &m.id);
     if let Some(filter) = &q.filter
@@ -731,7 +731,7 @@ async fn list_messages_collection_impl(
     let fixture = state.fixture();
     let q = odata::OdataQuery::parse(raw.as_deref());
     let host = host_or_default(&headers);
-    let expand = expand_attachments(q.expand.as_deref());
+    let expand = Expand::parse(q.expand.as_deref());
 
     let mut messages: Vec<&Email> = fixture.emails_for(account_id).collect();
     if let Some(filter) = &q.filter
@@ -817,7 +817,7 @@ async fn delta_messages_impl(
     };
     let q = odata::OdataQuery::parse(raw.as_deref());
     let host = host_or_default(&headers);
-    let expand = expand_attachments(q.expand.as_deref());
+    let expand = Expand::parse(q.expand.as_deref());
     let path = if me_path {
         format!("/v1.0/me/mailFolders/{}/messages/delta", m.id)
     } else {
@@ -1516,7 +1516,7 @@ async fn get_message_impl(
     }
     let fixture = state.fixture();
     let q = odata::OdataQuery::parse(raw.as_deref());
-    let expand = expand_attachments(q.expand.as_deref());
+    let expand = Expand::parse(q.expand.as_deref());
     match message_get_value(&fixture, account_id, message_id, expand) {
         Some(mut v) => {
             // Real Graph also returns the etag in an `ETag` HTTP header
@@ -1746,7 +1746,7 @@ fn patch_message_core(
         apply_graph_message_patch(&mut email, body);
         let parent = email.mailbox_ids.first().cloned().unwrap_or_default();
         let etag = email_etag(f, &acct, &mid);
-        projected = Some(message_value(&email, &parent, false, &etag));
+        projected = Some(message_value(&email, &parent, Expand::default(), &etag));
         f.emails[idx] = email;
         MutationDiff {
             email_updated: vec![mid.clone()],
@@ -1823,7 +1823,12 @@ fn move_message_core(
         f.emails[idx].mailbox_ids = new.clone();
         f.sync_mailbox_uids(&mid, &old, &new);
         let etag = email_etag(f, &acct, &mid);
-        projected = Some(message_value(&f.emails[idx], &dest, false, &etag));
+        projected = Some(message_value(
+            &f.emails[idx],
+            &dest,
+            Expand::default(),
+            &etag,
+        ));
         MutationDiff {
             email_updated: vec![mid.clone()],
             ..Default::default()
@@ -2153,11 +2158,13 @@ fn create_draft_mime_core(
             body: Body::Text(parsed.body_text.clone().unwrap_or_default()),
             attachments: vec![],
             raw_bytes: Some(raw_string.clone()),
+            reaction_type: None,
+            reaction_count: None,
         };
         f.emails.push(email.clone());
         f.assign_uid(&fid, id.clone());
         let etag = email_etag(f, &acct, &id);
-        projected = message_value(&email, &fid, false, &etag);
+        projected = message_value(&email, &fid, Expand::default(), &etag);
         MutationDiff {
             email_created: vec![id],
             ..Default::default()
@@ -2269,11 +2276,13 @@ fn create_draft_core(fix: &mut Fixture, account_id: &str, folder_id: &str, body:
             body: Body::Text(body_text),
             attachments: vec![],
             raw_bytes: None,
+            reaction_type: None,
+            reaction_count: None,
         };
         f.emails.push(email.clone());
         f.assign_uid(&fid, id.clone());
         let etag = email_etag(f, &acct, &id);
-        projected = message_value(&email, &fid, false, &etag);
+        projected = message_value(&email, &fid, Expand::default(), &etag);
         MutationDiff {
             email_created: vec![id],
             ..Default::default()
@@ -2310,7 +2319,7 @@ fn message_get_value(
     fixture: &Fixture,
     account_id: &str,
     message_id: &str,
-    expand: bool,
+    expand: Expand,
 ) -> Option<Value> {
     let e = fixture
         .emails_for(account_id)
@@ -2446,7 +2455,7 @@ fn dispatch_batch_request(
 
     match (method, suffix) {
         ("GET", None) => {
-            let expand = expand_attachments(odata::OdataQuery::parse(query).expand.as_deref());
+            let expand = Expand::parse(odata::OdataQuery::parse(query).expand.as_deref());
             match message_get_value(fix, &account_id, message_id, expand) {
                 Some(v) => (200, v),
                 None => not_found(),
@@ -2562,13 +2571,13 @@ fn message_value_for(
     fixture: &Fixture,
     e: &Email,
     parent_folder_id: &str,
-    expand_attachments: bool,
+    expand: Expand,
 ) -> Value {
     let etag = email_etag(fixture, &e.account_id, &e.id);
-    message_value(e, parent_folder_id, expand_attachments, &etag)
+    message_value(e, parent_folder_id, expand, &etag)
 }
 
-fn message_value(e: &Email, parent_folder_id: &str, expand_attachments: bool, etag: &str) -> Value {
+fn message_value(e: &Email, parent_folder_id: &str, expand: Expand, etag: &str) -> Value {
     let mut obj = Map::new();
     obj.insert("id".to_string(), Value::String(e.id.clone()));
     // `@odata.etag` is the `If-Match` precondition value bifrost's
@@ -2644,7 +2653,7 @@ fn message_value(e: &Email, parent_folder_id: &str, expand_attachments: bool, et
             None => Value::Null,
         },
     );
-    let attachments_array: Vec<Value> = if expand_attachments {
+    let attachments_array: Vec<Value> = if expand.attachments {
         e.attachments
             .iter()
             .map(|a| graph_attachment_value(&e.id, a, true))
@@ -2653,9 +2662,12 @@ fn message_value(e: &Email, parent_folder_id: &str, expand_attachments: bool, et
         Vec::new()
     };
     obj.insert("attachments".to_string(), Value::Array(attachments_array));
+    // The key is always present (an unexpanded read gets an empty
+    // array rather than a missing key), so a consumer that reads the
+    // field unconditionally never has to special-case its absence.
     obj.insert(
-        "singleValueExtendedProperties".to_string(),
-        Value::Array(vec![]),
+        SVEP.to_string(),
+        Value::Array(reaction_properties(e, expand)),
     );
     Value::Object(obj)
 }
@@ -2740,13 +2752,153 @@ fn next_offset(offset: u32, top: u32, total: u64) -> Option<u32> {
     }
 }
 
-/// True when the OData `$expand` clause asks for the `attachments`
-/// navigation property. Real Graph supports `$expand=attachments` and
-/// `$expand=attachments($select=...)`; we just look for the prefix.
-fn expand_attachments(expand: Option<&str>) -> bool {
-    expand
-        .map(|s| s.split(',').any(|p| p.trim().starts_with("attachments")))
-        .unwrap_or(false)
+/// Which navigation properties an OData `$expand` clause asked for.
+///
+/// The clause bifrost sends on initial / delta sync names two:
+///
+/// ```text
+/// $expand=attachments($select=id,name,contentType,size,isInline,contentId,contentBytes),
+///         singleValueExtendedProperties($filter=id eq '...' or id eq '...')
+/// ```
+///
+/// Both inner options carry commas, so the top-level clause has to be
+/// split paren-aware ([`split_expand_clauses`]) - a naive `split(',')`
+/// shreds the `$select` list and the `$filter` disjunction into
+/// fragments, which is why the old attachments-only check happened to
+/// work (attachments is always first) but could not be extended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Expand {
+    attachments: bool,
+    /// `String {GUID} Name OwnerReactionType` was selected by the
+    /// `singleValueExtendedProperties` `$filter`.
+    owner_reaction_type: bool,
+    /// `Integer {GUID} Name ReactionsCount` was selected.
+    reactions_count: bool,
+}
+
+impl Expand {
+    fn parse(expand: Option<&str>) -> Self {
+        let mut out = Self::default();
+        let Some(expand) = expand else {
+            return out;
+        };
+        for clause in split_expand_clauses(expand) {
+            let clause = clause.trim();
+            if clause.starts_with("attachments") {
+                out.attachments = true;
+            } else if clause.starts_with(SVEP) {
+                // No inner filter = "give me every extended property
+                // on the item", so both reaction props are in scope.
+                let filter = clause_options(clause);
+                match filter {
+                    Some(f) => {
+                        let f = f.to_ascii_lowercase();
+                        out.owner_reaction_type |= f.contains(OWNER_REACTION_TYPE_NAME_LC);
+                        out.reactions_count |= f.contains(REACTIONS_COUNT_NAME_LC);
+                    }
+                    None => {
+                        out.owner_reaction_type = true;
+                        out.reactions_count = true;
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Split a `$expand` clause on top-level commas only, leaving commas
+/// nested inside `(...)` options alone.
+fn split_expand_clauses(expand: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in expand.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&expand[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&expand[start..]);
+    out
+}
+
+/// The text between the outermost `(` and its matching `)` in one
+/// expand clause, e.g. the `$filter=...` of
+/// `singleValueExtendedProperties($filter=...)`. `None` when the
+/// clause carries no options at all.
+fn clause_options(clause: &str) -> Option<&str> {
+    let open = clause.find('(')?;
+    let close = clause.rfind(')')?;
+    if close <= open + 1 {
+        return None;
+    }
+    Some(&clause[open + 1..close])
+}
+
+/// Named-property set GUID Exchange stores message reactions under.
+/// Documented in `notes/ratatoskr-graph-surface.md`; a consumer
+/// filtering on the real id must match what we serve, so this is the
+/// literal GUID real Graph uses, braces and upper case included.
+const REACTIONS_GUID: &str = "{41F28F13-83F4-4114-A584-EEDB5A6B0BFF}";
+/// The `$expand` navigation-property name.
+const SVEP: &str = "singleValueExtendedProperties";
+/// Lower-cased property names, for case-insensitive `$filter`
+/// matching. Real Graph is case-sensitive on the `Name` segment; we
+/// are deliberately liberal so a consumer spelling variant still
+/// resolves (same posture as the `0x3fef` proptag match in
+/// [`deferred_send_time`]).
+const OWNER_REACTION_TYPE_NAME_LC: &str = "ownerreactiontype";
+const REACTIONS_COUNT_NAME_LC: &str = "reactionscount";
+
+/// Canonical id of the owner-reaction-type property, as real Graph
+/// echoes it back in the response.
+fn owner_reaction_type_id() -> String {
+    format!("String {REACTIONS_GUID} Name OwnerReactionType")
+}
+
+/// Canonical id of the reactions-count property.
+fn reactions_count_id() -> String {
+    format!("Integer {REACTIONS_GUID} Name ReactionsCount")
+}
+
+/// Project the message's reaction state as Graph
+/// `singleValueExtendedProperties` entries, filtered to whatever the
+/// `$expand` clause selected.
+///
+/// Two absence rules, both load-bearing for a consumer reconciling
+/// reaction state:
+///
+/// - A property the `$expand` did not select is never emitted, even
+///   when the fixture stages a value.
+/// - A selected property whose fixture slot is `None` is omitted
+///   entirely rather than emitted with an empty / zero `value`. Real
+///   Graph does the same (the named property simply does not exist on
+///   the item), and "absent" is what tells the consumer the reaction
+///   was removed rather than set to nothing.
+///
+/// `value` is a string on both properties even though the count is an
+/// `Integer`-typed MAPI property - Graph's
+/// `singleValueLegacyExtendedProperty` resource types `value` as
+/// `String` regardless of the underlying MAPI type.
+fn reaction_properties(e: &Email, expand: Expand) -> Vec<Value> {
+    let mut out = Vec::new();
+    if expand.owner_reaction_type
+        && let Some(t) = &e.reaction_type
+    {
+        out.push(json!({ "id": owner_reaction_type_id(), "value": t }));
+    }
+    if expand.reactions_count
+        && let Some(c) = e.reaction_count
+    {
+        out.push(json!({ "id": reactions_count_id(), "value": c.to_string() }));
+    }
+    out
 }
 
 fn graph_attachment_value(message_id: &str, a: &Attachment, include_bytes: bool) -> Value {

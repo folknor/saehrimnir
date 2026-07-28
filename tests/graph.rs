@@ -2969,3 +2969,241 @@ async fn folder_move_reparent_round_trips_through_list() {
         "deleted parent still listed"
     );
 }
+
+// ── Message reactions (singleValueExtendedProperties) ────────────────
+
+fn reactions_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-reactions.toml")).unwrap();
+    graph::router(graph::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+/// The GUID-qualified property ids real Graph uses for Exchange
+/// reactions. Spelled out literally here rather than pulled from a
+/// crate constant: the point of the assertion is that a consumer
+/// filtering on the *real* id matches what the mock serves, so the
+/// test must not share a typo with the implementation.
+const OWNER_REACTION_TYPE_ID: &str =
+    "String {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name OwnerReactionType";
+const REACTIONS_COUNT_ID: &str =
+    "Integer {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name ReactionsCount";
+
+/// The `$expand` clause the consumer sends, percent-encoded for the
+/// request line. Mirrors bifrost's shape: `attachments(...)` first,
+/// then `singleValueExtendedProperties($filter=id eq '..' or id eq
+/// '..')` - both carrying commas / `=` inside their options.
+fn reactions_expand_query() -> String {
+    let clause = format!(
+        "attachments($select=id,name,contentType),\
+         singleValueExtendedProperties($filter=id eq '{OWNER_REACTION_TYPE_ID}' \
+         or id eq '{REACTIONS_COUNT_ID}')"
+    );
+    format!("$expand={}", pct_encode(&clause))
+}
+
+/// Minimal percent-encoder for the characters a URI query cannot carry
+/// literally (space / braces / quotes). Everything else passes through.
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            ' ' => out.push_str("%20"),
+            '{' => out.push_str("%7B"),
+            '}' => out.push_str("%7D"),
+            '\'' => out.push_str("%27"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Pull the `singleValueExtendedProperties` entry with the given id out
+/// of a projected message. `None` when the property is absent.
+fn svep<'a>(msg: &'a Value, id: &str) -> Option<&'a Value> {
+    msg["singleValueExtendedProperties"]
+        .as_array()?
+        .iter()
+        .find(|p| p["id"] == id)
+}
+
+#[tokio::test]
+async fn graph_reactions_expand_serves_both_extended_properties() {
+    let q = reactions_expand_query();
+
+    // Owner reacted and others did: both properties present.
+    let (status, v) = get_json_with(
+        reactions_router(),
+        &format!("/v1.0/me/messages/email-001?{q}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        svep(&v, OWNER_REACTION_TYPE_ID).unwrap()["value"],
+        "like",
+        "owner reaction type: {v}"
+    );
+    // Graph types `value` as a string even for an Integer-typed MAPI
+    // property, so the count arrives quoted.
+    assert_eq!(svep(&v, REACTIONS_COUNT_ID).unwrap()["value"], "3");
+
+    // Others reacted but the owner did not: count only. The owner-type
+    // property is absent, NOT present with an empty value.
+    let (status, v) = get_json_with(
+        reactions_router(),
+        &format!("/v1.0/me/messages/email-002?{q}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        svep(&v, OWNER_REACTION_TYPE_ID).is_none(),
+        "owner type must be absent, not empty: {v}"
+    );
+    assert_eq!(svep(&v, REACTIONS_COUNT_ID).unwrap()["value"], "2");
+
+    // Nobody reacted: the array is empty even though the $expand
+    // selected both properties.
+    let (status, v) = get_json_with(
+        reactions_router(),
+        &format!("/v1.0/me/messages/email-003?{q}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v["singleValueExtendedProperties"],
+        json!([]),
+        "no reaction staged: {v}"
+    );
+
+    // The sibling attachments expand in the same clause still parses:
+    // the paren-aware split must not shred it.
+    assert!(v["attachments"].is_array());
+}
+
+#[tokio::test]
+async fn graph_reactions_absent_without_expand() {
+    // No $expand: the key is still present (consumers read it
+    // unconditionally) but empty, even for a message that has both
+    // properties staged.
+    let (status, v) = get_json_with(reactions_router(), "/v1.0/me/messages/email-001").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["singleValueExtendedProperties"], json!([]));
+
+    // An $expand that names only attachments does not leak reactions.
+    let (status, v) = get_json_with(
+        reactions_router(),
+        "/v1.0/me/messages/email-001?$expand=attachments($select=id,name)",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["singleValueExtendedProperties"], json!([]));
+}
+
+#[tokio::test]
+async fn graph_reactions_filter_selects_one_property() {
+    // A $filter naming only the count gets only the count back, even
+    // though the message also carries an owner reaction type.
+    let clause = format!("singleValueExtendedProperties($filter=id eq '{REACTIONS_COUNT_ID}')");
+    let (status, v) = get_json_with(
+        reactions_router(),
+        &format!(
+            "/v1.0/me/messages/email-001?$expand={}",
+            pct_encode(&clause)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let props = v["singleValueExtendedProperties"].as_array().unwrap();
+    assert_eq!(props.len(), 1, "only the count was selected: {v}");
+    assert_eq!(props[0]["id"], REACTIONS_COUNT_ID);
+
+    // An unfiltered expand means "every extended property on the item".
+    let (status, v) = get_json_with(
+        reactions_router(),
+        "/v1.0/me/messages/email-001?$expand=singleValueExtendedProperties",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v["singleValueExtendedProperties"].as_array().unwrap().len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn graph_batch_reads_reactions_per_message() {
+    // The shape the consumer actually drives: a chunked $batch of
+    // per-message extended-property reads.
+    let q = reactions_expand_query();
+    let body = json!({
+        "requests": [
+            { "id": "1", "method": "GET", "url": format!("/me/messages/email-001?{q}") },
+            { "id": "2", "method": "GET", "url": format!("/me/messages/email-002?{q}") },
+            { "id": "3", "method": "GET", "url": format!("/me/messages/email-003?{q}") },
+        ]
+    });
+    let resp = reactions_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1.0/$batch")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let responses = v["responses"].as_array().unwrap();
+    let by_id = |id: &str| responses.iter().find(|r| r["id"] == id).unwrap();
+
+    let r1 = &by_id("1")["body"];
+    assert_eq!(svep(r1, OWNER_REACTION_TYPE_ID).unwrap()["value"], "like");
+    assert_eq!(svep(r1, REACTIONS_COUNT_ID).unwrap()["value"], "3");
+
+    let r2 = &by_id("2")["body"];
+    assert!(svep(r2, OWNER_REACTION_TYPE_ID).is_none());
+    assert_eq!(svep(r2, REACTIONS_COUNT_ID).unwrap()["value"], "2");
+
+    // Cleared / never-set message: empty array, not a missing key and
+    // not an entry with an empty value.
+    let r3 = &by_id("3")["body"];
+    assert_eq!(r3["singleValueExtendedProperties"], json!([]));
+}
+
+#[tokio::test]
+async fn graph_reactions_surface_in_folder_listing_and_delta() {
+    // The same projection backs the collection reads, so an initial
+    // sync page carries reactions without a per-message follow-up.
+    let q = reactions_expand_query();
+    let (status, v) = get_json_with(
+        reactions_router(),
+        &format!("/v1.0/me/mailFolders/mb-inbox/messages?{q}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let msg = v["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "email-001")
+        .unwrap();
+    assert_eq!(svep(msg, OWNER_REACTION_TYPE_ID).unwrap()["value"], "like");
+
+    let (status, v) = get_json_with(
+        reactions_router(),
+        &format!("/v1.0/me/mailFolders/mb-inbox/messages/delta?{q}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let msg = v["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "email-002")
+        .unwrap();
+    assert_eq!(svep(msg, REACTIONS_COUNT_ID).unwrap()["value"], "2");
+    assert!(svep(msg, OWNER_REACTION_TYPE_ID).is_none());
+}

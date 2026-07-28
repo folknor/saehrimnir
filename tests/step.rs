@@ -687,6 +687,87 @@ async fn fixture_step_mutations_visible_through_graph_messages_delta() {
     assert_eq!(tombstone["@removed"]["reason"], "deleted");
 }
 
+/// A reaction's whole lifecycle through the change script: added,
+/// changed, then removed. The consumer's reconciliation only works if
+/// each transition is observable, and if "removed" reads back as the
+/// property being absent rather than present with an empty value.
+#[tokio::test]
+async fn fixture_step_drives_reaction_add_change_and_clear() {
+    use saehrimnir::graph;
+
+    const OWNER_ID: &str = "String {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name OwnerReactionType";
+    const COUNT_ID: &str = "Integer {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name ReactionsCount";
+
+    let path = std::path::Path::new("fixtures/graph-reactions.lua");
+    let source = std::fs::read_to_string(path).unwrap();
+    let chunk = format!("@{}", path.display());
+    let fix = lua::load_source_with_dir(&source, &chunk, path.parent().unwrap()).unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let route_state = routes::AppState::for_test(std::sync::Arc::clone(&handle));
+    let graph_state = graph::AppState {
+        shared: route_state.shared.clone(),
+    };
+    let app = routes::router(route_state);
+    let graph_app = graph::router(graph_state);
+
+    // Percent-encoded `$expand=singleValueExtendedProperties($filter=
+    // id eq '<owner>' or id eq '<count>')`.
+    let expand = format!(
+        "$expand=singleValueExtendedProperties($filter=id%20eq%20%27{}%27%20or%20id%20eq%20%27{}%27)",
+        OWNER_ID
+            .replace(' ', "%20")
+            .replace('{', "%7B")
+            .replace('}', "%7D"),
+        COUNT_ID
+            .replace(' ', "%20")
+            .replace('{', "%7B")
+            .replace('}', "%7D"),
+    );
+    let read = |uri: String| {
+        let graph_app = graph_app.clone();
+        async move { graph_get_json(&graph_app, &uri).await }
+    };
+    let uri = format!("/v1.0/me/messages/email-003?{expand}");
+    let prop = |v: &Value, id: &str| -> Option<String> {
+        v["singleValueExtendedProperties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .map(|p| p["value"].as_str().unwrap().to_string())
+    };
+
+    // Baseline: no reaction staged at all.
+    let v = read(uri.clone()).await;
+    assert_eq!(v["singleValueExtendedProperties"], json!([]));
+
+    // Step "react": the owner reacts.
+    let (status, r) = step(&app, json!({ "expect": "react" })).await;
+    assert_eq!(status, StatusCode::OK);
+    // A reaction change is an update, so a delta consumer re-hydrates.
+    assert_eq!(r["changes"]["emails"]["updated"], json!(["email-003"]));
+    let v = read(uri.clone()).await;
+    assert_eq!(prop(&v, OWNER_ID).as_deref(), Some("heart"));
+    assert_eq!(prop(&v, COUNT_ID).as_deref(), Some("1"));
+
+    // Step "rereact": the owner swaps reaction, count grows.
+    let (status, _) = step(&app, json!({ "expect": "rereact" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = read(uri.clone()).await;
+    assert_eq!(prop(&v, OWNER_ID).as_deref(), Some("laugh"));
+    assert_eq!(prop(&v, COUNT_ID).as_deref(), Some("2"));
+
+    // Step "unreact": both properties go away. Absent, not empty.
+    let (status, _) = step(&app, json!({ "expect": "unreact" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = read(uri).await;
+    assert_eq!(
+        v["singleValueExtendedProperties"],
+        json!([]),
+        "cleared reaction must read back as absent: {v}"
+    );
+}
+
 async fn graph_get_json(app: &axum::Router, uri: &str) -> Value {
     let resp = app
         .clone()

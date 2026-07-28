@@ -1240,6 +1240,8 @@ fn deliver_sent_message(
         body: Body::Text(parsed.body_text.unwrap_or_default()),
         attachments: vec![],
         raw_bytes: Some(raw_string),
+        reaction_type: None,
+        reaction_count: None,
     };
     let mb = sent_mailbox.to_string();
     let id = server_id.clone();

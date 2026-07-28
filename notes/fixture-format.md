@@ -228,6 +228,43 @@ Worked tests in `tests/malformed_mime.rs` exercise the JMAP and
 Gmail cross-protocol surfaces; `tests/imap.rs::body_raw_bytes_
 emits_verbatim_through_imap_fetch` exercises IMAP.
 
+### Message reactions (Graph extended properties)
+
+Two optional per-email fields stage Exchange reaction state:
+
+```toml
+[[email]]
+id = "email-001"
+# ... the usual fields ...
+reaction_type = "like"   # optional; the signed-in user's own reaction
+reaction_count = 3       # optional; total reactions across all reactors
+```
+
+They project onto the Microsoft Graph
+`singleValueExtendedProperties` read as the two GUID-qualified named
+properties real Graph uses:
+
+| Fixture field    | Graph property id                                              |
+|------------------|----------------------------------------------------------------|
+| `reaction_type`  | `String {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name OwnerReactionType`   |
+| `reaction_count` | `Integer {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name ReactionsCount`     |
+
+The two slots are independent, so all four combinations are
+authorable - notably "count with no owner type" (others reacted, the
+signed-in user did not) and "neither" (the message has no reaction at
+all). Absence is meaningful: a `None` slot omits the property entry
+entirely rather than emitting an empty / zero `value`, because a
+consumer reconciling reaction state has to tell "no reaction stored"
+apart from "reaction present but empty". `reaction_count` must be
+`>= 0` and `reaction_type` must be non-empty when declared; the
+loader rejects both.
+
+Only the Graph surface projects these. JMAP / IMAP / Gmail have no
+equivalent property, so they ignore the fields.
+
+Reactions are mutable mid-run through the `email_reaction`
+change-script op; see the change-script section below.
+
 ### Threading
 
 `thread_id` defaults to the email's own `id`, giving each message a
@@ -791,6 +828,10 @@ change({
     email_update = {
         { id = "email-002", keywords = { "$seen", "$flagged" } },
     },
+    email_reaction = {
+        { id = "email-003", reaction_type = "heart", reaction_count = 1 },
+        { id = "email-004", clear = true },
+    },
     email_move = {
         { id = "email-002", mailbox_ids = { "mb-archive" } },
     },
@@ -830,6 +871,21 @@ Op contracts:
   full-replace) routed through the same `apply_email_patch` the
   JMAP `Email/set` mutator uses. At least one of the two fields
   must be present.
+- **`email_reaction`**: array of `{ id, reaction_type?,
+  reaction_count?, clear? }`. Sets or clears the Graph reaction
+  extended properties on an existing message. Does NOT route through
+  `apply_email_patch` - reactions have no JMAP `Email/set` equivalent,
+  so the op writes the two fixture slots directly. Applies as a
+  regular update (the id lands in `email_updated`), so the next Graph
+  `messages/delta` / JMAP `Email/changes` cycle re-hydrates the
+  message. `clear = true` removes BOTH properties (the "reaction
+  removed" case) and is mutually exclusive with the value fields; an
+  omitted value field with `clear = false` leaves that slot alone, so
+  a step can bump the count without restating the owner's reaction.
+  An entry naming nothing at all is rejected. Chaining three steps
+  (set -> set -> clear) is how a consumer's reaction reconciliation
+  becomes observable; `fixtures/graph-reactions.{toml,lua}` stages
+  exactly that.
 - **`email_move`**: array of `{ id, mailbox_ids }`. Wire-equivalent
   to `email_update` with a `mailbox_ids` full-replace; the step
   handler additionally reports the id under

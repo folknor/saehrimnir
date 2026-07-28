@@ -482,6 +482,14 @@ checking whether the fact is already in `notes/`.
 - `fixtures/graph-contacts-incremental.lua` - 3-step contact
   change script (new + change + delete) driving the
   `contacts/delta` round-trip in `tests/step.rs`.
+- `fixtures/graph-reactions.toml` and
+  `fixtures/graph-reactions.lua` - equivalent Exchange
+  message-reaction fixtures: three baseline messages covering the
+  three authorable reaction states (owner type + count, count only,
+  neither) plus a 3-step `email_reaction` change script driving one
+  message through add -> change -> remove. Drive the
+  `singleValueExtendedProperties` tests in `tests/graph.rs` and
+  `tests/step.rs`; asserted byte-equivalent in `tests/lua_fixture.rs`.
 - `fixtures/gmail-incremental.lua` - baseline (incl. a
   two-message thread) plus a 4-step change script (new + delete
   + label swap + star-one-message-of-a-thread) driving the Gmail
@@ -799,6 +807,26 @@ record `category_*` transitions; the change_log entries are
 observability for tests asserting state moved (real Graph has no
 `masterCategories/delta` endpoint, so v0 doesn't expose one
 either). Tests in `tests/graph.rs`.
+
+Message reactions: per-email `reaction_type` / `reaction_count`
+fixture slots project onto the `singleValueExtendedProperties`
+read, selected by an `$expand=singleValueExtendedProperties($filter=
+id eq '...' or id eq '...')` clause naming the real Graph property
+ids `String {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name
+OwnerReactionType` and `Integer {41F28F13-83F4-4114-A584-EEDB5A6B0BFF}
+Name ReactionsCount`. Served on the single-message GET, the folder
+message list, `messages/delta`, and `$batch` GET sub-requests (the
+chunked shape the consumer actually drives). An unset slot omits the
+property entirely rather than emitting an empty value - "absent" is
+how a removed reaction reads back, and it is a different state to
+"present but empty". `value` is a string on both properties (Graph
+types `singleValueLegacyExtendedProperty.value` as `String`
+regardless of MAPI type). The `$expand` clause is split paren-aware,
+so a sibling `attachments($select=a,b,c)` clause and the `or`-joined
+filter both survive. Mid-run mutation rides the `email_reaction`
+change-script op (set / partial-set / `clear = true`), which records
+an `email_updated` transition so the change surfaces in the next
+delta cycle. See `notes/ratatoskr-graph-surface.md`.
 
 Groups: `/v1.0/groups` (list + single), `/v1.0/groups/{id}/members`
 projecting each member-account as a `#microsoft.graph.user` (id,

@@ -1954,6 +1954,26 @@ pub enum ChangeOp {
     EmailDestroy {
         id: String,
     },
+    /// Set or clear a message's Exchange reaction state mid-run. Does
+    /// not route through `apply_email_patch`: reactions are not a JMAP
+    /// `Email/set` property, they are Graph named extended properties
+    /// with no JMAP equivalent, so the op writes the two fixture slots
+    /// directly. Applies as a regular update (the diff lands in
+    /// `email_updated`) so a consumer's delta cycle sees the message
+    /// move.
+    ///
+    /// `clear` wipes both slots back to absent - the "reaction
+    /// removed" case, which a consumer must be able to tell apart from
+    /// "reaction present with count 0". Setting and clearing in one op
+    /// is rejected. A `None` field with `clear = false` leaves that
+    /// slot untouched, so a step can bump the count without restating
+    /// the owner's reaction.
+    EmailReaction {
+        id: String,
+        reaction_type: Option<String>,
+        reaction_count: Option<i64>,
+        clear: bool,
+    },
     MailboxCreate(Box<Mailbox>),
     MailboxUpdate {
         id: String,
@@ -2643,6 +2663,24 @@ pub struct Email {
     /// (the raw bytes are the entire body, including any MIME
     /// structure the author wanted).
     pub raw_bytes: Option<String>,
+    /// The signed-in user's own Exchange reaction on this message
+    /// (`"like"`, `"heart"`, ...). Projected on the Graph
+    /// `singleValueExtendedProperties` read as the named property
+    /// `String {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name
+    /// OwnerReactionType`. `None` means the property is absent from
+    /// the item - which is NOT the same as present-but-empty: a
+    /// consumer reconciling reaction state distinguishes "no reaction
+    /// stored" from "reaction cleared to the empty string", so the
+    /// mock omits the whole property entry rather than emitting an
+    /// empty value. See [`Email::reaction_count`] and
+    /// `notes/ratatoskr-graph-surface.md`.
+    pub reaction_type: Option<String>,
+    /// Total number of reactions on the message across all reactors.
+    /// Projected as `Integer {41F28F13-83F4-4114-A584-EEDB5A6B0BFF}
+    /// Name ReactionsCount`. Independent of [`Email::reaction_type`]:
+    /// a message others reacted to but the owner did not carries a
+    /// count with no owner type. `None` omits the property.
+    pub reaction_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2920,7 +2958,8 @@ pub(crate) struct RawFixture {
 /// one op kind is valid TOML.
 ///
 /// The op order inside the resulting [`ChangeStep`] matches the Lua
-/// reader: email_create / email_update / email_move / email_destroy,
+/// reader: email_create / email_update / email_reaction / email_move /
+/// email_destroy,
 /// then mailbox, then event, then contact_folder, then contact. The
 /// step handler walks ops in the produced order, so this also fixes
 /// the apply order (mailbox_create runs before email_create that
@@ -2932,6 +2971,8 @@ pub(crate) struct RawChangeStep {
     pub(crate) email_create: Vec<RawEmail>,
     #[serde(default)]
     pub(crate) email_update: Vec<RawEmailUpdate>,
+    #[serde(default)]
+    pub(crate) email_reaction: Vec<RawEmailReaction>,
     #[serde(default)]
     pub(crate) email_move: Vec<RawEmailMove>,
     #[serde(default)]
@@ -2993,6 +3034,21 @@ pub(crate) struct RawEmailUpdate {
     /// Full-replace mailbox membership.
     #[serde(default)]
     pub(crate) mailbox_ids: Option<Vec<String>>,
+}
+
+/// TOML / Lua projection of one `email_reaction` change-script entry.
+/// `[[change.email_reaction]]` with `{ id, reaction_type?,
+/// reaction_count?, clear? }`.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawEmailReaction {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) reaction_type: Option<String>,
+    #[serde(default)]
+    pub(crate) reaction_count: Option<i64>,
+    /// Clear both slots. Mutually exclusive with the value fields.
+    #[serde(default)]
+    pub(crate) clear: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3566,6 +3622,12 @@ pub(crate) struct RawEmail {
     /// IMAP-wire raw-bytes override. See [`Email::raw_bytes`].
     #[serde(default)]
     pub(crate) body_raw_bytes: Option<String>,
+    /// Owner's Exchange reaction. See [`Email::reaction_type`].
+    #[serde(default)]
+    pub(crate) reaction_type: Option<String>,
+    /// Total reaction count. See [`Email::reaction_count`].
+    #[serde(default)]
+    pub(crate) reaction_count: Option<i64>,
     #[serde(default, rename = "attachment")]
     pub(crate) attachments: Vec<RawAttachment>,
     /// Account this email belongs to. Defaults to primary when
@@ -4499,6 +4561,41 @@ pub(crate) fn email_update_op(
     })
 }
 
+/// Build an `EmailReaction` op from the `{ id, reaction_type?,
+/// reaction_count?, clear? }` tuple both authoring paths produce.
+/// Rejects the two shapes that would be author confusion rather than
+/// intent: a clear that also names values, and an entry that names
+/// nothing at all (a no-op step is a script bug).
+pub(crate) fn email_reaction_op(
+    id: String,
+    reaction_type: Option<String>,
+    reaction_count: Option<i64>,
+    clear: bool,
+) -> Result<ChangeOp, &'static str> {
+    if clear && (reaction_type.is_some() || reaction_count.is_some()) {
+        return Err("clear is mutually exclusive with reaction_type / reaction_count");
+    }
+    if !clear && reaction_type.is_none() && reaction_count.is_none() {
+        return Err("at least one of reaction_type / reaction_count / clear must be set");
+    }
+    if let Some(t) = &reaction_type
+        && t.is_empty()
+    {
+        return Err("reaction_type must be non-empty (use clear = true to remove it)");
+    }
+    if let Some(c) = reaction_count
+        && c < 0
+    {
+        return Err("reaction_count must be >= 0");
+    }
+    Ok(ChangeOp::EmailReaction {
+        id,
+        reaction_type,
+        reaction_count,
+        clear,
+    })
+}
+
 /// Build an `EmailMove` op. Empty `mailbox_ids` is rejected (a move
 /// to nowhere would orphan the email).
 pub(crate) fn email_move_op(
@@ -5071,6 +5168,18 @@ fn normalize_change_step(
                 .map_err(|e| format!("change step {id:?}: email_update entry {entry_id:?}: {e}"))?,
         );
     }
+    for r in raw.email_reaction {
+        let entry_id = r.id.clone();
+        ops.push(
+            email_reaction_op(
+                r.id,
+                r.reaction_type,
+                r.reaction_count,
+                r.clear.unwrap_or(false),
+            )
+            .map_err(|e| format!("change step {id:?}: email_reaction entry {entry_id:?}: {e}"))?,
+        );
+    }
     for m in raw.email_move {
         let entry_id = m.id.clone();
         ops.push(
@@ -5386,6 +5495,23 @@ pub(crate) fn normalize_email(
         ));
     }
 
+    if let Some(t) = &em.reaction_type
+        && t.is_empty()
+    {
+        return Err(format!(
+            "email {:?}: reaction_type must be non-empty (omit the field to stage a message with no reaction)",
+            em.id
+        ));
+    }
+    if let Some(c) = em.reaction_count
+        && c < 0
+    {
+        return Err(format!(
+            "email {:?}: reaction_count must be >= 0 (got {c})",
+            em.id
+        ));
+    }
+
     Ok(Email {
         thread_id: em.thread_id.unwrap_or_else(|| em.id.clone()),
         id: em.id,
@@ -5409,6 +5535,8 @@ pub(crate) fn normalize_email(
         body,
         attachments,
         raw_bytes: em.body_raw_bytes,
+        reaction_type: em.reaction_type,
+        reaction_count: em.reaction_count,
     })
 }
 

@@ -1271,30 +1271,10 @@ fn builder_bulk_mailboxes(state: &mut State) -> dellingr::Result<u8> {
 
 fn builder_email(state: &mut State) -> dellingr::Result<u8> {
     require_one_table_arg(state, "email")?;
-    let em = RawEmail {
-        id: read_string(state, 1, "id")?,
-        thread_id: read_string_opt(state, 1, "thread_id")?,
-        mailbox_ids: read_string_array(state, 1, "mailbox_ids")?,
-        keywords: read_string_array_opt(state, 1, "keywords")?,
-        size: read_int_opt(state, 1, "size")?,
-        received_at: read_string(state, 1, "received_at")?,
-        sent_at: read_string_opt(state, 1, "sent_at")?,
-        from: read_address_opt(state, 1, "from")?,
-        to: read_address_array_opt(state, 1, "to")?,
-        cc: read_address_array_opt(state, 1, "cc")?,
-        bcc: read_address_array_opt(state, 1, "bcc")?,
-        reply_to: read_address_array_opt(state, 1, "reply_to")?,
-        subject: read_string_opt(state, 1, "subject")?,
-        preview: read_string_opt(state, 1, "preview")?,
-        message_id: read_string_array_opt(state, 1, "message_id")?,
-        in_reply_to: read_string_array_opt(state, 1, "in_reply_to")?,
-        references: read_string_array_opt(state, 1, "references")?,
-        has_attachment: read_bool_opt(state, 1, "has_attachment")?,
-        body_text: read_string_opt(state, 1, "body_text")?,
-        body_raw_bytes: read_string_opt(state, 1, "body_raw_bytes")?,
-        attachments: read_attachment_array_opt(state, 1, "attachments")?,
-        account_id: read_string_opt(state, 1, "account_id")?,
-    };
+    // Same field list as the change-script `email_create` reader; both
+    // go through `read_raw_email_at` so a new fixture field can never
+    // land on one authoring path and not the other.
+    let em = read_raw_email_at(state, 1)?;
     builder_mut(state)?.emails.push(em);
     Ok(0)
 }
@@ -1365,6 +1345,12 @@ fn read_attachment_array_at_top(
 ///   tables. Each emits a JMAP-shape patch (`{"keywords": {...},
 ///   "mailboxIds": {...}}`) routed through `apply_email_patch` at
 ///   apply time, so the wire semantics match `Email/set` exactly.
+/// - `email_reaction`: array of `{ id, reaction_type?,
+///   reaction_count?, clear? }`. Sets or clears the Graph
+///   reaction extended properties on an existing message. `clear =
+///   true` removes both (the "reaction removed" case, distinct from a
+///   zero count); otherwise each named field is written and each
+///   omitted field left alone.
 /// - `email_move`: array of `{ id, mailbox_ids }`. Applies as a
 ///   regular `mailboxIds` full-replace update; the step handler
 ///   surfaces the id under `changes.emails.moved` so harness asserts
@@ -1410,6 +1396,7 @@ fn builder_change(state: &mut State) -> dellingr::Result<u8> {
     // email_update / email_move: shaped as { id, ... }; each op
     // emits a JMAP-style patch.
     read_email_update(state, 1, &mut ops)?;
+    read_email_reaction(state, 1, &mut ops)?;
     read_email_move(state, 1, &mut ops)?;
 
     // email_destroy: array of id strings.
@@ -1931,6 +1918,53 @@ fn read_email_update(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> de
     Ok(())
 }
 
+/// `email_reaction = { { id = ..., reaction_type? = ...,
+/// reaction_count? = ..., clear? = true }, ... }`
+#[allow(clippy::cast_possible_wrap)]
+fn read_email_reaction(
+    state: &mut State,
+    t: isize,
+    ops: &mut Vec<ChangeOp>,
+) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "email_reaction")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1)?;
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1)?;
+            return fail(state, "field \"email_reaction\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    let len = state.table_len(arr);
+    for i in 1..=len {
+        state.push_number(i as f64)?;
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2)?;
+            return fail(state, format!("email_reaction entry {i} must be a table"));
+        }
+        let entry_idx = state.get_top() as isize;
+        let id = read_string(state, entry_idx, "id")?;
+        let reaction_type = read_string_opt(state, entry_idx, "reaction_type")?;
+        let reaction_count = read_int_opt(state, entry_idx, "reaction_count")?;
+        let clear = read_bool_opt(state, entry_idx, "clear")?.unwrap_or(false);
+        state.pop(1)?;
+        let op = crate::fixture::email_reaction_op(id, reaction_type, reaction_count, clear)
+            .map_err(|e| {
+                state.error(ErrorKind::InternalError(format!(
+                    "email_reaction entry {i}: {e}"
+                )))
+            })?;
+        ops.push(op);
+    }
+    state.pop(1)?;
+    Ok(())
+}
+
 #[allow(clippy::cast_possible_wrap)]
 fn read_email_move(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
     let typ = lookup(state, t, "email_move")?;
@@ -2313,6 +2347,8 @@ fn read_raw_email_at(state: &mut State, t: isize) -> dellingr::Result<RawEmail> 
         body_raw_bytes: read_string_opt(state, t, "body_raw_bytes")?,
         attachments: read_attachment_array_opt(state, t, "attachments")?,
         account_id: read_string_opt(state, t, "account_id")?,
+        reaction_type: read_string_opt(state, t, "reaction_type")?,
+        reaction_count: read_int_opt(state, t, "reaction_count")?,
     })
 }
 

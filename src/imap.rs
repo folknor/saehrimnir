@@ -3870,6 +3870,8 @@ mod tests {
             body: Body::Text("x".into()),
             attachments: vec![],
             raw_bytes: None,
+            reaction_type: None,
+            reaction_count: None,
         };
         let mut fix = Fixture {
             name: "f".into(),
@@ -4753,6 +4755,8 @@ mod tests {
             body: Body::Text("hi\nthere".into()),
             attachments: vec![],
             raw_bytes: None,
+            reaction_type: None,
+            reaction_count: None,
         };
         let r = RenderedRfc822::for_email(&e).full;
         assert!(r.contains("From: Alice <alice@example.com>\r\n"));

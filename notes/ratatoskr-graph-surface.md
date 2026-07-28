@@ -438,7 +438,7 @@ immediate `@odata.deltaLink`.
 - `internetMessageId`: string.
 - `attachments`: array of attachment objects.
 - `singleValueExtendedProperties`: array of extended-property
-  objects. Used for Exchange reactions; v0 emits an empty list.
+  objects. Carries Exchange reactions. See the section below.
 
 Mapping from saehrimnir's fixture:
 
@@ -453,6 +453,64 @@ Mapping from saehrimnir's fixture:
 - fixture `message_id`, `in_reply_to`, `references` ->
   `internetMessageHeaders` entries plus the standalone
   `internetMessageId`.
+- fixture `reaction_type`, `reaction_count` ->
+  `singleValueExtendedProperties` entries (below).
+
+## Message reactions (`singleValueExtendedProperties`)
+
+Exchange stores a message's reaction state as named properties in the
+property set `{41F28F13-83F4-4114-A584-EEDB5A6B0BFF}`. Two are
+modelled:
+
+| Property id                                                            | Fixture field    |
+|------------------------------------------------------------------------|------------------|
+| `String {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name OwnerReactionType`  | `reaction_type`  |
+| `Integer {41F28F13-83F4-4114-A584-EEDB5A6B0BFF} Name ReactionsCount`    | `reaction_count` |
+
+The consumer reads them by expanding the navigation property with a
+`$filter` on the ids, either on a plain message GET or (the shape it
+actually drives, chunked ~20 messages per batch) as `$batch`
+sub-requests:
+
+```
+GET /v1.0/me/messages/{id}
+    ?$expand=singleValueExtendedProperties($filter=id eq '<owner id>'
+                                            or id eq '<count id>')
+```
+
+Serving rules:
+
+- The `$expand` clause is split paren-aware, so the inner `$select`
+  of a sibling `attachments(...)` clause and the `or`-joined
+  `$filter` disjunction survive intact.
+- Only properties the `$filter` selected are emitted. A
+  `singleValueExtendedProperties` expand with no `(...)` options
+  means "every extended property on the item" and yields both.
+- A selected property whose fixture slot is unset is OMITTED, not
+  emitted with an empty value. "Absent" and "present but empty" are
+  different states to a consumer reconciling reaction rows: absent is
+  how a removed reaction reads back.
+- `value` is a JSON string on both properties, including the count -
+  Graph's `singleValueLegacyExtendedProperty` resource types `value`
+  as `String` regardless of the underlying MAPI type.
+- The `singleValueExtendedProperties` key is always present on a
+  projected message (an unexpanded read gets `[]`), so a consumer can
+  read it unconditionally.
+- Property-name matching is case-insensitive on the `Name` segment,
+  deliberately more liberal than real Graph, so a consumer spelling
+  variant still resolves.
+- The same projection backs the folder message list and
+  `messages/delta`, so an initial-sync page carries reactions without
+  a per-message follow-up.
+
+Reactions are authorable in a fixture (`reaction_type` /
+`reaction_count` on `[[email]]`) and mutable mid-run through the
+`email_reaction` change-script op, which applies as a regular email
+update so the change surfaces in the next delta cycle. See
+`notes/fixture-format.md` and `fixtures/graph-reactions.{toml,lua}`.
+Tests: `tests/graph.rs` (standalone + batched reads, per-property
+filter, absent case) and
+`tests/step.rs::fixture_step_drives_reaction_add_change_and_clear`.
 
 ## Attachment model
 
@@ -509,7 +567,9 @@ responses (no change-log transitions):
 - `BATCH_SIZE = 50` (messages per page on initial sync).
 - `CONCURRENCY_LIMIT = 3` (per mailbox).
 - Folder pagination `$top = 250`.
-- Reactions GUID: `{41F28F13-83F4-4114-A584-EEDB5A6B0BFF}`.
+- Reactions GUID: `{41F28F13-83F4-4114-A584-EEDB5A6B0BFF}` (see the
+  message-reactions section).
+- Reaction `$batch` chunk size: ~20 messages per batch.
 
 ## Out of scope for v0 - resource categories to scaffold for later
 
