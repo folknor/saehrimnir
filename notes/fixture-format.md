@@ -538,6 +538,7 @@ description = "Engineering team"   # optional
 mail = "engineering@example.com"   # optional
 mail_enabled = true                # optional; defaults to false
 security_enabled = true            # optional; defaults to false
+group_types = ["Unified"]          # optional; defaults to []
 members = ["account-primary", "account-secondary"]
 ```
 
@@ -553,6 +554,14 @@ Groups project over the Graph
 `/v1.0/groups/{id}/members`, `/v1.0/me/memberOf`, and
 `/v1.0/users/{id}/memberOf` surfaces. The Lua loader exposes the
 same shape via `group({...})`.
+
+Change scripts can mutate this read surface without advancing an account
+mail delta: `group_create` accepts the full shape above, `group_update`
+accepts `{ id, display_name?, mail?, group_types?, members? }` (arrays are
+full replacements, so `{}` clears), and `group_destroy` is an array of ids.
+Group members are validated against declared accounts at apply time. Lua uses
+`mail = false` to clear mail because an absent table key and `nil` are the
+same value there.
 
 ## Shared-folder ACLs (optional)
 

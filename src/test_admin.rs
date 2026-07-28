@@ -852,6 +852,7 @@ async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) 
     let saved_contact_folders = touched.contact_folders.then(|| fix.contact_folders.clone());
     let saved_mailbox_uid_history = touched.emails.then(|| fix.mailbox_uid_history.clone());
     let saved_acls = touched.acls.then(|| fix.acls.clone());
+    let saved_groups = touched.groups.then(|| fix.groups.clone());
 
     let mut diff = crate::fixture::MutationDiff::default();
     let mut moved: Vec<String> = Vec::new();
@@ -880,6 +881,9 @@ async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) 
         }
         if let Some(v) = saved_acls {
             fix.acls = v;
+        }
+        if let Some(v) = saved_groups {
+            fix.groups = v;
         }
         return (code, Json(payload)).into_response();
     }
@@ -1024,6 +1028,7 @@ struct StepTouches {
     contacts: bool,
     contact_folders: bool,
     acls: bool,
+    groups: bool,
 }
 
 impl StepTouches {
@@ -1049,6 +1054,9 @@ impl StepTouches {
                 | ChangeOp::ContactFolderUpdate { .. }
                 | ChangeOp::ContactFolderDestroy { .. } => t.contact_folders = true,
                 ChangeOp::AclGrant { .. } | ChangeOp::AclRevoke { .. } => t.acls = true,
+                ChangeOp::GroupCreate(_)
+                | ChangeOp::GroupUpdate { .. }
+                | ChangeOp::GroupDestroy { .. } => t.groups = true,
             }
         }
         t
@@ -1612,6 +1620,81 @@ fn apply_change_step(
                 diff.contact_destroyed.push(id.clone());
                 diff.contact_destroyed_parents
                     .push(parent.expect("contact existed before retain"));
+            }
+            ChangeOp::GroupCreate(group) => {
+                if fix.groups.iter().any(|existing| existing.id == group.id) {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "duplicate",
+                        &format!("group_create {:?}: id already exists", group.id),
+                    ));
+                }
+                if group
+                    .members
+                    .iter()
+                    .any(|member| !fix.accounts.iter().any(|account| &account.id == member))
+                {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "unknownAccount",
+                        "group_create member not declared",
+                    ));
+                }
+                fix.groups.push((**group).clone());
+            }
+            ChangeOp::GroupUpdate {
+                id,
+                display_name,
+                mail,
+                group_types,
+                members,
+            } => {
+                if let Some(members) = members
+                    && members
+                        .iter()
+                        .any(|member| !fix.accounts.iter().any(|account| &account.id == member))
+                {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "unknownAccount",
+                        "group_update member not declared",
+                    ));
+                }
+                let Some(group) = fix.groups.iter_mut().find(|group| &group.id == id) else {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "notFound",
+                        &format!("group_update {id:?}: no such group"),
+                    ));
+                };
+                if let Some(value) = display_name {
+                    group.display_name = value.clone();
+                }
+                if let Some(value) = mail {
+                    group.mail = value.clone();
+                }
+                if let Some(value) = group_types {
+                    group.group_types = value.clone();
+                }
+                if let Some(value) = members {
+                    group.members = value.clone();
+                }
+            }
+            ChangeOp::GroupDestroy { id } => {
+                let before = fix.groups.len();
+                fix.groups.retain(|group| &group.id != id);
+                if before == fix.groups.len() {
+                    return Err(step_apply_error(
+                        &step.id,
+                        i,
+                        "notFound",
+                        &format!("group_destroy {id:?}: no such group"),
+                    ));
+                }
             }
             ChangeOp::AclGrant {
                 mailbox_id,

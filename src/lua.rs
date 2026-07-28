@@ -750,6 +750,7 @@ fn builder_group(state: &mut State) -> dellingr::Result<u8> {
         mail: read_string_opt(state, 1, "mail")?,
         mail_enabled: read_bool_opt(state, 1, "mail_enabled")?,
         security_enabled: read_bool_opt(state, 1, "security_enabled")?,
+        group_types: read_string_array_opt(state, 1, "group_types")?,
         members: read_string_array_opt(state, 1, "members")?,
     };
     builder_mut(state)?.groups.push(grp);
@@ -1444,6 +1445,15 @@ fn builder_change(state: &mut State) -> dellingr::Result<u8> {
         ChangeOp::ContactDestroy { id }
     })?;
 
+    // Directory-group ops deliberately do not produce an account delta:
+    // the Graph group surface has no delta endpoint. They remain fixture
+    // mutations so reconciliation tests can stage a new snapshot.
+    read_group_create(state, 1, &mut ops)?;
+    read_group_update(state, 1, &mut ops)?;
+    read_id_destroy(state, 1, "group_destroy", &mut ops, |id| {
+        ChangeOp::GroupDestroy { id }
+    })?;
+
     // ACL ops run last so a step can create a mailbox and share it in
     // the same transition. Matches the TOML projection's op order.
     read_acl_grant(state, 1, &mut ops)?;
@@ -1453,6 +1463,117 @@ fn builder_change(state: &mut State) -> dellingr::Result<u8> {
         .change_script
         .push(ChangeStep { id, ops });
     Ok(0)
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_group_create(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "group_create")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1)?;
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1)?;
+            return fail(state, "field \"group_create\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    for i in 1..=state.table_len(arr) {
+        state.push_number(i as f64)?;
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2)?;
+            return fail(state, format!("group_create entry {i} must be a table"));
+        }
+        let entry = state.get_top() as isize;
+        let raw = crate::fixture::RawGroup {
+            id: read_string(state, entry, "id")?,
+            display_name: read_string(state, entry, "display_name")?,
+            description: read_string_opt(state, entry, "description")?,
+            mail: read_string_opt(state, entry, "mail")?,
+            mail_enabled: read_bool_opt(state, entry, "mail_enabled")?,
+            security_enabled: read_bool_opt(state, entry, "security_enabled")?,
+            group_types: read_string_array_opt(state, entry, "group_types")?,
+            members: read_string_array_opt(state, entry, "members")?,
+        };
+        state.pop(1)?;
+        ops.push(ChangeOp::GroupCreate(Box::new(crate::fixture::Group {
+            id: raw.id,
+            display_name: raw.display_name,
+            description: raw.description,
+            mail: raw.mail,
+            mail_enabled: raw.mail_enabled.unwrap_or(false),
+            security_enabled: raw.security_enabled.unwrap_or(false),
+            group_types: raw.group_types,
+            members: raw.members,
+        })));
+    }
+    state.pop(1)?;
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn read_group_update(state: &mut State, t: isize, ops: &mut Vec<ChangeOp>) -> dellingr::Result<()> {
+    let typ = lookup(state, t, "group_update")?;
+    match typ {
+        LuaType::Nil => {
+            state.pop(1)?;
+            return Ok(());
+        }
+        LuaType::Table => {}
+        _ => {
+            state.pop(1)?;
+            return fail(state, "field \"group_update\" must be an array");
+        }
+    }
+    let arr = state.get_top() as isize;
+    for i in 1..=state.table_len(arr) {
+        state.push_number(i as f64)?;
+        state.get_table_raw(arr)?;
+        if state.typ(-1) != LuaType::Table {
+            state.pop(2)?;
+            return fail(state, format!("group_update entry {i} must be a table"));
+        }
+        let entry = state.get_top() as isize;
+        let id = read_string(state, entry, "id")?;
+        let display_name = read_string_opt(state, entry, "display_name")?;
+        // `false` clears mail. Lua table keys cannot distinguish an absent
+        // field from `nil`, so false is the explicit null spelling.
+        let mail = read_group_mail_patch(state, entry)?;
+        let group_types = read_string_array_opt_present(state, entry, "group_types")?;
+        let members = read_string_array_opt_present(state, entry, "members")?;
+        state.pop(1)?;
+        ops.push(ChangeOp::GroupUpdate {
+            id,
+            display_name,
+            mail,
+            group_types,
+            members,
+        });
+    }
+    state.pop(1)?;
+    Ok(())
+}
+
+fn read_group_mail_patch(state: &mut State, t: isize) -> dellingr::Result<Option<Option<String>>> {
+    let typ = lookup(state, t, "mail")?;
+    let result = match typ {
+        LuaType::Nil => Ok(None),
+        LuaType::String => state.to_string(-1).map(Some).map(Some),
+        LuaType::Boolean => {
+            let value = state.to_boolean(-1);
+            if value {
+                fail(state, "field \"mail\" must be a string or false")
+            } else {
+                Ok(Some(None))
+            }
+        }
+        _ => fail(state, "field \"mail\" must be a string or false"),
+    };
+    state.pop(1)?;
+    result
 }
 
 #[allow(clippy::cast_possible_wrap)]

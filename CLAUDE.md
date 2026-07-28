@@ -814,8 +814,9 @@ are all-pass filters (members are always user-typed, memberOf
 yields only group-typed objects); all four alias the plain
 handlers. Groups are cross-account by nature - each
 fixture `[[group]]` carries a `members = [...]` list of declared
-account ids. Read-only in v0 (no mutating verbs on the Graph
-group surface).
+account ids. The served Graph surface is read-only; fixture change scripts
+can stage group_create, group_update, and group_destroy between reads without
+advancing a mail delta or triggering push fan-out.
 
 Catchall returns the Graph error envelope so unimplemented
 resources are visibly out-of-scope. Sibling files for drive /

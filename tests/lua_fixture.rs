@@ -10,6 +10,37 @@ use std::path::Path;
 use saehrimnir::{fixture, lua};
 
 #[test]
+fn lua_group_change_ops_preserve_sparse_and_empty_replacements() {
+    let loaded = lua::load_source(
+        r#"
+        fixture({ name = "groups" })
+        account({ id = "a", name = "a@example.test", primary = true })
+        account({ id = "b", name = "b@example.test" })
+        group({ id = "g", display_name = "Group", group_types = { "Unified" }, members = { "a", "b" } })
+        change({ id = "mutate", group_update = { { id = "g", members = {}, group_types = {} } }, group_destroy = { "g" } })
+        "#,
+        "@groups",
+    ).unwrap();
+    assert_eq!(loaded.groups[0].group_types, ["Unified"]);
+    assert_eq!(loaded.change_script.len(), 1);
+    match &loaded.change_script[0].ops[0] {
+        fixture::ChangeOp::GroupUpdate {
+            group_types,
+            members,
+            ..
+        } => {
+            assert!(group_types.as_ref().is_some_and(Vec::is_empty));
+            assert!(members.as_ref().is_some_and(Vec::is_empty));
+        }
+        other => panic!("expected group update, got {other:?}"),
+    }
+    assert!(matches!(
+        loaded.change_script[0].ops[1],
+        fixture::ChangeOp::GroupDestroy { .. }
+    ));
+}
+
+#[test]
 fn dispatcher_invokes_registered_callback() {
     // Smallest dispatcher smoke test: load a scenario that
     // registers `on("test", "ping", ...)`, then dispatch a "test"/

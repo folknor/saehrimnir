@@ -177,6 +177,10 @@ fn serialize_group(g: &Group) -> Value {
     }
     obj.insert("mailEnabled".into(), Value::Bool(g.mail_enabled));
     obj.insert("securityEnabled".into(), Value::Bool(g.security_enabled));
+    obj.insert(
+        "groupTypes".into(),
+        Value::Array(g.group_types.iter().cloned().map(Value::String).collect()),
+    );
     Value::Object(obj)
 }
 

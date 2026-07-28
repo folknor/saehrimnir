@@ -142,7 +142,9 @@ ratatoskr's group-enumeration code path consumes:
 | `GET /v1.0/me/memberOf[/microsoft.graph.group]` | Groups containing the bearer-resolved account (`oauth::account_from_bearer`, same fallback-to-primary semantics as Gmail / gcal / People). The `microsoft.graph.group` type-cast is all-pass in v0 (`memberOf` yields only group-typed directoryObjects). |
 | `GET /v1.0/users/{userId}/memberOf[/microsoft.graph.group]` | Path-resolved: `me` aliases the bearer-resolved primary, otherwise the `userId` must match a declared account. Unknown id returns 404 `ResourceNotFound`. Same all-pass `microsoft.graph.group` type-cast twin. |
 
-Read-only in v0 - the Graph group surface has no mutating verbs.
+The served Graph surface remains read-only. Fixture change scripts can stage
+`group_create`, sparse `group_update`, and `group_destroy` between reads;
+they intentionally do not create account delta-log entries or push fan-out.
 
 ## Multi-account routing
 

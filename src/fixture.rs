@@ -1986,6 +1986,17 @@ pub enum ChangeOp {
     ContactDestroy {
         id: String,
     },
+    GroupCreate(Box<Group>),
+    GroupUpdate {
+        id: String,
+        display_name: Option<String>,
+        mail: Option<Option<String>>,
+        group_types: Option<Vec<String>>,
+        members: Option<Vec<String>>,
+    },
+    GroupDestroy {
+        id: String,
+    },
     /// Grant `identifier` (a declared account id) access to
     /// `mailbox_id` (an owned mailbox), i.e. add the `[[acl]]` row a
     /// static fixture would have declared. `rights` defaults to
@@ -2411,6 +2422,7 @@ pub struct Group {
     pub mail: Option<String>,
     pub mail_enabled: bool,
     pub security_enabled: bool,
+    pub group_types: Vec<String>,
     /// Account ids that belong to the group. Validated at load
     /// time against the declared `[[account]]` set.
     pub members: Vec<String>,
@@ -2948,6 +2960,12 @@ pub(crate) struct RawChangeStep {
     pub(crate) contact_update: Vec<RawContactUpdate>,
     #[serde(default)]
     pub(crate) contact_destroy: Vec<String>,
+    #[serde(default)]
+    pub(crate) group_create: Vec<RawGroup>,
+    #[serde(default)]
+    pub(crate) group_update: Vec<RawGroupUpdate>,
+    #[serde(default)]
+    pub(crate) group_destroy: Vec<String>,
     /// `[[change.acl_grant]]` - same fields as a static `[[acl]]`
     /// row (`mailbox_id`, `identifier`, optional `rights`).
     #[serde(default)]
@@ -3170,7 +3188,22 @@ pub(crate) struct RawGroup {
     #[serde(default)]
     pub(crate) security_enabled: Option<bool>,
     #[serde(default)]
+    pub(crate) group_types: Vec<String>,
+    #[serde(default)]
     pub(crate) members: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawGroupUpdate {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) mail: Option<Option<String>>,
+    #[serde(default)]
+    pub(crate) group_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) members: Option<Vec<String>>,
 }
 
 /// TOML / Lua projection of one `[[acl]]` grant. `rights` is optional;
@@ -4092,6 +4125,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
             mail: grp.mail,
             mail_enabled: grp.mail_enabled.unwrap_or(false),
             security_enabled: grp.security_enabled.unwrap_or(false),
+            group_types: grp.group_types,
             members: grp.members,
         });
     }
@@ -5129,6 +5163,30 @@ fn normalize_change_step(
     }
     for d in raw.contact_destroy {
         ops.push(ChangeOp::ContactDestroy { id: d });
+    }
+    for group in raw.group_create {
+        ops.push(ChangeOp::GroupCreate(Box::new(Group {
+            id: group.id,
+            display_name: group.display_name,
+            description: group.description,
+            mail: group.mail,
+            mail_enabled: group.mail_enabled.unwrap_or(false),
+            security_enabled: group.security_enabled.unwrap_or(false),
+            group_types: group.group_types,
+            members: group.members,
+        })));
+    }
+    for group in raw.group_update {
+        ops.push(ChangeOp::GroupUpdate {
+            id: group.id,
+            display_name: group.display_name,
+            mail: group.mail,
+            group_types: group.group_types,
+            members: group.members,
+        });
+    }
+    for id in raw.group_destroy {
+        ops.push(ChangeOp::GroupDestroy { id });
     }
 
     // ACL ops run last within a step, so a step may create a mailbox
