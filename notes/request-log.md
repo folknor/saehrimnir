@@ -192,6 +192,32 @@ Same shape as the Graph middleware:
 Gmail's mutating endpoints are stubs in v0, so no
 body-recording rows are emitted.
 
+### Announce triggers (`src/announce.rs`)
+
+A fixture `[[announce]]` trigger applies a change step before a
+nominated request is served (see `notes/fixture-format.md`). Each fire
+appends one row under the LISTENER's protocol tag, positioned
+immediately AHEAD of the row for the request it preceded - so the log
+itself shows the interleaving:
+
+```
+GET /gmail/v1/users/me/messages     <- page 1
+ANNOUNCE arrive-new                 <- the change landed here
+GET /gmail/v1/users/me/messages     <- page 2
+```
+
+- `command`: `"ANNOUNCE <step id>"`.
+- `detail.announce`: always `true` - the key to filter on.
+- `detail.step` / `detail.nth`: the step id and which matching request
+  it fired before.
+- `detail.applied`: `true` on success, with `detail.state` carrying
+  the post-mutation primary state token.
+- On failure `applied` is `false` and `detail.error` explains why
+  (the script was exhausted, or the cursor was not at the named step).
+  Both are authoring faults; they are recorded rather than swallowed
+  because a trigger that quietly did nothing leaves a race gate
+  passing while proving nothing.
+
 ### CalDAV (`src/caldav/mod.rs::dispatch`)
 
 Every CalDAV request records a middleware-style row:

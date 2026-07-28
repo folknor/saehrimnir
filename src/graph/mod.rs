@@ -164,6 +164,12 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
         .extensions()
         .get::<axum::extract::ConnectInfo<crate::connection_id::ConnInfo>>()
         .map(|c| c.id);
+    // Fixture-declared announce triggers fire HERE: before the handler
+    // runs, so the change and its push are strictly ordered ahead of
+    // the response this request is about to produce. That ordering is
+    // the whole point - see `crate::announce`. The trigger's own log
+    // row lands ahead of this request's row for the same reason.
+    crate::announce::fire_for_request(&state.shared, "graph", &format!("{method} {path}"));
     state.shared.request_log.record_with_conn(
         "graph",
         format!("{method} {path}"),

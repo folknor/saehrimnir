@@ -3330,3 +3330,276 @@ async fn graph_reactions_surface_in_folder_listing_and_delta() {
     assert_eq!(svep(msg, REACTIONS_COUNT_ID).unwrap()["value"], "2");
     assert!(svep(msg, OWNER_REACTION_TYPE_ID).is_none());
 }
+
+// ── reaction clear (property-scoped DELETE) ─────────────────────────
+
+/// bifrost's reaction CLEAR: a `$batch` of
+/// `DELETE .../messages/{id}/singleValueExtendedProperties/{propertyId}`
+/// per message (`graph pim.rs::delete_extended_property`), submitted
+/// with tolerate-404 on.
+///
+/// The status distinction is the whole point. The consumer reads a 404
+/// as "already absent, nothing to clear" and still resolves the item
+/// Ok; a 501 - what the `$batch` default arm returned before this route
+/// existed - is an unmodelled method, which puts the item in the failed
+/// lane and strands the cached reaction. So every not-applicable case
+/// must be a 404 and none of them may be a 501.
+#[tokio::test]
+async fn graph_batch_clears_an_extended_property_and_404s_the_rest() {
+    let app = reactions_router();
+    let owner_prop = pct_encode(OWNER_REACTION_TYPE_ID);
+    let count_prop = pct_encode(REACTIONS_COUNT_ID);
+    let body = json!({
+        "requests": [
+            // email-001 holds both properties: clearing the owner slot
+            // succeeds and leaves the count alone.
+            { "id": "1", "method": "DELETE",
+              "url": format!("/me/messages/email-001/singleValueExtendedProperties/{owner_prop}") },
+            // email-002 has a count but no owner reaction: clearing the
+            // absent slot is a 404, not an error.
+            { "id": "2", "method": "DELETE",
+              "url": format!("/me/messages/email-002/singleValueExtendedProperties/{owner_prop}") },
+            // email-003 has neither.
+            { "id": "3", "method": "DELETE",
+              "url": format!("/me/messages/email-003/singleValueExtendedProperties/{count_prop}") },
+            // Unknown message.
+            { "id": "4", "method": "DELETE",
+              "url": format!("/me/messages/no-such-message/singleValueExtendedProperties/{owner_prop}") },
+            // A property id the fixture models nothing for.
+            { "id": "5", "method": "DELETE",
+              "url": "/me/messages/email-001/singleValueExtendedProperties/String%20%7B00000000-0000-0000-0000-000000000000%7D%20Name%20Whatever" },
+        ]
+    });
+    let (status, v) = post_batch(app.clone(), &body).await;
+    assert_eq!(status, StatusCode::OK);
+    let responses = v["responses"].as_array().unwrap();
+    let by_id = |id: &str| responses.iter().find(|r| r["id"] == id).unwrap();
+
+    assert_eq!(by_id("1")["status"], 204, "{}", by_id("1"));
+    for id in ["2", "3", "4", "5"] {
+        let r = by_id(id);
+        assert_eq!(
+            r["status"], 404,
+            "sub-request {id} must be a tolerated 404, never a 501: {r}"
+        );
+    }
+
+    // The clear is real and surgical: the owner property is gone, the
+    // count on the same message survives.
+    let q = reactions_collection_query();
+    let (status, read) = get_json_with(
+        app,
+        &format!(
+            "/v1.0/me/messages/email-001/singleValueExtendedProperties?{}",
+            pct_encode(&q)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        collection_prop(&read, OWNER_REACTION_TYPE_ID).is_none(),
+        "cleared property must read back ABSENT, not empty: {read}"
+    );
+    assert_eq!(
+        collection_prop(&read, REACTIONS_COUNT_ID).unwrap()["value"],
+        "3",
+        "the sibling property must survive a property-scoped clear: {read}"
+    );
+}
+
+/// The routed twin of the same clear, so the two paths cannot drift.
+#[tokio::test]
+async fn graph_routed_extended_property_delete_matches_the_batch_arm() {
+    let app = reactions_router();
+    let uri = format!(
+        "/v1.0/me/messages/email-001/singleValueExtendedProperties/{}",
+        pct_encode(OWNER_REACTION_TYPE_ID)
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(&uri)
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Idempotent-by-404: a second clear finds nothing to remove.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(&uri)
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── reserved characters in `$batch` sub-request URLs ────────────────
+
+/// The message id staged by `fixtures/graph-reserved-ids.toml`, in its
+/// DECODED form (what the fixture declares and what the mock must
+/// resolve against).
+const RESERVED_MESSAGE_ID: &str = "AAMkAGI2+9/xZ0=";
+
+/// The shared-mailbox owner (`shared@contoso.com`) and that message id
+/// as bifrost puts them on the wire.
+/// `bifrost_net::url::encode_component` escapes `@` -> `%40`,
+/// `+` -> `%2B`, `/` -> `%2F`, `=` -> `%3D`.
+const SHARED_OWNER_ENC: &str = "shared%40contoso.com";
+const RESERVED_MESSAGE_ID_ENC: &str = "AAMkAGI2%2B9%2FxZ0%3D";
+
+fn reserved_ids_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-reserved-ids.toml")).unwrap();
+    graph::router(graph::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+async fn post_batch(app: axum::Router, body: &Value) -> (StatusCode, Value) {
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1.0/$batch")
+                .header(header::HOST, "127.0.0.1:9999")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// A `$batch` sub-request URL is a JSON string bifrost builds with
+/// `bifrost_net::url::encode_component`, so the `/users/{owner}`
+/// segment and the message id both arrive percent-encoded. The mock
+/// parses those URLs by hand; without decoding, a shared-mailbox
+/// hydration GET misses `Fixture::account` and 404s on an account the
+/// fixture declares.
+///
+/// Every assertion here is on a per-item `status`, not on the envelope:
+/// the envelope is 200 even when every sub-request inside it failed,
+/// which is precisely how this class of bug hides.
+#[tokio::test]
+async fn graph_batch_decodes_percent_encoded_owner_and_message_id() {
+    let q = reactions_collection_query();
+    let body = json!({
+        "requests": [
+            // Hydration GET, both segments encoded.
+            { "id": "1", "method": "GET",
+              "url": format!("/users/{SHARED_OWNER_ENC}/messages/{RESERVED_MESSAGE_ID_ENC}?$select=id,subject") },
+            // The reaction refresh's nested-collection GET. The encoded
+            // `/` inside the id must NOT be read as a segment boundary
+            // (decode-then-split would route this at `xZ0=` instead).
+            { "id": "2", "method": "GET",
+              "url": format!("/users/{SHARED_OWNER_ENC}/messages/{RESERVED_MESSAGE_ID_ENC}/singleValueExtendedProperties?{q}") },
+            // Same id through `/me`: still a per-item miss. Decoding
+            // must not leak the shared mailbox into the primary scope.
+            { "id": "3", "method": "GET",
+              "url": format!("/me/messages/{RESERVED_MESSAGE_ID_ENC}") },
+            // An encoded owner that resolves to no declared account is
+            // a ResourceNotFound, distinct from an unknown message.
+            { "id": "4", "method": "GET",
+              "url": format!("/users/nobody%40contoso.com/messages/{RESERVED_MESSAGE_ID_ENC}") },
+            // The `/v1.0`-prefixed spelling decodes identically.
+            { "id": "5", "method": "GET",
+              "url": format!("/v1.0/users/{SHARED_OWNER_ENC}/messages/{RESERVED_MESSAGE_ID_ENC}") },
+        ]
+    });
+    let (status, v) = post_batch(reserved_ids_router(), &body).await;
+    assert_eq!(status, StatusCode::OK);
+    let responses = v["responses"].as_array().unwrap();
+    assert_eq!(responses.len(), 5);
+    let by_id = |id: &str| responses.iter().find(|r| r["id"] == id).unwrap();
+
+    let r1 = by_id("1");
+    assert_eq!(r1["status"], 200, "{r1}");
+    assert_eq!(r1["body"]["id"], RESERVED_MESSAGE_ID);
+    assert_eq!(r1["body"]["subject"], "Hello shared");
+    // The etag derives from the DECODED id, which is the value bifrost
+    // will hand straight back as an `If-Match` on the next mutation.
+    assert_eq!(
+        r1["body"]["@odata.etag"],
+        format!("W/\"etag-{RESERVED_MESSAGE_ID}\"")
+    );
+
+    let r2 = by_id("2");
+    assert_eq!(r2["status"], 200, "{r2}");
+    assert_eq!(
+        collection_prop(&r2["body"], OWNER_REACTION_TYPE_ID).unwrap()["value"],
+        "like"
+    );
+    assert_eq!(
+        collection_prop(&r2["body"], REACTIONS_COUNT_ID).unwrap()["value"],
+        "2"
+    );
+
+    let r3 = by_id("3");
+    assert_eq!(r3["status"], 404, "{r3}");
+    assert_eq!(r3["body"]["error"]["code"], "ErrorItemNotFound");
+
+    let r4 = by_id("4");
+    assert_eq!(r4["status"], 404, "{r4}");
+    assert_eq!(r4["body"]["error"]["code"], "ResourceNotFound");
+
+    let r5 = by_id("5");
+    assert_eq!(r5["status"], 200, "{r5}");
+    assert_eq!(r5["body"]["id"], RESERVED_MESSAGE_ID);
+}
+
+/// The write half. bifrost routes PATCH / POST `.../move` through the
+/// same encoded URLs, gated on an `If-Match` it read from the encoded
+/// id's projection - so a decode bug shows up as a 404 (or, worse for
+/// `move`, as a 501 from the `{id}/move` split landing on the wrong
+/// boundary) rather than a mutation.
+#[tokio::test]
+async fn graph_batch_writes_route_through_percent_encoded_ids() {
+    let app = reserved_ids_router();
+    let etag = format!("W/\"etag-{RESERVED_MESSAGE_ID}\"");
+    let body = json!({
+        "requests": [
+            { "id": "1", "method": "PATCH",
+              "url": format!("/users/{SHARED_OWNER_ENC}/messages/{RESERVED_MESSAGE_ID_ENC}"),
+              "headers": { "If-Match": etag },
+              "body": { "isRead": true } },
+            { "id": "2", "method": "POST",
+              "url": format!("/users/{SHARED_OWNER_ENC}/messages/{RESERVED_MESSAGE_ID_ENC}/move"),
+              "headers": { "If-Match": etag },
+              "body": { "destinationId": "mbx-shared-archive" } },
+        ]
+    });
+    let (status, v) = post_batch(app.clone(), &body).await;
+    assert_eq!(status, StatusCode::OK);
+    let responses = v["responses"].as_array().unwrap();
+    let by_id = |id: &str| responses.iter().find(|r| r["id"] == id).unwrap();
+    assert_eq!(by_id("1")["status"], 200, "{}", by_id("1"));
+    assert_eq!(by_id("1")["body"]["isRead"], true);
+    assert_eq!(by_id("2")["status"], 201, "{}", by_id("2"));
+
+    // Persisted, and visible on the direct (axum-decoded) route too -
+    // the hand-rolled `$batch` parser and axum's `Path` extractor must
+    // agree on what the id is.
+    let (status, v) = get_json_with(
+        app,
+        &format!("/v1.0/users/{SHARED_OWNER_ENC}/messages/{RESERVED_MESSAGE_ID_ENC}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["id"], RESERVED_MESSAGE_ID);
+    assert_eq!(v["isRead"], true);
+    assert_eq!(v["parentFolderId"], "mbx-shared-archive");
+}

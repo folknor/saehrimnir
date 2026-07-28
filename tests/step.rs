@@ -974,6 +974,74 @@ async fn gmail_history_projects_each_step_into_records() {
     assert_eq!(ta[0]["labelIds"], json!(["STARRED"]));
 }
 
+/// The other half of the multi-message-thread contract, for a change
+/// that arrives from the SERVER (another client starred one message)
+/// rather than from the consumer's own mutation: the sibling's
+/// membership must survive untouched, and no history record may name
+/// it. Asserting only the record's shape leaves the interesting
+/// failure - a thread-wide write masquerading as a message-scoped
+/// record - undetected.
+#[tokio::test]
+async fn gmail_single_message_step_leaves_thread_siblings_intact() {
+    let (admin, mail) = gmail_routers();
+
+    let (status, before) = gmail_get(&mail, "/gmail/v1/users/me/threads/thread-003").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(before["messages"].as_array().unwrap().len(), 2);
+    let sibling_before = message_labels(&before, "email-003b");
+
+    for id in ["new", "delete", "label", "thread-label"] {
+        let (status, _) = step(&admin, json!({ "expect": id })).await;
+        assert_eq!(status, StatusCode::OK, "step {id} should apply");
+    }
+
+    let (status, after) = gmail_get(&mail, "/gmail/v1/users/me/threads/thread-003").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(after["messages"].as_array().unwrap().len(), 2);
+    assert!(message_labels(&after, "email-003a").contains(&"STARRED".to_string()));
+    assert_eq!(
+        message_labels(&after, "email-003b"),
+        sibling_before,
+        "the sibling's membership must survive a label change on its thread-mate"
+    );
+
+    // No record anywhere in the delta names the sibling.
+    let (_, hist) = gmail_get(&mail, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    let named: Vec<&str> = hist["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|r| {
+            ["labelsAdded", "labelsRemoved"]
+                .into_iter()
+                .filter_map(|k| r.get(k))
+                .filter_map(Value::as_array)
+                .flatten()
+                .filter_map(|e| e["message"]["id"].as_str())
+        })
+        .collect();
+    assert!(
+        !named.contains(&"email-003b"),
+        "label delta named the untouched sibling: {named:?}"
+    );
+}
+
+/// The Gmail label set of `message_id` inside a `threads.get` body.
+fn message_labels(thread: &Value, message_id: &str) -> Vec<String> {
+    let message = thread["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == message_id)
+        .unwrap_or_else(|| panic!("thread carries no message {message_id}: {thread}"));
+    message["labelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
 #[tokio::test]
 async fn gmail_history_partial_cursor_and_unknown() {
     let (admin, mail) = gmail_routers();

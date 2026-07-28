@@ -10,6 +10,7 @@
 // idiomatic.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod announce;
 pub mod caldav;
 pub mod carddav;
 pub mod cli;

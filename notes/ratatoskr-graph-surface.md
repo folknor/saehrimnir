@@ -309,6 +309,41 @@ v0 serves:
   through `$batch`, so this - not the direct PATCH/DELETE/move
   endpoints - is the path it actually exercises.
 
+  Sub-request URLs are PERCENT-ENCODED. bifrost builds them with
+  `bifrost_net::url::encode_component`, which escapes `@`, `/`, `+`,
+  `=`, `:` and friends, so a shared-mailbox hydration GET arrives as
+  `/users/shared%40contoso.com/messages/AAMk%2Bx%2Fy%3D` - real
+  Microsoft mailbox ids are SMTP addresses and real message ids are
+  base64-shaped, so this is the ordinary case, not an exotic one.
+  Unlike the routed endpoints (axum's `Path` extractor decodes for
+  free) this parser is hand-rolled, so it splits the path on its RAW
+  `/` separators and decodes each segment afterwards
+  (`odata::decode_path_segment`). The order is load-bearing in both
+  directions: no decoding at all and the `/users/{owner}` segment
+  misses `Fixture::account`; decoding before the split and a `%2F`
+  inside a message id becomes a segment boundary, so the id is
+  mis-read as an `{id}/{suffix}` pair and the hydration GET routes
+  into the `move` / property-collection arms. Only the path is
+  decoded - the query keeps its own rules, where `+` means a space.
+  `fixtures/graph-reserved-ids.toml` stages both reserved-character
+  ids; every other fixture uses hyphenated ASCII that survives a
+  missing decode unchanged.
+
+  `DELETE .../messages/{id}/singleValueExtendedProperties/{propId}` -
+  the sub-request bifrost's reaction CLEAR sends
+  (`pim.rs::delete_extended_property`, batched with tolerate-404 on).
+  Served on both the `$batch` arm and the routed twin. What matters
+  here is 404 vs 501: the consumer reads a 404 as "already absent,
+  nothing to clear" and still resolves the item Ok, but a 501 (the
+  `$batch` default arm, before this existed) is an unmodelled method
+  and lands the item in the failed lane with the cached reaction
+  stranded. So all three not-applicable cases answer 404 - unknown
+  message, a property id the fixture models nothing for, and a named
+  slot that is already empty (real Graph has no navigation entry to
+  delete either). Property-id matching reuses the read path's
+  `svep_selection`, so a consumer's GUID casing or spacing variant
+  resolves the same way on read and on clear.
+
 ### Folder mutation (bifrost container pipeline)
 
 `src/graph/mail.rs` serves the mailFolder write surface

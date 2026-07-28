@@ -1135,3 +1135,212 @@ async fn gmail_initial_sync_replay_message_labels_are_known_scopes() {
     }
     assert_eq!(hydrated, 2, "both fixture messages hydrate end to end");
 }
+
+// ── Multi-message threads: message-target vs thread-target ──────────
+//
+// bifrost's Gmail mutation pipeline (`google pim.rs::modify_target`)
+// splits on the mutation target: a `MutationTarget::Message` becomes
+// `POST /messages/{id}/modify`, a `MutationTarget::Thread` becomes
+// `POST /threads/{id}/modify`, and an already-trashed thread destroy
+// becomes `DELETE /threads/{id}`. A consumer gating "a label change on
+// ONE message of a multi-message thread leaves the other messages'
+// membership alone" needs all three served, and needs `history.list` to
+// stay MESSAGE-scoped so the two shapes are distinguishable in a delta.
+
+fn threads_router() -> axum::Router {
+    let path = std::path::Path::new("fixtures/gmail-threads.lua");
+    let source = std::fs::read_to_string(path).unwrap();
+    let chunk = format!("@{}", path.display());
+    let fix = lua::load_source_with_dir(&source, &chunk, path.parent().unwrap()).unwrap();
+    gmail::router(gmail::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+/// The Gmail label set of `message_id` inside a `threads.get` body.
+fn thread_labels(thread: &Value, message_id: &str) -> Vec<String> {
+    let message = thread["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == message_id)
+        .unwrap_or_else(|| panic!("thread carries no message {message_id}: {thread}"));
+    message["labelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Every `(message id, labelIds)` pair a `history.list` body reports
+/// under `key` (`labelsAdded` / `labelsRemoved`), across all records.
+fn history_label_entries(history: &Value, key: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for record in history["history"].as_array().unwrap() {
+        let Some(entries) = record.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            let labels = entry["labelIds"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("{key} entry has no labelIds array (bifrost's GmailHistoryLabelWrapper requires it): {entry}")
+                })
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            out.push((entry["message"]["id"].as_str().unwrap().to_string(), labels));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn gmail_message_target_modify_leaves_thread_siblings_intact() {
+    let app = threads_router();
+
+    let (status, before) =
+        get_json_with(app.clone(), "/gmail/v1/users/me/threads/thread-multi").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(before["messages"].as_array().unwrap().len(), 3);
+    let a_before = thread_labels(&before, "msg-a");
+    let c_before = thread_labels(&before, "msg-c");
+    // The siblings must differ from each other, or "unchanged" could
+    // hold by accident on a uniform thread.
+    assert!(c_before.contains(&"UNREAD".to_string()), "{c_before:?}");
+    assert!(!a_before.contains(&"UNREAD".to_string()), "{a_before:?}");
+
+    // Star exactly one message of the thread.
+    let (status, modified) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/messages/msg-b/modify",
+        serde_json::json!({ "addLabelIds": ["STARRED"], "removeLabelIds": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(modified["id"], "msg-b");
+    assert_eq!(modified["threadId"], "thread-multi");
+    let modified_labels: Vec<&str> = modified["labelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(modified_labels.contains(&"STARRED"), "{modified_labels:?}");
+
+    // The siblings' membership survives, byte for byte.
+    let (status, after) =
+        get_json_with(app.clone(), "/gmail/v1/users/me/threads/thread-multi").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(after["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(thread_labels(&after, "msg-a"), a_before);
+    assert_eq!(thread_labels(&after, "msg-c"), c_before);
+    assert!(thread_labels(&after, "msg-b").contains(&"STARRED".to_string()));
+
+    // And the delta names that one message alone. This is the half a
+    // consumer cannot fake: a thread-scoped record would let a
+    // whole-thread change masquerade as a single-message one.
+    let (status, history) = get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let added = history_label_entries(&history, "labelsAdded");
+    assert_eq!(
+        added,
+        vec![("msg-b".to_string(), vec!["STARRED".to_string()])],
+        "history: {history}"
+    );
+    assert!(history_label_entries(&history, "labelsRemoved").is_empty());
+}
+
+#[tokio::test]
+async fn gmail_thread_target_modify_touches_every_message_in_the_thread() {
+    let app = threads_router();
+
+    // The same patch bifrost sends for a message target, aimed at the
+    // thread instead: every message in it must move.
+    let (status, thread) = post_json(
+        app.clone(),
+        "/gmail/v1/users/me/threads/thread-multi/modify",
+        serde_json::json!({ "addLabelIds": ["STARRED"], "removeLabelIds": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The response is the shape bifrost deserializes (`GmailThread`).
+    assert_eq!(thread["id"], "thread-multi");
+    let messages = thread["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    for message in messages {
+        let labels: Vec<&str> = message["labelIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            labels.contains(&"STARRED"),
+            "message {} missed the thread-wide label: {labels:?}",
+            message["id"]
+        );
+    }
+
+    // One history record PER MESSAGE, not one for the thread - which is
+    // what makes this distinguishable from the single-message case.
+    let (_, history) =
+        get_json_with(app.clone(), "/gmail/v1/users/me/history?startHistoryId=1").await;
+    let mut added = history_label_entries(&history, "labelsAdded");
+    added.sort();
+    assert_eq!(
+        added,
+        vec![
+            ("msg-a".to_string(), vec!["STARRED".to_string()]),
+            ("msg-b".to_string(), vec!["STARRED".to_string()]),
+            ("msg-c".to_string(), vec!["STARRED".to_string()]),
+        ],
+        "history: {history}"
+    );
+
+    // A thread the account does not have is a per-request notFound,
+    // not a silent success.
+    let (status, v) = post_json(
+        app,
+        "/gmail/v1/users/me/threads/no-such-thread/modify",
+        serde_json::json!({ "addLabelIds": ["STARRED"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["errors"][0]["reason"], "notFound");
+}
+
+#[tokio::test]
+async fn gmail_thread_delete_destroys_every_message_and_reports_tombstones() {
+    let app = threads_router();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/gmail/v1/users/me/threads/thread-trashed")
+                .header(header::AUTHORIZATION, "Bearer doesnt-matter")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let (status, _) = get_json_with(app.clone(), "/gmail/v1/users/me/threads/thread-trashed").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Both messages surface as tombstones, and the untouched threads
+    // are not swept up with them.
+    let (_, history) = get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    let mut deleted: Vec<String> = history["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.get("messagesDeleted").and_then(Value::as_array))
+        .flatten()
+        .map(|e| e["message"]["id"].as_str().unwrap().to_string())
+        .collect();
+    deleted.sort();
+    assert_eq!(deleted, vec!["msg-t1".to_string(), "msg-t2".to_string()]);
+}

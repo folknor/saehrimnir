@@ -1,0 +1,57 @@
+name = "calendar-no-scheduling"
+
+# A plain RFC 4791 CalDAV store: it can hold events, but it advertises
+# no RFC 6638 scheduling, so it cannot transmit a reply to an
+# organizer.
+#
+# This exists because a client may DERIVE its RSVP capability from
+# discovery rather than hardcoding it - bifrost computes
+# `pim_methods.event_rsvp` from whether the principal PROPFIND returns
+# BOTH a `CALDAV:schedule-outbox-URL` and a
+# `CALDAV:calendar-user-address-set`. Every other fixture advertises
+# both, so they can only ever prove the TRUE branch of that
+# derivation. The FALSE branch is the case the derivation exists for:
+# reporting `event_rsvp = true` against a server like this one passes
+# a consumer's capability gate and then fails at the POST, which is a
+# far worse failure mode than reporting RSVP unavailable up front.
+#
+# The event mirrors `calendar-rsvp-small.toml` deliberately - same
+# account, same organizer, same attendee shape - so the ONLY thing
+# that differs between the two fixtures is the server's advertised
+# scheduling. Anything a gate observes differently between them is
+# attributable to that switch and nothing else.
+
+[caldav]
+scheduling = false
+
+[[account]]
+id = "self"
+name = "self@example.test"
+is_personal = true
+
+[[mailbox]]
+id = "mbx-inbox"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+[[calendar]]
+id = "cal-1"
+name = "Work"
+color = "lightBlue"
+is_default = true
+
+[[event]]
+id = "ev-rsvp"
+calendar_id = "cal-1"
+subject = "Planning"
+body_text = "Quarterly planning session."
+start = "2026-03-02T09:00:00Z"
+end = "2026-03-02T10:00:00Z"
+location = "Conf Room B"
+organizer = { name = "Organizer", email = "organizer@example.test" }
+attendees = [
+    "self@example.test",
+    { name = "Other", email = "other@example.test", status = "declined" },
+]
+is_all_day = false

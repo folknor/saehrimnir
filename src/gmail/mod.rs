@@ -122,6 +122,9 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
         .extensions()
         .get::<axum::extract::ConnectInfo<crate::connection_id::ConnInfo>>()
         .map(|c| c.id);
+    // See `graph::log_request` / `crate::announce`: triggers fire
+    // before the handler so the change precedes the response.
+    crate::announce::fire_for_request(&state.shared, "gmail", &format!("{method} {path}"));
     state.shared.request_log.record_with_conn(
         "gmail",
         format!("{method} {path}"),

@@ -234,14 +234,53 @@ record per transition newer than `startHistoryId`:
   `labelsRemoved` with the precise `labelIds` that moved (bifrost
   applies each as a `ScopeChange::Added` / `Removed`).
 
-The label delta is captured at mutation time by the change-script
-step applier (`src/test_admin.rs`) into the change log's
-`email_label_changes` sidecar; v0 only surfaces it for
-change-script-driven mutations (incremental Gmail sync is
-step-driven). A `startHistoryId` older than the bounded ring can
+The label delta is captured at mutation time into the change log's
+`email_label_changes` sidecar, by BOTH mutation paths: the
+change-script step applier (`src/test_admin.rs`, for a change that
+arrives from the server) and the served mutation verbs
+(`modify_one` in `src/gmail/mail.rs`, for a change the consumer
+made itself). Either way the record is MESSAGE-scoped, never
+thread-scoped - which is what lets a consumer tell "one message of
+this thread changed" apart from "every message in this thread
+changed". A `startHistoryId` older than the bounded ring can
 reconstruct returns a 404 mentioning `historyId`, driving the
 full-resync fallback. `startHistoryId` at or past the current id
 returns an empty `history[]` paired with the current id.
+
+### Mutations
+
+```
+POST   /gmail/v1/users/me/messages/{id}/modify
+POST   /gmail/v1/users/me/threads/{id}/modify
+DELETE /gmail/v1/users/me/threads/{id}
+POST   /gmail/v1/users/me/messages/batchModify
+POST   /gmail/v1/users/me/messages/batchDelete
+```
+
+bifrost's mutation pipeline (`google pim.rs::modify_target`) splits
+on the target: a `MutationTarget::Message` becomes the singular
+`messages/{id}/modify`, a `MutationTarget::Thread` becomes
+`threads/{id}/modify`, and `delete_thread` issues
+`DELETE /threads/{id}` only when the thread already sits in TRASH
+(every other destroy is a move-to-trash through `modify`). The two
+`batch*` forms are real Gmail endpoints the mock also serves, but
+bifrost does not currently drive them - do not treat their coverage
+as covering the mutation pipeline.
+
+The thread form is deliberately the message form looped over the
+thread's messages, one `modify_one` per message, so `history.list`
+emits one record per message exactly as real Gmail does. A
+thread-level history record would make a whole-thread change
+indistinguishable from a single-message one and would defeat the
+consumer gate that asserts a message's thread-mates kept their
+membership.
+
+Bodies are `{ addLabelIds: [...], removeLabelIds: [...] }` (plus
+`ids` for the batch forms). `messages/{id}/modify` answers 200 with
+the updated Message; `threads/{id}/modify` answers 200 with
+`{ id, historyId, messages: [...] }` (bifrost's `GmailThread`); the
+`batch*` forms and `DELETE /threads/{id}` answer 204. A thread the
+account cannot see is a `notFound`, not a silent success.
 
 ### SendAs / signatures (out of scope for read-only mail sync)
 

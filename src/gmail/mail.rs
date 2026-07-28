@@ -50,7 +50,20 @@ pub fn router() -> Router<AppState> {
             axum::routing::patch(patch_label).delete(delete_label),
         )
         .route("/gmail/v1/users/me/threads", get(list_threads))
-        .route("/gmail/v1/users/me/threads/{thread_id}", get(get_thread))
+        // Thread-target mutations. bifrost's mutation pipeline routes a
+        // `MutationTarget::Thread` here (`google pim.rs::modify_target`
+        // / `delete_thread`) and a `MutationTarget::Message` at
+        // `messages/{id}/modify`; the static `modify` segment sits
+        // under the `{thread_id}` param, which matchit resolves before
+        // the shorter route.
+        .route(
+            "/gmail/v1/users/me/threads/{thread_id}/modify",
+            axum::routing::post(modify_thread),
+        )
+        .route(
+            "/gmail/v1/users/me/threads/{thread_id}",
+            get(get_thread).delete(delete_thread),
+        )
         .route("/gmail/v1/users/me/messages", get(list_messages))
         // Mutations. Static `batchModify` / `batchDelete` segments
         // coexist with the `{message_id}` param at the same level
@@ -1285,6 +1298,101 @@ async fn modify_message(
             "notFound",
         ),
     }
+}
+
+/// Ids of every message in `thread_id` owned by `account_id`, oldest
+/// first. Empty when the thread does not exist in the account, which
+/// the thread-scoped handlers turn into a 404 rather than a silent
+/// no-op success (a consumer that mutated a thread it cannot see has
+/// a real problem, and Gmail says `notFound` too).
+fn thread_message_ids(state: &AppState, account_id: &str, thread_id: &str) -> Vec<String> {
+    let fixture = state.fixture();
+    let mut messages: Vec<&Email> = fixture
+        .emails_for(account_id)
+        .filter(|e| e.thread_id == thread_id)
+        .collect();
+    messages.sort_by_key(|e| e.received_at);
+    messages.iter().map(|e| e.id.clone()).collect()
+}
+
+/// `POST /gmail/v1/users/me/threads/{id}/modify`.
+///
+/// The thread half of the mutation surface. It is deliberately the
+/// same `modify_one` per message that `messages/{id}/modify` uses,
+/// looped over the whole thread, rather than a thread-level shortcut:
+/// real Gmail records one history entry per message, and the whole
+/// point of a multi-message-thread gate is telling "one message
+/// changed" apart from "every message in the thread changed". A
+/// thread-level record would make the two indistinguishable in
+/// `history.list`.
+///
+/// Returns the updated thread, which is what bifrost deserializes
+/// (`GmailThread { id, messages }`).
+async fn modify_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(thread_id): Path<String>,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let add = label_list(&body, "addLabelIds");
+    let remove = label_list(&body, "removeLabelIds");
+    let ids = thread_message_ids(&state, &account_id, &thread_id);
+    if ids.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("thread {thread_id:?} not found"),
+            "notFound",
+        );
+    }
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        for id in &ids {
+            modify_one(&mut fix, &account_id, id, &add, &remove);
+        }
+    }
+    let fixture = state.fixture();
+    let mut messages: Vec<&Email> = fixture
+        .emails_for(&account_id)
+        .filter(|e| e.thread_id == thread_id)
+        .collect();
+    messages.sort_by_key(|e| e.received_at);
+    let messages_json: Vec<Value> = messages
+        .iter()
+        .map(|e| message_value(e, &fixture))
+        .collect();
+    ok_json(json!({
+        "id": thread_id,
+        "historyId": fixture.gmail_history_id(&account_id).to_string(),
+        "messages": messages_json,
+    }))
+}
+
+/// `DELETE /gmail/v1/users/me/threads/{id}`. Permanently destroys every
+/// message in the thread; 204 No Content. bifrost only calls this when
+/// the thread is already in TRASH (`google pim.rs::delete_thread`) -
+/// every other destroy is a move-to-trash through `modify`.
+async fn delete_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(thread_id): Path<String>,
+) -> Response {
+    let account_id = bearer_account(&state, &headers);
+    let ids = thread_message_ids(&state, &account_id, &thread_id);
+    if ids.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            &format!("thread {thread_id:?} not found"),
+            "notFound",
+        );
+    }
+    {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        for id in &ids {
+            delete_one(&mut fix, &account_id, id);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `POST /gmail/v1/users/me/messages/batchModify`. Same label patch

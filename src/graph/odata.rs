@@ -123,6 +123,43 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Percent-decode one URL *path* segment.
+///
+/// Distinct from the query decoder above in one way that matters: a
+/// literal `+` stays a `+` rather than becoming a space. `+` is a
+/// perfectly ordinary path character, and it shows up verbatim inside
+/// base64-shaped Microsoft Graph message ids; a client that means a
+/// space in a path segment sends `%20`.
+///
+/// Malformed escapes (a trailing `%`, `%X`, non-hex digits) pass
+/// through verbatim so a deliberately-broken URL still routes
+/// deterministically instead of losing bytes.
+///
+/// Callers must split the path on its raw `/` separators BEFORE
+/// decoding each segment: an id carrying an encoded `%2F` would
+/// otherwise decode into a segment boundary and be mis-read as
+/// `{id}/{suffix}`.
+pub fn decode_path_segment(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(h), Some(l)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn hex(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -340,5 +377,28 @@ mod tests {
         let m: std::collections::HashMap<_, _> = pairs.into_iter().collect();
         assert_eq!(m["a"], "hello world");
         assert_eq!(m["b"], "/path");
+    }
+
+    #[test]
+    fn path_segment_decodes_reserved_characters_and_keeps_plus() {
+        // The two segments bifrost percent-encodes on a `$batch`
+        // sub-request URL: the shared-mailbox owner and a base64-shaped
+        // Graph message id.
+        assert_eq!(
+            decode_path_segment("shared%40contoso.com"),
+            "shared@contoso.com"
+        );
+        assert_eq!(
+            decode_path_segment("AAMkAGI2%2B9%2FxZ0%3D"),
+            "AAMkAGI2+9/xZ0="
+        );
+        // A literal `+` is a `+` in a path segment, unlike in a query.
+        assert_eq!(decode_path_segment("a+b"), "a+b");
+        assert_eq!(decode_path_segment("a%20b"), "a b");
+        // Lower-case hex, and malformed escapes passed through whole.
+        assert_eq!(decode_path_segment("%2f%2F"), "//");
+        assert_eq!(decode_path_segment("100%"), "100%");
+        assert_eq!(decode_path_segment("%zz"), "%zz");
+        assert_eq!(decode_path_segment("%2"), "%2");
     }
 }

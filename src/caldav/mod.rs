@@ -313,7 +313,13 @@ fn parse_path(fixture: &crate::fixture::Fixture, path: &str) -> ResourcePath {
         // Match it before the generic calendar arm so a POST there
         // routes to the schedule-reply handler rather than being read
         // as a calendar named "outbox" (no fixture declares one).
-        ["calendars", u, "outbox"] if fixture.account(u).is_some() => {
+        // Gated on the same fixture switch that advertises it. A
+        // scheduling-less server must not merely stop ADVERTISING the
+        // outbox while still honouring a POST to it - a consumer that
+        // guessed the conventional URL would then succeed against a
+        // server that reported no scheduling, and the fixture would be
+        // staging a shape no real server has.
+        ["calendars", u, "outbox"] if fixture.caldav.scheduling && fixture.account(u).is_some() => {
             ResourcePath::ScheduleOutbox {
                 user: (*u).to_string(),
             }
@@ -438,18 +444,30 @@ fn propfind_principal(fixture: &crate::fixture::Fixture, user: &str, body: &str)
     // principal's own address (a `mailto:` of the account's email, which
     // is `account.name` by the fixture convention); `schedule-outbox-URL`
     // points at the collection bifrost POSTs the iTIP REPLY to during an
-    // RSVP. Both must be present for bifrost's `event_rsvp` to proceed
-    // (a missing schedule-outbox-URL makes it return unsupported).
-    if requested.contains("calendar-user-address-set") {
-        props.push_str(&format!(
-            "<C:calendar-user-address-set><D:href>mailto:{}</D:href></C:calendar-user-address-set>",
-            xml::escape(&principal_email(fixture, user)),
-        ));
-    }
-    if requested.contains("schedule-outbox-URL") {
-        props.push_str(&format!(
-            "<C:schedule-outbox-URL><D:href>/calendars/{user}/outbox/</D:href></C:schedule-outbox-URL>",
-        ));
+    // RSVP.
+    //
+    // A client may DERIVE its RSVP capability from these rather than
+    // hardcoding it (bifrost's `scheduling_available` requires both
+    // non-empty), so what this block emits decides whether the
+    // consumer reports RSVP as supported at all. `[caldav] scheduling
+    // = false` omits both, which is how a fixture stages a plain
+    // RFC 4791 store - the FALSE branch of that derivation, and the
+    // case the derivation exists for. Omission is deliberate over
+    // emitting an empty element: a 207 that carries the property with
+    // no href is a half-answer real servers do not give, and it would
+    // conflate "no scheduling" with "scheduling, address unknown".
+    if fixture.caldav.scheduling {
+        if requested.contains("calendar-user-address-set") {
+            props.push_str(&format!(
+                "<C:calendar-user-address-set><D:href>mailto:{}</D:href></C:calendar-user-address-set>",
+                xml::escape(&principal_email(fixture, user)),
+            ));
+        }
+        if requested.contains("schedule-outbox-URL") {
+            props.push_str(&format!(
+                "<C:schedule-outbox-URL><D:href>/calendars/{user}/outbox/</D:href></C:schedule-outbox-URL>",
+            ));
+        }
     }
     multistatus(wrap_responses(&[Response207 {
         href: &format!("/principals/{user}/"),

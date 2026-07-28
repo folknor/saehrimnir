@@ -129,6 +129,8 @@ async fn log_request(State(state): State<AppState>, req: Request, next: Next) ->
         .extensions()
         .get::<axum::extract::ConnectInfo<crate::connection_id::ConnInfo>>()
         .map(|c| c.id);
+    // See `graph::log_request` / `crate::announce`.
+    crate::announce::fire_for_request(&state.shared, "people", &format!("{method} {path}"));
     state.shared.request_log.record_with_conn(
         "people",
         format!("{method} {path}"),

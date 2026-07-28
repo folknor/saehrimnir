@@ -87,6 +87,10 @@ pub fn router() -> Router<AppState> {
             get(get_message_extended_properties_me),
         )
         .route(
+            "/v1.0/me/messages/{message_id}/singleValueExtendedProperties/{property_id}",
+            axum::routing::delete(delete_message_extended_property_me),
+        )
+        .route(
             "/v1.0/me/messages/{message_id}",
             get(get_message_me)
                 .patch(patch_message_me)
@@ -147,6 +151,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1.0/users/{user}/messages/{message_id}/singleValueExtendedProperties",
             get(get_message_extended_properties_user),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{message_id}/singleValueExtendedProperties/{property_id}",
+            axum::routing::delete(delete_message_extended_property_user),
         )
         .route(
             "/v1.0/users/{user}/messages/{message_id}",
@@ -254,6 +262,31 @@ async fn get_message_extended_properties_me(
 ) -> Response {
     let account_id = state.fixture().primary_account().id.clone();
     get_message_extended_properties_impl(state, &account_id, &message_id, raw).await
+}
+
+async fn delete_message_extended_property_me(
+    State(state): State<AppState>,
+    Path((message_id, property_id)): Path<(String, String)>,
+) -> Response {
+    let account_id = state.fixture().primary_account().id.clone();
+    delete_message_extended_property_impl(&state, &account_id, &message_id, &property_id)
+}
+
+/// Routed twin of the `$batch` property-clear arm. bifrost only ever
+/// sends this batched, but every other message verb is served on both
+/// paths through one core, and a surface that exists on only one of
+/// them is the kind of asymmetry that hides a bug.
+fn delete_message_extended_property_impl(
+    state: &AppState,
+    account_id: &str,
+    message_id: &str,
+    property_id: &str,
+) -> Response {
+    let outcome = {
+        let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
+        delete_extended_property_core(&mut fix, account_id, message_id, property_id)
+    };
+    write_outcome_response(outcome, message_id, StatusCode::NO_CONTENT)
 }
 
 async fn get_message_value_me(
@@ -436,6 +469,17 @@ async fn get_message_extended_properties_user(
         Err(r) => return r,
     };
     get_message_extended_properties_impl(state, &account_id, &message_id, raw).await
+}
+
+async fn delete_message_extended_property_user(
+    State(state): State<AppState>,
+    Path((user, message_id, property_id)): Path<(String, String, String)>,
+) -> Response {
+    let account_id = match super::resolve_user_account(&state.fixture(), &user) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    delete_message_extended_property_impl(&state, &account_id, &message_id, &property_id)
 }
 
 async fn get_message_value_user(
@@ -1845,6 +1889,76 @@ fn delete_message_core(
     WriteOutcome::Applied(None)
 }
 
+/// Clear ONE extended property on a message:
+/// `DELETE .../messages/{id}/singleValueExtendedProperties/{propertyId}`.
+///
+/// This is the sub-request bifrost's reaction CLEAR sends
+/// (`graph pim.rs::delete_extended_property`, batched with
+/// tolerate-404 on). The distinction that matters is 404 vs 501: the
+/// consumer treats a 404 as "the property was already absent, nothing
+/// to clear" and still resolves the item Ok, but a 501 (what the
+/// `$batch` default arm returned before this existed) is an unmodelled
+/// method, which lands the item in the failed lane and strands the
+/// cached reaction. So every not-applicable case here is deliberately
+/// a 404, never an error status.
+///
+/// Three of those cases exist and all three are real Graph behaviour:
+/// the message is not in the account; the property id names nothing
+/// the fixture models; or the named slot is already empty (real Graph
+/// has no navigation entry to delete, so it 404s). Property-id
+/// matching reuses [`svep_selection`], so it is the same liberal
+/// name-substring rule the `$filter` read path uses - a consumer's
+/// GUID casing or spacing variant resolves identically on read and
+/// clear.
+fn delete_extended_property_core(
+    fix: &mut Fixture,
+    account_id: &str,
+    message_id: &str,
+    property_id: &str,
+) -> WriteOutcome {
+    let target = svep_selection(Some(property_id));
+    let acct = account_id.to_string();
+    let mid = message_id.to_string();
+    let Some(email) = fix
+        .emails_for(account_id)
+        .find(|e| e.id == message_id)
+        .cloned()
+    else {
+        return WriteOutcome::NotFound;
+    };
+    // Only the slots this property id actually names, and only when
+    // they hold something. Clearing an absent property is a 404.
+    let clear_owner = target.owner_reaction_type && email.reaction_type.is_some();
+    let clear_count = target.reactions_count && email.reaction_count.is_some();
+    if !clear_owner && !clear_count {
+        return WriteOutcome::NotFound;
+    }
+    let _ = fix.mutate(|f| {
+        let Some(idx) = f
+            .emails
+            .iter()
+            .position(|e| e.account_id == acct && e.id == mid)
+        else {
+            return MutationDiff::default();
+        };
+        if clear_owner {
+            f.emails[idx].reaction_type = None;
+        }
+        if clear_count {
+            f.emails[idx].reaction_count = None;
+        }
+        // Membership and keywords are untouched, so no UID sync and no
+        // Gmail label delta - just the update marker that makes the
+        // next delta cycle re-hydrate the message. Mirrors the
+        // `email_reaction` change-script op.
+        MutationDiff {
+            email_updated: vec![mid.clone()],
+            ..Default::default()
+        }
+    });
+    WriteOutcome::Applied(None)
+}
+
 /// Move a message to `dest` (single-folder membership replace),
 /// honouring the optional `If-Match` precondition bifrost's `Move`
 /// mutation always supplies. Returns the projected moved message.
@@ -2469,6 +2583,22 @@ fn batch_sub_response(fix: &mut Fixture, req: &Value) -> Value {
 /// DELETE, and POST `.../move`. Sub-request URLs are relative
 /// (`/me/...` or `/users/{u}/...`) and may or may not carry the
 /// `/v1.0` prefix.
+///
+/// The path is split on its RAW `/` separators and each segment is
+/// percent-decoded afterwards. Both halves of that order matter.
+/// bifrost builds every sub-request URL through
+/// `bifrost_net::url::encode_component`, which escapes `@`, `/`, `+`,
+/// `=`, `:` and friends - so a shared-mailbox hydration GET arrives as
+/// `/users/shared%40contoso.com/messages/AAMk%2Bx%2Fy%3D`. Without
+/// decoding, the `/users/{owner}` segment misses `Fixture::account`
+/// and the sub-request 404s even though the account is declared.
+/// Decoding *before* the split would be worse than not decoding at
+/// all: a `%2F` inside a message id would become a segment boundary
+/// and the id would be mis-read as an `{id}/{suffix}` pair.
+///
+/// Only the path is decoded. The query string keeps its own decoding
+/// rules (`odata::OdataQuery::parse`), which differ - `+` means a
+/// space there and a literal `+` in a path segment does not.
 fn dispatch_batch_request(
     fix: &mut Fixture,
     method: &str,
@@ -2482,51 +2612,54 @@ fn dispatch_batch_request(
         None => (url, None),
     };
     let path = path.strip_prefix("/v1.0").unwrap_or(path);
+    let segments: Vec<String> = path
+        .trim_start_matches('/')
+        .split('/')
+        .map(odata::decode_path_segment)
+        .collect();
+    let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
 
-    // Resolve the (account, "{id}" or "{id}/move") tail from the path.
-    let (account_id, tail) = if let Some(tail) = path.strip_prefix("/me/messages/") {
-        (fix.primary_account().id.clone(), tail)
-    } else if let Some(rest) = path.strip_prefix("/users/")
-        && let Some((user, tail)) = rest.split_once("/messages/")
-    {
-        let account_id = if user == "me" {
-            fix.primary_account().id.clone()
-        } else {
-            match fix.account(user) {
-                Some(a) => a.id.clone(),
-                None => {
-                    return (
-                        404,
-                        batch_error("ResourceNotFound", &format!("user {user:?} not found")),
-                    );
-                }
-            }
-        };
-        (account_id, tail)
-    } else {
-        return (
+    let not_implemented = || {
+        (
             404,
             batch_error(
                 "ResourceNotImplemented",
                 &format!("v0 $batch does not implement {method} {url}"),
             ),
-        );
+        )
     };
 
-    // The tail is `{id}` or `{id}/move`.
-    let (message_id, suffix) = match tail.split_once('/') {
-        Some((id, s)) => (id, Some(s)),
-        None => (tail, None),
+    // Resolve the account plus the `{id}` and any trailing path
+    // segments (`move`, `singleValueExtendedProperties`, ...).
+    let (account_id, message_id, rest): (String, &str, &[&str]) = match segs.as_slice() {
+        ["me", "messages", id, rest @ ..] => (fix.primary_account().id.clone(), *id, rest),
+        ["users", user, "messages", id, rest @ ..] => {
+            let account_id = if *user == "me" {
+                fix.primary_account().id.clone()
+            } else {
+                match fix.account(user) {
+                    Some(a) => a.id.clone(),
+                    None => {
+                        return (
+                            404,
+                            batch_error("ResourceNotFound", &format!("user {user:?} not found")),
+                        );
+                    }
+                }
+            };
+            (account_id, *id, rest)
+        }
+        _ => return not_implemented(),
     };
     if message_id.is_empty() {
-        return (
-            404,
-            batch_error(
-                "ResourceNotImplemented",
-                &format!("v0 $batch does not implement {method} {url}"),
-            ),
-        );
+        return not_implemented();
     }
+    let suffix = if rest.is_empty() {
+        None
+    } else {
+        Some(rest.join("/"))
+    };
+    let suffix = suffix.as_deref();
 
     let not_found = || {
         (
@@ -2537,6 +2670,21 @@ fn dispatch_batch_request(
             ),
         )
     };
+
+    // `singleValueExtendedProperties/{propertyId}` - the property-scoped
+    // clear (bifrost's reaction remove). Pulled out of the match below
+    // because the property id is a trailing path segment, not a fixed
+    // suffix, and because bifrost tolerates a 404 here but NOT the 501
+    // the default arm would otherwise return.
+    if method == "DELETE"
+        && let Some(property_id) = suffix
+            .and_then(|s| s.strip_prefix(SVEP))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .filter(|p| !p.is_empty())
+    {
+        let outcome = delete_extended_property_core(fix, &account_id, message_id, property_id);
+        return batch_write_outcome(outcome, message_id, 204);
+    }
 
     match (method, suffix) {
         ("GET", None) => {

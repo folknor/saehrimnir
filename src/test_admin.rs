@@ -373,6 +373,15 @@ async fn reset_fixture(State(state): State<AppState>) -> StatusCode {
     state.shared.latency.clear();
     state.shared.push.clear();
     state.shared.open_fault.clear();
+    // Announce-trigger match counts are per-run, not fixture state, so
+    // a reset must zero them or a replayed script's `nth = 2` trigger
+    // would fire on the first request of the second run.
+    state
+        .shared
+        .announce_counts
+        .lock()
+        .expect("announce counter lock poisoned")
+        .clear();
     if let Some(d) = &state.shared.dispatcher {
         d.reset_counts();
     }
@@ -801,38 +810,91 @@ async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) 
         }
     };
 
-    let mut cursor = state
-        .shared
-        .change_cursor
-        .lock()
-        .expect("cursor lock poisoned");
-    let mut fix = state.shared.fixture.write().expect("fixture lock poisoned");
-
-    // Cursor past the script end: nothing to apply.
-    if *cursor >= fix.change_script.len() {
-        return Json(json!({
+    match advance_change_cursor(&state.shared, expect.as_deref()) {
+        Err((code, payload)) => (code, Json(payload)).into_response(),
+        Ok(StepResult::Exhausted { fixture_name }) => Json(json!({
             "ok": true,
-            "fixture": fix.name,
+            "fixture": fixture_name,
             "step": Value::Null,
             "applied": false,
         }))
-        .into_response();
+        .into_response(),
+        Ok(StepResult::Applied(applied)) => Json(step_report(&applied)).into_response(),
+    }
+}
+
+/// One applied change-script step, in the shape both consumers of
+/// [`advance_change_cursor`] need after the mutation has landed.
+pub(crate) struct AppliedStep {
+    pub(crate) step_id: String,
+    pub(crate) fixture_name: String,
+    pub(crate) cursor_after: usize,
+    pub(crate) new_state: String,
+    pub(crate) trans: crate::fixture::Transition,
+    pub(crate) moved: Vec<String>,
+}
+
+pub(crate) enum StepResult {
+    /// The cursor is past the end of the script; nothing was applied.
+    Exhausted {
+        fixture_name: String,
+    },
+    // Boxed: the applied variant is far larger than the exhausted one
+    // and `large_enum_variant` is denied.
+    Applied(Box<AppliedStep>),
+}
+
+/// Apply the change-script step at the cursor, record its transition,
+/// advance the cursor, and fire the push surfaces for every touched
+/// account.
+///
+/// Shared by `POST /test/fixture/step` (harness-driven, and therefore
+/// only ever interleaved BETWEEN whole request/response pairs) and by
+/// the fixture's announce triggers (which fire mid-request, before a
+/// nominated response is computed). Both go through this one path
+/// deliberately: a trigger that applied its step by some second route
+/// would be staging a mutation shape the step endpoint never produces,
+/// and a race gate built on it would be exercising the mock's other
+/// implementation rather than its real one.
+///
+/// `expect` gates the apply on the cursor being where the caller
+/// thinks it is. The step endpoint takes it from the request body; a
+/// trigger always passes its own step id, so a script whose triggers
+/// and steps have drifted out of order fails loudly instead of firing
+/// the wrong mutation at the right moment.
+pub(crate) fn advance_change_cursor(
+    shared: &crate::shared::SharedHandles,
+    expect: Option<&str>,
+) -> Result<StepResult, (StatusCode, Value)> {
+    let mut cursor = shared
+        .change_cursor
+        .lock()
+        .map_err(|_| lock_poisoned("cursor"))?;
+    let mut fix = shared
+        .fixture
+        .write()
+        .map_err(|_| lock_poisoned("fixture"))?;
+
+    // Cursor past the script end: nothing to apply.
+    if *cursor >= fix.change_script.len() {
+        return Ok(StepResult::Exhausted {
+            fixture_name: fix.name.clone(),
+        });
     }
 
     let step = fix.change_script[*cursor].clone();
-    if let Some(want) = expect.as_deref()
+    if let Some(want) = expect
         && want != step.id
     {
-        return (
+        return Err((
             StatusCode::CONFLICT,
-            Json(json!({
+            json!({
                 "error": "expect mismatch",
                 "detail": format!("cursor is at {:?}; got expect={want:?}", step.id),
                 "cursor_step": step.id,
                 "expect": want,
-            })),
-        )
-            .into_response();
+            }),
+        ));
     }
 
     // Atomic apply: snapshot every mutable fixture section the
@@ -885,7 +947,7 @@ async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) 
         if let Some(v) = saved_groups {
             fix.groups = v;
         }
-        return (code, Json(payload)).into_response();
+        return Err((code, payload));
     }
 
     // Snapshot which accounts this diff touches before `diff` is
@@ -955,20 +1017,45 @@ async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) 
     // Fire the push surfaces (JMAP StateChange / Gmail Pub/Sub / Graph
     // webhook) for the touched accounts. No-op for accounts with no
     // registered subscriber. See `crate::push`.
-    state.shared.push.emit_state_advance(&pushes);
+    shared.push.emit_state_advance(&pushes);
 
-    Json(json!({
+    Ok(StepResult::Applied(Box::new(AppliedStep {
+        step_id: step.id,
+        fixture_name,
+        cursor_after,
+        new_state,
+        trans,
+        moved,
+    })))
+}
+
+/// A poisoned lock means some earlier handler panicked while holding
+/// it. On a `Result`-returning path we surface that as a 500 rather
+/// than re-panicking: one failed request with a legible reason beats a
+/// second panic that takes the listener down and leaves a harness run
+/// staring at a dead socket.
+fn lock_poisoned(what: &str) -> (StatusCode, Value) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({ "error": "lock poisoned", "detail": what }),
+    )
+}
+
+/// The `POST /test/fixture/step` response body for an applied step.
+fn step_report(applied: &AppliedStep) -> Value {
+    let trans = &applied.trans;
+    json!({
         "ok": true,
-        "fixture": fixture_name,
-        "step": step.id,
+        "fixture": applied.fixture_name,
+        "step": applied.step_id,
         "applied": 1,
-        "cursor": cursor_after,
+        "cursor": applied.cursor_after,
         "changes": {
             "emails": {
                 "created": trans.email_created,
                 "updated": trans.email_updated,
                 "destroyed": trans.email_destroyed,
-                "moved": moved,
+                "moved": applied.moved,
             },
             "mailboxes": {
                 "created": trans.mailbox_created,
@@ -995,9 +1082,8 @@ async fn step_fixture(State(state): State<AppState>, body: Option<Json<Value>>) 
                 "revoked": acl_refs(&trans.acl_revoked),
             },
         },
-        "state": new_state,
-    }))
-    .into_response()
+        "state": applied.new_state,
+    })
 }
 
 /// Render the ACL side of a step's transition for the step response:

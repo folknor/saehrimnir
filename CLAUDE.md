@@ -329,6 +329,22 @@ checking whether the fact is already in `notes/`.
   `messageRules` inbox filters, `/subscriptions` webhook push).
   Sibling files for drive / EWS land here when those surfaces are
   scouted.
+- `src/announce.rs` - request-ordered change-script triggers. A
+  fixture's `[[announce]]` / `announce({...})` entries name a change
+  step plus a request line; `fire_for_request` is called from each
+  HTTP listener's logging middleware (graph / gmail / gcal / people)
+  and applies the step - through the SAME
+  `test_admin::advance_change_cursor` the step endpoint uses - before
+  the handler runs. This is the only way to land a change while a
+  backfill walk is IN FLIGHT: `POST /test/fixture/step` can only
+  interleave between whole request/response pairs. Match counts are
+  process-volatile (`SharedHandles::announce_counts`, cleared by
+  `POST /test/fixture/reset`) and every fire is logged with
+  `announce: true`, because a trigger that silently never fired leaves
+  a race gate passing while proving nothing. NOT wired on the JMAP
+  listener: its request granularity is per method-call inside one
+  POST envelope, so a trigger there would need a different match key
+  than `"<METHOD> <path>"`.
 - `src/caldav/` - CalDAV mock. `mod.rs` (single-handler dispatch
   on PROPFIND / REPORT / GET / PUT / DELETE / OPTIONS for the
   WebDAV verb surface ratatoskr's CalDavClient exercises), `xml.rs`
@@ -407,6 +423,15 @@ checking whether the fact is already in `notes/`.
   `fixtures/jmap-bulk.lua`. Verifies pagination through the four
   protocol layers (JMAP `Email/query`, Graph `messages` and
   `messages/delta`, Gmail `threads`) without drops or dupes.
+- `tests/backfill_race.rs` - asserts what the MOCK does with a
+  mid-walk change: it lands strictly between two pages of one walk, it
+  is really published on the change feed (not just applied), and the
+  pages either side reflect it as an offset-paged server would. Also
+  pins the offset-shift hole a mid-walk delete opens, and that
+  `POST /test/fixture/reset` rewinds the trigger counters with the
+  fixture. Its module docs state the ceiling explicitly: the mock
+  places the change in the request sequence, it does not schedule what
+  the consumer's tasks do with it.
 - `tests/lifecycle.rs` - subprocess test that spawns the actual
   binary, polls for the readiness sentinel, hits a real network
   endpoint, sends SIGTERM, asserts a clean exit. Closes the
@@ -505,10 +530,46 @@ checking whether the fact is already in `notes/`.
   message through add -> change -> remove. Drive the
   `singleValueExtendedProperties` tests in `tests/graph.rs` and
   `tests/step.rs`; asserted byte-equivalent in `tests/lua_fixture.rs`.
+- `fixtures/graph-reserved-ids.toml` - reserved characters in the two
+  identifiers a Graph `$batch` sub-request URL is built from: a
+  shared-mailbox account id that is an SMTP address
+  (`shared@contoso.com`) and a base64-shaped message id
+  (`AAMkAGI2+9/xZ0=`). bifrost percent-encodes both, so this is the
+  fixture that catches a missing (or mis-ordered) decode in the
+  hand-rolled `$batch` URL parser; every other fixture uses
+  hyphenated ASCII ids that survive no decoding at all. Drives the
+  reserved-id batch tests in `tests/graph.rs`.
 - `fixtures/gmail-incremental.lua` - baseline (incl. a
   two-message thread) plus a 4-step change script (new + delete
   + label swap + star-one-message-of-a-thread) driving the Gmail
   `history.list` record-type projection in `tests/step.rs`.
+- `fixtures/gmail-threads.lua` - Gmail multi-message threads: a
+  three-message thread whose messages carry deliberately UNEQUAL
+  label sets (so a "the siblings were untouched" assertion cannot
+  pass by accident), a single-message control thread, an
+  already-trashed two-message thread for the permanent
+  `threads.delete` path, and a change step labelling ONE message.
+  Stages both drives of the multi-message-thread gate: the consumer's
+  own mutation (`messages/{id}/modify` vs `threads/{id}/modify`) and
+  a change that arrives from the server. Drives the thread-mutation
+  tests in `tests/gmail.rs`.
+- `fixtures/calendar-no-scheduling.toml` - a plain RFC 4791 CalDAV
+  store (`[caldav] scheduling = false`): the FALSE branch of a
+  client's discovery-derived RSVP capability. Mirrors
+  `calendar-rsvp-small.toml` field for field so the advertised
+  scheduling is the only difference between the two.
+- `fixtures/backfill-race-{created,updated}.lua` and
+  `fixtures/backfill-late-tombstone.lua` - cold-start interleavings,
+  one scenario per file (a fixture is one mock process, so isolating
+  them is what makes each provable). Six bulk messages walked two per
+  page while an `announce({...})` trigger lands a change mid-walk.
+  CREATED appends an id a later page also serves; UPDATED is the
+  negative control (an update must not suppress the backfill's own
+  emission, since a cold-start consumer may hold no row for it yet);
+  the late tombstone retracts an id an earlier page already delivered.
+  The late tombstone is an ORDERING fixture and is deliberately not
+  named after the resurrection race - see its header for what it does
+  not stage and why. Drive `tests/backfill_race.rs`.
 - `scripts/smoke.sh` - boot, curl, SIGTERM verification script.
 
 ## Status
@@ -779,7 +840,15 @@ batching: holds one write guard and routes each sub-request through
 the shared message cores - GET hydration plus the message writes
 bifrost batches: PATCH / DELETE / POST `.../move`; a sub-request it
 doesn't model gets a per-item error, so a batch degrades per-item
-rather than batch-wide),
+rather than batch-wide. Sub-request URLs are PERCENT-ENCODED by
+bifrost (`encode_component` escapes `@`, `/`, `+`, `=`), and this
+parser is hand-rolled rather than axum-routed, so it splits the path
+on its RAW `/` separators and decodes each segment afterwards
+(`odata::decode_path_segment`). Both halves of that order matter: no
+decoding and `/users/shared%40contoso.com` misses
+`Fixture::account`; decoding first and a `%2F` inside a message id
+becomes a segment boundary. Only the path is decoded - the query
+keeps its own rules, where `+` is a space),
 `/v1.0/me/messages` (account-wide collection honouring
 `$filter=conversationId eq '...'` for bifrost's thread fetch, with
 `$top` / `$skiptoken` paging; non-`conversationId` filters and
@@ -841,6 +910,18 @@ record `category_*` transitions; the change_log entries are
 observability for tests asserting state moved (real Graph has no
 `masterCategories/delta` endpoint, so v0 doesn't expose one
 either). Tests in `tests/graph.rs`.
+
+Reaction clear:
+`DELETE .../messages/{id}/singleValueExtendedProperties/{propId}`,
+served on both the `$batch` arm and the routed twin. bifrost sends it
+batched with tolerate-404 on, so the distinction that matters is 404
+vs 501: a 404 reads as "already absent, nothing to clear" and still
+resolves the item Ok, while the 501 the `$batch` default arm used to
+return is an unmodelled method that lands the item in the failed lane
+with the cached reaction stranded. All three not-applicable cases
+therefore answer 404 - unknown message, an unmodelled property id,
+and an already-empty slot (real Graph has no navigation entry to
+delete either).
 
 Message reactions: per-email `reaction_type` / `reaction_count`
 fixture slots project onto the `singleValueExtendedProperties`
@@ -965,10 +1046,26 @@ log and emits one record per transition newer than `startHistoryId`:
 `messagesDeleted`, and an updated email's label-set delta ->
 `labelsAdded` / `labelsRemoved` with the precise moved labels. The
 label delta is captured at mutation time into the change log's
-`email_label_changes` sidecar by the change-script step applier; v0
-surfaces it for change-script-driven mutations. An evicted
+`email_label_changes` sidecar by BOTH mutation paths - the
+change-script step applier and the served mutation verbs - and is
+always MESSAGE-scoped, never thread-scoped, which is what lets a
+consumer tell "one message of this thread changed" apart from
+"every message in this thread changed". An evicted
 `startHistoryId` 404s with `historyId` to trigger a full resync) +
-`/messages/{id}/attachments/{aid}` (404 stub) + `/settings/sendAs`
+`/messages/{id}/attachments/{aid}` (404 stub) + the mutation verbs
+(`POST /messages/{id}/modify` -> 200 + updated Message,
+`POST /threads/{id}/modify` -> 200 + `GmailThread`,
+`DELETE /threads/{id}` -> 204 permanent destroy,
+`POST /messages/batchModify` + `/messages/batchDelete` -> 204).
+bifrost's mutation pipeline splits on target: a
+`MutationTarget::Message` goes to `messages/{id}/modify` and a
+`MutationTarget::Thread` to `threads/{id}/modify` (`delete_thread`
+issues `DELETE /threads/{id}` only for an already-trashed thread).
+It does NOT currently drive either `batch*` form, so their coverage
+is not coverage of the mutation pipeline. The thread form loops the
+same per-message `modify_one` the message form uses, so
+`history.list` stays one-record-per-message as real Gmail does) +
+`/settings/sendAs`
 (list + per-address GET + PATCH). SendAs identities project from
 fixture `[[send_as]]` rows (TOML) or Lua `send_as({...})` builder,
 keyed `(account_id, send_as_email)`. List + GET scope to the
@@ -1107,8 +1204,41 @@ a `calendar_created` transition; Graph `/v1.0/me/calendars`
 (live read) and JMAP `Calendar/changes` (delta walk via
 `calendar_delta_since_account`) both observe the write. Returns
 405 on an existing calendar id and 404 under an unknown
-principal. v0 explicitly does not implement PROPPATCH / ACLs /
-scheduling.
+principal. v0 explicitly does not implement PROPPATCH or ACLs.
+
+RFC 6638 scheduling is a deliberate slice, not a full
+implementation, and it is now CAPABILITY-BEARING: bifrost derives
+`pim_methods.event_rsvp` from what discovery returns
+(`caldav capabilities.rs::scheduling_available`) instead of
+hardcoding it, so what the principal PROPFIND advertises decides
+whether the consumer's whole RSVP surface is reported as supported.
+Two facts must come back non-empty, and bifrost asks for them in
+SEPARATE single-prop PROPFINDs at Depth 0, each preceded by a root
+PROPFIND for `current-user-principal`:
+`CALDAV:calendar-user-address-set` (the `mailto:` of the account's
+own address - the `Originator` of the outbox POST and the
+`ATTENDEE` of the REPLY) and `CALDAV:schedule-outbox-URL`
+(`/calendars/{user}/outbox/`). `propfind_principal` serves both,
+gated per requested prop.
+
+`[caldav] scheduling = false` stages the other branch: a plain
+RFC 4791 store. It omits BOTH props (an empty element would be a
+half-answer real servers do not give, and would conflate "no
+scheduling" with "scheduling, address unknown") AND stops routing the
+schedule outbox, so a consumer that guessed the conventional URL
+cannot succeed against a server that reported no scheduling. The rest
+of the RFC 4791 surface is untouched - only `event_rsvp` moves. The
+switch defaults ON, so every fixture authored before it existed
+advertises exactly what it did before.
+`fixtures/calendar-no-scheduling.toml` mirrors
+`calendar-rsvp-small.toml` field for field so the advertised
+scheduling is the only difference between them.
+`POST` on the outbox accepts the iTIP
+REPLY with a bare 2xx and records `schedule_reply` /
+`originator` / `recipient` / `itip` in the request log; there is no
+schedule-response XML, no inbox, and no delivery to the organizer.
+`tests/caldav.rs::scheduling_discovery_walk_matches_bifrost_single_prop_propfinds`
+pins the walk in bifrost's shape.
 
 EWS (Exchange Web Services SOAP + Autodiscover): complete for v0's
 public-folder read path + streaming push (drives ratatoskr A5b).

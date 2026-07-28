@@ -1502,6 +1502,219 @@ async fn propfind_principal_serves_scheduling_props() {
     );
 }
 
+/// The two single-prop PROPFIND bodies bifrost actually sends, verbatim
+/// (`caldav client.rs::PROPFIND_CALENDAR_USER_ADDRESS` /
+/// `PROPFIND_SCHEDULE_OUTBOX`). It asks for ONE prop per request, not
+/// both together.
+const PROPFIND_CALENDAR_USER_ADDRESS_ONLY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <C:calendar-user-address-set/>
+  </D:prop>
+</D:propfind>"#;
+
+const PROPFIND_SCHEDULE_OUTBOX_ONLY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <C:schedule-outbox-URL/>
+  </D:prop>
+</D:propfind>"#;
+
+/// The scheduling discovery walk in the shape bifrost drives it: a root
+/// PROPFIND for `current-user-principal`, then ONE further PROPFIND per
+/// scheduling fact against that principal at Depth 0.
+///
+/// This matters more than it used to. bifrost derives
+/// `pim_methods.event_rsvp` from whether both facts come back non-empty
+/// (`caldav capabilities.rs::scheduling_available`) rather than
+/// hardcoding it, so a fixture that answers the combined two-prop body
+/// but not the single-prop ones would report the entire RSVP surface as
+/// unsupported - and a consumer's RSVP gate would go red without any
+/// request ever failing.
+#[tokio::test]
+async fn scheduling_discovery_walk_matches_bifrost_single_prop_propfinds() {
+    // 1. Root PROPFIND resolves the principal bifrost then asks.
+    let (status, body) = send_with(
+        rsvp_router(),
+        "PROPFIND",
+        "/",
+        Some("0"),
+        PROPFIND_PRINCIPAL,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        body.contains("/principals/self/"),
+        "root PROPFIND did not name the principal: {body}"
+    );
+
+    // 2. The calendar-user-address, alone. This is the `Originator` of
+    // the outbox POST and the `ATTENDEE` of the iTIP REPLY.
+    let (status, body) = send_with(
+        rsvp_router(),
+        "PROPFIND",
+        "/principals/self/",
+        Some("0"),
+        PROPFIND_CALENDAR_USER_ADDRESS_ONLY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        body.contains("<C:calendar-user-address-set><D:href>mailto:self@example.test</D:href>"),
+        "single-prop address PROPFIND: {body}"
+    );
+    // An empty element would parse to an empty href, which
+    // `scheduling_available` reads as absent.
+    assert!(
+        !body.contains("<C:calendar-user-address-set/>"),
+        "address-set came back empty: {body}"
+    );
+    assert!(
+        !body.contains("schedule-outbox-URL"),
+        "props are gated per request, not dumped wholesale: {body}"
+    );
+
+    // 3. The schedule outbox, alone. This is where the REPLY is POSTed.
+    let (status, body) = send_with(
+        rsvp_router(),
+        "PROPFIND",
+        "/principals/self/",
+        Some("0"),
+        PROPFIND_SCHEDULE_OUTBOX_ONLY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        body.contains("<C:schedule-outbox-URL><D:href>/calendars/self/outbox/</D:href>"),
+        "single-prop outbox PROPFIND: {body}"
+    );
+    assert!(
+        !body.contains("calendar-user-address-set"),
+        "props are gated per request, not dumped wholesale: {body}"
+    );
+}
+
+fn no_scheduling_router() -> axum::Router {
+    let fix = fixture::load(std::path::Path::new("fixtures/calendar-no-scheduling.toml")).unwrap();
+    caldav::router(caldav::AppState::for_test(saehrimnir::shared::handle(fix)))
+}
+
+/// `[caldav] scheduling = false` stages a plain RFC 4791 store: the
+/// FALSE branch of a client's derived RSVP capability.
+///
+/// Three things must hold together, and each one alone would be a
+/// misleading fixture:
+///
+/// - neither scheduling prop comes back, so `scheduling_available`
+///   computes false and the consumer reports `event_rsvp = false`;
+/// - the outbox is not routable either, so a consumer that GUESSED the
+///   conventional URL cannot succeed against a server that reported no
+///   scheduling (advertising nothing while still honouring the POST
+///   would stage a shape no real server has);
+/// - the rest of the RFC 4791 surface is untouched - discovery,
+///   calendar-home-set, the calendar listing and the events still
+///   work. `event_rsvp` is the only capability that moves; a fixture
+///   that took the whole calendar surface down with it would pass a
+///   naive "rsvp is false" assertion while proving nothing.
+#[tokio::test]
+async fn scheduling_can_be_switched_off_per_fixture() {
+    // 1. calendar-user-address-set: absent.
+    let (status, body) = send_with(
+        no_scheduling_router(),
+        "PROPFIND",
+        "/principals/self/",
+        Some("0"),
+        PROPFIND_CALENDAR_USER_ADDRESS_ONLY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        !body.contains("calendar-user-address-set"),
+        "scheduling-less fixture advertised a calendar-user-address: {body}"
+    );
+    assert!(!body.contains("mailto:"), "{body}");
+
+    // 2. schedule-outbox-URL: absent.
+    let (status, body) = send_with(
+        no_scheduling_router(),
+        "PROPFIND",
+        "/principals/self/",
+        Some("0"),
+        PROPFIND_SCHEDULE_OUTBOX_ONLY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(
+        !body.contains("schedule-outbox-URL"),
+        "scheduling-less fixture advertised an outbox: {body}"
+    );
+    assert!(!body.contains("/outbox/"), "{body}");
+
+    // 3. The outbox is not a resource at all.
+    let resp = no_scheduling_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/calendars/self/outbox/")
+                .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+                .header("Originator", "mailto:self@example.test")
+                .header("Recipient", "mailto:organizer@example.test")
+                .body(Body::from("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 4. The plain RFC 4791 surface is intact: principal discovery,
+    // calendar home, and the event listing all still resolve.
+    let (status, body) = send_with(
+        no_scheduling_router(),
+        "PROPFIND",
+        "/",
+        Some("0"),
+        PROPFIND_PRINCIPAL,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(body.contains("/principals/self/"), "{body}");
+
+    let (status, body) = send_with(
+        no_scheduling_router(),
+        "PROPFIND",
+        "/principals/self/",
+        Some("0"),
+        PROPFIND_CALENDAR_HOME,
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(body.contains("/calendars/self/"), "{body}");
+
+    let resp = no_scheduling_router()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/calendars/self/cal-1/ev-rsvp.ics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// The switch defaults ON, so every fixture authored before it existed
+/// keeps advertising exactly what it did before. Pinned rather than
+/// assumed: a default flip would silently turn the RSVP capability off
+/// across every existing gate.
+#[tokio::test]
+async fn scheduling_defaults_on_for_fixtures_that_declare_no_caldav_block() {
+    let fix = fixture::load(std::path::Path::new("fixtures/calendar-rsvp-small.toml")).unwrap();
+    assert!(fix.caldav.scheduling);
+    let fix = fixture::load(std::path::Path::new("fixtures/graph-calendar-small.toml")).unwrap();
+    assert!(fix.caldav.scheduling);
+}
+
 /// A POST of an iTIP REPLY to the schedule outbox is accepted (bare
 /// 2xx) and recorded in the request log with the Originator / Recipient
 /// headers - bifrost checks the HTTP status only.

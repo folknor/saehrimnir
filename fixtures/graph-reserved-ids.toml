@@ -1,0 +1,85 @@
+name = "graph-reserved-ids"
+state = "rid-0"
+
+# Reserved characters in the two identifiers a Graph `$batch`
+# sub-request URL is built from: the `/users/{owner}` segment and the
+# message id.
+#
+# bifrost routes a shared-mailbox message through
+# `/users/{owner}/messages/{id}` and percent-encodes both segments
+# (`bifrost_net::url::encode_component` escapes `@`, `/`, `+`, `=`,
+# `:` ...). Real Microsoft mailbox ids ARE SMTP addresses and real
+# Graph message ids are base64-shaped, so `shared@contoso.com` and
+# `AAMkAGI2+9/xZ0=` are the ordinary case on the wire, not an exotic
+# one. Every other fixture uses hyphenated ASCII ids that survive a
+# missing percent-decode unchanged, which is exactly why the mock's
+# hand-rolled `$batch` URL parser could go that long without one.
+#
+# Two shared mailboxes' worth of shape here matters:
+#   - the `@` in the account id proves the `/users/{owner}` segment is
+#     decoded before `Fixture::account` is consulted,
+#   - the `/` inside the message id proves the path is split on its
+#     RAW separators BEFORE decoding: decode-then-split would read
+#     `AAMkAGI2+9/xZ0=` as `{id}/{suffix}` and route the hydration GET
+#     into the `move` / property-collection arms.
+
+[[account]]
+id = "account-primary"
+name = "primary@example.com"
+is_personal = true
+primary = true
+
+[[account]]
+id = "shared@contoso.com"
+name = "shared@contoso.com"
+is_personal = false
+
+[[mailbox]]
+id = "mbx-primary-inbox"
+account_id = "account-primary"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+[[mailbox]]
+id = "mbx-shared-inbox"
+account_id = "shared@contoso.com"
+name = "Inbox"
+role = "inbox"
+sort_order = 0
+
+[[mailbox]]
+id = "mbx-shared-archive"
+account_id = "shared@contoso.com"
+name = "Archive"
+role = "archive"
+sort_order = 1
+
+[[email]]
+id = "email-primary-001"
+mailbox_ids = ["mbx-primary-inbox"]
+keywords = ["$seen"]
+received_at = "2026-01-15T10:00:00Z"
+from = "sender@example.com"
+to = ["primary@example.com"]
+subject = "Hello primary"
+body_text = "Primary account inbox email."
+message_id = ["<p001@example.com>"]
+
+# The reserved-character message. `+`, `/` and `=` all round-trip
+# through `encode_component` as `%2B` / `%2F` / `%3D`. A reaction is
+# staged so the nested `singleValueExtendedProperties` `$batch` arm
+# has something non-empty to answer with - an empty collection would
+# be a 200 either way and would not tell a decode bug from a miss.
+[[email]]
+id = "AAMkAGI2+9/xZ0="
+mailbox_ids = ["mbx-shared-inbox"]
+keywords = ["$seen"]
+received_at = "2026-01-20T11:00:00Z"
+from = "elsewhere@example.com"
+to = ["shared@contoso.com"]
+subject = "Hello shared"
+body_text = "Shared mailbox inbox email."
+message_id = ["<s001@example.com>"]
+reaction_type = "like"
+reaction_count = 2

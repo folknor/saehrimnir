@@ -119,6 +119,9 @@ pub fn load_source_with_dispatcher_and_dir(
     let (raw, change_script, handlers) = builder.into_parts()?;
     let mut fixture = fixture::normalize_with_dir(raw, fixture_dir)?;
     fixture.change_script = change_script;
+    // Announce triggers name change-script steps, and the script is
+    // only attached here (normalize never sees it on the Lua path).
+    fixture::validate_announce_triggers(&fixture)?;
     let dispatcher = Dispatcher::new(state, handlers);
     Ok((fixture, dispatcher))
 }
@@ -161,6 +164,10 @@ struct Builder {
     mailboxes: Vec<RawMailbox>,
     emails: Vec<RawEmail>,
     oauth: Option<RawOAuth>,
+    /// CalDAV server-capability block set via `caldav({...})`.
+    caldav: Option<crate::fixture::RawCalDav>,
+    /// Request-ordered change-script triggers via `announce({...})`.
+    announce: Vec<crate::fixture::RawAnnounce>,
     /// Discovery entries accumulated via `discovery({...})`. Keyed
     /// by prefix; duplicate prefixes are rejected at builder time.
     discovery: std::collections::BTreeMap<String, crate::fixture::RawDiscoveryEntry>,
@@ -210,6 +217,8 @@ impl Builder {
             mailboxes: self.mailboxes,
             emails: self.emails,
             oauth: self.oauth,
+            caldav: self.caldav,
+            announce: self.announce,
             discovery: self.discovery,
             calendars: vec![],
             events: vec![],
@@ -245,6 +254,10 @@ fn install_builders(state: &mut State) -> dellingr::Result<()> {
     state.set_global("account");
     state.push_rust_fn(builder_oauth)?;
     state.set_global("oauth");
+    state.push_rust_fn(builder_caldav)?;
+    state.set_global("caldav");
+    state.push_rust_fn(builder_announce)?;
+    state.set_global("announce");
     state.push_rust_fn(builder_mailbox)?;
     state.set_global("mailbox");
     state.push_rust_fn(builder_email)?;
@@ -408,6 +421,51 @@ fn builder_oauth(state: &mut State) -> dellingr::Result<u8> {
         return fail(state, "oauth { ... } may only be called once");
     }
     builder.oauth = Some(RawOAuth { enforce, issuer });
+    Ok(0)
+}
+
+/// `caldav({ scheduling = true|false })`. Optional; omitting it (or
+/// omitting the key) leaves the CalDAV surface advertising RFC 6638
+/// scheduling, which is what every fixture did before the block
+/// existed. Set `scheduling = false` to stage a plain RFC 4791 store,
+/// the server shape a client's derived `event_rsvp = false` describes.
+/// Rejected on a second call so a scenario cannot shadow itself.
+fn builder_caldav(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "caldav")?;
+    let scheduling = read_bool_opt(state, 1, "scheduling")?;
+    let builder = builder_mut(state)?;
+    if builder.caldav.is_some() {
+        return fail(state, "caldav { ... } may only be called once");
+    }
+    builder.caldav = Some(crate::fixture::RawCalDav { scheduling });
+    Ok(0)
+}
+
+/// `announce({ step = "...", before = "GET /path", nth = 2 })`.
+///
+/// Declares that the named change-script step is applied - and pushed
+/// on the change feed - immediately BEFORE the `nth` request whose
+/// `"<METHOD> <path>"` line starts with `before`. This is the only way
+/// to land a change while a backfill walk is IN FLIGHT;
+/// `POST /test/fixture/step` can only interleave between whole
+/// request/response pairs. Callable repeatedly; each call adds one
+/// trigger. See `crate::fixture::AnnounceTrigger`.
+fn builder_announce(state: &mut State) -> dellingr::Result<u8> {
+    require_one_table_arg(state, "announce")?;
+    let step = read_string(state, 1, "step")?;
+    let before = read_string(state, 1, "before")?;
+    let nth = read_int_opt(state, 1, "nth")?;
+    let nth = match nth {
+        None => None,
+        Some(n) => match u32::try_from(n) {
+            Ok(n) => Some(n),
+            Err(_) => return fail(state, format!("announce {step:?}: nth must fit in u32")),
+        },
+    };
+    let builder = builder_mut(state)?;
+    builder
+        .announce
+        .push(crate::fixture::RawAnnounce { step, before, nth });
     Ok(0)
 }
 

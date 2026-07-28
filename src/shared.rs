@@ -81,6 +81,10 @@ pub struct SharedHandles {
     /// budget to exhaustion. Defaults to disarmed. Cleared by
     /// `POST /test/fixture/reset`. See `crate::open_fault`.
     pub open_fault: OpenFault,
+    /// Per-trigger match counts for the fixture's announce triggers.
+    /// Process-volatile; cleared by `POST /test/fixture/reset`. See
+    /// `crate::announce`.
+    pub announce_counts: crate::announce::AnnounceCounters,
 }
 
 impl SharedHandles {
@@ -101,6 +105,7 @@ impl SharedHandles {
             latency: LatencyKnob::default(),
             push: PushHub::new(),
             open_fault: OpenFault::default(),
+            announce_counts: crate::announce::AnnounceCounters::default(),
         }
     }
 

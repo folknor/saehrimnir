@@ -742,6 +742,111 @@ scenario (a second call returns a load-time error).
 and demonstrates the revoked-token-recovery flow harness scripts can
 drive against `/oauth/token` + `/test/oauth/invalidate`.
 
+## CalDAV server capabilities (optional)
+
+```toml
+[caldav]
+scheduling = true   # default
+```
+
+```lua
+caldav({ scheduling = false })
+```
+
+Whether the CalDAV surface advertises RFC 6638 scheduling. It exists
+because a client can DERIVE a capability from discovery rather than
+hardcoding it: bifrost computes `pim_methods.event_rsvp` from whether
+the principal PROPFIND returns BOTH a `CALDAV:schedule-outbox-URL`
+and a `CALDAV:calendar-user-address-set`. A mock that always
+advertises them can only prove the TRUE branch of that derivation.
+
+`scheduling = false` stages the FALSE branch - a plain RFC 4791 store
+that can hold events but cannot transmit a reply to an organizer:
+
+- both scheduling props are omitted from the principal PROPFIND
+  (omitted, not emitted empty - an element with no href is a
+  half-answer real servers do not give, and would conflate "no
+  scheduling" with "scheduling, address unknown"),
+- `/calendars/{user}/outbox/` stops being a routable resource, so a
+  POST there is a plain 404. Advertising nothing while still honouring
+  the POST would stage a server shape that does not exist, and a
+  consumer that guessed the conventional URL would succeed against a
+  server that reported no scheduling.
+
+Everything else about the CalDAV surface is unaffected: discovery,
+calendar-home-set, listings, event GET/PUT/DELETE. Only `event_rsvp`
+moves. The knob is all-or-nothing on purpose; a fixture advertising
+one prop but not the other would be a half-scheduling server, which
+is a different (and much rarer) scenario than the one this stages.
+Defaults to `true`, so a fixture without the block behaves exactly as
+it did before the block existed. Canonical fixture:
+`fixtures/calendar-no-scheduling.toml`.
+
+## Request-ordered change triggers (optional)
+
+```toml
+[[announce]]
+step = "arrive-new"                            # a `[[change]]` step id
+before = "GET /gmail/v1/users/me/messages"     # request-line prefix
+nth = 2                                        # default 1, 1-based
+```
+
+```lua
+announce({ step = "arrive-new", before = "GET /gmail/v1/users/me/messages", nth = 2 })
+```
+
+Applies the named change step - and pushes it on the change feed -
+IMMEDIATELY BEFORE the `nth` matching request is served.
+
+This is the only way to land a change while a paginated walk is IN
+FLIGHT. `POST /test/fixture/step` interleaves only between whole
+request/response pairs, and the consumer decides when it asks, so a
+harness can put a change before or after a backfill but never during
+one. The cold-start seam - an object announced by the live feed while
+the backfill walk is mid-flight, which the walk then also serves -
+lives exactly there.
+
+Request granularity is the ceiling, and it bounds what a fixture built
+on this can honestly claim. A window between two operations INSIDE a
+consumer, with no request in between, is not addressable however the
+trigger is keyed: there is no server interaction in that window to
+order against. What a trigger fixes is where the change lands in the
+REQUEST sequence; what the consumer's own tasks then do with it -
+including whether a push-driven read completes before the walk reaches
+the same id - is not the mock's to schedule. Say so in the fixture
+header when it matters. A fixture that overstates its interleaving is
+worse than no fixture, because it makes a race look covered.
+
+- `before` matches a prefix of the request LINE, `"<METHOD> <path>"`
+  with the query string excluded (the same string the request log
+  records). Prefix, so `GET /gmail/v1/users/me/messages` also matches
+  `.../messages/{id}` hydration reads - a gate that hydrates between
+  pages must count those when picking `nth`.
+- `nth` is 1-based and counted per trigger. `0` is a load-time error
+  rather than "never fires": a trigger that silently never fired
+  leaves a race gate passing while proving nothing.
+- `step` must name a declared `change` step, checked at load. When the
+  trigger fires, the cursor must actually be AT that step - the script
+  stays a linear sequence and the trigger only decides WHEN each step
+  lands. A mismatch is recorded in the request log and the mutation is
+  skipped, rather than firing the wrong step at the right moment.
+- Firing goes through the same apply path as
+  `POST /test/fixture/step`, so the transition, the per-account state
+  advance, and the push fan-out are identical.
+- Every fire appends a request-log row (`ANNOUNCE <step>`, protocol of
+  the listener, `detail.announce = true`) immediately ahead of the
+  request it preceded, so a harness can assert the interleaving really
+  happened.
+- Match counts are process-volatile and cleared by
+  `POST /test/fixture/reset` along with the fixture rewind, so a
+  replayed script fires at the same points on the second run.
+- Wired on the graph / gmail / gcal / people listeners. NOT on JMAP:
+  its request granularity is per method-call inside one POST envelope,
+  so a trigger there would need a different match key.
+
+Canonical fixtures: `fixtures/backfill-race-{created,updated}.lua` and
+`fixtures/backfill-late-tombstone.lua`.
+
 ## Validation rules
 
 The mock refuses to start (non-zero exit, stderr message) if:
@@ -762,6 +867,8 @@ The mock refuses to start (non-zero exit, stderr message) if:
   once added).
 - A `body_path` does not exist or is not readable.
 - `received_at` cannot be parsed.
+- An `[[announce]]` trigger has an empty `step` or `before`, an `nth`
+  of `0`, or names a `step` no `change` step declares.
 
 Notable non-rules - things the validator deliberately accepts so
 that adversarial-shape fixtures can be authored:

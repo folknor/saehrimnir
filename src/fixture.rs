@@ -39,6 +39,13 @@ pub struct Fixture {
     pub mailboxes: Vec<Mailbox>,
     pub emails: Vec<Email>,
     pub oauth: OAuthConfig,
+    /// CalDAV server-capability configuration. Defaults to
+    /// "advertises RFC 6638 scheduling", which is what every fixture
+    /// authored before the block existed gets. See [`CalDavConfig`].
+    pub caldav: CalDavConfig,
+    /// Request-ordered change-script triggers. Empty by default. See
+    /// [`AnnounceTrigger`].
+    pub announce: Vec<AnnounceTrigger>,
     /// Discovery surface (WebFinger / OIDC discovery / Mozilla
     /// autoconfig) served on the JMAP HTTP listener. Empty by
     /// default; fixtures that don't exercise ratatoskr's
@@ -2062,6 +2069,91 @@ impl Default for OAuthConfig {
     }
 }
 
+/// A fixture-declared request trigger: apply one change-script step,
+/// and announce it on the push feed, IMMEDIATELY BEFORE a nominated
+/// request is served.
+///
+/// This is the mock's ordering affordance for cold start. A consumer
+/// doing an initial backfill walks a paginated inventory while a live
+/// change feed runs alongside it, and the interesting behaviour lives
+/// at the seam: an object announced by the feed while the walk is
+/// mid-flight may also be served by the walk. That is not reachable by
+/// driving `POST /test/fixture/step` between requests - that only ever
+/// interleaves BETWEEN whole request/response pairs, and the consumer
+/// controls when it asks. The step has to land while the walk is in
+/// flight, at a point the fixture author picked.
+///
+/// Firing happens in each HTTP listener's logging middleware, before
+/// the handler runs, so the mutation and its push are strictly ordered
+/// ahead of the response the handler then computes. `nth` picks WHICH
+/// matching request to fire before: before the page that CONTAINS the
+/// id (the feed and the page both offer it), or before a later page
+/// (the id was already handed out when the feed changed it).
+///
+/// The ceiling is request granularity, and it is worth stating because
+/// it bounds what any fixture built on this can honestly claim. A
+/// window between two operations INSIDE a consumer, with no request
+/// in between, cannot be addressed from here however the trigger is
+/// keyed - there is no server interaction in that window to order
+/// against. What the mock guarantees is where the change lands in the
+/// request sequence; what the consumer's tasks then do with it is not
+/// the mock's to schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnounceTrigger {
+    /// Change-script step id to apply. Must name the step the cursor
+    /// is actually at when the trigger fires - the script stays a
+    /// linear sequence and the trigger only decides WHEN each step
+    /// lands, never reorders them. A mismatch is recorded and the
+    /// mutation is skipped rather than silently applying the wrong
+    /// step.
+    pub step: String,
+    /// Request-line prefix to match, `"<METHOD> <path>"` with no query
+    /// string (e.g. `"GET /gmail/v1/users/me/messages"`). Prefix
+    /// rather than equality so a fixture does not have to spell out
+    /// paging parameters that live in the path.
+    pub before: String,
+    /// Fire before the `nth` matching request, 1-based. Counted per
+    /// trigger and process-volatile (reset by
+    /// `POST /test/fixture/reset`), never part of fixture state.
+    pub nth: u32,
+}
+
+/// Fixture-side CalDAV server capabilities.
+///
+/// One knob today: whether the server advertises RFC 6638 scheduling.
+/// It exists because a client can DERIVE a capability from discovery
+/// rather than hardcoding it - bifrost computes
+/// `pim_methods.event_rsvp` from whether the principal PROPFIND
+/// returns both a `CALDAV:schedule-outbox-URL` and a
+/// `CALDAV:calendar-user-address-set`
+/// (`caldav capabilities.rs::scheduling_available`). A mock that
+/// always advertises them can only ever prove the TRUE branch of that
+/// derivation; the FALSE branch - a plain RFC 4791 store that can hold
+/// events but cannot transmit a reply to an organizer - is the case
+/// the derivation exists for, and it needs a fixture that stages a
+/// server without scheduling.
+///
+/// Defaults to `true`, so every fixture authored before this block
+/// existed keeps advertising exactly what it advertised before and no
+/// current gate moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalDavConfig {
+    /// When false, `propfind_principal` omits BOTH scheduling props
+    /// even if the client asks for them, and the schedule outbox
+    /// stops being a routable resource (a POST there is a 404, the
+    /// same as any other undeclared collection). Omitting only one of
+    /// the two, or serving an empty element, would be a different and
+    /// less honest scenario - a half-scheduling server - so the knob
+    /// is deliberately all-or-nothing.
+    pub scheduling: bool,
+}
+
+impl Default for CalDavConfig {
+    fn default() -> Self {
+        Self { scheduling: true }
+    }
+}
+
 /// Account-discovery surface served on the JMAP HTTP listener.
 ///
 /// Mirrors ratatoskr's multi-stage discovery cascade: WebFinger
@@ -2914,6 +3006,10 @@ pub(crate) struct RawFixture {
     pub(crate) emails: Vec<RawEmail>,
     #[serde(default)]
     pub(crate) oauth: Option<RawOAuth>,
+    #[serde(default)]
+    pub(crate) caldav: Option<RawCalDav>,
+    #[serde(default, rename = "announce")]
+    pub(crate) announce: Vec<RawAnnounce>,
     /// `[discovery."prefix"]` table. Iteration order matters
     /// (preserved insertion order via `toml::Table`) so the
     /// emitted fixture is byte-deterministic; the runtime is
@@ -3481,6 +3577,27 @@ pub(crate) struct RawOAuth {
     pub(crate) issuer: Option<String>,
 }
 
+/// TOML form: `[[announce]] step = "..." before = "GET /path" nth = 2`.
+/// See [`AnnounceTrigger`].
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawAnnounce {
+    pub(crate) step: String,
+    pub(crate) before: String,
+    #[serde(default)]
+    pub(crate) nth: Option<u32>,
+}
+
+/// TOML form: `[caldav] scheduling = false`. `Option<bool>` rather
+/// than `bool` so an omitted key inherits [`CalDavConfig::default`]
+/// (scheduling ON) instead of `bool::default()` (which would be OFF
+/// and would silently flip every fixture that declares the block for
+/// some future unrelated key).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawCalDav {
+    #[serde(default)]
+    pub(crate) scheduling: Option<bool>,
+}
+
 /// TOML form: `[discovery."prefix"]` map. The bare table is the
 /// path-prefix key; nested `webfinger` / `oidc` / `autoconfig`
 /// are the per-shape docs. Authoring shape mirrors the user-
@@ -3737,8 +3854,34 @@ pub fn load(path: &Path) -> Result<Fixture, String> {
         let raw: RawFixture =
             toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
         let dir = path.parent().unwrap_or(Path::new("."));
-        normalize_with_dir(raw, dir)
+        let fixture = normalize_with_dir(raw, dir)?;
+        validate_announce_triggers(&fixture)?;
+        Ok(fixture)
     }
+}
+
+/// Cross-check every [`AnnounceTrigger`] against the change script.
+///
+/// Deliberately NOT inside `normalize_with_dir`: the Lua loader
+/// normalises before it attaches `change_script` (the script is
+/// accumulated on the Lua `Builder`, not on `RawFixture`), so a check
+/// living in normalize would reject every Lua-authored trigger. Both
+/// entry points call this once the script is final instead.
+///
+/// A trigger naming a step that does not exist is a load error, not a
+/// runtime no-op. The failure it prevents is the quiet one: a race
+/// gate whose trigger never fires still runs the backfill, still
+/// passes, and proves nothing about the race it was written for.
+pub(crate) fn validate_announce_triggers(fixture: &Fixture) -> Result<(), String> {
+    for trigger in &fixture.announce {
+        if !fixture.change_script.iter().any(|s| s.id == trigger.step) {
+            return Err(format!(
+                "announce trigger references step {:?}, which no `change` step declares",
+                trigger.step
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Convenience wrapper for unit tests that build a `RawFixture` from
@@ -3912,6 +4055,43 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         }
         None => OAuthConfig::default(),
     };
+
+    let caldav = match raw.caldav {
+        Some(raw_caldav) => CalDavConfig {
+            scheduling: raw_caldav
+                .scheduling
+                .unwrap_or(CalDavConfig::default().scheduling),
+        },
+        None => CalDavConfig::default(),
+    };
+
+    let mut announce = Vec::with_capacity(raw.announce.len());
+    for raw_trigger in raw.announce {
+        if raw_trigger.step.is_empty() {
+            return Err("announce trigger: `step` must be a non-empty step id".into());
+        }
+        if raw_trigger.before.is_empty() {
+            return Err(format!(
+                "announce trigger {:?}: `before` must be a non-empty \"<METHOD> <path>\" prefix",
+                raw_trigger.step
+            ));
+        }
+        // 1-based, so 0 is an authoring mistake rather than "never
+        // fires" - a trigger that silently never fires would let a
+        // race gate pass without ever staging the race.
+        let nth = raw_trigger.nth.unwrap_or(1);
+        if nth == 0 {
+            return Err(format!(
+                "announce trigger {:?}: `nth` is 1-based; 0 would never fire",
+                raw_trigger.step
+            ));
+        }
+        announce.push(AnnounceTrigger {
+            step: raw_trigger.step,
+            before: raw_trigger.before,
+            nth,
+        });
+    }
 
     let discovery = normalize_discovery(raw.discovery)?;
 
@@ -4440,6 +4620,8 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         mailboxes,
         emails,
         oauth,
+        caldav,
+        announce,
         discovery,
         calendars,
         events,
