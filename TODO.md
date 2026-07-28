@@ -73,18 +73,18 @@ Landed: the fixture identity digest
 reconciliation, and coverage of the previously-untested `batchModify`
 / `batchDelete` paths. Lateral findings from that work:
 
-- **BUG: JMAP `Email/set` can still empty `mailbox_ids`.**
-  `src/jmap.rs:1594-1620`. Both the full replace (`mailboxIds: {}`)
-  and the patch form (`mailboxIds/<last-one>: null`) accept an update
-  that leaves the email in no mailbox - the same state the loader
-  rejects, now fixed on the Gmail side. JMAP is NOT the Gmail case:
-  RFC 8621 has no All Mail, an Email must belong to at least one
-  Mailbox, and the spec's answer is to reject with
-  `invalidProperties`. So the fix here is the opposite of the Gmail
-  one - refuse rather than fall back to the archive mailbox. IMAP
-  already gets this right (`EXPUNGE` destroys a message whose last
-  mailbox membership goes away); Graph's move always writes a single
-  non-empty parent.
+- **[done] JMAP `Email/set` could empty `mailbox_ids`.** Fixed in
+  `apply_email_patch`: every shape that lands on an empty
+  `mailboxIds` (full replace with `{}` or an all-`false` map, and
+  `mailboxIds/<last-one>` set to `null` or `false`) is now a per-item
+  `invalidProperties` `SetError`, applied to a clone so the refusal
+  leaves no partial mutation, no state bump, and no transition.
+  `Email/set` create and `Email/import` take the same rule (RFC 8621
+  §4.6 requires the new Email to name a Mailbox). Deliberately the
+  OPPOSITE of the Gmail fallback-to-archive, and the contrast is
+  documented at both decision sites plus in the two surface notes;
+  IMAP (`EXPUNGE` destroys) and Graph (always one non-empty parent)
+  were already correct.
 - **`apply_gmail_label` silently ignores unknown label ids.**
   `src/gmail/mail.rs`. Anything without a `Label_` prefix that is not
   a known system label is dropped on the floor; real Gmail 400s on an

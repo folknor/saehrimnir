@@ -1265,9 +1265,16 @@ fn thread_changes(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
 //     map. The `unread` synthetic property is *not* exposed - the
 //     client toggles `$seen` directly via `keywords`.
 //   - `mailboxIds` (full replace) and `mailboxIds/<id>` (true=add,
-//     null=remove). RFC 8621 §4.1.1: a Set<Id> represented as
+//     null/false=remove). RFC 8621 §4.1.1: a Set<Id> represented as
 //     `String[true]`.
 // Anything else is rejected as `notUpdated[<id>] = invalidProperties`.
+//
+// So is any mutation that would leave an email in NO mailbox, whether
+// it arrives as a full replace (`mailboxIds: {}` / all-`false`) or as
+// the per-key form dropping the last membership. RFC 8621 has no All
+// Mail, so that is not a representable state; see
+// `apply_email_patch` for the rule and for why the Gmail listener
+// answers the same shape with an archive instead.
 //
 // Create / destroy are full-replace and ID-removal respectively;
 // they round-trip through `Email/changes` with no extra trickery.
@@ -1435,11 +1442,21 @@ fn build_email_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
     let body = body
         .as_object()
         .ok_or_else(|| set_error("invalidProperties", "create body must be an object"))?;
-    let mailbox_ids: Vec<String> = body
-        .get("mailboxIds")
-        .and_then(Value::as_object)
-        .map(|m| m.keys().cloned().collect())
-        .ok_or_else(|| set_error("invalidProperties", "missing mailboxIds"))?;
+    // RFC 8621 §4.6 create: `mailboxIds` is a required property and
+    // must place the new Email somewhere. Absent is `invalidProperties`
+    // for the missing property; present-but-empty (or all-`false`) is
+    // `invalidProperties` for the same reason an update cannot empty
+    // it - see `empty_mailbox_ids_error`. Refusing here also keeps the
+    // account derivation below honest: with no mailbox to derive from
+    // it would silently fall back to the primary account.
+    let mailbox_ids = jmap_bool_set(
+        body.get("mailboxIds")
+            .and_then(Value::as_object)
+            .ok_or_else(|| set_error("invalidProperties", "missing mailboxIds"))?,
+    );
+    if mailbox_ids.is_empty() {
+        return Err(empty_mailbox_ids_error());
+    }
     for id in &mailbox_ids {
         if !fix.mailboxes.iter().any(|m| &m.id == id) {
             return Err(set_error(
@@ -1451,7 +1468,7 @@ fn build_email_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
     let keywords: Vec<String> = body
         .get("keywords")
         .and_then(Value::as_object)
-        .map(|m| m.keys().cloned().collect())
+        .map(jmap_bool_set)
         .unwrap_or_default();
     let server_id = fix.mint_email_id();
     // Determinism: a create-into-empty-fixture must produce the
@@ -1579,52 +1596,74 @@ fn jmap_text_body(body: &Map<String, Value>) -> String {
         .unwrap_or_default()
 }
 
+/// Apply an `Email/set` update patch to `email`.
+///
+/// Every JMAP-shaped email mutation funnels through here - `Email/set`'s
+/// `update` map, `EmailSubmission/set`'s `onSuccessUpdateEmail`, and the
+/// test-admin change-script `email_update` op - so the RFC 8621 invariant
+/// that an Email is a member of at least one Mailbox is enforced in one
+/// place. Every caller patches a *clone* and only swaps it back in on
+/// `Ok`, so a rejection applies no partial mutation: the fixture, the
+/// per-account state token, and the change log all stay exactly as they
+/// were.
 pub(crate) fn apply_email_patch(email: &mut Email, patch: &Value) -> Result<(), Value> {
     let obj = patch
         .as_object()
         .ok_or_else(|| set_error("invalidProperties", "patch must be an object"))?;
+    // Whether any path in this patch touched membership. The
+    // non-empty check below only fires for patches that could have
+    // emptied the set, so a keywords-only patch against an email the
+    // loader somehow let through unmailboxed still reports the error
+    // it actually has, not a membership one.
+    let mut touches_mailboxes = false;
     for (path, value) in obj {
         match path.as_str() {
             "keywords" => {
                 let map = value
                     .as_object()
                     .ok_or_else(|| set_error("invalidProperties", "keywords must be an object"))?;
-                email.keywords = map.keys().cloned().collect();
+                email.keywords = jmap_bool_set(map);
             }
             "mailboxIds" => {
                 let map = value.as_object().ok_or_else(|| {
                     set_error("invalidProperties", "mailboxIds must be an object")
                 })?;
-                email.mailbox_ids = map.keys().cloned().collect();
+                touches_mailboxes = true;
+                email.mailbox_ids = jmap_bool_set(map);
             }
             other if other.starts_with("keywords/") => {
                 let name = other.strip_prefix("keywords/").expect("checked");
-                if value.is_null() {
-                    email.keywords.retain(|k| k != name);
-                } else if value.as_bool() == Some(true) {
-                    if !email.keywords.iter().any(|k| k == name) {
-                        email.keywords.push(name.to_string());
+                match patch_set_member(value) {
+                    Some(true) => {
+                        if !email.keywords.iter().any(|k| k == name) {
+                            email.keywords.push(name.to_string());
+                        }
                     }
-                } else {
-                    return Err(set_error(
-                        "invalidProperties",
-                        &format!("{path} expects true or null"),
-                    ));
+                    Some(false) => email.keywords.retain(|k| k != name),
+                    None => {
+                        return Err(set_error(
+                            "invalidProperties",
+                            &format!("{path} expects true, false, or null"),
+                        ));
+                    }
                 }
             }
             other if other.starts_with("mailboxIds/") => {
                 let id = other.strip_prefix("mailboxIds/").expect("checked");
-                if value.is_null() {
-                    email.mailbox_ids.retain(|m| m != id);
-                } else if value.as_bool() == Some(true) {
-                    if !email.mailbox_ids.iter().any(|m| m == id) {
-                        email.mailbox_ids.push(id.to_string());
+                touches_mailboxes = true;
+                match patch_set_member(value) {
+                    Some(true) => {
+                        if !email.mailbox_ids.iter().any(|m| m == id) {
+                            email.mailbox_ids.push(id.to_string());
+                        }
                     }
-                } else {
-                    return Err(set_error(
-                        "invalidProperties",
-                        &format!("{path} expects true or null"),
-                    ));
+                    Some(false) => email.mailbox_ids.retain(|m| m != id),
+                    None => {
+                        return Err(set_error(
+                            "invalidProperties",
+                            &format!("{path} expects true, false, or null"),
+                        ));
+                    }
                 }
             }
             other => {
@@ -1635,7 +1674,77 @@ pub(crate) fn apply_email_patch(email: &mut Email, patch: &Value) -> Result<(), 
             }
         }
     }
+    // Checked once, after the whole patch has been folded in, so the
+    // verdict does not depend on the order the map yields paths: a
+    // patch that drops the last inbox membership and adds an archive
+    // one nets out non-empty either way.
+    //
+    // NOTE: this is deliberately the OPPOSITE of the Gmail listener's
+    // handling of the same shape (`gmail::mail::modify_one`), where a
+    // modify that removes every container falls back to the
+    // archive-role mailbox. Gmail really has All Mail, so "in no
+    // label" is a representable, meaningful state there - it is an
+    // archive. RFC 8621 has no such concept: `mailboxIds` is the only
+    // thing that places a message, so an email in no mailbox is not
+    // representable and a conforming server refuses the update rather
+    // than inventing a destination. IMAP reaches the third possible
+    // answer (`EXPUNGE` destroys a message whose last mailbox
+    // membership goes away); Graph's move always writes exactly one
+    // non-empty parent folder.
+    if touches_mailboxes && email.mailbox_ids.is_empty() {
+        return Err(empty_mailbox_ids_error());
+    }
     Ok(())
+}
+
+/// Interpret one RFC 8620 §5.3 patch value against a `Set` property
+/// (`mailboxIds/<id>`, `keywords/<flag>`): `true` adds the member,
+/// `null` removes it (the removal encoding RFC 8620 defines), and
+/// `false` also removes it - a `Set` member whose value is not `true`
+/// is not a member, so `false` and "absent" mean the same thing, which
+/// keeps the per-key form agreeing with the full-replace form parsed by
+/// [`jmap_bool_set`]. Anything else (a number, a string, an object) is
+/// `None` -> `invalidProperties`.
+fn patch_set_member(value: &Value) -> Option<bool> {
+    if value.is_null() {
+        return Some(false);
+    }
+    value.as_bool()
+}
+
+/// Parse a JMAP `Set` property serialized as an `Id[Boolean]` /
+/// `String[Boolean]` map (RFC 8620 §1.2, RFC 8621 §4.1.1 for
+/// `mailboxIds` and `keywords`) into the fixture's flat member vector.
+///
+/// The value for a present member MUST be `true`, so a key mapped to
+/// `false` is NOT a member: an all-`false` map collapses to the empty
+/// set, exactly like `{}`. Callers that require a non-empty result
+/// (`mailboxIds` everywhere) check for emptiness afterwards, which
+/// makes `{}` and `{"mbx-x": false}` land on the same error instead of
+/// one of them silently manufacturing a membership.
+fn jmap_bool_set(map: &Map<String, Value>) -> Vec<String> {
+    map.iter()
+        .filter(|(_, value)| value.as_bool() == Some(true))
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// The single `SetError` for "this would leave the email in no
+/// mailbox", shared by the update, create, and import paths so all
+/// three refuse an unrepresentable email identically.
+///
+/// RFC 8621 §4.1.1: `mailboxIds` is "The set of Mailbox ids this Email
+/// belongs to. An Email in the mail store MUST belong to one or more
+/// Mailboxes at all times". There is no All Mail to fall back to, so
+/// the conforming answer is a per-item `invalidProperties` rejection:
+/// the id lands in `notUpdated` / `notCreated`, no mutation is applied,
+/// and the account's state does not advance for it.
+fn empty_mailbox_ids_error() -> Value {
+    set_error(
+        "invalidProperties",
+        "mailboxIds must name at least one mailbox: RFC 8621 has no All Mail, \
+         so an email in no mailbox is not a representable state",
+    )
 }
 
 // ── Email/import ────────────────────────────────────────────────────
@@ -1732,11 +1841,17 @@ fn build_email_from_import(fix: &mut Fixture, body: &Value) -> Result<(String, E
         .get(blob_id)
         .map(|b| b.data.clone())
         .ok_or_else(|| set_error("blobNotFound", &format!("unknown blobId {blob_id:?}")))?;
-    let mailbox_ids: Vec<String> = body
-        .get("mailboxIds")
-        .and_then(Value::as_object)
-        .map(|m| m.keys().cloned().collect())
-        .ok_or_else(|| set_error("invalidProperties", "missing mailboxIds"))?;
+    // Same membership rule as `Email/set` create (RFC 8621 §4.8 imports
+    // an Email, so it lands under the same §4.1.1 invariant): the
+    // import must name at least one real mailbox.
+    let mailbox_ids = jmap_bool_set(
+        body.get("mailboxIds")
+            .and_then(Value::as_object)
+            .ok_or_else(|| set_error("invalidProperties", "missing mailboxIds"))?,
+    );
+    if mailbox_ids.is_empty() {
+        return Err(empty_mailbox_ids_error());
+    }
     for id in &mailbox_ids {
         if !fix.mailboxes.iter().any(|m| &m.id == id) {
             return Err(set_error(
@@ -1748,7 +1863,7 @@ fn build_email_from_import(fix: &mut Fixture, body: &Value) -> Result<(String, E
     let keywords: Vec<String> = body
         .get("keywords")
         .and_then(Value::as_object)
-        .map(|m| m.keys().cloned().collect())
+        .map(jmap_bool_set)
         .unwrap_or_default();
 
     let account_id = fix

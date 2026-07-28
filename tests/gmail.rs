@@ -1440,12 +1440,14 @@ async fn gmail_batch_modify_applies_add_and_remove_in_one_request() {
     }
 
     // Untouched ids stay untouched: a bulk patch is not a broadcast.
-    assert_eq!(mailbox_ids(&handle, "msg-spam"), vec!["mb-spam".to_string()]);
+    assert_eq!(
+        mailbox_ids(&handle, "msg-spam"),
+        vec!["mb-spam".to_string()]
+    );
 
     // One history record PER MESSAGE, each carrying both sides of the
     // patch. A consumer resyncing after a bulk move reads exactly this.
-    let (_, history) =
-        get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    let (_, history) = get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
     let mut added = history_label_entries(&history, "labelsAdded");
     added.sort();
     assert_eq!(
@@ -1529,7 +1531,10 @@ async fn gmail_message_modify_honours_combined_add_and_remove() {
     // trusts the returned Message must not need a follow-up read.
     assert!(labels.contains(&"INBOX"), "{labels:?}");
     assert!(!labels.contains(&"SPAM"), "{labels:?}");
-    assert_eq!(mailbox_ids(&handle, "msg-spam"), vec!["mb-inbox".to_string()]);
+    assert_eq!(
+        mailbox_ids(&handle, "msg-spam"),
+        vec!["mb-inbox".to_string()]
+    );
 }
 
 /// Adds are applied before removes. Observable here because the add is
@@ -1599,7 +1604,10 @@ async fn gmail_archive_lands_the_message_in_all_mail() {
 
     // The canonical state is the archive mailbox, never empty - which
     // is what keeps the served fixture loadable by its own loader.
-    assert_eq!(mailbox_ids(&handle, "msg-1"), vec!["mb-archive".to_string()]);
+    assert_eq!(
+        mailbox_ids(&handle, "msg-1"),
+        vec!["mb-archive".to_string()]
+    );
 
     // Still readable, still listed: archive is not a delete.
     let (status, _) = get_json_with(app.clone(), "/gmail/v1/users/me/messages/msg-1").await;
@@ -1624,7 +1632,11 @@ async fn gmail_batch_modify_archive_lands_every_message_in_all_mail() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     for id in ["msg-1", "msg-2"] {
         assert_eq!(mailbox_ids(&handle, id), vec!["mb-archive".to_string()]);
-        assert!(!message_labels(app.clone(), id).await.contains(&"INBOX".to_string()));
+        assert!(
+            !message_labels(app.clone(), id)
+                .await
+                .contains(&"INBOX".to_string())
+        );
     }
 }
 
@@ -1671,8 +1683,7 @@ async fn gmail_archive_without_an_archive_mailbox_is_refused_and_changes_nothing
     // empty MutationDiff records no transition), so a consumer polling
     // history does not see a phantom change.
     assert_eq!(mailbox_ids(&handle, "only"), vec!["mb-inbox".to_string()]);
-    let (_, history) =
-        get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
+    let (_, history) = get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
     assert!(
         history["history"]
             .as_array()
@@ -1743,12 +1754,16 @@ async fn gmail_batch_delete_destroys_the_listed_ids_only() {
     assert_eq!(body, Value::Null);
 
     for id in ["msg-1", "msg-trash"] {
-        let (status, _) = get_json_with(app.clone(), &format!("/gmail/v1/users/me/messages/{id}"))
-            .await;
+        let (status, _) =
+            get_json_with(app.clone(), &format!("/gmail/v1/users/me/messages/{id}")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{id} survived batchDelete");
     }
     let (status, _) = get_json_with(app.clone(), "/gmail/v1/users/me/messages/msg-2").await;
-    assert_eq!(status, StatusCode::OK, "batchDelete swept up an unlisted id");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "batchDelete swept up an unlisted id"
+    );
 
     let (_, history) = get_json_with(app, "/gmail/v1/users/me/history?startHistoryId=1").await;
     let mut deleted: Vec<String> = history["history"]

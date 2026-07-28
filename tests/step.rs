@@ -517,6 +517,63 @@ async fn change_script_destroy_then_create_does_not_reuse_imap_uid() {
     );
 }
 
+/// The change-script `email_update` op routes through the same
+/// `apply_email_patch` as JMAP `Email/set`, so it inherits the RFC 8621
+/// §4.1.1 rule: a `mailbox_ids` full-replace that names nothing leaves
+/// the email in no mailbox, which is not a representable state, and the
+/// step fails instead of silently orphaning the message. The loader
+/// rejects the same shape at load time and `email_move` rejects it at
+/// build time; this closes the third door. Scripts that mean "the
+/// message is gone" use `email_destroy`.
+#[tokio::test]
+async fn change_script_email_update_to_empty_mailbox_ids_is_rejected() {
+    let scenario = r#"
+        fixture({ name = "empty-mailbox-update" })
+        account({ id = "account-1", name = "test@example.com" })
+        mailbox({ id = "mb-inbox", name = "Inbox", role = "inbox" })
+        email({
+            id = "email-001",
+            mailbox_ids = {"mb-inbox"},
+            received_at = "2026-01-15T10:00:00Z",
+            body_text = "first",
+            message_id = {"<001@x>"},
+        })
+        change({
+            id = "orphan",
+            email_update = {
+                { id = "email-001", mailbox_ids = {} },
+            },
+        })
+    "#;
+    let fix = lua::load_source(scenario, "@empty-mailbox-update").unwrap();
+    let handle = saehrimnir::shared::handle(fix);
+    let app = routes::router(routes::AppState::for_test(std::sync::Arc::clone(&handle)));
+
+    let before = current_state(&app).await;
+
+    let (status, v) = step(&app, json!({ "expect": "orphan" })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let detail = v["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("mailboxIds must name at least one mailbox"),
+        "error should name the membership rule: {v:?}"
+    );
+
+    // Failed step: membership intact, state token unmoved.
+    assert_eq!(current_state(&app).await, before);
+    let v = jmap_call(
+        &app,
+        "Email/get",
+        json!({ "accountId": "account-1", "ids": ["email-001"] }),
+        "c0",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["list"][0]["mailboxIds"],
+        json!({ "mb-inbox": true }),
+    );
+}
+
 async fn run_imap(handle: &saehrimnir::shared::FixtureHandle, script: &[u8]) -> String {
     let fix = std::sync::Arc::clone(handle);
     let (server, mut client) = tokio::io::duplex(32 * 1024);

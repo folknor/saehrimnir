@@ -312,6 +312,13 @@ derives an email's account from its mailboxes). The MUTATION is the
 side that adapts - a patch that would empty the set lands the message
 in the archive mailbox instead.
 
+That fallback is Gmail-only. The same shape on JMAP (`Email/set`
+emptying `mailboxIds`) is REFUSED with `invalidProperties`, because
+RFC 8621 has no All Mail for the message to fall into; see
+`notes/ratatoskr-jmap-surface.md` § "`mailboxIds` can never end up
+empty". The divergence is the protocols disagreeing, not an
+inconsistency in the mock.
+
 Two cases the mock cannot represent are refused with a Gmail-shaped
 `400 invalidArgument` naming the missing fixture declaration, after
 rolling the patch back whole (no partial application, no state

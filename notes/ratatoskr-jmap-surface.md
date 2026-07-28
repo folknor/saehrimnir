@@ -262,10 +262,62 @@ before any mutation; mismatch returns `stateMismatch`.
 `Email/set` patch shapes ratatoskr drives:
 
 - `keywords` (full replace, `String[Boolean]`) and
-  `keywords/<flag>` (`true` to add, `null` to remove).
+  `keywords/<flag>` (`true` to add, `null` or `false` to remove).
 - `mailboxIds` (full replace, `String[true]`) and
-  `mailboxIds/<id>` (`true` to add, `null` to remove).
+  `mailboxIds/<id>` (`true` to add, `null` or `false` to remove).
 - Other patch paths return `notUpdated[<id>] = invalidProperties`.
+
+Both properties are RFC 8620 `Set`s, so a member's value MUST be
+`true`: on the full-replace form a key mapped to `false` is NOT a
+member and is dropped, exactly as if it had been omitted. That keeps
+the two forms agreeing on what `false` means.
+
+### `mailboxIds` can never end up empty
+
+RFC 8621 §4.1.1: an Email "MUST belong to one or more Mailboxes at all
+times". JMAP has no All Mail, so a mutation whose result is an empty
+`mailboxIds` has no representable outcome, and the mock refuses it
+with a per-item `SetError`:
+
+```json
+"notUpdated": { "email-001": {
+  "type": "invalidProperties",
+  "description": "mailboxIds must name at least one mailbox: ..."
+}}
+```
+
+This covers every shape that reaches the empty set:
+
+- full replace with `{}` or with an all-`false` map;
+- `mailboxIds/<id>` set to `null` or `false` where `<id>` is the last
+  remaining membership;
+- `Email/set` create and `Email/import` with an empty / all-`false`
+  `mailboxIds` (RFC 8621 §4.6 requires the new Email to name a
+  Mailbox); those land in `notCreated`.
+
+The check runs once after the whole patch is folded in, so it is
+order-insensitive: a patch that drops one mailbox and adds another
+nets out non-empty and applies. A refusal is per item and total - no
+partial mutation, no state bump, no transition appended, so the next
+`Email/changes` shows nothing for that id and any sibling update in
+the same envelope still applies.
+
+Contrast with the other protocols, which genuinely disagree here:
+
+- **Gmail** treats "no container" as a real state (All Mail), so
+  `batchModify`/`modify` removing the last container is an ARCHIVE and
+  the message lands in the `role = "archive"` mailbox. See
+  `notes/ratatoskr-gmail-surface.md`.
+- **IMAP** destroys it: `EXPUNGE` on the last mailbox membership
+  removes the message outright.
+- **Graph** never reaches the case; a move always writes exactly one
+  non-empty parent folder.
+
+A well-behaved client never produces the empty shape anyway (bifrost's
+bulk move REPLACES membership with the destination). The rejection
+exists so a buggy or hostile mutation gets the answer a conforming
+server gives, instead of the mock manufacturing an unmailboxed email
+that downstream sync would then ingest.
 
 `Mailbox/set` honours `name`, `parentId`, `sortOrder`, `role`,
 `isSubscribed` on both create and update. Destroy fails with

@@ -1518,9 +1518,7 @@ fn modify_gap_error(outcome: &ModifyOutcome) -> Response {
             "addLabelIds names the system container {label:?}, but the account declares no \
              mailbox with the matching role; add one to the fixture"
         ),
-        ModifyOutcome::Applied | ModifyOutcome::NotFound => {
-            "unexpected modify outcome".to_string()
-        }
+        ModifyOutcome::Applied | ModifyOutcome::NotFound => "unexpected modify outcome".to_string(),
     };
     error(StatusCode::BAD_REQUEST, &message, "invalidArgument")
 }
@@ -1614,6 +1612,17 @@ fn container_mailbox(fix: &Fixture, account_id: &str, label: &str) -> Option<Str
 /// mailboxes). The mutation is the side that was wrong - it emptied
 /// the set instead of landing the message in All Mail. Here it lands
 /// it in the archive mailbox.
+///
+/// This fallback is Gmail-ONLY, and deliberately so. The identical
+/// shape on JMAP (`Email/set` emptying `mailboxIds`) is REFUSED with
+/// `invalidProperties` in `jmap::apply_email_patch`, because RFC 8621
+/// has no All Mail: `mailboxIds` is the only thing that places a
+/// message, so "in no mailbox" is unrepresentable rather than
+/// meaningful. Do not unify the two paths - the divergence is the
+/// protocols disagreeing, not an inconsistency in the mock. (IMAP
+/// takes the third answer: `EXPUNGE` destroys a message that loses its
+/// last mailbox. Graph never reaches the case; a move always writes
+/// one non-empty parent folder.)
 fn modify_one(
     fix: &mut Fixture,
     account_id: &str,

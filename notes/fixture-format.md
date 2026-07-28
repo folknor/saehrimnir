@@ -986,7 +986,11 @@ Op contracts:
   Each emits a JMAP-shape patch (`keywords` and / or `mailboxIds`
   full-replace) routed through the same `apply_email_patch` the
   JMAP `Email/set` mutator uses. At least one of the two fields
-  must be present.
+  must be present. A `mailbox_ids` that is present but EMPTY is
+  rejected at apply time (`invalidPatch`), for the same reason
+  `email_move` rejects it at build time and the loader rejects it at
+  load time: an email in no mailbox is not a representable state.
+  Removing a message is `email_destroy`.
 - **`email_reaction`**: array of `{ id, reaction_type?,
   reaction_count?, clear? }`. Sets or clears the Graph reaction
   extended properties on an existing message. Does NOT route through

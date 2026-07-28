@@ -2957,6 +2957,324 @@ async fn mailbox_set_destroy_rejects_non_empty_mailbox() {
     assert_eq!(body["newState"], "fixture-state");
 }
 
+// ── Email/set: mailboxIds must never end up empty ───────────────────
+//
+// RFC 8621 §4.1.1: an Email belongs to one or more Mailboxes at all
+// times. There is no All Mail on JMAP, so an update that would empty
+// `mailboxIds` has no representable result and the mock refuses it
+// per-item with `invalidProperties` instead of manufacturing an
+// unmailboxed email that downstream sync would then ingest. This is
+// the deliberate opposite of the Gmail listener, where the same shape
+// is a legitimate archive (`tests/gmail.rs`).
+
+/// Full-replace `mailboxIds: {}` is refused: the id lands in
+/// `notUpdated` with `invalidProperties`, the membership is unchanged,
+/// and the account's state does not advance.
+#[tokio::test]
+async fn email_set_full_replace_to_empty_mailbox_ids_is_rejected() {
+    let app = router();
+
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "update": { "email-001": { "mailboxIds": {} } }
+        }),
+        "c0",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert!(body["updated"].is_null(), "nothing may report as updated");
+    assert_eq!(body["notUpdated"]["email-001"]["type"], "invalidProperties");
+    assert_eq!(
+        body["oldState"], body["newState"],
+        "a refused update must not bump state"
+    );
+
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({"accountId": "account-1", "ids": ["email-001"]}),
+        "c1",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["list"][0]["mailboxIds"],
+        json!({ "mbx-inbox": true }),
+        "membership must survive the refusal intact"
+    );
+}
+
+/// A full replace whose every value is `false` names no members at all
+/// (RFC 8620 `Set`: a member's value MUST be `true`), so it collapses
+/// to the same empty set as `{}` and takes the same refusal - rather
+/// than the pre-fix behaviour of reading the keys and silently
+/// treating `false` as membership.
+#[tokio::test]
+async fn email_set_all_false_mailbox_ids_replace_is_rejected() {
+    let app = router();
+
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "update": { "email-001": { "mailboxIds": { "mbx-archive": false } } }
+        }),
+        "c0",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert!(body["updated"].is_null());
+    assert_eq!(body["notUpdated"]["email-001"]["type"], "invalidProperties");
+
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({"accountId": "account-1", "ids": ["email-001"]}),
+        "c1",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["list"][0]["mailboxIds"],
+        json!({ "mbx-inbox": true }),
+    );
+}
+
+/// The per-key patch form hits the same rule: `mailboxIds/<id>: null`
+/// removing the ONLY membership is refused. `false` is the same
+/// removal encoding and takes the same answer.
+#[tokio::test]
+async fn email_set_removing_last_mailbox_membership_by_key_is_rejected() {
+    for removal in [json!(null), json!(false)] {
+        let app = router();
+
+        let v = jmap_call_on(
+            &app,
+            "Email/set",
+            json!({
+                "accountId": "account-1",
+                "update": { "email-001": { "mailboxIds/mbx-inbox": removal } }
+            }),
+            "c0",
+        )
+        .await;
+        let body = &v["methodResponses"][0][1];
+        assert!(body["updated"].is_null(), "removal encoding {removal:?}");
+        assert_eq!(
+            body["notUpdated"]["email-001"]["type"], "invalidProperties",
+            "removal encoding {removal:?}"
+        );
+        assert_eq!(body["oldState"], body["newState"]);
+    }
+}
+
+/// The rule is "must not END empty", not "must not remove": an email
+/// in two mailboxes may drop either one. Also covers the mixed patch
+/// (drop one, add another) that a well-behaved move drives, which nets
+/// out non-empty whatever order the patch paths are folded in.
+#[tokio::test]
+async fn email_set_losing_one_of_two_mailbox_memberships_succeeds() {
+    let app = router();
+
+    // Stage a two-mailbox email out of the single-mailbox fixture.
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "update": { "email-001": { "mailboxIds/mbx-archive": true } }
+        }),
+        "c0",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["updated"],
+        json!({ "email-001": null })
+    );
+
+    // Drop the inbox membership: archive still holds it, so this is a
+    // perfectly representable state and must apply.
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "update": { "email-001": { "mailboxIds/mbx-inbox": null } }
+        }),
+        "c1",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["updated"], json!({ "email-001": null }));
+    assert!(body["notUpdated"].is_null());
+    assert_ne!(body["oldState"], body["newState"]);
+
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({"accountId": "account-1", "ids": ["email-001"]}),
+        "c2",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["list"][0]["mailboxIds"],
+        json!({ "mbx-archive": true }),
+    );
+
+    // Swap back to the inbox in one patch: the transient empty set
+    // between the remove and the add is not a rejection.
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "update": {
+                "email-001": {
+                    "mailboxIds/mbx-archive": null,
+                    "mailboxIds/mbx-inbox": true
+                }
+            }
+        }),
+        "c3",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["updated"],
+        json!({ "email-001": null })
+    );
+
+    let v = jmap_call_on(
+        &app,
+        "Email/get",
+        json!({"accountId": "account-1", "ids": ["email-001"]}),
+        "c4",
+    )
+    .await;
+    assert_eq!(
+        v["methodResponses"][0][1]["list"][0]["mailboxIds"],
+        json!({ "mbx-inbox": true }),
+    );
+}
+
+/// A refused update records NO transition: the account's change log is
+/// untouched, so `Email/changes` from the original seed still reports
+/// the steady state. A second email updated in the SAME envelope still
+/// applies - the rejection is per-item, not per-request - and is the
+/// only id the delta carries.
+#[tokio::test]
+async fn email_set_rejected_mailbox_removal_leaves_change_log_untouched() {
+    let app = router();
+
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c0",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["newState"], "fixture-state");
+
+    // Refusal alone: no state movement at all.
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "update": { "email-001": { "mailboxIds": {} } }
+        }),
+        "c1",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["newState"], "fixture-state");
+
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c2",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["oldState"], "fixture-state");
+    assert_eq!(body["newState"], "fixture-state");
+    assert_eq!(body["created"], json!([]));
+    assert_eq!(body["updated"], json!([]));
+    assert_eq!(body["destroyed"], json!([]));
+
+    // Mixed envelope: the refused id must not poison its neighbour,
+    // and the delta must carry the neighbour alone.
+    let v = jmap_call_on(
+        &app,
+        "Email/set",
+        json!({
+            "accountId": "account-1",
+            "update": {
+                "email-001": { "mailboxIds": {} },
+                "email-002": { "keywords/$flagged": true }
+            }
+        }),
+        "c3",
+    )
+    .await;
+    let body = &v["methodResponses"][0][1];
+    assert_eq!(body["updated"], json!({ "email-002": null }));
+    assert_eq!(body["notUpdated"]["email-001"]["type"], "invalidProperties");
+
+    let v = jmap_call_on(
+        &app,
+        "Email/changes",
+        json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+        "c4",
+    )
+    .await;
+    assert_eq!(v["methodResponses"][0][1]["updated"], json!(["email-002"]));
+}
+
+/// Create takes the same rule (RFC 8621 §4.6 requires the new Email to
+/// name at least one Mailbox): an empty or all-`false` `mailboxIds`
+/// lands in `notCreated` with `invalidProperties` and mints nothing.
+#[tokio::test]
+async fn email_set_create_with_empty_mailbox_ids_is_rejected() {
+    for mailbox_ids in [json!({}), json!({ "mbx-inbox": false })] {
+        let app = router();
+
+        let v = jmap_call_on(
+            &app,
+            "Email/set",
+            json!({
+                "accountId": "account-1",
+                "create": {
+                    "draft": { "mailboxIds": mailbox_ids, "keywords": { "$draft": true } }
+                }
+            }),
+            "c0",
+        )
+        .await;
+        let body = &v["methodResponses"][0][1];
+        assert!(body["created"].is_null(), "mailboxIds {mailbox_ids:?}");
+        assert_eq!(
+            body["notCreated"]["draft"]["type"], "invalidProperties",
+            "mailboxIds {mailbox_ids:?}"
+        );
+        assert_eq!(body["oldState"], body["newState"]);
+
+        let v = jmap_call_on(
+            &app,
+            "Email/changes",
+            json!({"accountId": "account-1", "sinceState": "fixture-state"}),
+            "c1",
+        )
+        .await;
+        assert_eq!(
+            v["methodResponses"][0][1]["created"],
+            json!([]),
+            "mailboxIds {mailbox_ids:?}"
+        );
+    }
+}
+
 /// `ifInState` mismatch short-circuits the envelope and leaves the
 /// fixture untouched.
 #[tokio::test]
@@ -3834,7 +4152,10 @@ async fn fixture_identity_publishes_source_digest_for_a_lua_fixture() {
         std::path::Path::new(reported).is_absolute(),
         "path must be absolute: {reported}"
     );
-    assert!(reported.ends_with("fixtures/gmail-incremental.lua"), "{reported}");
+    assert!(
+        reported.ends_with("fixtures/gmail-incremental.lua"),
+        "{reported}"
+    );
     assert_eq!(
         std::fs::read(reported).unwrap(),
         bytes,

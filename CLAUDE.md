@@ -593,6 +593,13 @@ mutators honouring the create / update / destroy maps and the patch
 shapes ratatoskr drives - `keywords` / `keywords/<flag>`, `mailboxIds`
 / `mailboxIds/<id>`, plus `name` / `parentId` / `sortOrder` / `role` /
 `isSubscribed` on mailboxes. Full integration test coverage).
+Any `Email/set` create or update whose result would be an EMPTY
+`mailboxIds` is refused with a per-item `invalidProperties` `SetError`
+(RFC 8621 §4.1.1: an Email always belongs to at least one Mailbox, and
+JMAP has no All Mail to fall back to). That is deliberately the
+opposite of the Gmail listener, where the same shape is a legitimate
+archive; see `notes/ratatoskr-jmap-surface.md` § "`mailboxIds` can
+never end up empty" before touching either path.
 `Thread/get` derives threads from each email's `thread_id`
 (`{ id, emailIds }`, emailIds sorted by `receivedAt` ascending,
 account-scoped); bifrost's JMAP `Account::open` probes it during
