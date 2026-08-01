@@ -1495,7 +1495,7 @@ Use `brokkr` (not `cargo`) for check/test. It runs a gremlins scan (banned Unico
 - Each agent gets exclusive ownership of specific files. No two agents touch the same file.
 - `main.rs` is shared - agents may ONLY add Message enum variants and one-line dispatch arms. All handler logic goes in `handlers/*.rs`.
 - Agents must read their handler file FIRST (it already has extracted methods). Do not replace existing code with placeholders.
-- Agents must NOT run `cargo check/build/test`. The orchestrator validates between agents.
+- Agents must NOT run `brokkr` or `cargo`. The orchestrator validates between agents.
 
 **Verification standard - "implemented" means wired:**
 - A feature is NOT implemented unless the user can reach it through current Message dispatch -> handler -> view wiring.
@@ -1531,3 +1531,37 @@ echo "follow up on the second finding" | review bugs --provider claude --session
 Don't reach for a second `--oneshot` to follow up - that creates a different fresh session with no memory of the first. Use `--session` for continuity within a thread, `--oneshot` for new threads.
 
 To update the prime prompt for an archetype, pipe new content to `review prime <archetype> --provider <p>`. The prompt is stored once per archetype and shared across providers; once stored, prime any other provider with no stdin to reuse it.
+
+## Document folders
+
+The standing layout, across every project. Three live folders plus one retired,
+split by durability first, subject second.
+
+| Folder | Contents | Rule |
+|---|---|---|
+| `reference/` | Durable in-repo reference for anyone working on or with the code - how the thing is built and why: `architecture.md`, `technical-implementation-spec.md`, `performance.md` (the durable record of measured numbers over time), invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `docs/` | Durable in-repo documentation of how the thing is used - guides, CLI reference, the consumer-facing API surface. Sometimes exposed as a hand-edited VitePress gh-pages site | Same must-be-true rule. |
+| `notes/` | Transient - work items (`todo.md`), future plans, hypotheticals, bug reports, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
+| `plans/` | Retired | Plan documents are transient: they go in `notes/`. |
+
+`reference/` and `docs/` are both durable and both binding. The difference is
+subject, not audience: `reference/` covers how the thing is built and why - what
+you need in order to change it safely - while `docs/` covers how it is used. A
+developer or library consumer reads both. Where a project publishes a site,
+`docs/` is what gets published; the folder means the same thing either way.
+`notes/` is neither durable nor binding, which is the whole point of keeping it
+separate: a document that may be wrong must not sit where a document that must
+be right is expected.
+
+The dependency direction is therefore one-way. `notes/` may cite `docs/` and
+`reference/`; nothing durable may cite `notes/` - not a code comment, not
+`docs/`, not `reference/`. A code comment must carry its full context, because
+it outlives the note.
+
+**Root-level convention files are exempt.** `AGENTS.md`, `CLAUDE.md`,
+`README.md`, `LICENSE`, `CHANGELOG.md` and their kin are found by tooling and by
+convention at the repository root, and stay there. These folders govern
+documents we chose where to put, not files whose location is dictated.
+
+In `notes/`, `docs/` and `reference/` alike, avoid citing source line numbers -
+they drift fast.
