@@ -571,7 +571,7 @@ async fn list_threads(
                 "invalidQuery",
             );
         };
-        let cutoff = chrono::Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default());
+        let cutoff = crate::timeutil::utc_midnight(date).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
         threads.retain(|t| t.received_at >= cutoff);
     }
 
@@ -611,7 +611,7 @@ async fn list_threads(
 struct ThreadSummary {
     id: String,
     snippet: String,
-    received_at: chrono::DateTime<chrono::Utc>,
+    received_at: jiff::Timestamp,
 }
 
 fn thread_summaries(fixture: &Fixture, account_id: &str) -> Vec<ThreadSummary> {
@@ -719,7 +719,7 @@ fn message_value(e: &Email, fixture: &Fixture) -> Value {
         "labelIds": label_ids,
         "snippet": snippet,
         "historyId": fixture.gmail_history_id(&e.account_id).to_string(),
-        "internalDate": e.received_at.timestamp_millis().to_string(),
+        "internalDate": e.received_at.as_millisecond().to_string(),
         "sizeEstimate": body_size,
         "payload": payload,
     })
@@ -745,7 +745,7 @@ fn build_payload(e: &Email) -> Value {
     if let Some(s) = &e.subject {
         headers.push(header("Subject", s));
     }
-    headers.push(header("Date", &e.sent_at.to_rfc2822()));
+    headers.push(header("Date", &crate::timeutil::rfc2822(e.sent_at)));
     if !e.message_id.is_empty() {
         headers.push(header("Message-ID", &e.message_id.join(" ")));
     }
@@ -918,7 +918,7 @@ async fn list_messages(
                 "invalidQuery",
             );
         };
-        let cutoff = chrono::Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default());
+        let cutoff = crate::timeutil::utc_midnight(date).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
         messages.retain(|e| e.received_at >= cutoff);
     }
     // Most-recent message first; id-lex tiebreak for byte determinism.
@@ -1223,9 +1223,9 @@ fn deliver_sent_message(
         .map(|e| e.received_at)
         .max()
         .unwrap_or_else(|| {
-            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            "2026-01-01T00:00:00Z"
+                .parse::<jiff::Timestamp>()
                 .expect("hardcoded RFC3339")
-                .with_timezone(&chrono::Utc)
         });
     let server_id = fix.mint_email_id();
     let thread_id = thread_id.unwrap_or_else(|| server_id.clone());
@@ -2068,12 +2068,10 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-fn parse_after_query(q: &str) -> Option<chrono::NaiveDate> {
+fn parse_after_query(q: &str) -> Option<jiff::civil::Date> {
     let rest = q.trim().strip_prefix("after:")?.trim();
-    chrono::NaiveDate::parse_from_str(rest, "%Y/%m/%d").ok()
+    jiff::civil::Date::strptime("%Y/%m/%d", rest).ok()
 }
-
-use chrono::TimeZone;
 
 fn encode_token(offset: usize) -> String {
     format!("t.{offset}")
@@ -2203,7 +2201,7 @@ mod tests {
     #[test]
     fn parse_after_query_accepts_yyyy_m_d() {
         let d = parse_after_query("after:2026/1/15").unwrap();
-        assert_eq!(d, chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
+        assert_eq!(d, jiff::civil::date(2026, 1, 15));
     }
 
     #[test]

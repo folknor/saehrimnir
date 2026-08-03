@@ -22,7 +22,7 @@ axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.2"
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "0.2.35", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dellingr = "0.4.0"
 rand = "0.10"

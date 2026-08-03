@@ -500,7 +500,7 @@ fn find_item(state: &AppState, body: &str) -> Response {
 </t:Message>",
                 xml::escape(&it.id),
                 xml::escape(&it.subject),
-                it.received_at.format("%Y-%m-%dT%H:%M:%SZ"),
+                it.received_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 xml::escape(&it.from.email),
             ));
         }
@@ -605,7 +605,7 @@ fn get_item(state: &AppState, body: &str) -> Response {
                     xml::escape(&it.id),
                     xml::escape(&it.folder_id),
                     xml::escape(&it.subject),
-                    it.received_at.format("%Y-%m-%dT%H:%M:%SZ"),
+                    it.received_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     xml::escape(&it.from.email),
                     body = body_xml(it),
                     attachments = attachments_xml(it),

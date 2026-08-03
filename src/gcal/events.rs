@@ -26,7 +26,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete as delete_route, get},
 };
-use chrono::SecondsFormat;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -330,7 +329,7 @@ fn serialize_event(e: &Event) -> Value {
         for ex in &e.recurrence_exdates {
             rec.push(Value::String(format!(
                 "EXDATE:{}",
-                ex.format("%Y%m%dT%H%M%SZ")
+                ex.strftime("%Y%m%dT%H%M%SZ")
             )));
         }
         obj.insert("recurrence".into(), Value::Array(rec));
@@ -340,16 +339,16 @@ fn serialize_event(e: &Event) -> Value {
 
 fn serialize_event_times(e: &Event) -> (Value, Value) {
     if e.is_all_day {
-        let start = json!({"date": e.start.format("%Y-%m-%d").to_string()});
-        let end = json!({"date": e.end.format("%Y-%m-%d").to_string()});
+        let start = json!({"date": e.start.strftime("%Y-%m-%d").to_string()});
+        let end = json!({"date": e.end.strftime("%Y-%m-%d").to_string()});
         (start, end)
     } else {
         let start = json!({
-            "dateTime": e.start.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "dateTime": format!("{:.0}", e.start),
             "timeZone": "UTC",
         });
         let end = json!({
-            "dateTime": e.end.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "dateTime": format!("{:.0}", e.end),
             "timeZone": "UTC",
         });
         (start, end)
@@ -359,18 +358,16 @@ fn serialize_event_times(e: &Event) -> (Value, Value) {
 /// Parse a Google Calendar range bound (`timeMin` / `timeMax`) as an
 /// RFC 3339 instant. bifrost always sends these with an offset (`Z` or
 /// `+HH:MM`), so a bare offsetless value returns None (open bound).
-fn parse_range_bound(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+fn parse_range_bound(s: &str) -> Option<jiff::Timestamp> {
+    s.parse::<jiff::Timestamp>().ok()
 }
 
 /// Half-open overlap test against `[min, max)`; an absent bound is open
 /// on that side.
 fn event_in_window(
     e: &Event,
-    min: Option<chrono::DateTime<chrono::Utc>>,
-    max: Option<chrono::DateTime<chrono::Utc>>,
+    min: Option<jiff::Timestamp>,
+    max: Option<jiff::Timestamp>,
 ) -> bool {
     if let Some(m) = min
         && e.end <= m
@@ -656,9 +653,9 @@ fn build_event_from_create(
 /// prefixes are silently dropped (real Google emits the array
 /// the client posts back verbatim including unknown shapes; the
 /// fixture only stores what the read path can re-emit).
-fn parse_gcal_recurrence(v: &Value) -> (Option<String>, Vec<chrono::DateTime<chrono::Utc>>) {
+fn parse_gcal_recurrence(v: &Value) -> (Option<String>, Vec<jiff::Timestamp>) {
     let mut rrule: Option<String> = None;
-    let mut exdates: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
+    let mut exdates: Vec<jiff::Timestamp> = Vec::new();
     let Some(arr) = v.as_array() else {
         return (None, exdates);
     };
@@ -683,11 +680,11 @@ fn parse_gcal_recurrence(v: &Value) -> (Option<String>, Vec<chrono::DateTime<chr
 /// Parse an iCal UTC date-time (`YYYYMMDDTHHMMSSZ`). Tolerant of
 /// the trailing `Z` being missing (real clients sometimes drop it
 /// when the X-WR-TIMEZONE is UTC).
-fn parse_ical_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+fn parse_ical_dt(s: &str) -> Option<jiff::Timestamp> {
     let stripped = s.trim_end_matches('Z');
-    chrono::NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S")
+    jiff::civil::DateTime::strptime("%Y%m%dT%H%M%S", stripped)
         .ok()
-        .map(|dt| dt.and_utc())
+        .and_then(crate::timeutil::utc)
 }
 
 fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response>> {
@@ -747,11 +744,7 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
 fn parse_event_times(
     start: Option<&Value>,
     end: Option<&Value>,
-) -> Option<(
-    chrono::DateTime<chrono::Utc>,
-    chrono::DateTime<chrono::Utc>,
-    bool,
-)> {
+) -> Option<(jiff::Timestamp, jiff::Timestamp, bool)> {
     let s = start?;
     let e = end?;
     if let (Some(sdt), Some(edt)) = (parse_date_time(s), parse_date_time(e)) {
@@ -759,22 +752,14 @@ fn parse_event_times(
     }
     let sd = s.get("date").and_then(Value::as_str)?;
     let ed = e.get("date").and_then(Value::as_str)?;
-    let sdt = chrono::NaiveDate::parse_from_str(sd, "%Y-%m-%d")
-        .ok()?
-        .and_hms_opt(0, 0, 0)?
-        .and_utc();
-    let edt = chrono::NaiveDate::parse_from_str(ed, "%Y-%m-%d")
-        .ok()?
-        .and_hms_opt(0, 0, 0)?
-        .and_utc();
+    let sdt = crate::timeutil::utc_midnight(jiff::civil::Date::strptime("%Y-%m-%d", sd).ok()?)?;
+    let edt = crate::timeutil::utc_midnight(jiff::civil::Date::strptime("%Y-%m-%d", ed).ok()?)?;
     Some((sdt, edt, true))
 }
 
-fn parse_date_time(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+fn parse_date_time(v: &Value) -> Option<jiff::Timestamp> {
     let s = v.get("dateTime")?.as_str()?;
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+    s.parse::<jiff::Timestamp>().ok()
 }
 
 fn parse_address(v: &Value) -> Option<Address> {

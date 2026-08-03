@@ -20,7 +20,8 @@
 //! the union of every fixture calendar and merge the resulting
 //! delta sets.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use jiff::Timestamp;
+use jiff::civil;
 use serde_json::{Map, Value, json};
 
 use crate::fixture::{
@@ -305,8 +306,8 @@ fn jscalendar_alert_action(action: Option<&str>) -> Option<&'static str> {
 /// verbatim.
 fn ical_utc_to_rfc3339(value: &str) -> String {
     let trimmed = value.trim_end_matches('Z');
-    match NaiveDateTime::parse_from_str(trimmed, "%Y%m%dT%H%M%S") {
-        Ok(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    match civil::DateTime::strptime("%Y%m%dT%H%M%S", trimmed) {
+        Ok(dt) => dt.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
         Err(_) => value.to_string(),
     }
 }
@@ -371,7 +372,7 @@ fn jscalendar_recurrence_rule(rule: &crate::recurrence::ParsedRule) -> Option<Va
         // events is UTC anyway.
         obj.insert(
             "until".into(),
-            Value::String(u.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            Value::String(u.strftime("%Y-%m-%dT%H:%M:%S").to_string()),
         );
     }
     Some(Value::Object(obj))
@@ -450,9 +451,9 @@ fn parse_jscalendar_recurrence_rules(v: &Value) -> Option<String> {
         rule.count = Some(c);
     }
     if let Some(u) = first.get("until").and_then(Value::as_str)
-        && let Ok(dt) = chrono::NaiveDateTime::parse_from_str(u, "%Y-%m-%dT%H:%M:%S")
+        && let Ok(dt) = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", u)
     {
-        rule.until = Some(dt.and_utc());
+        rule.until = crate::timeutil::utc(dt);
     }
     crate::recurrence::format_rrule(&rule)
 }
@@ -613,12 +614,8 @@ impl EventFilter {
         // to the shared recurrence-aware matcher so a recurring master
         // whose DTSTART predates the window still matches when its rule
         // recurs into it (and an UNTIL-ended series drops out).
-        let range_start = self
-            .after
-            .and_then(|a| DateTime::<Utc>::from_timestamp(a, 0));
-        let range_end = self
-            .before
-            .and_then(|b| DateTime::<Utc>::from_timestamp(b, 0));
+        let range_start = self.after.and_then(|a| Timestamp::from_second(a).ok());
+        let range_end = self.before.and_then(|b| Timestamp::from_second(b).ok());
         if !crate::recurrence::event_matches_range(
             e.start,
             e.end,
@@ -711,12 +708,14 @@ fn parse_event_utc(val: &Value) -> Result<i64, Value> {
         return Ok(i);
     }
     if let Some(s) = val.as_str() {
-        if let Ok(value) = DateTime::parse_from_rfc3339(s) {
-            return Ok(value.timestamp());
+        if let Ok(value) = s.parse::<Timestamp>() {
+            return Ok(value.as_second());
         }
-        return NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-            .map(|value| value.and_utc().timestamp())
-            .map_err(|_| {
+        return civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", s)
+            .ok()
+            .and_then(crate::timeutil::utc)
+            .map(Timestamp::as_second)
+            .ok_or_else(|| {
                 invalid_args(
                     "after/before must be an RFC3339 UTCDate, bare JSCalendar date-time, or unix seconds",
                 )
@@ -1022,12 +1021,12 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Value> {
             .map(str::to_string)
             .unwrap_or_else(|| {
                 if event.is_all_day {
-                    event.start.format("%Y-%m-%d").to_string()
+                    event.start.strftime("%Y-%m-%d").to_string()
                 } else {
-                    event.start.format("%Y-%m-%dT%H:%M:%S").to_string()
+                    event.start.strftime("%Y-%m-%dT%H:%M:%S").to_string()
                 }
             });
-        let secs = (event.end - event.start).num_seconds().max(0);
+        let secs = event.end.duration_since(event.start).as_secs().max(0);
         let default_duration = if event.is_all_day {
             format!("P{}D", (secs / 86400).max(1))
         } else {
@@ -1133,17 +1132,17 @@ fn participant_index(pid: &str) -> Option<usize> {
 // ── JSCalendar time helpers ─────────────────────────────────────────
 
 fn format_jscalendar_times(
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    start: Timestamp,
+    end: Timestamp,
     is_all_day: bool,
 ) -> (String, String) {
     if is_all_day {
-        let start_str = start.format("%Y-%m-%d").to_string();
-        let days = ((end - start).num_seconds() / 86400).max(1);
+        let start_str = start.strftime("%Y-%m-%d").to_string();
+        let days = (end.duration_since(start).as_secs() / 86400).max(1);
         (start_str, format!("P{days}D"))
     } else {
-        let start_str = start.format("%Y-%m-%dT%H:%M:%S").to_string();
-        let secs = (end - start).num_seconds().max(0);
+        let start_str = start.strftime("%Y-%m-%dT%H:%M:%S").to_string();
+        let secs = end.duration_since(start).as_secs().max(0);
         (start_str, format_duration_iso8601(secs))
     }
 }
@@ -1181,20 +1180,23 @@ fn parse_jscalendar_times(
     start: &str,
     duration: &str,
     is_all_day: bool,
-) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+) -> Option<(Timestamp, Timestamp)> {
     let start_dt = if is_all_day {
-        let date = NaiveDate::parse_from_str(start, "%Y-%m-%d").ok()?;
-        Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?)
+        let date = civil::Date::strptime("%Y-%m-%d", start).ok()?;
+        crate::timeutil::utc_midnight(date)?
     } else {
-        let naive = NaiveDateTime::parse_from_str(start, "%Y-%m-%dT%H:%M:%S")
-            .or_else(|_| {
-                DateTime::parse_from_rfc3339(start).map(|dt| dt.with_timezone(&Utc).naive_utc())
-            })
-            .ok()?;
-        Utc.from_utc_datetime(&naive)
+        match civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", start) {
+            Ok(dt) => crate::timeutil::utc(dt)?,
+            Err(_) => start.parse::<Timestamp>().ok()?,
+        }
     };
     let secs = parse_iso8601_duration(duration);
-    Some((start_dt, start_dt + chrono::Duration::seconds(secs)))
+    Some((
+        start_dt,
+        start_dt
+            .checked_add(jiff::SignedDuration::from_secs(secs))
+            .ok()?,
+    ))
 }
 
 fn parse_iso8601_duration(s: &str) -> i64 {
@@ -1276,6 +1278,11 @@ fn set_error(kind: &str, description: &str) -> Value {
 mod tests {
     use super::*;
 
+    /// Test-local stand-in for the old `Utc.with_ymd_and_hms`.
+    fn utc_ymd_hms(y: i16, mo: i8, d: i8, h: i8, mi: i8, s: i8) -> Option<Timestamp> {
+        crate::timeutil::ymd_hms(y, mo, d, h, mi, s)
+    }
+
     #[test]
     fn iso8601_duration_round_trips() {
         assert_eq!(parse_iso8601_duration("PT1H"), 3600);
@@ -1289,8 +1296,8 @@ mod tests {
 
     #[test]
     fn jscalendar_times_round_trip_timed() {
-        let start = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
-        let end = Utc.with_ymd_and_hms(2026, 1, 15, 9, 15, 0).unwrap();
+        let start = utc_ymd_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let end = utc_ymd_hms(2026, 1, 15, 9, 15, 0).unwrap();
         let (s, d) = format_jscalendar_times(start, end, false);
         assert_eq!(s, "2026-01-15T09:00:00");
         assert_eq!(d, "PT15M");
@@ -1308,8 +1315,8 @@ mod tests {
             subject: "Sync".into(),
             body_preview: None,
             body_text: None,
-            start: Utc.with_ymd_and_hms(2026, 6, 2, 9, 0, 0).unwrap(),
-            end: Utc.with_ymd_and_hms(2026, 6, 2, 9, 30, 0).unwrap(),
+            start: utc_ymd_hms(2026, 6, 2, 9, 0, 0).unwrap(),
+            end: utc_ymd_hms(2026, 6, 2, 9, 30, 0).unwrap(),
             location: None,
             organizer: None,
             attendees: vec![],
@@ -1349,8 +1356,8 @@ mod tests {
 
     #[test]
     fn jscalendar_times_round_trip_all_day() {
-        let start = Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap();
-        let end = Utc.with_ymd_and_hms(2026, 1, 16, 0, 0, 0).unwrap();
+        let start = utc_ymd_hms(2026, 1, 15, 0, 0, 0).unwrap();
+        let end = utc_ymd_hms(2026, 1, 16, 0, 0, 0).unwrap();
         let (s, d) = format_jscalendar_times(start, end, true);
         assert_eq!(s, "2026-01-15");
         assert_eq!(d, "P1D");

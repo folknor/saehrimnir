@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 
 /// Identity of the fixture *source* this process was loaded from.
@@ -2388,8 +2388,8 @@ pub struct Event {
     pub subject: String,
     pub body_preview: Option<String>,
     pub body_text: Option<String>,
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
+    pub start: Timestamp,
+    pub end: Timestamp,
     pub location: Option<String>,
     pub organizer: Option<Address>,
     pub attendees: Vec<EventAttendee>,
@@ -2407,7 +2407,7 @@ pub struct Event {
     /// on CalDAV + gcal but are not emitted on JMAP / Graph (those
     /// schemas want a per-date override object the v0 fixture
     /// can't author yet). Empty by default.
-    pub recurrence_exdates: Vec<DateTime<Utc>>,
+    pub recurrence_exdates: Vec<Timestamp>,
     /// Optional IANA/named timezone for the event's timed values. When
     /// set, CalDAV emits `DTSTART;TZID=<zone>:<wall-clock>` and JMAP
     /// emits `timeZone: "<zone>"` with a bare local `start`, so the
@@ -2761,7 +2761,7 @@ pub struct PublicItem {
     /// Attachments on the item. Metadata rides the `GetItem`
     /// projection; the bytes come back from `GetAttachment`.
     pub attachments: Vec<Attachment>,
-    pub received_at: DateTime<Utc>,
+    pub received_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2811,8 +2811,8 @@ pub struct Email {
     pub mailbox_ids: Vec<String>,
     pub keywords: Vec<String>,
     pub size: i64,
-    pub received_at: DateTime<Utc>,
-    pub sent_at: DateTime<Utc>,
+    pub received_at: Timestamp,
+    pub sent_at: Timestamp,
     pub from: Option<Address>,
     pub to: Vec<Address>,
     pub cc: Vec<Address>,
@@ -4243,7 +4243,7 @@ pub(crate) fn normalize_with_dir(raw: RawFixture, fixture_dir: &Path) -> Result<
         }
         let start = parse_ts(&ev.start).map_err(|e| format!("event {:?} start: {e}", ev.id))?;
         let end = parse_ts(&ev.end).map_err(|e| format!("event {:?} end: {e}", ev.id))?;
-        let mut recurrence_exdates: Vec<DateTime<Utc>> =
+        let mut recurrence_exdates: Vec<Timestamp> =
             Vec::with_capacity(ev.recurrence_exdates.len());
         for s in &ev.recurrence_exdates {
             recurrence_exdates.push(
@@ -4946,7 +4946,7 @@ pub(crate) fn event_create_op(raw: RawEvent) -> Result<ChangeOp, String> {
     let id_for_msg = raw.id.clone();
     let start = parse_ts(&raw.start).map_err(|e| format!("{id_for_msg:?} start: {e}"))?;
     let end = parse_ts(&raw.end).map_err(|e| format!("{id_for_msg:?} end: {e}"))?;
-    let mut recurrence_exdates: Vec<DateTime<Utc>> =
+    let mut recurrence_exdates: Vec<Timestamp> =
         Vec::with_capacity(raw.recurrence_exdates.len());
     for s in &raw.recurrence_exdates {
         recurrence_exdates
@@ -5588,9 +5588,8 @@ fn normalize_change_step(
     Ok(ChangeStep { id, ops })
 }
 
-pub fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
+pub fn parse_ts(s: &str) -> Result<Timestamp, String> {
+    s.parse::<Timestamp>()
         .map_err(|e| format!("invalid RFC3339 timestamp {s:?}: {e}"))
 }
 

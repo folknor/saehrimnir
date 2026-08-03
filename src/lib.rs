@@ -42,4 +42,5 @@ pub mod shutdown;
 pub mod smtp;
 pub mod templates;
 pub mod test_admin;
+pub mod timeutil;
 pub mod tls;

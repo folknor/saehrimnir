@@ -23,7 +23,8 @@ use tokio::io::{
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use jiff::Timestamp;
+use jiff::civil;
 
 use crate::fixture::{Address, Body, Email, Fixture, Mailbox, OWNER_RIGHTS, Role};
 
@@ -2625,7 +2626,7 @@ impl<'a> AstringParser<'a> {
 enum SearchCriteria {
     All,
     UidRange { lo: u32, hi: Option<u32> },
-    Since(DateTime<Utc>),
+    Since(Timestamp),
 }
 
 impl SearchCriteria {
@@ -2646,7 +2647,7 @@ fn parse_uid_search(args: &str) -> Option<SearchCriteria> {
     // SINCE <date>
     if let Some(rest) = strip_prefix_ci(trimmed, "SINCE ") {
         let date = parse_imap_date(rest.trim())?;
-        let dt = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?);
+        let dt = crate::timeutil::utc_midnight(date)?;
         return Some(SearchCriteria::Since(dt));
     }
     // <lo>:<hi> or <lo>:* (UID set; v0 only supports a single range).
@@ -2672,9 +2673,9 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// Parse an IMAP date string `dd-Mmm-yyyy` (RFC 3501 sec 9). The mock
 /// accepts both quoted and unquoted forms.
-fn parse_imap_date(s: &str) -> Option<NaiveDate> {
+fn parse_imap_date(s: &str) -> Option<civil::Date> {
     let s = s.trim_matches('"');
-    NaiveDate::parse_from_str(s, "%d-%b-%Y").ok()
+    civil::Date::strptime("%d-%b-%Y", s).ok()
 }
 
 // ── UID FETCH helpers ───────────────────────────────────────────────
@@ -3216,7 +3217,7 @@ fn fetch_response_line(
             FetchAttr::InternalDate => {
                 out.push_str(&format!(
                     "INTERNALDATE \"{}\"",
-                    email.received_at.format("%d-%b-%Y %H:%M:%S %z")
+                    email.received_at.strftime("%d-%b-%Y %H:%M:%S %z")
                 ));
             }
             FetchAttr::Rfc822Size => {
@@ -3301,7 +3302,7 @@ fn flags_for(email: &Email) -> String {
 // suffice; we escape `"` and `\` for safety.
 
 fn render_envelope(email: &Email) -> String {
-    let date = imap_nstring(Some(&email.sent_at.to_rfc2822()));
+    let date = imap_nstring(Some(&crate::timeutil::rfc2822(email.sent_at)));
     let subject = imap_nstring(email.subject.as_deref());
     let from = imap_addr_list(email.from.iter());
     // Sender + Reply-To default to From when the message carries
@@ -3425,7 +3426,7 @@ fn render_rfc822_headers(email: &Email) -> String {
     if !email.reply_to.is_empty() {
         push_header(&mut out, "Reply-To", &format_address_list(&email.reply_to));
     }
-    push_header(&mut out, "Date", &email.sent_at.to_rfc2822());
+    push_header(&mut out, "Date", &crate::timeutil::rfc2822(email.sent_at));
     if let Some(subject) = &email.subject {
         push_header(&mut out, "Subject", subject);
     }
@@ -3802,8 +3803,12 @@ fn parse_command_line(line: &str) -> Option<Parsed<'_>> {
 mod tests {
     use super::*;
     use crate::fixture::{Account, Fixture};
-    use chrono::TimeZone;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Test-local stand-in for the old `Utc.with_ymd_and_hms`.
+    fn utc_ymd_hms(y: i16, mo: i8, d: i8, h: i8, mi: i8, s: i8) -> Option<Timestamp> {
+        crate::timeutil::ymd_hms(y, mo, d, h, mi, s)
+    }
 
     fn fixture() -> crate::shared::FixtureHandle {
         crate::shared::handle(Fixture {
@@ -3849,7 +3854,7 @@ mod tests {
 
     fn fixture_with_folders() -> crate::shared::FixtureHandle {
         use crate::fixture::{Body, Email, Mailbox};
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        let ts = utc_ymd_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let mk_email = |id: &str, mailbox: &str, seen: bool| Email {
             id: id.into(),
             account_id: "a".into(),
@@ -4731,7 +4736,7 @@ mod tests {
     #[test]
     fn render_rfc822_includes_load_bearing_headers() {
         use crate::fixture::{Address, Body};
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        let ts = utc_ymd_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let e = Email {
             id: "e1".into(),
             account_id: "a".into(),

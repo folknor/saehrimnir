@@ -1032,7 +1032,7 @@ fn report_calendar_query(
 /// fails to parse).
 fn parse_time_range(
     body: &str,
-) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+) -> Option<(jiff::Timestamp, jiff::Timestamp)> {
     let idx = body.find("time-range")?;
     let tail = &body[idx..];
     let start = extract_attr(tail, "start").and_then(|s| ical::parse_dt(&s))?;
@@ -1079,8 +1079,8 @@ fn event_body(ev: &crate::fixture::Event) -> String {
 /// before the window opens. See [`crate::recurrence::event_matches_range`].
 fn overlaps(
     ev: &crate::fixture::Event,
-    range_start: chrono::DateTime<chrono::Utc>,
-    range_end: chrono::DateTime<chrono::Utc>,
+    range_start: jiff::Timestamp,
+    range_end: jiff::Timestamp,
 ) -> bool {
     crate::recurrence::event_matches_range(
         ev.start,
@@ -1210,7 +1210,7 @@ async fn handle_put(state: &AppState, path: &str, headers: &HeaderMap, body: &[u
         // applies, or it's an instantaneous event). v0 fixtures
         // always carry both; default DTEND to `start + 1h` to
         // match `synthesize_event_dto`'s behaviour in ratatoskr.
-        None => start + chrono::Duration::hours(1),
+        None => start + jiff::SignedDuration::from_hours(1),
     };
     // Derive the event's account from the principal that owns the
     // URL. The calendar exists in this principal's space (we already

@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -64,7 +64,7 @@ pub struct Submission {
     /// byte-stable - the determinism contract covers only the
     /// submission contents (from / recipients / data), not the
     /// timestamp.
-    pub received_at: DateTime<Utc>,
+    pub received_at: Timestamp,
 }
 
 /// Server-side MIME projection of a captured submission. Returned by
@@ -696,7 +696,7 @@ impl Conn {
             auth_mechanism: self.state.auth.clone(),
             account_id: self.account_id.clone(),
             data,
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
         };
         // Reset envelope state - even though v0 only handles one
         // submission per connection, leaving the slate clean keeps

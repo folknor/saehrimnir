@@ -616,7 +616,7 @@ async fn email_get_full_email_shape_with_body_values() {
         .as_str()
         .expect("receivedAt is a UTCDate string");
     assert!(
-        chrono::DateTime::parse_from_rfc3339(received).is_ok(),
+        received.parse::<jiff::Timestamp>().is_ok(),
         "receivedAt {received:?} is RFC3339",
     );
     let from = item["from"].as_array().unwrap();
@@ -1641,7 +1641,7 @@ fn sample_submission(from: &str, attachment_size: usize) -> saehrimnir::smtp::Su
         auth_mechanism: Some("PLAIN".to_string()),
         account_id: "account-1".to_string(),
         data: body.into_bytes(),
-        received_at: chrono::Utc::now(),
+        received_at: jiff::Timestamp::now(),
     }
 }
 

@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use crate::jmap::{self, JmapRequest, JmapResponse};
@@ -428,7 +428,7 @@ async fn api(
     // about (per-method asserts, not per-batch). Batched into a
     // single `extend` so a 16-call envelope doesn't take 16 lock
     // round-trips.
-    let now = Utc::now();
+    let now = Timestamp::now();
     state
         .shared
         .request_log

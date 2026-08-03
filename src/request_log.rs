@@ -20,7 +20,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -42,7 +42,7 @@ pub const REQUEST_LOG_CAP: usize = 100_000;
 pub struct RequestEntry {
     pub protocol: &'static str,
     pub command: String,
-    pub received_at: DateTime<Utc>,
+    pub received_at: Timestamp,
     pub detail: Value,
     /// Per-accepted-TCP-connection id assigned by
     /// `crate::connection_id::next()` in the listener's
@@ -91,7 +91,7 @@ impl RequestLog {
     }
 
     /// Convenience: build an entry from `protocol` + `command` +
-    /// `detail` and stamp `received_at` to `Utc::now()`. Most
+    /// `detail` and stamp `received_at` to `Timestamp::now()`. Most
     /// callers should use this rather than constructing
     /// `RequestEntry` by hand.
     pub fn record(&self, protocol: &'static str, command: impl Into<String>, detail: Value) {
@@ -114,7 +114,7 @@ impl RequestLog {
         self.push(RequestEntry {
             protocol,
             command: command.into(),
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
             detail,
             connection_id,
         });

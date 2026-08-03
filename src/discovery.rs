@@ -33,7 +33,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -139,7 +139,7 @@ fn log_request(
     state.shared.request_log.push(RequestEntry {
         protocol: "discovery",
         command: command.to_string(),
-        received_at: Utc::now(),
+        received_at: Timestamp::now(),
         detail,
         connection_id,
     });

@@ -10,37 +10,35 @@
 
 #![allow(dead_code)]
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::fixture::{Address, Event, EventAttendee, ParticipationStatus};
 
 /// Format `dt` as an RFC 5545 UTC date-time:
 /// `YYYYMMDDTHHMMSSZ`.
-pub(crate) fn format_dt(dt: DateTime<Utc>) -> String {
-    // chrono's `to_rfc3339` is `2026-01-15T09:00:00+00:00`. iCal
-    // wants `20260115T090000Z`. Build from the components rather
-    // than munging the rfc3339 string so daylight rounding stays
-    // honest.
-    dt.format("%Y%m%dT%H%M%SZ").to_string()
+pub(crate) fn format_dt(dt: Timestamp) -> String {
+    // The RFC 3339 rendering is `2026-01-15T09:00:00Z`; iCal wants
+    // `20260115T090000Z`. Build from the components rather than
+    // munging the rfc3339 string so daylight rounding stays honest.
+    dt.strftime("%Y%m%dT%H%M%SZ").to_string()
 }
 
 /// Parse an iCalendar UTC date-time as emitted by `format_dt`.
 /// Tolerates both UTC (`Z` suffix) and floating-local times by
 /// treating the latter as UTC. Returns None for any other shape.
-pub(crate) fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_dt(s: &str) -> Option<Timestamp> {
     // RFC 5545 form: `YYYYMMDDTHHMMSS[Z]`. Try the Z form first.
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s.trim_end_matches('Z'), "%Y%m%dT%H%M%S")
-    {
-        return Some(dt.and_utc());
+    if let Ok(dt) = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%S", s.trim_end_matches('Z')) {
+        return crate::timeutil::utc(dt);
     }
     // RFC 3339 fallback (some clients send full timestamps).
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
+    if let Ok(dt) = s.parse::<Timestamp>() {
+        return Some(dt);
     }
     // Date-only form (`YYYYMMDD`), as emitted for an all-day
     // `DTSTART;VALUE=DATE` / `DTEND;VALUE=DATE`: midnight UTC.
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y%m%d") {
-        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    if let Ok(d) = jiff::civil::Date::strptime("%Y%m%d", s) {
+        return crate::timeutil::utc_midnight(d);
     }
     None
 }
@@ -109,21 +107,21 @@ pub(crate) fn event_to_ical(event: &Event) -> String {
 fn write_datetime(
     out: &mut String,
     name: &str,
-    dt: DateTime<Utc>,
+    dt: Timestamp,
     is_all_day: bool,
     tzid: Option<&str>,
 ) {
     if is_all_day {
         out.push_str(name);
         out.push_str(";VALUE=DATE:");
-        out.push_str(&dt.format("%Y%m%d").to_string());
+        out.push_str(&dt.strftime("%Y%m%d").to_string());
         out.push_str("\r\n");
     } else if let Some(tz) = tzid {
         out.push_str(name);
         out.push_str(";TZID=");
         out.push_str(&tzid_param(tz));
         out.push(':');
-        out.push_str(&dt.format("%Y%m%dT%H%M%S").to_string());
+        out.push_str(&dt.strftime("%Y%m%dT%H%M%S").to_string());
         out.push_str("\r\n");
     } else {
         write_line(out, name, &format_dt(dt));
@@ -277,13 +275,13 @@ pub(crate) struct ParsedEvent {
     pub summary: Option<String>,
     pub description: Option<String>,
     pub location: Option<String>,
-    pub start: Option<DateTime<Utc>>,
-    pub end: Option<DateTime<Utc>>,
+    pub start: Option<Timestamp>,
+    pub end: Option<Timestamp>,
     pub is_all_day: bool,
     pub organizer: Option<Address>,
     pub attendees: Vec<EventAttendee>,
     pub recurrence_rule: Option<String>,
-    pub recurrence_exdates: Vec<DateTime<Utc>>,
+    pub recurrence_exdates: Vec<Timestamp>,
 }
 
 /// Parse a VCALENDAR body, returning the first VEVENT's fields.
@@ -466,10 +464,8 @@ fn strip_mailto_prefix(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
-
-    fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    fn dt(y: i16, mo: i8, d: i8, h: i8, mi: i8, s: i8) -> Timestamp {
+        crate::timeutil::ymd_hms(y, mo, d, h, mi, s).unwrap()
     }
 
     fn base_event() -> Event {

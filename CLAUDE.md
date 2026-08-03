@@ -213,6 +213,14 @@ checking whether the fact is already in `notes/`.
   `bulk_emails`. Lifted from `<ratatoskr>/crates/dev-seed/src/
   templates.rs` and pruned.
 - `src/sentinel.rs` - atomic readiness-file write (temp + rename).
+- `src/timeutil.rs` - UTC helpers over `jiff`. Timestamps are
+  `jiff::Timestamp` everywhere (fixture, wire, request log); the
+  civil <-> instant conversions all go through `tz::Offset::UTC`
+  rather than a named `TimeZone`, so nothing depends on a tzdb
+  being installed. `rfc2822` spells the mail `Date:` header out
+  via `strftime` because jiff's own RFC 2822 printer emits an
+  unpadded day and `-0000`, both of which would move the
+  byte-stable IMAP / Gmail transcripts.
 - `src/tls.rs` - self-signed cert + `tokio_rustls::TlsAcceptor`
   generated at startup. Used by SMTP for STARTTLS upgrades; clients
   must accept invalid certs.

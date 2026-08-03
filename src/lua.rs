@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use dellingr::{Anchor, ArgCount, LuaType, RetCount, State, error::ErrorKind};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -1042,8 +1042,8 @@ fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
     let interval_seconds = read_int_opt(state, 1, "interval_seconds")?.unwrap_or(60);
     let id_prefix = read_string_opt(state, 1, "id_prefix")?.unwrap_or_else(|| "bulk".to_string());
 
-    let start = match DateTime::parse_from_rfc3339(&start_at_raw) {
-        Ok(dt) => dt.with_timezone(&Utc),
+    let start = match start_at_raw.parse::<Timestamp>() {
+        Ok(dt) => dt,
         Err(e) => return fail(state, format!("bulk_emails bad start_at: {e}")),
     };
 
@@ -1055,11 +1055,11 @@ fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
     if count > 0 {
         let last_offset = (count - 1)
             .checked_mul(interval_seconds)
-            .and_then(|s| start.checked_add_signed(Duration::seconds(s)));
+            .and_then(|s| start.checked_add(SignedDuration::from_secs(s)).ok());
         if last_offset.is_none() {
             return fail(
                 state,
-                "bulk_emails extends past the chrono datetime range; reduce count or interval_seconds",
+                "bulk_emails extends past the supported datetime range; reduce count or interval_seconds",
             );
         }
     }
@@ -1073,7 +1073,7 @@ fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
     let pad = pad_width(count);
     for i in 0..count {
         let id = format!("{id_prefix}-{i:0pad$}");
-        let received_at = start + Duration::seconds(i * interval_seconds);
+        let received_at = start + SignedDuration::from_secs(i * interval_seconds);
         let (from_name, from_email) = templates::pick_address(&mut rng);
         let (_, to_email) = templates::pick_address(&mut rng);
         let subject_tmpl = templates::SUBJECT_TEMPLATES
@@ -1087,7 +1087,7 @@ fn builder_bulk_emails(state: &mut State) -> dellingr::Result<u8> {
             id: id.clone(),
             thread_id: Some(id.clone()),
             mailbox_ids: vec![mailbox.clone()],
-            received_at: received_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            received_at: format!("{received_at:.0}"),
             from: Some(RawAddress::Full {
                 name: Some(from_name),
                 email: from_email,
@@ -1165,8 +1165,8 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
     let reply_interval = read_int_opt(state, 1, "reply_interval_seconds")?.unwrap_or(300);
     let id_prefix = read_string_opt(state, 1, "id_prefix")?.unwrap_or_else(|| "thread".to_string());
 
-    let start = match DateTime::parse_from_rfc3339(&start_at_raw) {
-        Ok(dt) => dt.with_timezone(&Utc),
+    let start = match start_at_raw.parse::<Timestamp>() {
+        Ok(dt) => dt,
         Err(e) => return fail(state, format!("bulk_threads bad start_at: {e}")),
     };
 
@@ -1178,11 +1178,11 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
         let last = thread_offset
             .zip(reply_offset)
             .and_then(|(t, r)| t.checked_add(r))
-            .and_then(|s| start.checked_add_signed(Duration::seconds(s)));
+            .and_then(|s| start.checked_add(SignedDuration::from_secs(s)).ok());
         if last.is_none() {
             return fail(
                 state,
-                "bulk_threads extends past the chrono datetime range; reduce count, messages_per_thread, or interval seconds",
+                "bulk_threads extends past the supported datetime range; reduce count, messages_per_thread, or interval seconds",
             );
         }
     }
@@ -1197,7 +1197,7 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
 
     for thread_i in 0..count {
         let thread_id = format!("{id_prefix}-{thread_i:0thread_pad$}");
-        let thread_start = start + Duration::seconds(thread_i * thread_interval);
+        let thread_start = start + SignedDuration::from_secs(thread_i * thread_interval);
         let first_subject_tmpl = templates::SUBJECT_TEMPLATES
             [(seed.wrapping_add(thread_i as u64) as usize) % templates::SUBJECT_TEMPLATES.len()];
         let first_subject = templates::fill_template(first_subject_tmpl, &mut rng);
@@ -1206,7 +1206,7 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
         for msg_i in 0..messages_per_thread {
             let n = msg_i + 1;
             let msg_id = format!("{thread_id}-{n:0msg_pad$}");
-            let received_at = thread_start + Duration::seconds(msg_i as i64 * reply_interval);
+            let received_at = thread_start + SignedDuration::from_secs(msg_i as i64 * reply_interval);
             let subject = if msg_i == 0 {
                 first_subject.clone()
             } else {
@@ -1227,7 +1227,7 @@ fn builder_bulk_threads(state: &mut State) -> dellingr::Result<u8> {
                 id: msg_id,
                 thread_id: Some(thread_id.clone()),
                 mailbox_ids: vec![mailbox.clone()],
-                received_at: received_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                received_at: format!("{received_at:.0}"),
                 from: Some(RawAddress::Full {
                     name: Some(from_name),
                     email: from_email,

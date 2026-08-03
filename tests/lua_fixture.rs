@@ -627,9 +627,9 @@ fn bulk_threads_received_at_monotonic_within_and_across_threads() {
     // Within each thread, the second message is 600s after the first.
     // Each thread starts 7200s after the previous.
     let ts: Vec<_> = fix.emails.iter().map(|e| e.received_at).collect();
-    assert_eq!((ts[1] - ts[0]).num_seconds(), 600);
-    assert_eq!((ts[3] - ts[2]).num_seconds(), 600);
-    assert_eq!((ts[2] - ts[0]).num_seconds(), 7200);
+    assert_eq!(ts[1].duration_since(ts[0]).as_secs(), 600);
+    assert_eq!(ts[3].duration_since(ts[2]).as_secs(), 600);
+    assert_eq!(ts[2].duration_since(ts[0]).as_secs(), 7200);
 }
 
 #[test]
@@ -665,7 +665,7 @@ fn bulk_emails_count_above_max_errors() {
 #[test]
 fn bulk_emails_negative_interval_overflow_caught_clean() {
     // Combining a large count with an obscene interval exceeds
-    // chrono's range; should error cleanly, not panic.
+    // the timestamp range; should error cleanly, not panic.
     let err = lua::load_source(
         r#"
         fixture({ name = "x" })
@@ -680,10 +680,7 @@ fn bulk_emails_negative_interval_overflow_caught_clean() {
         "@bulk",
     )
     .unwrap_err();
-    assert!(
-        err.contains("range") || err.contains("chrono"),
-        "got: {err}"
-    );
+    assert!(err.contains("range"), "got: {err}");
 }
 
 #[test]

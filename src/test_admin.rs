@@ -29,7 +29,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -213,7 +213,7 @@ pub struct SubmissionJson {
     pub rcpt_params: Vec<std::collections::BTreeMap<String, String>>,
     pub auth_mechanism: Option<String>,
     pub account_id: String,
-    pub received_at: DateTime<Utc>,
+    pub received_at: Timestamp,
     pub raw_size: usize,
     pub parsed: Option<ParsedJson>,
 }
@@ -707,7 +707,7 @@ async fn snapshot_state(State(state): State<AppState>) -> Json<Value> {
                 "mailbox_ids": e.mailbox_ids,
                 "keywords": e.keywords,
                 "subject": e.subject,
-                "received_at": e.received_at.to_rfc3339(),
+                "received_at": e.received_at.to_string(),
                 "has_attachment": e.has_attachment,
             })
         })
@@ -720,8 +720,8 @@ async fn snapshot_state(State(state): State<AppState>) -> Json<Value> {
                 "id": e.id,
                 "calendar_id": e.calendar_id,
                 "subject": e.subject,
-                "start": e.start.to_rfc3339(),
-                "end": e.end.to_rfc3339(),
+                "start": e.start.to_string(),
+                "end": e.end.to_string(),
                 "location": e.location,
             })
         })

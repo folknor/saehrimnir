@@ -657,7 +657,7 @@ struct Filter {
 
 impl Filter {
     fn matches(&self, e: &crate::fixture::Email) -> bool {
-        let ts = e.received_at.timestamp();
+        let ts = e.received_at.as_second();
         if let Some(a) = self.after
             && ts < a
         {
@@ -686,7 +686,7 @@ fn parse_utc_date(field: &str, val: &Value) -> Result<i64, Value> {
         return Ok(i);
     }
     if let Some(s) = val.as_str() {
-        let parsed = chrono::DateTime::parse_from_rfc3339(s).map_err(|_| {
+        let parsed = s.parse::<jiff::Timestamp>().map_err(|_| {
             json!({
                 "type": "invalidArguments",
                 "description": format!(
@@ -694,7 +694,7 @@ fn parse_utc_date(field: &str, val: &Value) -> Result<i64, Value> {
                 ),
             })
         })?;
-        return Ok(parsed.timestamp());
+        return Ok(parsed.as_second());
     }
     Err(json!({
         "type": "invalidArguments",
@@ -851,14 +851,11 @@ fn serialize_email(e: &Email, fetch_text: bool, fetch_html: bool, fetch_all: boo
     // bytes byte-stable across runs.
     obj.insert(
         "receivedAt".to_string(),
-        Value::String(
-            e.received_at
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        ),
+        Value::String(format!("{:.0}", e.received_at)),
     );
     obj.insert(
         "sentAt".to_string(),
-        Value::String(e.sent_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        Value::String(format!("{:.0}", e.sent_at)),
     );
 
     obj.insert("mailboxIds".to_string(), bool_map(&e.mailbox_ids));
@@ -1481,9 +1478,9 @@ fn build_email_from_create(fix: &mut Fixture, body: &Value) -> Result<(String, E
         .map(|e| e.received_at)
         .max()
         .unwrap_or_else(|| {
-            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            "2026-01-01T00:00:00Z"
+                .parse::<jiff::Timestamp>()
                 .expect("hardcoded RFC3339")
-                .with_timezone(&chrono::Utc)
         });
     // Email/set create is scoped to the primary account in v0;
     // mailboxIds in the body must belong to it. Stage 3 of the
@@ -1878,9 +1875,9 @@ fn build_email_from_import(fix: &mut Fixture, body: &Value) -> Result<(String, E
         .map(|e| e.received_at)
         .max()
         .unwrap_or_else(|| {
-            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            "2026-01-01T00:00:00Z"
+                .parse::<jiff::Timestamp>()
                 .expect("hardcoded RFC3339")
-                .with_timezone(&chrono::Utc)
         });
     let server_id = fix.mint_email_id();
     let parsed = crate::fixture::parse_rfc822_email(&raw);
@@ -2456,10 +2453,14 @@ fn set_response(
 mod tests {
     use super::*;
     use crate::fixture::{Account, Body, Email, Fixture, Mailbox, Role};
-    use chrono::TimeZone;
+
+    /// Test-local stand-in for the old `Utc.with_ymd_and_hms`.
+    fn utc_ymd_hms(y: i16, mo: i8, d: i8, h: i8, mi: i8, s: i8) -> Option<jiff::Timestamp> {
+        crate::timeutil::ymd_hms(y, mo, d, h, mi, s)
+    }
 
     fn fix() -> Fixture {
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        let ts = utc_ymd_hms(2026, 1, 15, 10, 0, 0).unwrap();
         Fixture {
             name: "t".into(),
             identity: crate::fixture::FixtureIdentity::default(),
@@ -2687,7 +2688,7 @@ mod tests {
         assert_eq!(resp.method_responses[1].2, "b");
     }
 
-    fn email(id: &str, mailbox: &str, ts: chrono::DateTime<chrono::Utc>) -> Email {
+    fn email(id: &str, mailbox: &str, ts: jiff::Timestamp) -> Email {
         Email {
             id: id.into(),
             account_id: "acct".into(),
@@ -2717,7 +2718,7 @@ mod tests {
     }
 
     fn fix_for_query() -> Fixture {
-        let mk = |y, m, d, hh| chrono::Utc.with_ymd_and_hms(y, m, d, hh, 0, 0).unwrap();
+        let mk = |y, m, d, hh| utc_ymd_hms(y, m, d, hh, 0, 0).unwrap();
         Fixture {
             name: "q".into(),
             identity: crate::fixture::FixtureIdentity::default(),
@@ -2826,10 +2827,7 @@ mod tests {
     fn email_query_after_filter_uses_unix_seconds() {
         let f = fix_for_query();
         // 2026-01-15T11:00:00Z -> matches "a", "a2", "b".
-        let ts = chrono::Utc
-            .with_ymd_and_hms(2026, 1, 15, 11, 0, 0)
-            .unwrap()
-            .timestamp();
+        let ts = utc_ymd_hms(2026, 1, 15, 11, 0, 0).unwrap().as_second();
         let resp = email_query(&f, &json!({"accountId": "acct", "filter": {"after": ts}})).unwrap();
         let ids: Vec<&str> = resp
             .get("ids")
@@ -2955,10 +2953,7 @@ mod tests {
         // `after` and `inMailbox` would silently ignore inMailbox and
         // bleed cross-mailbox results.
         let f = fix_for_query();
-        let cutoff = chrono::Utc
-            .with_ymd_and_hms(2026, 1, 15, 11, 0, 0)
-            .unwrap()
-            .timestamp();
+        let cutoff = utc_ymd_hms(2026, 1, 15, 11, 0, 0).unwrap().as_second();
         let resp = email_query(
             &f,
             &json!({
@@ -3012,10 +3007,8 @@ mod tests {
     // ── Email/get tests ─────────────────────────────────────────────
 
     fn fix_for_get() -> Fixture {
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
-        let sent = chrono::Utc
-            .with_ymd_and_hms(2026, 1, 15, 9, 59, 50)
-            .unwrap();
+        let ts = utc_ymd_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        let sent = utc_ymd_hms(2026, 1, 15, 9, 59, 50).unwrap();
         Fixture {
             name: "g".into(),
             identity: crate::fixture::FixtureIdentity::default(),
@@ -3131,8 +3124,8 @@ mod tests {
         assert_eq!(item.get("receivedAt").unwrap(), "2026-01-15T10:00:00Z");
         let sent = item.get("sentAt").unwrap().as_str().unwrap();
         let received = item.get("receivedAt").unwrap().as_str().unwrap();
-        let sent_ts = chrono::DateTime::parse_from_rfc3339(sent).unwrap();
-        let received_ts = chrono::DateTime::parse_from_rfc3339(received).unwrap();
+        let sent_ts = sent.parse::<jiff::Timestamp>().unwrap();
+        let received_ts = received.parse::<jiff::Timestamp>().unwrap();
         assert!(sent_ts < received_ts);
 
         // mailboxIds + keywords are maps to true.

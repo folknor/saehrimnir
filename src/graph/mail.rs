@@ -21,7 +21,6 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
-use chrono::SecondsFormat;
 use serde_json::{Map, Value, json};
 
 use axum::body::Body as AxumBody;
@@ -2297,9 +2296,9 @@ fn create_draft_mime_core(
             .map(|e| e.received_at)
             .max()
             .unwrap_or_else(|| {
-                chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                "2026-01-01T00:00:00Z"
+                    .parse::<jiff::Timestamp>()
                     .expect("hardcoded RFC3339")
-                    .with_timezone(&chrono::Utc)
             });
         let email = Email {
             id: id.clone(),
@@ -2414,9 +2413,9 @@ fn create_draft_core(fix: &mut Fixture, account_id: &str, folder_id: &str, body:
             .map(|e| e.received_at)
             .max()
             .unwrap_or_else(|| {
-                chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                "2026-01-01T00:00:00Z"
+                    .parse::<jiff::Timestamp>()
                     .expect("hardcoded RFC3339")
-                    .with_timezone(&chrono::Utc)
             });
         let size = i64::try_from(body_text.len()).unwrap_or(i64::MAX);
         let email = Email {
@@ -2860,11 +2859,11 @@ fn message_value(e: &Email, parent_folder_id: &str, expand: Expand, etag: &str) 
     obj.insert("replyTo".to_string(), recipient_array(&e.reply_to));
     obj.insert(
         "receivedDateTime".to_string(),
-        Value::String(e.received_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        Value::String(format!("{:.0}", e.received_at)),
     );
     obj.insert(
         "sentDateTime".to_string(),
-        Value::String(e.sent_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        Value::String(format!("{:.0}", e.sent_at)),
     );
     obj.insert(
         "isRead".to_string(),
@@ -3256,11 +3255,9 @@ fn base64_standard(input: &[u8]) -> String {
 
 /// Parse the only `$filter` shape ratatoskr emits during initial mail
 /// sync: `receivedDateTime ge <iso8601>`.
-fn parse_received_ge_filter(filter: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+fn parse_received_ge_filter(filter: &str) -> Option<jiff::Timestamp> {
     let s = filter.trim();
     let rest = s.strip_prefix("receivedDateTime")?.trim_start();
     let rest = rest.strip_prefix("ge")?.trim_start();
-    chrono::DateTime::parse_from_rfc3339(rest.trim())
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+    rest.trim().parse::<jiff::Timestamp>().ok()
 }

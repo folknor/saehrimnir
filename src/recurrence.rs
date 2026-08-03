@@ -17,7 +17,7 @@
 //! author them for those paths. Stage 2 of CalDAV recurrence (when
 //! a fixture forces it) extends the structured translators.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Frequency {
@@ -173,7 +173,7 @@ pub struct ParsedRule {
     pub freq: Option<Frequency>,
     pub interval: Option<u32>,
     pub count: Option<u32>,
-    pub until: Option<DateTime<Utc>>,
+    pub until: Option<Timestamp>,
     pub by_day: Vec<ByDay>,
     pub by_month_day: Vec<i8>,
     pub by_month: Vec<u8>,
@@ -268,7 +268,7 @@ pub fn format_rrule(rule: &ParsedRule) -> Option<String> {
         parts.push(format!("COUNT={c}"));
     }
     if let Some(u) = rule.until {
-        parts.push(format!("UNTIL={}", u.format("%Y%m%dT%H%M%SZ")));
+        parts.push(format!("UNTIL={}", u.strftime("%Y%m%dT%H%M%SZ")));
     }
     Some(parts.join(";"))
 }
@@ -313,11 +313,11 @@ fn parse_by_day(s: &str) -> Option<ByDay> {
 ///
 /// An absent bound is open on that side.
 pub fn event_matches_range(
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    start: Timestamp,
+    end: Timestamp,
     recurrence_rule: Option<&str>,
-    range_start: Option<DateTime<Utc>>,
-    range_end: Option<DateTime<Utc>>,
+    range_start: Option<Timestamp>,
+    range_end: Option<Timestamp>,
 ) -> bool {
     // DTSTART must fall before the window closes, for both recurring and
     // non-recurring events (a series' first occurrence is its DTSTART).
@@ -356,15 +356,16 @@ pub fn event_matches_range(
 /// (`YYYYMMDD`) or a UTC `DATE-TIME` (`YYYYMMDDTHHMMSSZ`). Fixtures
 /// today only need the UTC form, but accepting the date form too
 /// keeps the parser permissive against well-formed real-world rules.
-fn parse_until(s: &str) -> Option<DateTime<Utc>> {
+fn parse_until(s: &str) -> Option<Timestamp> {
     // UTC date-time, e.g. `20260315T100000Z`.
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s.trim_end_matches('Z'), "%Y%m%dT%H%M%S")
+    if let Ok(dt) =
+        jiff::civil::DateTime::strptime("%Y%m%dT%H%M%S", s.trim_end_matches('Z'))
     {
-        return Some(dt.and_utc());
+        return crate::timeutil::utc(dt);
     }
     // Date-only form, e.g. `20260315`: midnight UTC.
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y%m%d") {
-        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
+    if let Ok(d) = jiff::civil::Date::strptime("%Y%m%d", s) {
+        return crate::timeutil::utc_midnight(d);
     }
     None
 }
@@ -372,7 +373,19 @@ fn parse_until(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+
+    /// Test-local stand-in for the old `Utc.with_ymd_and_hms`: an
+    /// `Option<Timestamp>` the call sites unwrap, same as before.
+    fn utc_ymd_hms(
+        y: i16,
+        mo: i8,
+        d: i8,
+        h: i8,
+        mi: i8,
+        s: i8,
+    ) -> Option<Timestamp> {
+        crate::timeutil::ymd_hms(y, mo, d, h, mi, s)
+    }
 
     #[test]
     fn parses_weekly_with_byday_and_count() {
@@ -412,7 +425,7 @@ mod tests {
         let r = ParsedRule::parse("FREQ=DAILY;UNTIL=20260315T100000Z");
         assert_eq!(
             r.until,
-            Some(Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap())
+            Some(utc_ymd_hms(2026, 3, 15, 10, 0, 0).unwrap())
         );
     }
 
@@ -421,7 +434,7 @@ mod tests {
         let r = ParsedRule::parse("FREQ=DAILY;UNTIL=20260315");
         assert_eq!(
             r.until,
-            Some(Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap())
+            Some(utc_ymd_hms(2026, 3, 15, 0, 0, 0).unwrap())
         );
     }
 
@@ -506,15 +519,15 @@ mod tests {
         assert_eq!(format_rrule(&r), None);
     }
 
-    fn dt(y: i32, mo: u32, d: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(y, mo, d, 0, 0, 0).unwrap()
+    fn dt(y: i16, mo: i8, d: i8) -> Timestamp {
+        utc_ymd_hms(y, mo, d, 0, 0, 0).unwrap()
     }
 
     #[test]
     fn non_recurring_uses_exact_half_open_overlap() {
         // Event [Jan 15 09:00, Jan 15 09:30) vs a January window.
-        let s = Utc.with_ymd_and_hms(2026, 1, 15, 9, 0, 0).unwrap();
-        let e = Utc.with_ymd_and_hms(2026, 1, 15, 9, 30, 0).unwrap();
+        let s = utc_ymd_hms(2026, 1, 15, 9, 0, 0).unwrap();
+        let e = utc_ymd_hms(2026, 1, 15, 9, 30, 0).unwrap();
         assert!(event_matches_range(
             s,
             e,
@@ -545,8 +558,8 @@ mod tests {
     fn recurring_unbounded_matches_window_after_dtstart() {
         // Weekly series starting Jan 2024, unbounded: matches a 2026
         // window even though its own [start, end) is years earlier.
-        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
-        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        let s = utc_ymd_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = utc_ymd_hms(2024, 1, 1, 9, 30, 0).unwrap();
         assert!(event_matches_range(
             s,
             e,
@@ -558,8 +571,8 @@ mod tests {
 
     #[test]
     fn recurring_count_bounded_treated_as_not_terminated() {
-        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
-        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        let s = utc_ymd_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = utc_ymd_hms(2024, 1, 1, 9, 30, 0).unwrap();
         assert!(event_matches_range(
             s,
             e,
@@ -572,8 +585,8 @@ mod tests {
     #[test]
     fn recurring_until_in_past_drops_out() {
         // Series ends 2025-06; a 2026 window must not match it.
-        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
-        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        let s = utc_ymd_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = utc_ymd_hms(2024, 1, 1, 9, 30, 0).unwrap();
         assert!(!event_matches_range(
             s,
             e,
@@ -585,8 +598,8 @@ mod tests {
 
     #[test]
     fn recurring_until_after_window_start_matches() {
-        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
-        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        let s = utc_ymd_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = utc_ymd_hms(2024, 1, 1, 9, 30, 0).unwrap();
         assert!(event_matches_range(
             s,
             e,
@@ -600,8 +613,8 @@ mod tests {
     fn recurring_dtstart_after_window_end_drops_out() {
         // A series that does not begin until after the window closes
         // cannot have an in-window occurrence.
-        let s = Utc.with_ymd_and_hms(2027, 1, 1, 9, 0, 0).unwrap();
-        let e = Utc.with_ymd_and_hms(2027, 1, 1, 9, 30, 0).unwrap();
+        let s = utc_ymd_hms(2027, 1, 1, 9, 0, 0).unwrap();
+        let e = utc_ymd_hms(2027, 1, 1, 9, 30, 0).unwrap();
         assert!(!event_matches_range(
             s,
             e,
@@ -613,8 +626,8 @@ mod tests {
 
     #[test]
     fn open_bounds_are_permissive() {
-        let s = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
-        let e = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        let s = utc_ymd_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let e = utc_ymd_hms(2024, 1, 1, 9, 30, 0).unwrap();
         // No bounds at all: everything matches.
         assert!(event_matches_range(s, e, None, None, None));
         assert!(event_matches_range(

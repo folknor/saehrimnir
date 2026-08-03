@@ -270,9 +270,9 @@ async fn imap_multipart_email_emits_boundary_and_attachment_part() {
 #[tokio::test]
 async fn deterministic_two_runs_emit_identical_bytes() {
     // The byte-determinism contract: same fixture, same script -> same
-    // bytes out. The IMAP path threads through `chrono` formatting
+    // bytes out. The IMAP path threads through timestamp formatting
     // (INTERNALDATE, Date:) which is the most likely place to drift if
-    // someone accidentally pulls in `Utc::now()`.
+    // someone accidentally pulls in `Timestamp::now()`.
     let script = b"\
         a LOGIN \"u\" \"p\"\r\n\
         b SELECT \"INBOX\"\r\n\

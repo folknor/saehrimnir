@@ -34,7 +34,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::SecondsFormat;
 use serde_json::{Map, Value, json};
 
 use super::{AppState, error, odata, ok_json};
@@ -718,14 +717,14 @@ async fn calendar_view_impl(
 /// (`2026-01-01T00:00:00Z`) or a naive local datetime
 /// (`2026-01-01T00:00:00`, treated as UTC, which is how Graph emits
 /// `startDateTime` / `endDateTime` without an offset).
-fn parse_view_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&chrono::Utc));
+fn parse_view_dt(s: &str) -> Option<jiff::Timestamp> {
+    if let Ok(dt) = s.parse::<jiff::Timestamp>() {
+        return Some(dt);
     }
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+    jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", s)
+        .or_else(|_| jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", s))
         .ok()
-        .map(|n| n.and_utc())
+        .and_then(crate::timeutil::utc)
 }
 
 /// Recurrence-aware range match. A non-recurring event overlaps
@@ -737,8 +736,8 @@ fn parse_view_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// [`crate::recurrence::event_matches_range`].
 fn event_overlaps_range(
     e: &Event,
-    start: Option<chrono::DateTime<chrono::Utc>>,
-    end: Option<chrono::DateTime<chrono::Utc>>,
+    start: Option<jiff::Timestamp>,
+    end: Option<jiff::Timestamp>,
 ) -> bool {
     crate::recurrence::event_matches_range(e.start, e.end, e.recurrence_rule.as_deref(), start, end)
 }
@@ -1247,7 +1246,7 @@ fn apply_event_patch(event: &mut Event, body: &Value) -> Result<(), Box<Response
     Ok(())
 }
 
-fn parse_graph_datetime(v: Option<&Value>) -> Option<chrono::DateTime<chrono::Utc>> {
+fn parse_graph_datetime(v: Option<&Value>) -> Option<jiff::Timestamp> {
     let s = v?.get("dateTime")?.as_str()?;
     let normalised = if s.ends_with('Z') || s.contains('+') || s.contains('-') {
         s.to_string()
@@ -1368,14 +1367,14 @@ fn serialize_event(_fixture: &Fixture, e: &Event) -> Value {
     out.insert(
         "start".to_string(),
         json!({
-            "dateTime": e.start.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "dateTime": format!("{:.0}", e.start),
             "timeZone": "UTC",
         }),
     );
     out.insert(
         "end".to_string(),
         json!({
-            "dateTime": e.end.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "dateTime": format!("{:.0}", e.end),
             "timeZone": "UTC",
         }),
     );
@@ -1426,7 +1425,7 @@ fn serialize_event(_fixture: &Fixture, e: &Event) -> Value {
 /// reference and Stage-1 scope.
 fn graph_recurrence(
     rule: &crate::recurrence::ParsedRule,
-    start: chrono::DateTime<chrono::Utc>,
+    start: jiff::Timestamp,
 ) -> Option<Value> {
     use crate::recurrence::Frequency;
     let freq = rule.freq?;
@@ -1472,7 +1471,7 @@ fn graph_recurrence(
                 json!({
                     "type": "absoluteMonthly",
                     "interval": interval,
-                    "dayOfMonth": start.format("%-d").to_string().parse::<u32>().unwrap_or(1),
+                    "dayOfMonth": u32::try_from(crate::timeutil::civil_utc(start).day()).unwrap_or(1),
                 })
             }
         }
@@ -1481,7 +1480,9 @@ fn graph_recurrence(
                 .by_month
                 .first()
                 .copied()
-                .unwrap_or_else(|| start.format("%-m").to_string().parse::<u8>().unwrap_or(1));
+                .unwrap_or_else(|| {
+                    u8::try_from(crate::timeutil::civil_utc(start).month()).unwrap_or(1)
+                });
             if let Some(&day) = rule.by_month_day.first().filter(|d| **d > 0) {
                 json!({
                     "type": "absoluteYearly",
@@ -1493,14 +1494,14 @@ fn graph_recurrence(
                 json!({
                     "type": "absoluteYearly",
                     "interval": interval,
-                    "dayOfMonth": start.format("%-d").to_string().parse::<u32>().unwrap_or(1),
+                    "dayOfMonth": u32::try_from(crate::timeutil::civil_utc(start).day()).unwrap_or(1),
                     "month": month,
                 })
             }
         }
     };
 
-    let start_date = start.format("%Y-%m-%d").to_string();
+    let start_date = start.strftime("%Y-%m-%d").to_string();
     let range = if let Some(count) = rule.count {
         json!({
             "type": "numbered",
@@ -1511,7 +1512,7 @@ fn graph_recurrence(
         json!({
             "type": "endDate",
             "startDate": start_date,
-            "endDate": until.format("%Y-%m-%d").to_string(),
+            "endDate": until.strftime("%Y-%m-%d").to_string(),
         })
     } else {
         json!({
@@ -1523,17 +1524,16 @@ fn graph_recurrence(
     Some(json!({ "pattern": pattern, "range": range }))
 }
 
-fn weekday_of(dt: chrono::DateTime<chrono::Utc>) -> crate::recurrence::Weekday {
+fn weekday_of(dt: jiff::Timestamp) -> crate::recurrence::Weekday {
     use crate::recurrence::Weekday;
-    use chrono::Datelike;
-    match dt.weekday() {
-        chrono::Weekday::Mon => Weekday::Mo,
-        chrono::Weekday::Tue => Weekday::Tu,
-        chrono::Weekday::Wed => Weekday::We,
-        chrono::Weekday::Thu => Weekday::Th,
-        chrono::Weekday::Fri => Weekday::Fr,
-        chrono::Weekday::Sat => Weekday::Sa,
-        chrono::Weekday::Sun => Weekday::Su,
+    match crate::timeutil::civil_utc(dt).weekday() {
+        jiff::civil::Weekday::Monday => Weekday::Mo,
+        jiff::civil::Weekday::Tuesday => Weekday::Tu,
+        jiff::civil::Weekday::Wednesday => Weekday::We,
+        jiff::civil::Weekday::Thursday => Weekday::Th,
+        jiff::civil::Weekday::Friday => Weekday::Fr,
+        jiff::civil::Weekday::Saturday => Weekday::Sa,
+        jiff::civil::Weekday::Sunday => Weekday::Su,
     }
 }
 
@@ -1658,10 +1658,9 @@ fn parse_graph_recurrence(v: &Value) -> Option<String> {
         "noend" => {}
         "enddate" => {
             if let Some(s) = range.get("endDate").and_then(Value::as_str)
-                && let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                && let Some(dt) = d.and_hms_opt(23, 59, 59)
+                && let Ok(d) = jiff::civil::Date::strptime("%Y-%m-%d", s)
             {
-                rule.until = Some(dt.and_utc());
+                rule.until = crate::timeutil::utc(d.at(23, 59, 59, 0));
             }
         }
         "numbered" => {
