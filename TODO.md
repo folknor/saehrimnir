@@ -383,6 +383,47 @@ What's left:
   `crates/calendar/src/lib.rs:12`). Sæhrimnir's listeners are in
   place; ratatoskr just needs the env-driven base URL plumbing.
 
+## From the chrono -> jiff migration
+
+Three behaviour deltas the swap introduced. All three are in the
+test/admin control plane or the fixture loader, none on a protocol
+wire (the 747-test suite passed with no transcript changes), but
+each is observable to a harness script.
+
+- **`/test/snapshot-state` timestamps changed offset form.**
+  `src/test_admin.rs`. The email `received_at` and event
+  `start` / `end` fields were `chrono`'s `to_rfc3339()`
+  (`2026-01-15T10:00:00+00:00`) and are now jiff's `Display`
+  (`2026-01-15T10:00:00Z`). Both are valid RFC 3339 for the same
+  instant, so a parsing consumer is unaffected and a
+  string-matching one breaks. No test covered the form, which is
+  why the swap was silent. Decide which form is the contract and
+  pin it with a test; the `Z` form is the more conventional one
+  and matches what every protocol wire already emits, so leaving
+  it is defensible - but it should be a decision, not an
+  accident.
+- **Request-log `received_at` fractional digits are now minimal,
+  not padded.** `src/request_log.rs`. chrono's serde used
+  `SecondsFormat::AutoSi`, padding the fraction to 0/3/6/9
+  digits (`.100`); jiff's `Display` emits the shortest form
+  (`.1`). Pinned in `src/timeutil.rs::display_forms_are_the_ones_
+  the_wire_expects`. Low impact - the module docs already tell
+  consumers to match on `protocol` / `command` / `detail` and
+  ignore `received_at`, and `?stable=true` strips it entirely -
+  but a script slicing the field at a fixed width would now
+  mis-parse. Only the request log sees this; every fixture
+  timestamp is a whole second.
+- **`fixture::parse_ts` got more lenient.** `src/fixture.rs`.
+  chrono's `parse_from_rfc3339` was strict; jiff's
+  `Timestamp::from_str` also accepts a space separator
+  (`2026-01-15 10:00:00Z`) and a truncated time (`2026-01-15
+  10:00Z`). So fixtures that the loader used to reject now load.
+  An offset is still required, which is what keeps the gcal
+  range-bound contract intact (a bare offsetless `timeMin` is
+  still an open bound, not midnight UTC). Harmless in itself;
+  worth knowing when a fixture-format validation test asserts a
+  malformed timestamp is refused.
+
 ## Cosmetic and housekeeping
 
 - A `brokkr.toml` with `project = "saehrimnir"` plus a `[[check]]`

@@ -44,3 +44,37 @@ pub fn ymd_hms(year: i16, month: i8, day: i8, hour: i8, min: i8, sec: i8) -> Opt
     let d = civil::Date::new(year, month, day).ok()?;
     utc(d.at(hour, min, sec, 0))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole wire surface renders instants one of two ways:
+    /// `format!("{ts:.0}")` for the second-precision `UTCDate` shapes
+    /// (JMAP `receivedAt`, Graph `dateTime`, gcal `dateTime`), and the
+    /// bare `Display` for the serde path (the request log's
+    /// `received_at`). Pin both: a change in either moves bytes that
+    /// harness scripts match on.
+    #[test]
+    fn display_forms_are_the_ones_the_wire_expects() {
+        let ts = ymd_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        assert_eq!(format!("{ts:.0}"), "2026-01-15T10:00:00Z");
+        assert_eq!(ts.to_string(), "2026-01-15T10:00:00Z");
+
+        // A sub-second instant: `.0` truncates, plain Display keeps the
+        // fraction. This is the one place the two forms diverge, and
+        // the request log is the only surface that sees it (fixture
+        // timestamps are all whole seconds).
+        let sub = ts.checked_add(jiff::SignedDuration::from_millis(100)).unwrap();
+        assert_eq!(format!("{sub:.0}"), "2026-01-15T10:00:00Z");
+        assert_eq!(sub.to_string(), "2026-01-15T10:00:00.1Z");
+    }
+
+    /// The mail `Date:` header form, which the IMAP and Gmail
+    /// transcripts pin byte-for-byte: zero-padded day, `+0000`.
+    #[test]
+    fn rfc2822_is_zero_padded_with_a_numeric_offset() {
+        let ts = ymd_hms(2026, 1, 5, 9, 30, 0).unwrap();
+        assert_eq!(rfc2822(ts), "Mon, 05 Jan 2026 09:30:00 +0000");
+    }
+}
