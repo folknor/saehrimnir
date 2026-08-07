@@ -256,7 +256,7 @@ fn decode_base64url(s: &str) -> Vec<u8> {
 }
 
 /// Loaded for fixture-level path correctness; this is the path the
-/// notes/fixture-format.md doc points fixture authors at.
+/// reference/fixture-format.md doc points fixture authors at.
 fn _ensure_fixture_module_imports_compile() {
     let path = Path::new("fixtures/jmap-small.toml");
     let _ = fixture::load(path);

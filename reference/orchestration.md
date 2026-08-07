@@ -207,7 +207,7 @@ feature gate guards these. All routes are scoped under `/test/`.
 
 - `GET /test/smtp/submissions` - JSON array of captured SMTP
   submissions (parsed projection, see
-  `notes/ratatoskr-smtp-surface.md`).
+  `reference/ratatoskr-smtp-surface.md`).
 - `DELETE /test/smtp/submissions` -> 204; clears the SMTP log.
 - `GET /test/requests` - JSON array of every protocol-level
   dispatch event the binary has handled across all five protocols,
@@ -437,7 +437,7 @@ feature gate guards these. All routes are scoped under `/test/`.
 
 The request log is process-scoped: a fresh saehrimnir start is
 always an empty log. The log is a 100k-entry drop-oldest ring
-(see `notes/request-log.md`).
+(see `reference/request-log.md`).
 
 OAuth provider routes (also mounted on the JMAP listener):
 
@@ -450,7 +450,7 @@ OAuth provider routes (also mounted on the JMAP listener):
 - `POST /test/oauth/invalidate` - admin route, body
   `{"token": "..."}`; drops the token so subsequent requests 401.
 
-Full surface details in `notes/ratatoskr-oauth-surface.md`. Bearer
+Full surface details in `reference/ratatoskr-oauth-surface.md`. Bearer
 enforcement on the mail HTTP listeners (JMAP, Graph, Gmail) is
 opt-in via `[oauth] enforce = true` in the fixture; default keeps
 the v0 "no auth" baseline.

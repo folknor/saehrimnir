@@ -8,53 +8,54 @@ backed by one shared fixture authored as either TOML or Lua.
 
 All five protocols are implemented for v0. See `TODO.md` for what's
 left per protocol (mostly future fixture-format growth and sibling
-resource modules), and `notes/` for the per-protocol surface docs.
+resource modules), and `reference/` for the per-protocol surface docs.
 
 ## Where to read
 
-- `notes/orchestration.md` - how brokkr drives us: lifecycle,
+- `reference/orchestration.md` - how brokkr drives us: lifecycle,
   sentinel, env vars, brokkr.toml fields.
-- `notes/fixture-format.md` - fixture shape and validation rules,
+- `reference/fixture-format.md` - fixture shape and validation rules,
   shared by the TOML and Lua loaders.
-- `notes/ratatoskr-jmap-surface.md` - what the JMAP client expects
-  on the wire, with `crates/jmap/src/...:LL` citations.
-- `notes/ratatoskr-imap-surface.md` - same shape, for IMAP.
-- `notes/ratatoskr-smtp-surface.md` - same shape, for SMTP.
-- `notes/ratatoskr-graph-surface.md` - same shape, for Microsoft
+- `reference/ratatoskr-jmap-surface.md` - what the JMAP client expects
+  on the wire.
+- `reference/ratatoskr-imap-surface.md` - same shape, for IMAP.
+- `reference/ratatoskr-smtp-surface.md` - same shape, for SMTP.
+- `reference/ratatoskr-graph-surface.md` - same shape, for Microsoft
   Graph (mail-sync only in v0; the doc also lists the resource
   categories we'll need to scaffold for later).
-- `notes/ratatoskr-gmail-surface.md` - same shape, for Gmail's REST
+- `reference/ratatoskr-gmail-surface.md` - same shape, for Gmail's REST
   API.
-- `notes/ratatoskr-people-surface.md` - same shape, for Google
+- `reference/ratatoskr-people-surface.md` - same shape, for Google
   People API contacts (`/v1/people/me/connections` +
   `/v1/otherContacts`). Hosted on a separate listener since real
   People API uses a different host from Gmail.
-- `notes/ratatoskr-gcal-surface.md` - same shape, for Google
+- `reference/ratatoskr-gcal-surface.md` - same shape, for Google
   Calendar v3 (`/calendar/v3/users/me/calendarList` +
   `/calendar/v3/calendars/{id}/events[/...]`). Sibling listener
   to Gmail.
-- `notes/ratatoskr-ews-surface.md` - same shape, for Exchange
+- `reference/ratatoskr-ews-surface.md` - same shape, for Exchange
   Web Services SOAP + Autodiscover (`/autodiscover/autodiscover.svc`
   GetUserSettings, `/EWS/Exchange.asmx` FindFolder / FindItem /
   GetItem over public folders + Subscribe / GetStreamingEvents /
   Unsubscribe streaming push). Own listener (`--ews-port`).
-- `notes/ratatoskr-oauth-surface.md` - mock OAuth 2.0 provider
+- `reference/ratatoskr-oauth-surface.md` - mock OAuth 2.0 provider
   mounted on the JMAP listener (`/oauth/token`,
   `/oauth/userinfo`, `/test/oauth/invalidate`) plus the
   fixture-side `[oauth]` block that gates bearer enforcement on
   the mail listeners.
-- `notes/ratatoskr-discovery-surface.md` - account-discovery
+- `reference/ratatoskr-discovery-surface.md` - account-discovery
   routes (WebFinger / OIDC discovery / Mozilla autoconfig XML)
   mounted on the JMAP HTTP listener. Drives ratatoskr's
   multi-stage discovery cascade.
-- `notes/request-log.md` - cross-protocol request log
+- `reference/request-log.md` - cross-protocol request log
   (`/test/requests`): per-protocol command / detail-key
   contract harness scripts can rely on.
 - `TODO.md` - what's left, per protocol.
 
-The notes are the source of truth. Do not refer to siblings
-(`../ratatoskr`, `../jmap-client`, `../brokkr`) without first
-checking whether the fact is already in `notes/`.
+These surface docs are binding protocol contracts (see Document
+folders below). Read them before referring to siblings
+(`../ratatoskr`, `../brokkr`) - most facts are already captured
+there.
 
 ## Project constraints
 
@@ -69,7 +70,7 @@ checking whether the fact is already in `notes/`.
   in the fixture; tokens come from the mock OAuth provider on the
   JMAP listener (`/oauth/token`). IMAP and SMTP keep their own
   always-accept auth surfaces. See
-  `notes/ratatoskr-oauth-surface.md`.
+  `reference/ratatoskr-oauth-surface.md`.
 - Multi-account fixtures: every resource type carries an
   `account_id`, derived from its parent and validated against
   the declared `[[account]]` set at load time.
@@ -168,7 +169,7 @@ checking whether the fact is already in `notes/`.
   back as nothing. Backed by `Principal/get` only
   (`src/jmap_principals.rs`) - `Principal/set` / `/changes` /
   `/query` and the `ShareNotification` family stay `unknownMethod`.
-  See `notes/ratatoskr-jmap-surface.md` for the shapes and the two
+  See `reference/ratatoskr-jmap-surface.md` for the shapes and the two
   silent-failure traps.
 - The session advertises `urn:ietf:params:jmap:calendars` iff the
   fixture carries any `[[calendar]]` entries; this gates the JMAP
@@ -238,7 +239,7 @@ checking whether the fact is already in `notes/`.
   raw ids to dense first-seen indices for byte-deterministic
   snapshots. Read out via `GET /test/requests`, cleared via
   `DELETE /test/requests` or `POST /test/fixture/reset`. See
-  `notes/orchestration.md` "Test / admin control plane".
+  `reference/orchestration.md` "Test / admin control plane".
 - `src/connection_id.rs` - process-wide monotonic `u64` generator
   plus the `ConnInfo` carrier and `OptConnId` extractor. IMAP /
   SMTP `serve_connection` call `next()` once per accepted
@@ -268,7 +269,7 @@ checking whether the fact is already in `notes/`.
   `/test/fixture/identity` (`{ name, path, sha256 }` over the fixture
   SOURCE BYTES, so a consumer holding its own copy of a fixture file
   can detect drift between the two copies; publish-only, the consumer
-  decides whether to check - see `notes/orchestration.md`),
+  decides whether to check - see `reference/orchestration.md`),
   `/test/fixture/reset` (rewinds the fixture image to the post-load
   baseline + clears volatile state + clears latency knob; the
   identity survives it),
@@ -606,7 +607,7 @@ Any `Email/set` create or update whose result would be an EMPTY
 (RFC 8621 §4.1.1: an Email always belongs to at least one Mailbox, and
 JMAP has no All Mail to fall back to). That is deliberately the
 opposite of the Gmail listener, where the same shape is a legitimate
-archive; see `notes/ratatoskr-jmap-surface.md` § "`mailboxIds` can
+archive; see `reference/ratatoskr-jmap-surface.md` § "`mailboxIds` can
 never end up empty" before touching either path.
 `Thread/get` derives threads from each email's `thread_id`
 (`{ id, emailIds }`, emailIds sorted by `receivedAt` ascending,
@@ -977,7 +978,7 @@ so a sibling `attachments($select=a,b,c)` clause and the `or`-joined
 filter both survive. Mid-run mutation rides the `email_reaction`
 change-script op (set / partial-set / `clear = true`), which records
 an `email_updated` transition so the change surfaces in the next
-delta cycle. See `notes/ratatoskr-graph-surface.md`.
+delta cycle. See `reference/ratatoskr-graph-surface.md`.
 
 Groups: `/v1.0/groups` (list + single), `/v1.0/groups/{id}/members`
 projecting each member-account as a `#microsoft.graph.user` (id,
@@ -1104,7 +1105,7 @@ declared, or with an `addLabelIds` naming an `INBOX`/`TRASH`/`SPAM`
 container the fixture declares no role mailbox for, the patch is
 rolled back whole and refused with `400 invalidArgument` rather
 than silently producing a state the fixture loader would reject.
-See the archive section of `notes/ratatoskr-gmail-surface.md`) +
+See the archive section of `reference/ratatoskr-gmail-surface.md`) +
 `/settings/sendAs`
 (list + per-address GET + PATCH). SendAs identities project from
 fixture `[[send_as]]` rows (TOML) or Lua `send_as({...})` builder,
@@ -1335,7 +1336,7 @@ no write surface to enforce them against).
 item with an HTML body + attachment) and
 `fixtures/shared-rights.toml` (a read-only and a writable public
 folder in one fixture) + `tests/ews.rs` cover the surface. See
-`notes/ratatoskr-ews-surface.md`.
+`reference/ratatoskr-ews-surface.md`.
 
 Discovery (WebFinger / OIDC / autoconfig): complete for v0.
 Mounted on the JMAP HTTP listener, unauthenticated (real
@@ -1353,7 +1354,7 @@ JRD, non-HTTPS href, issuer mismatch). The loader does NOT
 enforce OIDC's issuer self-claim, so a fixture can stage a
 deliberate mismatch and the route serves it verbatim - the
 client (ratatoskr) is the one that checks. See
-`notes/ratatoskr-discovery-surface.md`. Integration tests in
+`reference/ratatoskr-discovery-surface.md`. Integration tests in
 `tests/discovery.rs`.
 
 Lua fixture loader: wired via [dellingr](https://crates.io/crates/dellingr),

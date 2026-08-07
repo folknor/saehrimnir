@@ -57,16 +57,17 @@ that nothing else can:
 1. **Cross-account token bleed.** Any account's mutation advances
    every account's `newState`. This is the core wrongness.
 2. **Shared eviction.** `change_log` is one bounded ring
-   (`MAX_TRANSITIONS = 256`, `src/fixture.rs:279`). Heavy churn on
-   account B can evict account A's `sinceState` boundary and
+   (`ChangeLog::MAX_TRANSITIONS = 256` in `src/fixture.rs`). Heavy
+   churn on account B can evict account A's `sinceState` boundary and
    spuriously hand account A a `cannotCalculateChanges`. A per-account
    log makes eviction per-account too. Id-filtering cannot touch this.
 
 ### Disagree on the diagnosis
 
 The writeup says the mock "returns the primary's own email as
-changed" through `Email/changes`. It does not. `email_delta_since_account`
-(`src/fixture.rs:695`) already filters: it retains created/updated by
+changed" through `Email/changes`. It does not.
+`Fixture::email_delta_since_account` in `src/fixture.rs` already
+filters: it retains created/updated by
 the live email's `account_id` and destroyed by the parallel
 `email_destroyed_accounts`. After a secondary `Email/set`, the
 primary's `Email/changes` walk collects the secondary's email id, then
@@ -92,7 +93,7 @@ token + eviction isolation, not content isolation.
 1. **Keep the token format; do not take "map accountId ->
    {state_string, changelog}" literally on the wire string.** ~40
    tests pin the literal `"fixture-state"` / `"fixture-state.N"`
-   (`tests/api.rs:118`, `tests/step.rs:135`, Graph
+   (throughout `tests/api.rs` and `tests/step.rs`, Graph
    `$deltatoken=d.fixture-state`, unit `state == "s1"`). Keep a
    **shared seed** plus the `{seed}.{counter}` format with a
    **per-account counter** - byte-identical for the primary,
@@ -111,10 +112,10 @@ token + eviction isolation, not content isolation.
    correct in one move and is less code than special-casing JMAP.
 
    Note: **Thread carries no independent state.** `Thread/get` /
-   `Thread/changes` (`src/jmap.rs:1105`, `:1197`) report
-   `Fixture::state` and derive the delta from the email log. "Thread
-   state" rides email state; it is not a separate changelog. Same for
-   the JMAP session resource's `state`.
+   `Thread/changes` (`thread_get` and `thread_changes` in
+   `src/jmap.rs`) report `Fixture::state` and derive the delta from
+   the email log. "Thread state" rides email state; it is not a
+   separate changelog. Same for the JMAP session resource's `state`.
 
 ## Plan
 
@@ -146,8 +147,8 @@ token + eviction isolation, not content isolation.
    - Admin `/test/snapshot-state` and `/test/fixture/step` report the
      primary account's state (or a per-account map).
 5. Reset is free: `POST /test/fixture/reset` clones the baseline
-   `Fixture` (`src/shared.rs:78`), so per-account state living inside
-   `Fixture` rewinds with it.
+   `Fixture` (`SharedHandles::baseline` in `src/shared.rs`), so
+   per-account state living inside `Fixture` rewinds with it.
 6. `brokkr check`.
 
 ## Open question

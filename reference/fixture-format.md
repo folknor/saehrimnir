@@ -281,7 +281,7 @@ fixture.
 
 ### Address shape
 
-Per `crates/jmap/src/parse.rs:200-207`, the client expects each
+Per `crates/jmap/src/parse.rs`, the client expects each
 address as `{name, email}`. Fixtures accept two forms:
 
 - A bare string `"alice@example.com"` - interpreted as
@@ -438,7 +438,7 @@ the `calendarView/delta` walker; CalDAV covers PROPFIND
 discovery, REPORT calendar-multiget / calendar-query, GET
 event.ics, and PUT / DELETE with `If-Match`. Mutations in either
 protocol surface in the other's delta path through the shared
-change_log (see `notes/ratatoskr-caldav-surface.md` for the wire
+change_log (see `reference/ratatoskr-caldav-surface.md` for the wire
 shape).
 
 ## Contact folders and contacts (optional)
@@ -634,7 +634,7 @@ stages both in one fixture. The Lua loader exposes the same shape via
 `acl({...})`. Grants are also mutable mid-run through the change
 script's `acl_grant` / `acl_revoke` ops (see "Incremental change
 scripts"); `fixtures/imap-acl-lifecycle.toml` stages a mid-session
-grant and revoke. See `notes/ratatoskr-imap-surface.md` "Shared
+grant and revoke. See `reference/ratatoskr-imap-surface.md` "Shared
 folders".
 
 ## EWS public folders (optional)
@@ -708,7 +708,7 @@ Validation:
 
 Read-only in v0 (the rights are reported, not enforced - there is no
 EWS write surface). No Lua builders yet - TOML-only. See
-`notes/ratatoskr-ews-surface.md`.
+`reference/ratatoskr-ews-surface.md`.
 
 ## OAuth (optional)
 
@@ -727,7 +727,7 @@ their own auth surfaces and are unaffected. CalDAV's rejection is
 a bare `401` with `WWW-Authenticate: Bearer` (no shared error
 envelope; the JMAP / Graph / Gmail listeners each return their own
 protocol-shaped rejection body). See
-`notes/ratatoskr-oauth-surface.md` for the full token-issuance /
+`reference/ratatoskr-oauth-surface.md` for the full token-issuance /
 userinfo / invalidation contract.
 
 The Lua loader exposes the same block via the `oauth` builder:
@@ -862,7 +862,7 @@ The mock refuses to start (non-zero exit, stderr message) if:
   projection deliberately renders as NO Gmail label (Gmail's All Mail
   is not a label). Mutations that could otherwise empty the set are
   responsible for honouring this; see the archive section of
-  `notes/ratatoskr-gmail-surface.md`.
+  `reference/ratatoskr-gmail-surface.md`.
 - Any `mailbox.parent_id` references a mailbox not declared in the
   fixture.
 - A mailbox's role is set but not one of the seven recognized values.
@@ -917,7 +917,7 @@ loaded fixture. A Lua `change(...)` call (or one TOML `[[change]]`
 table) adds one named entry to the fixture's incremental-sync
 script. Each entry is a `ChangeStep` with an `id` plus zero-or-more
 op buckets. The harness drives steps via `POST /test/fixture/step`
-(see `notes/orchestration.md`); each step's ops accumulate into a
+(see `reference/orchestration.md`); each step's ops accumulate into a
 single `Fixture::mutate` call so the change_log gains exactly one
 transition per step. RFC 8620 §5.2 dominance applies naturally on
 subsequent `Email/changes` walks.
@@ -1187,7 +1187,7 @@ end)
 For batched per-protocol slowdowns that don't depend on call shape,
 prefer `POST /test/latency` (per-protocol or `global` knob) over an
 `on()` hook - it skips the dispatcher mutex entirely. See
-`notes/orchestration.md` "Test / admin control plane".
+`reference/orchestration.md` "Test / admin control plane".
 
 ## Reserved for v1+
 

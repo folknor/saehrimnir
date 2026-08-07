@@ -11,11 +11,11 @@ so the next person can re-verify after the client drifts.
 
 - Client connects via TCP to `host:port` with security mode: `"tls"`
   (direct TLS), `"starttls"` (plain to upgrade), or `"none"`
-  (plaintext). Source: `connection.rs:228-266`.
+  (plaintext). Source: `connection.rs`.
 - Server greeting line required (`* OK ...`). For plain and starttls
   paths the client reads and validates the greeting; STARTTLS path
-  explicitly checks for `OK` in the response. `connection.rs:285-296`
-  (plain greeting), `:299-315` (STARTTLS response).
+  explicitly checks for `OK` in the response (plain greeting and
+  STARTTLS response). `connection.rs`.
 - v0 mock plan: plaintext only (`security = "none"`). No STARTTLS, no
   TLS, no compression. The mock will not advertise STARTTLS.
 - After connection the client sends `CAPABILITY`, then authenticates,
@@ -25,7 +25,7 @@ so the next person can re-verify after the client drifts.
 
 - Three auth methods supported: LOGIN (password), XOAUTH2,
   OAUTHBEARER. Determined by `config.auth_method`. Source:
-  `connection.rs:344-390`.
+  `connection.rs`.
 - v0 mock: every credential and method succeeds (no validation).
   Stage 5 of the multi-account refactor grew **per-connection
   account binding** on top: the credential's identity is parsed
@@ -56,12 +56,12 @@ The mock advertises:
 
 - `IMAP4REV1` - baseline.
 - `CONDSTORE` (RFC 4551) - enables HIGHESTMODSEQ in SELECT and the
-  `CHANGEDSINCE` modifier in FETCH. Probed at `connection.rs:419-427`,
-  used at `client/commands.rs:293-320`.
+  `CHANGEDSINCE` modifier in FETCH. Probed in `connection.rs`,
+  used in `client/commands.rs`.
 - `QRESYNC` (RFC 7162) - efficient resync. Client sends
   `ENABLE QRESYNC` after LOGIN and expects `* ENABLED QRESYNC` in the
   response. Without that line the client falls back to CONDSTORE-only.
-  `connection.rs:438-502`.
+  `connection.rs`.
 - `NAMESPACE` (RFC 2342) - advertised and implemented. Returns the
   personal namespace (`("" "/")`), the other-users namespace
   (`("#user/" "/")`) that surfaces shared folders, and a NIL shared
@@ -95,31 +95,31 @@ NOT advertised in v0:
 
 ## Folder listing
 
-- Command: `LIST "" "*"` (list all). `client/mod.rs:43`.
+- Command: `LIST "" "*"` (list all). `client/mod.rs`.
 - Shared folders use `LIST "" "{prefix}*"` per namespace
-  (`client/mod.rs:134`). We advertise NAMESPACE and serve the
+  (`client/mod.rs`). We advertise NAMESPACE and serve the
   other-users prefix `#user/`: a `LIST "" "#user/*"` enumerates
   mailboxes other accounts have shared with the authenticated one
   (fixture `[[acl]]` grants), projected as `#user/<owner>/<path>`. A
   bare `LIST "" "*"` stays personal-only. See "Shared folders" below.
 - Untagged response: `* LIST (attributes) "delimiter" "name"`. Parser:
-  `parse.rs:14-40`.
+  `parse.rs`.
   - Attributes: `\Noselect` skips the folder. RFC 6154 special-use
     flags (`\Sent`, `\Trash`, `\Drafts`, `\Junk`, `\Archive`, `\All`,
     `\Flagged`, `\Important`, plus `\Inbox` for the inbox) are parsed
     and used to tag folders.
   - Delimiter: string or NIL. Folder hierarchy separator (e.g., `/`).
   - Name: modified UTF-7 (RFC 3501 sec 5.1.3). Client decodes it to
-    UTF-8 (`client/mod.rs:61`). All-ASCII names need no encoding.
-  - Casing: case-insensitive flag matching via
-    `eq_ignore_ascii_case` (`client/mod.rs:27`, `parse.rs:27`).
+    UTF-8 (`client/mod.rs`). All-ASCII names need no encoding.
+  - Casing: case-insensitive flag matching via `eq_ignore_ascii_case`
+    in `client/mod.rs` and `parse.rs`.
 - After LIST, client sends `STATUS "folder" (MESSAGES UNSEEN)` per
-  folder. `client/mod.rs:82-90`.
+  folder. `client/mod.rs`.
 
 ## SELECT / EXAMINE / folder state
 
 - Command: `SELECT folder` (read-write) before any UID FETCH or UID
-  SEARCH. `client/sync.rs:34`. bifrost opens with the RFC 7162
+  SEARCH. `client/sync.rs`. bifrost opens with the RFC 7162
   CONDSTORE select-parameter: `SELECT INBOX (CONDSTORE)`. The mock
   parses the `(...)` select-parameter group (`parse_select_args`):
   `CONDSTORE` is accepted, and `QRESYNC (<uidvalidity> <modseq>
@@ -133,8 +133,7 @@ NOT advertised in v0:
 - Untagged responses parsed, in any order, until the tagged OK:
   - `* <n> EXISTS` - total messages.
   - `* OK [UIDVALIDITY <u32>]` - folder identity. Cached per-folder;
-    mismatch on resync triggers full refetch
-    (`sync_pipeline.rs:487-503`).
+    mismatch on resync triggers full refetch (`sync_pipeline.rs`).
   - `* OK [UIDNEXT <u32>]` - predicted next UID.
   - `* <n> RECENT` - parsed by async_imap, not actively used.
   - `* OK [HIGHESTMODSEQ <u64>]` - required for CONDSTORE/QRESYNC
@@ -152,13 +151,13 @@ NOT advertised in v0:
   - `* FLAGS (\Seen \Flagged \Draft ...)` - supported flags.
   - `* OK [PERMANENTFLAGS (\Seen \Flagged \* ...)]` - flags clients
     can set/create. The `\*` token signals custom-keyword support
-    (Flag::MayCreate, `client/mod.rs:24-31`).
+    (`Flag::MayCreate` in `client/mod.rs`).
 
 ## Message fetching - initial sync
 
 - Per-folder: `UID FETCH 1:* (UID FLAGS INTERNALDATE BODY.PEEK[])` in
-  batches of 200 messages. `client/sync.rs:279`, `client/mod.rs:230`,
-  `sync_pipeline.rs:24` (CHUNK_SIZE).
+  batches of 200 messages. `client/sync.rs`, `client/mod.rs`,
+  `CHUNK_SIZE` in `sync_pipeline.rs`.
 - Attributes:
   - `UID` - numeric message id.
   - `FLAGS` - `\Seen`, `\Flagged`, `\Draft`, plus custom keywords.
@@ -174,8 +173,9 @@ NOT advertised in v0:
 The sections above describe the OLD ratatoskr-direct IMAP client.
 bifrost's inventory FETCH is different and the mock must serve it:
 `UID FLAGS ENVELOPE RFC822.SIZE` plus `MODSEQ` whenever CONDSTORE is
-enabled (`research/bifrost/crates/imap/src/account/inventory.rs:225-231`,
-`get.rs:213-219`). Two consequences for the mock:
+enabled (`inventory_attrs` in `account/inventory.rs`,
+`attrs_for_projection` in `account/get.rs`). Two consequences for the
+mock:
 
 - `ENVELOPE` (RFC 3501 7.4.2) must parse and emit - bifrost reads
   sender/subject/date from it instead of the raw headers. `src/imap.rs`
@@ -199,19 +199,17 @@ bifrost's initial mail sync right after SELECT.
 ## Message fetching - delta / CONDSTORE
 
 - New messages: `UID SEARCH (last_uid+1):*` to find new UIDs, then the
-  same FETCH as initial. `client/sync.rs:111`,
-  `client/commands.rs:9-33`.
+  same FETCH as initial. `client/sync.rs`, `client/commands.rs`.
 - Flag changes (CONDSTORE): `UID FETCH 1:* (FLAGS) (CHANGEDSINCE
   <modseq>)`. Returns only flags for messages changed since cached
-  HIGHESTMODSEQ. `client/commands.rs:293-320`. The mock honours this
+  HIGHESTMODSEQ. `client/commands.rs`. The mock honours this
   per-message: it keeps only emails whose `email_modseq` exceeds the
   given value, so a message touched since the client's cached modseq
   surfaces while untouched ones are filtered out.
 - Flag changes (no CONDSTORE): `UID FETCH 1:* (FLAGS)` - full sweep,
-  diffed client-side. `client/commands.rs:366-393`.
+  diffed client-side. `client/commands.rs`.
 - Deletion detection: `UID SEARCH ALL` to enumerate live UIDs; client
-  diffs against cache. `imap_delta_janitor.rs:144-189`,
-  `client/commands.rs:35-59`.
+  diffs against cache. `imap_delta_janitor.rs`, `client/commands.rs`.
 
 ## Search / UID SEARCH
 
@@ -220,7 +218,7 @@ Client uses UID SEARCH only - no SORT, no THREAD, no plain SEARCH.
 - `UID SEARCH ALL` - all UIDs.
 - `UID SEARCH <last_uid+1>:*` - UIDs newer than the cached cursor.
 - `UID SEARCH SINCE <date>` - UIDs after a date (initial sync uses a
-  `days_back` cutoff). `client/sync.rs:173-176`.
+  `days_back` cutoff). `client/sync.rs`.
 
 Response: untagged `* SEARCH uid1 uid2 ...` (space-separated, may be
 empty). Order does not matter to the client (it sorts anyway), but
@@ -232,14 +230,14 @@ Per-folder fields ratatoskr stores in its DB and compares on every
 sync run:
 
 - `uidvalidity: u32` - compared on every SELECT. Mismatch triggers
-  full refetch. `imap_delta.rs:159`, `sync_pipeline.rs:487-503`.
+  full refetch. `imap_delta.rs`, `sync_pipeline.rs`.
 - `last_uid: u32` - highest UID seen previously. Drives
   `(last_uid+1):*`.
 - `modseq: u64` (optional) - cached HIGHESTMODSEQ. Used for
   CHANGEDSINCE.
 - `last_sync_at` - timestamp; throttles deletion checks and
   non-CONDSTORE flag syncs (10-5 min intervals).
-  `imap_delta_janitor.rs:16-21`.
+  `imap_delta_janitor.rs`.
 
 These must remain stable across runs. The mock pins UIDVALIDITY to 1
 and derives HIGHESTMODSEQ from the per-account change counter
@@ -270,8 +268,7 @@ by ratatoskr 2026-05-10.
 ## Wire format strictness
 
 - Parser uses `async_imap::imap_proto`. Keywords (commands,
-  capabilities, flags) are case-insensitive.
-  `connection.rs:457-474`, `connection.rs:461`.
+  capabilities, flags) are case-insensitive. `connection.rs`.
 - Untagged responses can arrive in any order between command tag and
   tagged OK.
 - Both quoted-string and literal-string forms are accepted on the
@@ -279,7 +276,7 @@ by ratatoskr 2026-05-10.
   literals only when forced (CR/LF, NUL, > 1024 bytes).
 - All lines end `\r\n`.
 - NAMESPACE is not parsed by imap_proto; the client extracts the raw
-  line and walks it manually (`connection.rs:514-643`). Not relevant
+  line and walks it manually (`connection.rs`). Not relevant
   in v0 because we do not advertise NAMESPACE.
 
 ## Mutation surface (v0)
@@ -375,7 +372,7 @@ rights = "lr"                  # RFC 4314 rights; default "lr"
 ### Mid-session grant / revoke
 
 Grants are not load-time-only. The change script's `acl_grant` /
-`acl_revoke` ops (see `notes/fixture-format.md` "Incremental change
+`acl_revoke` ops (see `reference/fixture-format.md` "Incremental change
 scripts") mutate the grant set through the same
 `POST /test/fixture/step` path every other op uses, and every
 shared-folder read path re-resolves grants from the live fixture on
@@ -410,8 +407,8 @@ drives it.
 
 ## Constants worth knowing
 
-- TCP_CONNECT_TIMEOUT: 30s. `connection.rs:11`.
+- TCP_CONNECT_TIMEOUT: 30s. `connection.rs`.
 - IMAP_CMD_TIMEOUT: 30s (SELECT, STATUS, LIST, CAPABILITY).
 - IMAP_FETCH_TIMEOUT: 120s (UID FETCH with bodies).
 - IMAP_SEARCH_TIMEOUT: 60s.
-- CHUNK_SIZE: 200 messages per FETCH batch. `sync_pipeline.rs:24`.
+- CHUNK_SIZE: 200 messages per FETCH batch. `sync_pipeline.rs`.

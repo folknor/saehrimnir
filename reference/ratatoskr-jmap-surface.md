@@ -14,7 +14,7 @@ so the next person can re-verify after the client drifts.
   No `.well-known/jmap` probe in the ratatoskr path. **v0 mock does
   not need a `.well-known` route**; the configured endpoint is hit as
   the session URL.
-  Source: `crates/jmap/src/client.rs:319-326`.
+  Source: `crates/jmap/src/client.rs` (`Client::connect`).
 - Auth is bearer (OAuth) or basic. v0 ignores credentials entirely;
   the listener accepts any header.
 
@@ -25,7 +25,7 @@ What ratatoskr reads off the session object:
 - `session.accounts()` - iterated; one account is enough.
 - `account.is_personal()` - must be `true` for the only account, or
   the shared-account branches fire.
-  Source: `crates/jmap/src/sync/mod.rs:611-625`.
+  Source: `crates/jmap/src/sync/`.
 - `account.name()` - used as a fallback owner email when the account
   advertises no owner principal. Should be the account's email address
   (every mock surface follows that convention).
@@ -62,22 +62,22 @@ code paths.
 In order, every method `jmap_initial_sync` reaches:
 
 1. `Mailbox/get` (no ids = list all). Reads list + `state` token.
-   Source: `crates/jmap/src/sync/mailbox.rs:281-287`.
+   Source: `crates/jmap/src/sync/`.
 2. `Mailbox/get` again (also no ids), this time for the state token
    only - called by `get_mailbox_state` after the list is persisted.
-   Same call, just discards the list. Source: `:217`.
+   Same call, just discards the list.
 3. `Email/query` in a loop until a page returns fewer than 50 ids.
    Per call: filter `{ "after": <UTCDate> }` (RFC3339 string per RFC
    8621, integer unix seconds also accepted by the mock), sort
    `[{"property": "receivedAt"}]`, `position`, `limit: 50`,
    `calculateTotal: true` on first page only.
-   Source: `crates/jmap/src/sync/mod.rs:241-269`.
+   Source: `crates/jmap/src/sync/`.
 4. `Email/get` per batch of 50 ids, with the property list below,
    `fetchTextBodyValues: true`, `fetchHtmlBodyValues: true`.
-   Source: `crates/jmap/src/sync/mod.rs:444-472`.
+   Source: `crates/jmap/src/sync/`.
 5. `Email/get` once more with empty ids - called by `get_email_state`
    purely to read a state token. **Mock must return a `state` field
-   even when no ids were requested.** Source: `:236-258`.
+   even when no ids were requested.**
 
 Then unconditionally (but they won't fire if the session is shaped
 right):
@@ -96,7 +96,7 @@ right):
 ## `Email/get` property list
 
 Exactly what `email_get_properties()` returns
-(`crates/jmap/src/parse.rs:35-63`):
+(`crates/jmap/src/parse.rs`):
 
 ```
 id, blobId, threadId, mailboxIds, keywords, size, receivedAt,
@@ -118,7 +118,7 @@ ratatoskr's path.
 
 ## What ratatoskr reads off `Email/get` responses
 
-Per email (`crates/jmap/src/parse.rs:72-197`):
+Per email (`crates/jmap/src/parse.rs`):
 
 - `id` - required, errors if missing.
 - `threadId` - required, errors if missing.
@@ -138,7 +138,7 @@ Per email (`crates/jmap/src/parse.rs:72-197`):
   with spaces for DB storage.
 - `textBody`, `htmlBody` - arrays of `EmailBodyPart`. Each has
   `partId` and `type`. Parts with `type: "text/x-amp-html"` are
-  **skipped** by the client (`parse.rs:231`).
+  **skipped** by the client (`parse.rs`).
 - `bodyValues` - map keyed by `partId`, value
   `{ "value": "<body string>" }`. Client looks up by `partId` from
   the `textBody`/`htmlBody` arrays.
@@ -148,20 +148,19 @@ Per email (`crates/jmap/src/parse.rs:72-197`):
 
 ## What ratatoskr reads off `Mailbox/get` responses
 
-Per mailbox (`crates/jmap/src/sync/mailbox.rs:36-95`):
+Per mailbox (`crates/jmap/src/sync/mailbox.rs`):
 
 - `id` - required.
 - `name` - string, falls back to `"(unnamed)"`.
 - `role` - enum. Recognized values:
   `inbox, archive, drafts, sent, trash, junk, important`.
   Anything else stringifies to `"other"` and is treated as a generic
-  user folder. Source: `crates/jmap/src/sync/mailbox.rs:294-306`.
+  user folder.
 - `parentId` - optional string; resolved against the mailbox list to
   build the parent label id.
 - `myRights` - object with these booleans:
   `mayReadItems, mayAddItems, mayRemoveItems, maySetSeen,
    maySetKeywords, mayCreateChild, mayRename, mayDelete, maySubmit`.
-  Source: `crates/jmap/src/sync/mailbox.rs:323-334`.
 - `isSubscribed` - boolean.
 - `state` - top-level on the response, NOT per-mailbox. Returned by
   the wrapping `Mailbox/get` response.
@@ -171,8 +170,7 @@ read by the parser, but the mock still emits them. Either way works.
 
 ## `Email/query` shape
 
-What the client sends (`crates/jmap/src/sync/mod.rs:248-258`,
-`helpers.rs:11-21`):
+What the client sends (`crates/jmap/src/sync/`):
 
 - `accountId` - defaulted to the session's primary mail account.
 - `filter` - for initial sync: `{ "after": <UTCDate> }`. Per RFC 8621
@@ -183,14 +181,14 @@ What the client sends (`crates/jmap/src/sync/mod.rs:248-258`,
   For thread-scoped lookups (used outside initial sync):
   `{ "inThread": "<thread_id>" }`.
   v0 needs `after`/`before` only; `inThread` can be a v1 concern.
-- `sort` - `[{ "property": "receivedAt" }]`. Direction defaults to
-  ascending in jmap-client; ratatoskr does not pass `isAscending`,
+- `sort` - `[{ "property": "receivedAt" }]`. ratatoskr does not
+  pass `isAscending`,
   but reads results in the order returned. **For determinism, sort
   by `receivedAt` descending and break ties by `id` lexicographic.**
   (Plan 2 explicitly decides this; the client doesn't care about
   direction at the query level since it persists everything.)
 - `position` - int offset (0 on first page, then accumulates).
-- `limit` - `50` (`BATCH_SIZE` in `sync/mod.rs:22`).
+- `limit` - `50` (`BATCH_SIZE` in `sync/mod.rs`).
 - `calculateTotal` - `true` on first page, `false` after.
 
 What the client reads off the response:
@@ -202,7 +200,7 @@ What the client reads off the response:
 
 So the mock must:
 - Honor `position` and `limit`.
-- Return `total` on every response (jmap-client always includes it
+- Return `total` on every response (the client always includes it
   in the deserialized `QueryResponse`); the client just only uses
   the first one.
 - Return fewer than 50 ids on the final page so the loop exits.
@@ -307,7 +305,7 @@ Contrast with the other protocols, which genuinely disagree here:
 - **Gmail** treats "no container" as a real state (All Mail), so
   `batchModify`/`modify` removing the last container is an ARCHIVE and
   the message lands in the `role = "archive"` mailbox. See
-  `notes/ratatoskr-gmail-surface.md`.
+  `reference/ratatoskr-gmail-surface.md`.
 - **IMAP** destroys it: `EXPUNGE` on the last mailbox membership
   removes the message outright.
 - **Graph** never reaches the case; a move always writes exactly one
@@ -336,7 +334,7 @@ RFC 8621 §3. Not part of `jmap_initial_sync`, but bifrost's JMAP
 `Account::open` probes it during account discovery (`discover`); if
 the method returns `unknownMethod` the open fails with
 `Wire(Jmap(UnknownMethod))` and no sync runs at all. The legacy
-`jmap-client` open path never needed it, so this only surfaced once
+client's open path never needed it, so this only surfaced once
 account-open was routed through bifrost's JMAP account.
 
 What the mock serves:
@@ -447,9 +445,9 @@ always orders by id).
 ## Constants worth knowing
 
 - `BATCH_SIZE = 50` - `Email/query` limit, `Email/get` chunk size.
-  `crates/jmap/src/sync/mod.rs:22`.
+  `crates/jmap/src/sync/mod.rs`.
 - `JMAP_MAX_CHANGES = 500` - `Email/changes` / `Mailbox/changes`
-  batch cap. `crates/jmap/src/lib.rs:9`. v1+ concern.
+  batch cap. `crates/jmap/src/lib.rs`. v1+ concern.
 - `MAILBOX_CACHE_TTL = 60s` - client-side TTL on the mailbox list.
   Doesn't affect the wire protocol.
 
@@ -602,7 +600,7 @@ Things that WILL break calendar sync if wrong:
   args, callId], ...]}`).
 - Response is `{"methodResponses": [[name, result, callId], ...],
   "sessionState": "<string>"}`.
-- jmap-client's reqwest layer handles 401/redirects/retries - v0
+- bifrost's reqwest layer handles 401/redirects/retries - v0
   always returns 200 on the API endpoint.
 - The session URL accepts `GET` and returns `application/json`.
 

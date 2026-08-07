@@ -1,6 +1,6 @@
 -- Same scenario as fixtures/discovery-small.toml. Drives the
 -- WebFinger / OIDC discovery / Mozilla autoconfig routes mounted
--- on the JMAP HTTP listener. See notes/ratatoskr-discovery-surface.md.
+-- on the JMAP HTTP listener. See reference/ratatoskr-discovery-surface.md.
 
 fixture({
   name = "discovery-small",

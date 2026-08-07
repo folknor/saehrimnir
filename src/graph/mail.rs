@@ -3,7 +3,7 @@
 //! Implements the subset of `/v1.0/me/mailFolders/...` and the
 //! parallel `/v1.0/users/{userId}/mailFolders/...` paths
 //! ratatoskr's Graph client exercises during initial and delta
-//! sync. See `notes/ratatoskr-graph-surface.md`.
+//! sync. See `reference/ratatoskr-graph-surface.md`.
 //!
 //! Stage 3 of the multi-account refactor introduces per-account
 //! routing on the Graph mail surface: `/v1.0/me/...` continues to
@@ -3101,7 +3101,7 @@ fn clause_options(clause: &str) -> Option<&str> {
 }
 
 /// Named-property set GUID Exchange stores message reactions under.
-/// Documented in `notes/ratatoskr-graph-surface.md`; a consumer
+/// Documented in `reference/ratatoskr-graph-surface.md`; a consumer
 /// filtering on the real id must match what we serve, so this is the
 /// literal GUID real Graph uses, braces and upper case included.
 const REACTIONS_GUID: &str = "{41F28F13-83F4-4114-A584-EEDB5A6B0BFF}";

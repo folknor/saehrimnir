@@ -357,7 +357,7 @@ async fn clear_requests(State(state): State<AppState>) -> StatusCode {
 // ── Test-only fixture admin ─────────────────────────────────────────
 
 /// `POST /test/fixture/reset` -> 204. Contract is documented in
-/// `notes/orchestration.md` (the "Test / admin control plane"
+/// `reference/orchestration.md` (the "Test / admin control plane"
 /// section) and tracked there as the source of truth: this
 /// handler is the implementation, not the spec.
 ///

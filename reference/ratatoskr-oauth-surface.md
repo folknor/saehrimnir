@@ -79,7 +79,7 @@ or invalidated. 200 returns the token's account claims:
 ```
 
 Email and name both source from the token's account `name` field
-(which is email-shaped, see `notes/fixture-format.md`). Tokens
+(which is email-shaped, see `reference/fixture-format.md`). Tokens
 minted without an `account_id` form field default to the primary
 account, so single-account fixtures see no behaviour change.
 

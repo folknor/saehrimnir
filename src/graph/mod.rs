@@ -7,7 +7,7 @@
 //! The module is laid out as a directory so calendar/contacts/drive/
 //! groups/EWS can drop in as sibling files when their surfaces are
 //! scouted - see the resource-category table in
-//! `notes/ratatoskr-graph-surface.md`.
+//! `reference/ratatoskr-graph-surface.md`.
 
 pub mod calendar;
 pub mod contacts;

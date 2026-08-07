@@ -4,7 +4,7 @@
 //! Mail sync only in v0; everything else falls through to the Gmail
 //! error envelope on 404. The module is laid out as a directory so
 //! contacts (People API) and Drive can drop in as sibling files - see
-//! `notes/ratatoskr-gmail-surface.md`.
+//! `reference/ratatoskr-gmail-surface.md`.
 
 pub mod mail;
 

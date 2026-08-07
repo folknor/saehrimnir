@@ -7,7 +7,7 @@ sæhrimnir's implementation, to find calls that would hit
 do.
 
 - **Source of truth:** `research/bifrost/crates/*` (the client we are
-  migrating TO). The old `research/jmap-client/` was ignored.
+  migrating TO).
 - **`research/` is gitignored** (vendored scratch); citations below
   point into it for verification but it is not part of the tree.
 
@@ -73,9 +73,8 @@ foreign mailbox's owner email resolves; served by
 bifrost's NEW client does **not** drive `Calendar/changes`,
 `CalendarEvent/changes`, or `ContactCard/changes` - its calendar read
 is `CalendarEvent/query` and its contacts delta is query-based. Those
-three `*/changes` handlers we built serve the **old jmap-client**
-ratatoskr still runs today, so keep them until that cutover completes;
-they are dead weight only from bifrost's POV.
+three `*/changes` handlers we built served the retired legacy client;
+now that bifrost has taken over they are dead weight from its POV.
 
 ---
 
@@ -292,7 +291,7 @@ namespace-agnostically).
 ## CardDAV - whole protocol MISSING (latent)
 
 bifrost has a full `carddav` client crate; sæhrimnir has **no carddav
-module** (only `caldav/`), and zero mention in `notes/` or `TODO.md`.
+module** (only `caldav/`), and zero mention in `reference/` or `TODO.md`.
 
 **Urgency: latent, not urgent.** There is no standalone CardDAV sync
 entry. `CardDavAccountFactory` is invoked only from the IMAP factory's

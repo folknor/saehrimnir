@@ -13,7 +13,7 @@ outbound message. That makes the surface small.
 
 - Client connects via TCP with security mode: `"tls"` (direct TLS,
   port 465), `"starttls"` (plain to upgrade, port 587), or `"none"`
-  (plaintext, port 25). Source: `client.rs:34-79`.
+  (plaintext, port 25). Source: `client.rs`.
 - Server greeting line required before any commands. `lettre` parses
   any `220 ...` greeting; mock will emit
   `220 saehrimnir ESMTP ready\r\n`.
@@ -29,7 +29,7 @@ outbound message. That makes the surface small.
 
 - Three mechanisms attempted, gated on `config.auth_method`:
   XOAUTH2 (when `auth_method == "oauth2"`), otherwise PLAIN and LOGIN
-  in that order. Source: `client.rs:28-32`.
+  in that order. Source: `client.rs`.
 - v0 mock: every credential succeeds (no validation). Stage 5 of
   the multi-account refactor wires **per-connection account
   binding**: the SASL response is parsed and matched against the
@@ -93,7 +93,7 @@ Per outbound message, exactly:
 No RSET in the read path. One message per connection.
 
 Recipients come from To, Cc, Bcc headers extracted client-side
-(`client.rs:104-135`); the mock just sees them as RCPT TO commands.
+(`client.rs`); the mock just sees them as RCPT TO commands.
 
 ## Response codes the mock has to emit
 

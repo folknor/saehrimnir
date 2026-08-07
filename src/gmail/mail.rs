@@ -2,7 +2,7 @@
 //!
 //! Implements the subset of `/gmail/v1/users/me/...` ratatoskr's
 //! Gmail mail-sync code path exercises. See
-//! `notes/ratatoskr-gmail-surface.md` for the wire-format citations
+//! `reference/ratatoskr-gmail-surface.md` for the wire-format citations
 //! against ratatoskr's `crates/gmail/` source.
 
 use axum::{
@@ -533,7 +533,7 @@ fn email_carries_label(email: &Email, fixture: &Fixture, label_id: &str) -> bool
 /// Compute the full label set for a fixture email. The projection
 /// rules live on `Fixture::gmail_label_ids` so the read path and the
 /// `history.list` label-delta capture share one source of truth; see
-/// `notes/ratatoskr-gmail-surface.md`.
+/// `reference/ratatoskr-gmail-surface.md`.
 fn label_ids_for(email: &Email, fixture: &Fixture) -> Vec<String> {
     fixture.gmail_label_ids(email)
 }

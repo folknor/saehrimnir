@@ -1,7 +1,7 @@
 //! Fixture loader and validator.
 //!
 //! Reads a TOML fixture, normalises raw values into typed structs, and
-//! enforces the invariants documented in `notes/fixture-format.md`. The
+//! enforces the invariants documented in `reference/fixture-format.md`. The
 //! returned [`Fixture`] is read-only and feeds every JMAP response.
 
 use std::collections::BTreeMap;
@@ -107,7 +107,7 @@ pub struct Fixture {
     /// `"fixture-state.N"`). Per-account independence comes from each
     /// account owning its own counter inside [`Self::account_logs`],
     /// not from a per-account seed string. See
-    /// `notes/per-account-state.md`.
+    /// `reference/per-account-state.md`.
     pub state_seed: String,
     /// Declared accounts. v0 ships at least one and at most one is
     /// flagged `primary` (the v0 mail account every protocol surface
@@ -167,7 +167,7 @@ pub struct Fixture {
     /// exposing it under that account's `#user/<owner>/...` other-
     /// users namespace. Empty by default; fixtures that don't need
     /// shared-folder coverage omit the `[[acl]]` table. See
-    /// `AclGrant` and `notes/ratatoskr-imap-surface.md`.
+    /// `AclGrant` and `reference/ratatoskr-imap-surface.md`.
     pub acls: Vec<AclGrant>,
     /// Org-wide EWS public-folder tree. Empty by default; fixtures
     /// that don't exercise the EWS public-folder surface omit the
@@ -208,7 +208,7 @@ pub struct Fixture {
     /// `Email/changes` / `Mailbox/changes` and the Graph / gcal /
     /// People / CalDAV delta surfaces walk the requesting account's
     /// log to compute deltas between two known states. See
-    /// `notes/per-account-state.md`.
+    /// `reference/per-account-state.md`.
     pub account_logs: BTreeMap<String, ChangeLog>,
     /// Optional incremental-sync script. Populated by the Lua
     /// `change({...})` builder; empty for fixtures (TOML or Lua)
@@ -354,7 +354,7 @@ pub struct Transition {
     /// `ScopeChange`). Captured at mutation time by the change-script
     /// step applier; empty for other producers in v0 (incremental Gmail
     /// sync is change-script-driven). See
-    /// `notes/ratatoskr-gmail-surface.md`.
+    /// `reference/ratatoskr-gmail-surface.md`.
     pub email_label_changes: Vec<EmailLabelChange>,
     pub mailbox_created: Vec<String>,
     pub mailbox_updated: Vec<String>,
@@ -724,7 +724,7 @@ impl Fixture {
     /// account has never been mutated, else `{seed}.{counter}` from
     /// its log. Every per-protocol reporting site resolves the state
     /// it emits through here so a mutation on one account never moves
-    /// a sibling's wire token. See `notes/per-account-state.md`.
+    /// a sibling's wire token. See `reference/per-account-state.md`.
     pub fn state_for(&self, account_id: &str) -> &str {
         self.account_logs
             .get(account_id)
@@ -2251,7 +2251,7 @@ impl Default for CalDavConfig {
 /// the bare domain (`corp.test`) but may be any sub-path
 /// (`idp/realms/corp`) when a WebFinger response chained the
 /// client onto a sub-issuer. See
-/// `notes/ratatoskr-discovery-surface.md`.
+/// `reference/ratatoskr-discovery-surface.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiscoveryConfig {
     pub entries: Vec<DiscoveryEntry>,
@@ -2850,7 +2850,7 @@ pub struct Email {
     /// stored" from "reaction cleared to the empty string", so the
     /// mock omits the whole property entry rather than emitting an
     /// empty value. See [`Email::reaction_count`] and
-    /// `notes/ratatoskr-graph-surface.md`.
+    /// `reference/ratatoskr-graph-surface.md`.
     pub reaction_type: Option<String>,
     /// Total number of reactions on the message across all reactors.
     /// Projected as `Integer {41F28F13-83F4-4114-A584-EEDB5A6B0BFF}

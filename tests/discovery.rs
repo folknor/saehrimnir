@@ -4,7 +4,7 @@
 //! HTTP listener: WebFinger (`/.well-known/webfinger`), OIDC
 //! discovery (`/.well-known/openid-configuration`), and Mozilla
 //! autoconfig (`/mail/config-v1.1.xml`). See
-//! `notes/ratatoskr-discovery-surface.md` for the wire contract.
+//! `reference/ratatoskr-discovery-surface.md` for the wire contract.
 
 use axum::{
     body::Body,

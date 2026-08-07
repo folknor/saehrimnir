@@ -17,12 +17,12 @@ sibling files the module needs to accommodate.
   for v0 mail; will land alongside contacts.
 - HTTP/1.1, JSON, UTF-8.
 - Bearer auth: `Authorization: Bearer <token>` on every request
-  (`client.rs:306-308`). Refresh on 401; v0 mock never returns 401.
+  (`client.rs`). Refresh on 401; v0 mock never returns 401.
 - Concurrency: 10 worker tasks during initial thread fetch
-  (`sync/mod.rs:90`), 5 during delta sync (`sync/delta.rs:82`). No
+  (`sync/mod.rs`), 5 during delta sync (`sync/delta.rs`). No
   per-account cap on the wire; v0 mock has no concurrency cap.
 - Retry: 3 attempts on 429 with 1 s initial backoff
-  (`client.rs:14-16`). v0 mock never emits 429.
+  (`client.rs`). v0 mock never emits 429.
 
 ## Mail-sync endpoints
 
@@ -32,7 +32,7 @@ sibling files the module needs to accommodate.
 GET /gmail/v1/users/me/profile
 ```
 
-Response (`api.rs:14-17`):
+Response (`api.rs`):
 
 ```json
 {
@@ -52,7 +52,7 @@ it after every cycle.
 GET /gmail/v1/users/me/labels
 ```
 
-Response (`api.rs:23-26`):
+Response (`api.rs`):
 
 ```json
 {
@@ -78,7 +78,7 @@ Response (`api.rs:23-26`):
 }
 ```
 
-System label IDs ratatoskr recognises (`sync/labels.rs:36-41`):
+System label IDs ratatoskr recognises (`sync/labels.rs`):
 
 `INBOX`, `SENT`, `DRAFT`, `TRASH`, `SPAM`, `IMPORTANT`, `STARRED`,
 `UNREAD`. Anything else with `type: "user"` becomes a user-defined
@@ -93,7 +93,7 @@ GET /gmail/v1/users/me/threads
     &pageToken=<token>
 ```
 
-Query (`sync/mod.rs:169-176`):
+Query (`sync/mod.rs`):
 
 - `q`: free-form Gmail search query. The mail-sync code only ever
   emits `after:YYYY/M/D` (no quoting; the date comes from the
@@ -124,7 +124,7 @@ GET /gmail/v1/users/me/threads/{threadId}?format=full
 
 Returns a `GmailThread` with nested `messages[]`. Each message has
 the wire shape described under "Message model" below
-(`api.rs:103-111`, `storage.rs:25`).
+(`api.rs`, `storage.rs`).
 
 ### Message list (bifrost's message-centric backfill)
 
@@ -179,7 +179,7 @@ Unknown id -> 404 (`reason: notFound`).
 GET /gmail/v1/users/me/messages/{messageId}/attachments/{attachmentId}
 ```
 
-Returns `{ "data": "<base64url>", "size": <int> }` (`api.rs:184-195`).
+Returns `{ "data": "<base64url>", "size": <int> }` (`api.rs`).
 v0 fixtures carry no attachments, so any call gets a 404 with the
 canonical Gmail error envelope.
 
@@ -196,7 +196,7 @@ GET /gmail/v1/users/me/history
     &pageToken=<opaque>
 ```
 
-Response (`types.rs:101-124`):
+Response (`types.rs`):
 
 ```json
 {
@@ -216,7 +216,7 @@ Response (`types.rs:101-124`):
 
 The client persists `historyId` between cycles. A 404 on this
 endpoint (or an error mentioning `historyId`) triggers a full
-re-sync (`sync/delta.rs:180-182`).
+re-sync (`sync/delta.rs`).
 
 `historyId` is the per-account change-log counter mapped to the
 reported space as `counter + 1`, so a freshly-loaded fixture reports
@@ -315,7 +315,7 @@ in the archive mailbox instead.
 That fallback is Gmail-only. The same shape on JMAP (`Email/set`
 emptying `mailboxIds`) is REFUSED with `invalidProperties`, because
 RFC 8621 has no All Mail for the message to fall into; see
-`notes/ratatoskr-jmap-surface.md` § "`mailboxIds` can never end up
+`reference/ratatoskr-jmap-surface.md` § "`mailboxIds` can never end up
 empty". The divergence is the protocols disagreeing, not an
 inconsistency in the mock.
 
@@ -367,7 +367,7 @@ concern.
 
 ## Message model
 
-`types.rs:10-24`:
+`types.rs`:
 
 ```json
 {
@@ -384,11 +384,11 @@ concern.
 ```
 
 `internalDate` is Unix milliseconds as a quoted string, not ISO 8601
-(`parse.rs:79-83`).
+(`parse.rs`).
 
 ### MIME payload tree
 
-`types.rs:27-38`:
+`types.rs`:
 
 ```json
 {
@@ -412,7 +412,7 @@ concern.
 }
 ```
 
-Headers ratatoskr looks up case-insensitively (`parse.rs:121-123`):
+Headers ratatoskr looks up case-insensitively (`parse.rs`):
 
 `From`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`, `Message-ID`,
 `References`, `In-Reply-To`, `List-Unsubscribe`,
@@ -420,14 +420,14 @@ Headers ratatoskr looks up case-insensitively (`parse.rs:121-123`):
 `Authentication-Results`.
 
 Body data: base64url without padding (`=` chars stripped). Decoded
-via `decode_base64url_nopad()` (`parse.rs:269-275`).
+via `decode_base64url_nopad()` (`parse.rs`).
 
 Special MIME types:
 
-- `text/x-amp-html`: skipped by parser (`parse.rs:231` JMAP analogue;
+- `text/x-amp-html`: skipped by parser (`parse.rs`; JMAP analogue,
   same skip logic in Gmail parse).
 - `text/vnd.google.email-reaction+json`: emoji reactions, payload is
-  small JSON (`parse.rs:247-266`). v0 mock does not emit these.
+  small JSON (`parse.rs`). v0 mock does not emit these.
 
 ### Attachment parts
 
@@ -438,14 +438,14 @@ A part is treated as an attachment when:
   header.
 
 The client deduplicates attachments by `attachmentId` when the same
-blob appears in multiple parts (`parse.rs:152-184`). v0 fixtures
+blob appears in multiple parts (`parse.rs`). v0 fixtures
 have no attachments; the payload is always a single `text/plain`
 leaf.
 
 ## Label semantics
 
 `labelIds` on a message drives every keyword/folder relationship the
-client cares about (`parse.rs:98-99`):
+client cares about (`parse.rs`):
 
 - `UNREAD` -> not read; absence means read.
 - `STARRED` -> starred / flagged.
@@ -478,12 +478,12 @@ Mapping from saehrimnir's fixture:
 ## Pagination
 
 All list endpoints use `nextPageToken` cursors. The client treats
-them as opaque strings (`api.rs:90`). v0 mock uses `t.<offset>` and
+them as opaque strings (`api.rs`). v0 mock uses `t.<offset>` and
 follows the same shape for thread list and history.
 
 ## Wire-format strictness
 
-- camelCase everywhere (`types.rs:11` uses
+- camelCase everywhere (`types.rs` uses
   `#[serde(rename_all = "camelCase")]`).
 - `internalDate` and `historyId`: numeric values quoted as strings.
 - `labelIds`: array of strings, never null.
@@ -495,12 +495,12 @@ follows the same shape for thread list and history.
 
 ## Constants worth knowing
 
-- `INITIAL_THREAD_FETCH_WORKERS = 10` (`sync/mod.rs:90`).
-- `DELTA_THREAD_FETCH_WORKERS = 5` (`sync/delta.rs:82`).
-- `HISTORY_MAX_RESULTS = 500` (`api.rs:209`).
-- Thread list page size default: 100 (`sync/mod.rs:172`).
+- `INITIAL_THREAD_FETCH_WORKERS = 10` (`sync/mod.rs`).
+- `DELTA_THREAD_FETCH_WORKERS = 5` (`sync/delta.rs`).
+- `HISTORY_MAX_RESULTS = 500` (`api.rs`).
+- Thread list page size default: 100 (`sync/mod.rs`).
 - Contact full-sync runs on the 20th delta cycle
-  (`sync/delta.rs:48-60`).
+  (`sync/delta.rs`).
 
 ## Out of scope for v0 - resource categories to scaffold for later
 

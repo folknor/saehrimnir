@@ -8,7 +8,7 @@
 //! v0 scope: plaintext only, accept any credential, one message per
 //! connection. STARTTLS, CHUNKING, DSN, and PIPELINING are
 //! deliberately not advertised. See
-//! `notes/ratatoskr-smtp-surface.md` for the wire surface.
+//! `reference/ratatoskr-smtp-surface.md` for the wire surface.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

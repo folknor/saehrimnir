@@ -20,7 +20,7 @@
 //! Graph `calendarView/delta` walk observes the CalDAV write
 //! through the same `event_*` id sets, and vice versa.
 //!
-//! See `notes/ratatoskr-caldav-surface.md` for the wire shape.
+//! See `reference/ratatoskr-caldav-surface.md` for the wire shape.
 
 // Helpers below land in subsequent wedges; suppress the noisy
 // "unused" warnings while the verb handlers are still stubs.

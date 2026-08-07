@@ -195,7 +195,7 @@ body-recording rows are emitted.
 ### Announce triggers (`src/announce.rs`)
 
 A fixture `[[announce]]` trigger applies a change step before a
-nominated request is served (see `notes/fixture-format.md`). Each fire
+nominated request is served (see `reference/fixture-format.md`). Each fire
 appends one row under the LISTENER's protocol tag, positioned
 immediately AHEAD of the row for the request it preceded - so the log
 itself shows the interleaving:

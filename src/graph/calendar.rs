@@ -1421,7 +1421,7 @@ fn serialize_event(_fixture: &Fixture, e: &Event) -> Value {
 }
 
 /// Translate a parsed RRULE into Graph's structured `recurrence`
-/// object. See `notes/ratatoskr-graph-surface.md` for the schema
+/// object. See `reference/ratatoskr-graph-surface.md` for the schema
 /// reference and Stage-1 scope.
 fn graph_recurrence(
     rule: &crate::recurrence::ParsedRule,

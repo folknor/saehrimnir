@@ -86,11 +86,11 @@ seeded `SmallRng`. `fixtures/jmap-bulk.lua` shows the shape; loads
 - `CLAUDE.md` - project rules, layout, and the `brokkr check` /
   `scripts/smoke.sh` workflow.
 - `TODO.md` - per-protocol task list, what's done and what's left.
-- `notes/orchestration.md` - how brokkr drives us: lifecycle,
+- `reference/orchestration.md` - how brokkr drives us: lifecycle,
   sentinel, env vars.
-- `notes/fixture-format.md` - fixture shape and validation rules
+- `reference/fixture-format.md` - fixture shape and validation rules
   (shared by the TOML and Lua loaders).
-- `notes/ratatoskr-{jmap,imap,smtp,graph,gmail,oauth}-surface.md` -
+- `reference/ratatoskr-{jmap,imap,smtp,graph,gmail,oauth}-surface.md` -
   per-protocol cheat sheets distilled from ratatoskr's client code,
   with `crates/<proto>/src/...:LL` citations.
 
@@ -152,7 +152,7 @@ across cohort cycles without restarting it:
   store so subsequent userinfo / bearer-enforced requests reject
   it.
 
-See `notes/orchestration.md` for the full contract.
+See `reference/orchestration.md` for the full contract.
 
 ## Status
 

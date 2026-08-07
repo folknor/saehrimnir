@@ -1,7 +1,7 @@
 # TODO
 
 Running task list, ordered by what ratatoskr is actively waiting on.
-Per-protocol design notes live alongside in `notes/`; this file just
+Per-protocol design notes live alongside in `reference/`; this file just
 tracks what's next. Landed work is described in `CLAUDE.md` "Status".
 
 ## Priority (no particular order)
@@ -19,13 +19,13 @@ From the ratatoskr A5 / B8-groups gap report:
   `$value`, `$batch` sub-requests, calendarView).
 - **[done] IMAP NAMESPACE + MYRIGHTS/GETACL + `#user/` shared
   folders.** Fixture `[[acl]]` grants + other-users namespace read
-  path. See CLAUDE.md "IMAP" + `notes/ratatoskr-imap-surface.md`.
+  path. See CLAUDE.md "IMAP" + `reference/ratatoskr-imap-surface.md`.
 - **[done] EWS SOAP + Autodiscover (A5b).** New listener
   (`src/ews/`, `--ews-port`): Autodiscover GetUserSettings,
   FindFolder / FindItem / GetItem over `[[public_folder]]` /
   `[[public_item]]`, and Subscribe / GetStreamingEvents /
   Unsubscribe streaming push wired through `PushHub`. See
-  CLAUDE.md "EWS" + `notes/ratatoskr-ews-surface.md`. Follow-ups
+  CLAUDE.md "EWS" + `reference/ratatoskr-ews-surface.md`. Follow-ups
   below.
 - **[done] Shared mailboxes / public folders, uniform surface.**
   POX Autodiscover (`AlternativeMailboxes` projection); the EWS
@@ -62,7 +62,7 @@ redirect responses - only the direct POST is served), enforcement of
 `EffectiveRights` (reported, not enforced - there is no write
 surface), and Lua builders for the
 public-folder tables (TOML-only today). Tighten
-`notes/ratatoskr-ews-surface.md` against the real ratatoskr EWS
+`reference/ratatoskr-ews-surface.md` against the real ratatoskr EWS
 client when that integration lands (the doc was authored from the
 EWS schemas + gap report, not a client citation).
 
@@ -239,7 +239,7 @@ escape hatch).
   the post-load image. No test trips this today; flag for
   when one might.
 - **[arch] `body_raw_bytes` doc lives in three places**
-  (`notes/fixture-format.md`, the `Email::raw_bytes` field
+  (`reference/fixture-format.md`, the `Email::raw_bytes` field
   doc, the IMAP render doc). Consolidate onto the field
   doc-comment when next touched.
 
@@ -295,7 +295,7 @@ Remaining items are unblocked-but-unneeded.
   state advance already moves HIGHESTMODSEQ; bumping UIDVALIDITY
   would need a fixture-side knob).
 - `body_html` parallel to `body_text`. Reserved in
-  `notes/fixture-format.md`; not implemented. Pressing once IMAP
+  `reference/fixture-format.md`; not implemented. Pressing once IMAP
   needs to render an HTML wire body or Graph wants HTML rendering.
 - Multipart MIME via `body_path` for fixtures that want to round-trip
   a real `.eml` rather than authoring per-protocol projections from
@@ -431,9 +431,9 @@ each is observable to a harness script.
   or the file would fail brokkr's parse-time validation. Until then,
   rely on `brokkr check`'s no-toml fallback.
 - Plan-3 / ratatoskr wiring. From saehrimnir's side this just needs
-  jmap-client + ratatoskr's IMAP/Graph/Gmail/SMTP clients to talk
+  bifrost's JMAP/IMAP/Graph/Gmail/SMTP clients to talk
   to us cleanly. Behaviours worth re-verifying when plan-3 lights
-  up: whether jmap-client follows a relative `apiUrl`, whether
+  up: whether the JMAP client follows a relative `apiUrl`, whether
   ratatoskr's IMAP client tolerates our exact greeting/CAPABILITY
   ordering, whether Gmail's q-parser mismatch (we only honour
   `after:YYYY/M/D`) trips any internal-sync code path.

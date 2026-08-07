@@ -606,7 +606,7 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
 
     // Filtered + sorted id list. Sort is descending by receivedAt with
     // id-lexicographic tiebreak, matching the determinism contract in
-    // notes/fixture-format.md.
+    // reference/fixture-format.md.
     let mut matches: Vec<&crate::fixture::Email> = fixture
         .emails_for(account_id)
         .filter(|e| filter.matches(e))

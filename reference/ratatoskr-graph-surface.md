@@ -13,7 +13,7 @@ accommodate.
 
 ## Profile / account-open (`src/graph/profile.rs`)
 
-`GraphAccountFactory::open` (bifrost `crates/graph/src/account/mod.rs:288`)
+`GraphAccountFactory::open` (bifrost `crates/graph/src/account/mod.rs`)
 issues `GET /me?$select=displayName,mail,userPrincipalName` as its
 FIRST request, then derives the account's own address from
 `profile.mail.or(profile.user_principal_name)`. This must succeed or
@@ -124,7 +124,7 @@ entries are purely observability for tests asserting state
 moved.
 
 The fixture format adds a flat `[[category]]` block (see
-`notes/fixture-format.md`); the Lua loader exposes the same
+`reference/fixture-format.md`); the Lua loader exposes the same
 shape via `category({...})`.
 
 ## Groups (`src/graph/group_sync.rs`)
@@ -179,9 +179,9 @@ mail (`mailFolders`, `messages`, `messages/delta`,
   Refresh-token cycle is invisible to us; mock accepts any token,
   never returns 401.
 - Concurrency: ratatoskr caps itself at 3 concurrent in-flight
-  requests per mailbox (`client.rs:21,92`). Graph itself enforces 4.
-  v0 mock has no concurrency cap.
-- Retry: `client.rs:23-26` retries 429s up to 3 times with 1s
+  requests per mailbox (`CONCURRENCY_LIMIT` in `client.rs`). Graph
+  itself enforces 4. v0 mock has no concurrency cap.
+- Retry: `client.rs` retries 429s up to 3 times with 1s
   initial backoff. v0 mock never emits 429.
 
 ## OData envelope
@@ -195,21 +195,21 @@ mail (`mailFolders`, `messages`, `messages/delta`,
 }
 ```
 
-Read by ratatoskr (`types.rs:4-11`):
+Read by ratatoskr (`ODataCollection` in `types.rs`):
 
 - `value` - required, an array.
 - `@odata.nextLink` - absolute URL, optional. Client follows it
-  verbatim (`sync/folders.rs:200`). Relative URLs are not supported.
+  verbatim (`sync/folders.rs`). Relative URLs are not supported.
 - `@odata.deltaLink` - absolute URL, optional. Stored per folder for
   the next delta cycle.
 - `@odata.context` - tolerated, not required.
 - Per-item `@odata.id` and `@odata.type` - tolerated, not required.
 - Deleted-item marker on a delta response: `{"@removed": ...}` -
-  any truthy value satisfies the parser (`sync/mod.rs:390`).
+  any truthy value satisfies the parser (`sync/mod.rs`).
 
 ## Folder model
 
-Per `types.rs:75-80`, `parse.rs`, and `folder_mapper.rs`:
+Per `types.rs`, `parse.rs`, and `folder_mapper.rs`:
 
 ```json
 {
@@ -224,7 +224,7 @@ Per `types.rs:75-80`, `parse.rs`, and `folder_mapper.rs`:
 ```
 
 Well-known aliases (case-insensitive) and how they map to ratatoskr's
-internal label IDs (`crates/db/src/db/folder_roles.rs:129-138`):
+internal label IDs (`crates/db/src/db/folder_roles.rs`):
 
 | alias          | label   |
 |----------------|---------|
@@ -365,7 +365,7 @@ GET /v1.0/me/mailFolders/{alias}
 ```
 
 Returns the single folder matching `alias` (well-known) or `id`
-(opaque). 404 if neither matches. `sync/folders.rs:28-39`.
+(opaque). 404 if neither matches. See `sync/folders.rs`.
 
 ### Folder tree
 
@@ -375,7 +375,7 @@ GET /v1.0/me/mailFolders/{folderId}/childFolders?$top=250
 ```
 
 Returns `ODataCollection<Folder>`. Pagination via `@odata.nextLink`
-when the page is full. `sync/folders.rs:174-219`.
+when the page is full. See `sync/folders.rs`.
 
 ### Initial message fetch
 
@@ -388,7 +388,7 @@ GET /v1.0/me/mailFolders/{folderId}/messages
     &$orderby=receivedDateTime desc
 ```
 
-`MESSAGE_SELECT` fields (`types.rs:206-211`):
+`MESSAGE_SELECT` fields (in `types.rs`):
 
 ```
 id, conversationId, subject, bodyPreview, body, uniqueBody,
@@ -399,14 +399,14 @@ inferenceClassification, isReadReceiptRequested,
 internetMessageHeaders, internetMessageId
 ```
 
-`EXPAND` (`types.rs:220-224`):
+`EXPAND` (in `types.rs`):
 
 ```
 attachments($select=id,name,contentType,size,isInline,contentId,contentBytes),
 singleValueExtendedProperties($filter=...REACTIONS_GUID...)
 ```
 
-Page size: 50 (`sync/mod.rs:30 BATCH_SIZE`). Pagination via
+Page size: 50 (`BATCH_SIZE` in `sync/mod.rs`). Pagination via
 `@odata.nextLink`.
 
 ### Delta sync bootstrap
@@ -417,8 +417,8 @@ GET /v1.0/me/mailFolders/{folderId}/messages/delta
 ```
 
 Walks pages until a response carries `@odata.deltaLink` (no
-`nextLink`). The deltaLink is stored per folder
-(`sync/delta_tokens.rs:18-52`).
+`nextLink`). The deltaLink is stored per folder, in
+`sync/delta_tokens.rs`.
 
 Minimal-bootstrap variant for newly discovered folders:
 
@@ -426,8 +426,8 @@ Minimal-bootstrap variant for newly discovered folders:
 GET /v1.0/me/mailFolders/{folderId}/messages/delta?$deltatoken=latest
 ```
 
-Returns no messages, just a fresh `@odata.deltaLink`
-(`sync/delta_tokens.rs:96-114`).
+Returns no messages, just a fresh `@odata.deltaLink`, from
+`sync/delta_tokens.rs`.
 
 ### Delta sync query
 
@@ -437,14 +437,14 @@ GET <deltaLink-from-previous-cycle>
 
 Same response shape. Deleted messages appear as
 `{"@removed": ..., "id": "<opaque>"}` items in `value[]`. The
-`@removed` field's content is ignored (`sync/mod.rs:390`).
+`@removed` field's content is ignored (`sync/mod.rs`).
 
 A "no changes since last cycle" response is empty `value[]` with an
 immediate `@odata.deltaLink`.
 
 ## Message model
 
-`types.rs:14-38`, `parse.rs:47-193`. The non-trivial fields:
+`types.rs`, `parse.rs`. The non-trivial fields:
 
 - `id` (string, required).
 - `conversationId` (string, optional). Falls back to `id` for
@@ -466,7 +466,7 @@ immediate `@odata.deltaLink`.
   FOCUSED label client-side.
 - `isReadReceiptRequested`: bool.
 - `internetMessageHeaders`: `[{"name": "...", "value": "..."}]`.
-  Headers ratatoskr looks up case-insensitively (`parse.rs:109-120`):
+  Headers ratatoskr looks up case-insensitively (see `parse.rs`):
   `Message-ID`, `References`, `In-Reply-To`,
   `Authentication-Results`, `List-Unsubscribe`,
   `List-Unsubscribe-Post`, `Disposition-Notification-To`.
@@ -559,14 +559,14 @@ Reactions are authorable in a fixture (`reaction_type` /
 `reaction_count` on `[[email]]`) and mutable mid-run through the
 `email_reaction` change-script op, which applies as a regular email
 update so the change surfaces in the next delta cycle. See
-`notes/fixture-format.md` and `fixtures/graph-reactions.{toml,lua}`.
+`reference/fixture-format.md` and `fixtures/graph-reactions.{toml,lua}`.
 Tests: `tests/graph.rs` (standalone + batched reads, per-property
 filter, absent case) and
 `tests/step.rs::fixture_step_drives_reaction_add_change_and_clear`.
 
 ## Attachment model
 
-`types.rs:96-105`:
+`types.rs`:
 
 ```json
 {
@@ -587,13 +587,13 @@ attachments, this is the moment to fill it in.
 
 ## Wire-format strictness
 
-- camelCase everywhere (`types.rs:14` uses
+- camelCase everywhere (`types.rs` uses
   `#[serde(rename_all = "camelCase")]`).
 - ISO 8601 dates accepted with or without timezone, with or without
   fractional seconds. Mock will always emit
   `<yyyy>-<mm>-<dd>T<HH>:<MM>:<SS>Z` (full UTC).
 - `@odata.nextLink` MUST be an absolute URL or the client breaks
-  (`sync/folders.rs:200`).
+  (`sync/folders.rs`).
 - 401 triggers token refresh; v0 never returns 401.
 - 429 triggers exponential-backoff retry; v0 never emits.
 
@@ -638,7 +638,7 @@ Remaining:
 EWS + Autodiscover (public folders, EWS-streaming push) landed as its
 own listener (`src/ews/`, `--ews-port`), not under `src/graph/` -
 it's a separate SOAP wire paradigm. See
-`notes/ratatoskr-ews-surface.md`.
+`reference/ratatoskr-ews-surface.md`.
 
 The v0 module structure (`src/graph/`) keeps mail handlers in
 `mail.rs`, OData plumbing in `odata.rs`, and reserves room for

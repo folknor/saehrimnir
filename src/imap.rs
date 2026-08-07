@@ -11,7 +11,7 @@
 //! `AUTHENTICATE` (PLAIN / XOAUTH2 / OAUTHBEARER), `ENABLE QRESYNC`,
 //! `LIST`, `STATUS`, `SELECT` / `EXAMINE`, `UID SEARCH`, `UID FETCH`.
 //! Everything else returns tagged `BAD`. See
-//! `notes/ratatoskr-imap-surface.md` for what the client expects on
+//! `reference/ratatoskr-imap-surface.md` for what the client expects on
 //! the wire.
 
 use std::collections::HashMap;
@@ -379,7 +379,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         // `false` for metadata-only fetches (FLAGS, UID, MODSEQ,
         // INTERNALDATE, BODYSTRUCTURE, RFC822.SIZE). Lets a script
         // assert "no body refetch" while still permitting a flag-only
-        // reconciliation pass. See `notes/request-log.md`.
+        // reconciliation pass. See `reference/request-log.md`.
         let mut detail = serde_json::json!({ "tag": parsed.tag, "args": logged_args });
         if recorded == "UID FETCH" {
             // At this layer `parsed.command == "UID"` and `parsed.args
@@ -2620,7 +2620,7 @@ impl<'a> AstringParser<'a> {
 }
 
 /// IMAP search criteria the v0 mock understands. ratatoskr only sends
-/// these three shapes (`notes/ratatoskr-imap-surface.md`); everything
+/// these three shapes (`reference/ratatoskr-imap-surface.md`); everything
 /// else maps to `BAD`.
 #[derive(Debug)]
 enum SearchCriteria {

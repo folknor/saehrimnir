@@ -163,7 +163,7 @@ async fn root() -> &'static str {
 ///
 /// Capabilities are `core` + `mail` + `submission` + `websocket` +
 /// `principals`, plus `calendars` / `contacts` gated on the fixture
-/// carrying those resources. See `notes/ratatoskr-jmap-surface.md`.
+/// carrying those resources. See `reference/ratatoskr-jmap-surface.md`.
 /// `principals` is served narrowly (`Principal/get` only, for
 /// owner-email resolution); the `ShareNotification` family it nominally
 /// unlocks stays `unknownMethod`.
@@ -356,7 +356,7 @@ async fn session(
     // `supportsPush` advertises that the server emits `StateChange`
     // objects (vs. WebSocket-as-request-transport only). Derived from
     // the advertised HTTP base by swapping the scheme so it tracks the
-    // actually-bound listener. See `notes/ratatoskr-jmap-surface.md`.
+    // actually-bound listener. See `reference/ratatoskr-jmap-surface.md`.
     let ws_base = base
         .strip_prefix("https://")
         .map(|rest| format!("wss://{rest}"))

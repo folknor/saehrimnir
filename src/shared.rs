@@ -27,7 +27,7 @@ use crate::request_log::RequestLog;
 /// Shared, mutex-protected handle to the live `Fixture`. Cloning is
 /// cheap (an `Arc` bump). Holders acquire `.read()` for the read
 /// paths and `.write()` for the JMAP `Email/set` / `Mailbox/set`
-/// mutators (see `notes/fixture-format.md`). The single fixture-level
+/// mutators (see `reference/fixture-format.md`). The single fixture-level
 /// lock fits the read-heavy / narrow-mutation profile and avoids the
 /// locking discipline a per-resource scheme would demand. Guards are
 /// held only for the duration of an in-memory walk; never across a

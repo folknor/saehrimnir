@@ -3620,7 +3620,7 @@ async fn multi_account_mailbox_changes_partition_by_account() {
 #[tokio::test]
 async fn multi_account_secondary_write_does_not_move_primary_state() {
     // Faithful mirror of the ratatoskr `mutate_other_account`
-    // scenario, the regression notes/per-account-state.md targets:
+    // scenario, the regression reference/per-account-state.md targets:
     //   1. Initial sync of primary -> persist primary's Email state
     //      token S_p (the value Email/get returns).
     //   2. Raw Email/set on the SECONDARY flips $seen. Its own

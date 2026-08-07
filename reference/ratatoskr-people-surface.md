@@ -8,7 +8,7 @@ Source-of-truth lives there; this file is a cheat sheet.
 
 - Real Google People API host: `https://people.googleapis.com/v1`.
   Different from Gmail's `https://www.googleapis.com/gmail/v1/users/me`.
-  Source: `crates/gmail/src/contacts/mod.rs:112`.
+  Source: `crates/gmail/src/contacts/mod.rs`.
 - ratatoskr's HTTP client uses `GmailClient::get_absolute(&url, db)`
   with the absolute URL; bearer auth re-uses the Gmail OAuth token.
 - ratatoskr does NOT yet have a `RATATOSKR_TEST_PEOPLE_ENDPOINT`
@@ -17,7 +17,7 @@ Source-of-truth lives there; this file is a cheat sheet.
   unreachable from a live ratatoskr binary; the hardcoded
   `PEOPLE_API_BASE` in ratatoskr blocks us. Adding the override
   follows the same shape as `RATATOSKR_TEST_GMAIL_ENDPOINT` in
-  `crates/gmail/src/client.rs:73-82`.
+  `crates/gmail/src/client.rs`.
 
 ## Endpoints invoked
 
@@ -31,12 +31,12 @@ In order:
    - `requestSyncToken=true` (always set).
    - `pageToken=...` (subsequent pages).
    Source:
-   `crates/gmail/src/contacts/google_contacts.rs:64-66, 138-140`.
+   `crates/gmail/src/contacts/google_contacts.rs`.
 
 2. `GET /v1/people/me/connections?syncToken=<previous>` - delta
    sync. Errors containing `"410"` or `"GONE"` or the substring
    `"syncToken"` trigger a full re-sync via the no-token call.
-   Source: `:37`.
+   Source: `crates/gmail/src/contacts/google_contacts.rs`.
 
 3. `GET /v1/otherContacts` - same shape as connections, but
    wrapping the response in `otherContacts[]` instead of
@@ -46,7 +46,7 @@ In order:
 ## Response shapes
 
 `PeopleConnectionsResponse`
-(`crates/gmail/src/contacts/mod.rs:26-34`):
+(`crates/gmail/src/contacts/mod.rs`):
 
 ```
 {
@@ -58,7 +58,7 @@ In order:
 }
 ```
 
-`OtherContactsResponse` (`:36-43`):
+`OtherContactsResponse` (same file):
 
 ```
 {
@@ -69,7 +69,7 @@ In order:
 }
 ```
 
-`Person` (`:45-56`): every field is `Option<...>`, and ratatoskr
+`Person` (same file): every field is `Option<...>`, and ratatoskr
 tolerates omission everywhere. The fields it actually reads:
 
 - `resourceName` (e.g. `people/c123`) - keyed in DB.

@@ -22,7 +22,7 @@ In order:
    each entry's `id`, `summary`, `backgroundColor`, `primary`,
    `accessRole` (one of `"owner"`, `"writer"`, `"reader"`,
    `"freeBusyReader"`; only owner / writer permit mutation).
-   Source: `google.rs:95-122`.
+   Source: `google.rs`.
 
 2. `GET /calendar/v3/calendars/{id}/events` - paged events.
    Query params:
@@ -32,7 +32,7 @@ In order:
    - Subsequent calls: `syncToken=<previous>` instead of
      `timeMin`/`timeMax`.
    - All calls: optional `pageToken` for mid-list paging.
-   Sync-token recovery: `google.rs:175-186` matches on `"410"`
+   Sync-token recovery: `google.rs` matches on `"410"`
    or `"sync token"` (case-insensitive) substrings, returns an
    empty result + `new_sync_token: None` so the caller drops
    the saved token and re-bootstraps.
@@ -45,7 +45,7 @@ In order:
 
 ## Event JSON shape
 
-Per `google.rs:33-94` (`GoogleCalendarEvent` deserialiser):
+Per `google.rs` (`GoogleCalendarEvent` deserialiser):
 
 ```
 {
@@ -89,7 +89,7 @@ read.
 ## Tombstones
 
 Event deletes surface as `{ "id": "...", "status": "cancelled" }`
-in the events list. ratatoskr's `:189-200` branch routes
+in the events list. ratatoskr's `google.rs` branch routes
 `status == "cancelled"` to `deleted_remote_ids`. The mock uses
 the `event_destroyed` change-log entries (recorded by the same
 `Fixture::mutate` path Graph / CalDAV / JMAP write) to surface
