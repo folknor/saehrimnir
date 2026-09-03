@@ -105,6 +105,26 @@ pub(crate) fn body_requests_prop(body: &str, local_name: &str) -> bool {
     requested_props(body).contains(local_name)
 }
 
+/// Reduce a DAV `<href>` value to its absolute path.
+///
+/// RFC 4918 allows an href to be either a path or a full absolute URI,
+/// and bifrost's CardDAV multiget sends the RESOLVED form
+/// (`http://host:port/addressbooks/...`) because its listing resolves
+/// every href against the response URL. A path-only `parse_path` maps
+/// every such href to Unknown, which serves a 404 propstat per resource
+/// and reads as "all contacts failed" with no error anywhere - the
+/// silent wrong-shape failure mode this repo's lessons warn about.
+pub(crate) fn href_path(href: &str) -> &str {
+    let Some(scheme_end) = href.find("://") else {
+        return href;
+    };
+    let after_authority = &href[scheme_end + 3..];
+    match after_authority.find('/') {
+        Some(slash) => &after_authority[slash..],
+        None => "/",
+    }
+}
+
 /// Extract every `<href>` element value from an XML body, regardless
 /// of namespace prefix. Used by REPORT calendar-multiget to read
 /// the list of requested resource URLs. Whitespace inside the
@@ -247,6 +267,20 @@ mod tests {
     fn body_requests_prop_matches_bare_open_close() {
         let body = r#"<propfind xmlns="DAV:"><prop><current-user-principal></current-user-principal></prop></propfind>"#;
         assert!(body_requests_prop(body, "current-user-principal"));
+    }
+
+    #[test]
+    fn href_path_strips_scheme_and_authority() {
+        assert_eq!(
+            href_path("http://127.0.0.1:12345/addressbooks/u/book/c.vcf"),
+            "/addressbooks/u/book/c.vcf"
+        );
+        assert_eq!(
+            href_path("https://dav.example.test/calendars/u/cal/"),
+            "/calendars/u/cal/"
+        );
+        assert_eq!(href_path("/addressbooks/u/book/c.vcf"), "/addressbooks/u/book/c.vcf");
+        assert_eq!(href_path("https://dav.example.test"), "/");
     }
 
     #[test]

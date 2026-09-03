@@ -334,6 +334,27 @@ async fn report_calendar_multiget_returns_ical_for_each_href() {
 }
 
 #[tokio::test]
+async fn report_calendar_multiget_accepts_absolute_uri_hrefs() {
+    // RFC 4918 allows an href to be a full absolute URI, and bifrost's DAV
+    // clients send the RESOLVED form. The mock must match on the path, not
+    // 404 the whole batch.
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+  <D:href>http://127.0.0.1:12345/calendars/account-1/cal-work/ev-001.ics</D:href>
+</C:calendar-multiget>"#;
+    let (status, response) =
+        send("REPORT", "/calendars/account-1/cal-work/", Some("1"), body).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert!(response.contains("<C:calendar-data>"));
+    assert!(response.contains("BEGIN:VEVENT"));
+    assert!(!response.contains("HTTP/1.1 404 Not Found"));
+}
+
+#[tokio::test]
 async fn report_calendar_query_filters_by_time_range() {
     // ev-001 is 2026-01-15, ev-002 is 2026-02-01. Query a window
     // that covers only January.

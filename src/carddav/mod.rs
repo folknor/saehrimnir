@@ -606,7 +606,8 @@ fn report_multiget(
     let hrefs = xml::collect_hrefs(body);
     let mut out = report_prelude();
     for href in hrefs {
-        let contact_id = match parse_path(fixture, &href) {
+        // bifrost sends resolved absolute-URI hrefs; match on the path.
+        let contact_id = match parse_path(fixture, xml::href_path(&href)) {
             ResourcePath::Contact {
                 user: u,
                 book: b,

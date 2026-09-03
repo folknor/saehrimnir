@@ -927,7 +927,8 @@ fn report_multiget(
     out.push_str(r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">"#);
 
     for href in hrefs {
-        let resolved = match parse_path(fixture, &href) {
+        // bifrost may send resolved absolute-URI hrefs; match on the path.
+        let resolved = match parse_path(fixture, xml::href_path(&href)) {
             ResourcePath::Event {
                 user: u,
                 calendar_id: c,
