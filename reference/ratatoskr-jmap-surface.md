@@ -66,12 +66,16 @@ In order, every method `jmap_initial_sync` reaches:
 2. `Mailbox/get` again (also no ids), this time for the state token
    only - called by `get_mailbox_state` after the list is persisted.
    Same call, just discards the list.
-3. `Email/query` in a loop until a page returns fewer than 50 ids.
+3. `Email/query` in a loop until a page returns an EMPTY ids array.
    Per call: filter `{ "after": <UTCDate> }` (RFC3339 string per RFC
    8621, integer unix seconds also accepted by the mock), sort
-   `[{"property": "receivedAt"}]`, `position`, `limit: 50`,
-   `calculateTotal: true` on first page only.
-   Source: `crates/jmap/src/sync/`.
+   `[{"property": "receivedAt", "isAscending": false}]`, `limit`.
+   The first page sends `position: 0`; every later page instead sends
+   `anchor: <last id of the previous page>` + `anchorOffset: 1`
+   (RFC 8620 section 5.5) so churn behind the cursor cannot shift the
+   window. A server that ignores the anchor serves page one forever
+   and the walk never terminates.
+   Source: `crates/jmap/src/sync/inventory.rs`.
 4. `Email/get` per batch of 50 ids, with the property list below,
    `fetchTextBodyValues: true`, `fetchHtmlBodyValues: true`.
    Source: `crates/jmap/src/sync/`.
@@ -187,23 +191,30 @@ What the client sends (`crates/jmap/src/sync/`):
   by `receivedAt` descending and break ties by `id` lexicographic.**
   (Plan 2 explicitly decides this; the client doesn't care about
   direction at the query level since it persists everything.)
-- `position` - int offset (0 on first page, then accumulates).
-- `limit` - `50` (`BATCH_SIZE` in `sync/mod.rs`).
-- `calculateTotal` - `true` on first page, `false` after.
+- `position` - `0` on the FIRST page only. Later pages omit it in
+  favour of the anchor pair below.
+- `anchor` / `anchorOffset` - every page after the first anchors on
+  the previous page's last id with `anchorOffset: 1` (RFC 8620
+  section 5.5: the window starts at the anchor's index in the current
+  result set plus the offset; anchor overrides position).
+- `limit` - the account's `maxObjectsInGet`, floor 1.
 
 What the client reads off the response:
 
 - `ids` - array of email ids.
-- `total` - only consumed on first page (`query_result.total()`).
-- Loop terminates when `ids.len() < BATCH_SIZE` (i.e., the last
-  partial page).
+- `queryState` - pinned across the walk; a page whose `queryState`
+  differs from the first page's terminates the walk WITHOUT `Done`
+  so the engine restarts the scope.
+- Loop terminates when `ids` comes back EMPTY (not on a partial
+  page - a partial page still advances the anchor and re-queries).
 
 So the mock must:
-- Honor `position` and `limit`.
-- Return `total` on every response (the client always includes it
-  in the deserialized `QueryResponse`); the client just only uses
-  the first one.
-- Return fewer than 50 ids on the final page so the loop exits.
+- Honor `position` and `limit`, AND honor `anchor`/`anchorOffset` -
+  an unknown anchor is a hard `anchorNotFound` error, never a silent
+  fallback to `position`.
+- Return a stable `queryState` while the fixture is unmutated.
+- Return an empty `ids` array once the anchor is the last match, so
+  the loop exits.
 
 ## State tokens
 
@@ -473,10 +484,14 @@ always orders by id).
   does NOT fall back to the account name once a principal id is
   present, so an unresolvable id is worse than no id at all: it
   silently yields no owner email.
-- An `Email/query` final page that returns exactly 50 ids - the loop
-  re-queries with `position += 50` and the mock must terminate.
-  Either return `< 50` on the last page, or return an empty page
-  next.
+- An `Email/query` server that ignores `anchor`/`anchorOffset`. The
+  inventory walk anchors every page after the first on the previous
+  page's last id and terminates only on an EMPTY page, so ignoring
+  the anchor replays page one forever - the walk floods the change
+  stream until the consumer lags, which is how the whole jmap-* mail
+  harness family went red at once. Resolve the anchor against the
+  filtered, sorted result set and return `anchorNotFound` when it is
+  absent.
 
 ## Principals (RFC 9670)
 

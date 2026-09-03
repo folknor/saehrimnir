@@ -599,6 +599,25 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
         }
     };
 
+    let anchor = match args.get("anchor") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| {
+            json!({
+                "type": "invalidArguments",
+                "description": "anchor must be a string",
+            })
+        })?),
+    };
+    let anchor_offset = match args.get("anchorOffset") {
+        None | Some(Value::Null) => 0i64,
+        Some(v) => v.as_i64().ok_or_else(|| {
+            json!({
+                "type": "invalidArguments",
+                "description": "anchorOffset must be an integer",
+            })
+        })?,
+    };
+
     let calculate_total = args
         .get("calculateTotal")
         .and_then(Value::as_bool)
@@ -616,6 +635,27 @@ fn email_query(fixture: &Fixture, args: &Value) -> Result<Value, Value> {
             .cmp(&a.received_at)
             .then_with(|| a.id.cmp(&b.id))
     });
+
+    // RFC 8620 section 5.5: when `anchor` is supplied it OVERRIDES
+    // `position` - the window starts at the anchor's index in the current
+    // result set plus `anchorOffset` (clamped at the list head for a
+    // negative overshoot). An anchor absent from the result set is a hard
+    // `anchorNotFound` error, never a silent fallback to `position`:
+    // bifrost's inventory walk anchors every page after the first on the
+    // previous page's last id, so a server that ignores the anchor serves
+    // page one forever and the walk never terminates.
+    let position = if let Some(anchor_id) = anchor {
+        let Some(idx) = matches.iter().position(|e| e.id == anchor_id) else {
+            return Err(json!({
+                "type": "anchorNotFound",
+                "description": format!("anchor {anchor_id:?} is not in the query results"),
+            }));
+        };
+        let idx = i64::try_from(idx).expect("fixture email count fits in i64");
+        u64::try_from((idx + anchor_offset).max(0)).expect("clamped at zero")
+    } else {
+        position
+    };
 
     let total = matches.len() as u64;
     // start/end are bounded by `total = matches.len()` which already
@@ -2918,6 +2958,120 @@ mod tests {
         )
         .unwrap();
         assert_eq!(len(&p4), 0);
+    }
+
+    #[test]
+    fn email_query_anchor_walk_terminates() {
+        // bifrost's inventory walk: page 1 is position 0, every later page
+        // anchors on the previous page's last id with anchorOffset 1. The
+        // walk ends on an empty ids array; a server that ignores the anchor
+        // serves page one forever.
+        let f = fix_for_query();
+        let ids_of = |v: &Value| -> Vec<String> {
+            v.get("ids")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let p1 = email_query(&f, &json!({"accountId": "acct", "limit": 2, "position": 0})).unwrap();
+        assert_eq!(ids_of(&p1), vec!["a", "a2"]);
+        let p2 = email_query(
+            &f,
+            &json!({"accountId": "acct", "limit": 2, "anchor": "a2", "anchorOffset": 1}),
+        )
+        .unwrap();
+        assert_eq!(ids_of(&p2), vec!["b", "c"]);
+        assert_eq!(p2.get("position").unwrap().as_u64().unwrap(), 2);
+        let p3 = email_query(
+            &f,
+            &json!({"accountId": "acct", "limit": 2, "anchor": "c", "anchorOffset": 1}),
+        )
+        .unwrap();
+        assert_eq!(ids_of(&p3), vec!["d"]);
+        let p4 = email_query(
+            &f,
+            &json!({"accountId": "acct", "limit": 2, "anchor": "d", "anchorOffset": 1}),
+        )
+        .unwrap();
+        assert!(ids_of(&p4).is_empty(), "walk must terminate on empty page");
+    }
+
+    #[test]
+    fn email_query_anchor_overrides_position() {
+        // RFC 8620 section 5.5: anchor wins over position when both are sent.
+        let f = fix_for_query();
+        let resp = email_query(
+            &f,
+            &json!({"accountId": "acct", "limit": 2, "position": 0, "anchor": "b"}),
+        )
+        .unwrap();
+        let ids: Vec<&str> = resp
+            .get("ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["b", "c"]);
+        assert_eq!(resp.get("position").unwrap().as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn email_query_anchor_negative_offset_clamps_at_head() {
+        let f = fix_for_query();
+        let resp = email_query(
+            &f,
+            &json!({"accountId": "acct", "limit": 2, "anchor": "a2", "anchorOffset": -5}),
+        )
+        .unwrap();
+        let ids: Vec<&str> = resp
+            .get("ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["a", "a2"]);
+        assert_eq!(resp.get("position").unwrap().as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn email_query_unknown_anchor_is_anchor_not_found() {
+        let f = fix_for_query();
+        let err = email_query(
+            &f,
+            &json!({"accountId": "acct", "anchor": "no-such-id"}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.get("type").unwrap().as_str().unwrap(),
+            "anchorNotFound"
+        );
+    }
+
+    #[test]
+    fn email_query_anchor_respects_filter_scope() {
+        // The anchor resolves against the FILTERED result set: an id the
+        // filter excludes is anchorNotFound even though the email exists.
+        let f = fix_for_query();
+        let err = email_query(
+            &f,
+            &json!({
+                "accountId": "acct",
+                "filter": {"inMailbox": "mb-archive"},
+                "anchor": "a",
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.get("type").unwrap().as_str().unwrap(),
+            "anchorNotFound"
+        );
     }
 
     #[test]

@@ -713,8 +713,8 @@ fn bulk_mailboxes_breadth_first_tree_with_default_branching() {
     assert_eq!(a.mailboxes[0].id, "mb-00");
     assert!(a.mailboxes[0].parent_id.is_none());
     // First-tier children mb-01..mb-04 all parent root.
-    for i in 1..=4 {
-        assert_eq!(a.mailboxes[i].parent_id.as_deref(), Some("mb-00"));
+    for mb in &a.mailboxes[1..=4] {
+        assert_eq!(mb.parent_id.as_deref(), Some("mb-00"));
     }
     // mb-05 is the first grandchild; parent (5-1)/4 = 1 -> mb-01.
     assert_eq!(a.mailboxes[5].parent_id.as_deref(), Some("mb-01"));
